@@ -1,0 +1,23 @@
+{
+  // OpenCode config — orchestrator agent for ad-decompiler.
+  // Docs: https://opencode.ai/docs/config  •  the agent's instructions live in AGENTS.md
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md", "docs/CONTRACT.md"],
+  "agent": {
+    "orchestrator": {
+      "description": "Runs the ad->Figma pipeline stage by stage, inspects JSON artifacts, and drives repairs until QA passes.",
+      "mode": "primary",
+      // point this at whatever you run on the Windows box (local Qwen/Ollama, or a hosted model).
+      "model": "ollama/qwen2.5-coder:14b",
+      "tools": { "bash": true, "read": true, "write": true, "edit": true },
+      "permission": { "bash": "allow" }
+    }
+  },
+  // Example: register a local model provider (edit to match your setup).
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:11434/v1" }
+    }
+  }
+}

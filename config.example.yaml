@@ -1,0 +1,29 @@
+# ad-decompiler config — copy to config.yaml and adjust for your Windows/RTX 5080 box.
+device: cuda                          # cuda | cpu
+
+ocr:
+  primary: ppocr-v6                   # ppocr-v6 | surya | doctr | tesseract
+  challengers: []                     # e.g. [surya] to run + reconcile by IoU
+  lang: en
+
+qwen:
+  mode: comfyui                       # comfyui | direct-diffusers
+  workflow: workflows/qwen_layered_8_api.json
+  layers: 8
+backend_url: http://127.0.0.1:8188    # ComfyUI, only used when qwen.mode=comfyui
+
+vectorize:
+  color_engine: vtracer               # resolved from PATH or .bin/vtracer(.exe)
+  binary_engine: potrace
+
+upscale:
+  enabled: true                       # Real-ESRGAN for compressed Meta Library assets
+
+figma:
+  mode: plugin                        # plugin | clipboard
+  inbox: ~/figma-inbox                # plugin mode staging folder
+  bridge_port: 8790
+  # studio_path: C:/…/NEUEGEN/studio  # only for clipboard mode (reuses the kiwi encoder)
+
+qa_ocr: true                          # OCR the render for text-recall QA
+export_wait_s: 0                      # >0 to poll for the plugin's figma_export.png

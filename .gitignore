@@ -1,0 +1,27 @@
+# runs & caches
+/runs/*
+!/runs/.gitkeep
+**/.cache/
+figma-inbox/
+
+# models & binaries (download on the target box)
+*.onnx
+*.pth
+*.safetensors
+/.bin/
+vtracer
+vtracer.exe
+potrace
+potrace.exe
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+config.yaml
+
+# os
+.DS_Store
+Thumbs.db

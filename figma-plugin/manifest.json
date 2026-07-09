@@ -1,0 +1,12 @@
+{
+  "name": "ad-decompiler import",
+  "id": "ad-decompiler-import",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "networkAccess": {
+    "allowedDomains": ["http://127.0.0.1:8790", "http://localhost:8790"],
+    "reasoning": "Fetches design.json/assets from the local ad-decompiler bridge and POSTs the exported PNG back."
+  }
+}

@@ -1,0 +1,70 @@
+<style>
+  body { font: 12px -apple-system, system-ui, sans-serif; margin: 12px; color: #222; }
+  button { width: 100%; padding: 8px; margin: 4px 0; border: 0; border-radius: 6px; background: #18a0fb; color: #fff; font-weight: 600; cursor: pointer; }
+  button.sec { background: #eee; color: #333; }
+  input { width: 100%; box-sizing: border-box; padding: 6px; margin: 2px 0 8px; }
+  .row { font-size: 11px; color: #666; margin: 6px 0; }
+</style>
+<div class="row">Bridge (ad-decompiler serves inbox here):</div>
+<input id="bridge" value="http://127.0.0.1:8790" />
+<button id="fetch">Import latest from bridge</button>
+<button id="pick" class="sec">…or load a design.json file</button>
+<input id="file" type="file" accept="application/json" style="display:none" />
+<div class="row" id="status">idle</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const status = (m) => ($("status").textContent = m);
+let EXPORT_TO = null;
+
+async function fetchAssets(base, doc) {
+  const assets = {};
+  for (const L of doc.layers) {
+    if (L.type === "image" && L.src) {
+      try {
+        const r = await fetch(base + "/asset?path=" + encodeURIComponent(L.src));
+        const buf = await r.arrayBuffer();
+        assets[L.src] = Array.from(new Uint8Array(buf));
+      } catch (e) { status("asset miss: " + L.src); }
+    }
+  }
+  return assets;
+}
+
+$("fetch").onclick = async () => {
+  const base = $("bridge").value.replace(/\/$/, "");
+  status("fetching inbox…");
+  try {
+    const man = await (await fetch(base + "/inbox.json")).json();
+    EXPORT_TO = man.export_to || null;
+    const doc = await (await fetch(base + "/design.json")).json();
+    status("building " + doc.layers.length + " layers…");
+    const assets = await fetchAssets(base, doc);
+    parent.postMessage({ pluginMessage: { type: "build", design: doc, assets, export_to: EXPORT_TO } }, "*");
+  } catch (e) { status("bridge error: " + e.message + " — try the file loader"); }
+};
+
+$("pick").onclick = () => $("file").click();
+$("file").onchange = async (e) => {
+  const doc = JSON.parse(await e.target.files[0].text());
+  status("building " + doc.layers.length + " layers (no assets — image layers blank)…");
+  parent.postMessage({ pluginMessage: { type: "build", design: doc, assets: {}, export_to: null } }, "*");
+};
+
+onmessage = async (e) => {
+  const m = e.data.pluginMessage;
+  if (m && m.type === "exported") {
+    const bytes = new Uint8Array(m.bytes);
+    // POST back to the bridge so run_pipeline picks up figma_export.png, else download.
+    const base = $("bridge").value.replace(/\/$/, "");
+    try {
+      await fetch(base + "/export", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: bytes });
+      status("exported → bridge (run_pipeline --resume qa)");
+    } catch (err) {
+      const blob = new Blob([bytes], { type: "image/png" });
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+      a.download = "figma_export.png"; a.click();
+      status("exported → downloaded figma_export.png (drop into the run dir)");
+    }
+  }
+};
+</script>

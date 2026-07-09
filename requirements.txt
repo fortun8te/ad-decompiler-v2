@@ -1,0 +1,14 @@
+# CPU-side deps (deterministic stages: normalize, element_detect, merge, build, pixel_diff,
+# routing, wordmark, figma bridge). Runs on any machine incl. the Mac reference box.
+numpy>=1.26
+pillow>=10.2
+opencv-python>=4.9
+scipy>=1.11
+shapely>=2.0
+requests>=2.31
+pyyaml>=6.0
+cairosvg>=2.7          # rasterize vectorizer output for the fidelity gate
+pytest>=8.0            # tests
+
+# GPU / vision backends (OCR, Qwen-Image-Layered, upscaler) live in requirements-gpu.txt —
+# install those on the Windows RTX 5080 machine.
