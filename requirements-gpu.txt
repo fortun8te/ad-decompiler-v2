@@ -1,0 +1,48 @@
+# requirements-gpu.txt — ad-decompiler GPU/CV stack for Windows + CUDA 12.x (RTX 5080)
+# =============================================================================
+# TORCH — install FIRST from the CUDA 12.1 wheel index, NOT from PyPI, e.g.:
+#
+#     pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+#
+# NOTE (RTX 5080 / Blackwell / sm_120): the cu121 wheels above cover most setups.
+# If you hit "no kernel image is available for execution on the device", the 5080
+# needs a newer CUDA build — use the cu124 (or nightly cu128) index instead:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Then install the rest of this file with:  pip install -r requirements-gpu.txt
+# =============================================================================
+
+# ── core CV / array (CPU-safe, used by normalize/element_detect/vectorize) ──
+numpy>=1.26,<2.3
+opencv-python>=4.9
+scipy>=1.11
+pillow>=10.2
+requests>=2.31
+
+# ── OCR: primary + challengers + baseline ──
+paddleocr>=3.0            # PP-OCRv6 pipeline (primary)
+paddlepaddle-gpu>=3.0     # CUDA build of Paddle; use `paddlepaddle` for CPU-only boxes
+surya-ocr>=0.6            # challenger (torch-based)
+python-doctr[torch]>=0.8  # challenger (torch-based)
+# pytesseract>=0.3.10     # OPTIONAL Tesseract baseline; also needs the tesseract binary
+#                           (choco install tesseract  /  apt install tesseract-ocr)
+
+# ── Qwen-Image-Layered (direct-diffusers backend) ──
+# diffusers must be the git build — QwenImageLayeredPipeline is not in a release yet:
+#     pip install "git+https://github.com/huggingface/diffusers"
+transformers>=4.51.3      # Qwen2.5-VL support required by the layered pipeline
+accelerate>=0.30
+python-pptx>=0.6          # imported by the layered pipeline's PSD/layer export path
+# ComfyUI backend needs only `requests` (already above) talking to a running ComfyUI.
+
+# ── vectorize rasterization gate ──
+cairosvg>=2.7             # rasterize traced SVG for the fidelity check
+# vtracer + potrace are external BINARIES, not pip packages:
+#   vtracer:  cargo install vtracer            (or grab a release from
+#             https://github.com/visioncortex/vtracer/releases and put it on PATH)
+#   potrace:  choco install potrace            (Windows)  /  brew install potrace (mac)
+
+# ── optional upscaler for compressed Meta Library assets ──
+# realesrgan is often painful to pin against modern torch; prefer the spandrel route
+# inside ComfyUI, OR install standalone:
+#   pip install realesrgan basicsr        # may need basicsr patched for torchvision>=0.17
+# If realesrgan won't build, skip it and set cfg.upscale.enabled=false.
