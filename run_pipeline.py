@@ -14,11 +14,11 @@ import argparse, os, sys, time, glob, traceback, json
 
 sys.path.insert(0, os.path.dirname(__file__))
 from src import (normalize, ocr, element_detect, qwen_worker, merge_layers,
-                 build_design_json, figma_import, pixel_diff, repair)
+                 build_design_json, figma_import, pixel_diff, repair, render_preview)
 from src.schema import dump, load
 
 STAGES = ["normalize", "ocr", "elements", "qwen", "merge", "design",
-          "figma", "export", "diff", "qa"]
+          "preview", "figma", "export", "diff", "qa"]
 
 
 def load_cfg(path):
@@ -92,8 +92,13 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                                           doc_id=os.path.basename(run_dir), name=os.path.basename(run_dir))
             _log(run_dir, f"design.json → {len(doc.layers)} layers, kept_in_photo={len(doc.kept_in_photo)}")
 
-        # 9 figma import
-        if stage("figma"):
+        # 8.5 LOCAL PREVIEW — see the layers without Figma (default on)
+        if stage("preview") and cfg.get("preview", True):
+            pv = render_preview.render(A("design.json"), run_dir)
+            _log(run_dir, f"preview → {pv['preview']} ({pv['count']} layers in layers/, see layers_contact.png)")
+
+        # 9 figma import (optional — Figma export can come later)
+        if stage("figma") and cfg.get("figma", {}).get("enabled", False):
             imp = figma_import.import_design(A("design.json"), run_dir, cfg)
             dump(imp, A("figma_import.json")); _log(run_dir, f"figma import: {imp.get('action', imp)}")
 
@@ -102,10 +107,12 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             exp = figma_import.export_screenshot(run_dir, cfg, wait_s=cfg.get("export_wait_s", 0))
             _log(run_dir, f"export: {exp.get('note', exp.get('path'))}")
 
-        # 11 diff + 12 qa (only if we have a render)
-        if stage("diff") and exists("figma_export.png"):
-            ren_ocr = ocr.run_ocr(A("figma_export.png"), cfg) if cfg.get("qa_ocr", True) else None
-            qa_partial = pixel_diff.compare(norm_path, A("figma_export.png"), run_dir,
+        # 11 diff + 12 qa — QA against the Figma render if present, else the local preview
+        qa_render = A("figma_export.png") if exists("figma_export.png") else \
+            (A("preview.png") if exists("preview.png") else None)
+        if stage("diff") and qa_render:
+            ren_ocr = ocr.run_ocr(qa_render, cfg) if cfg.get("qa_ocr", True) else None
+            qa_partial = pixel_diff.compare(norm_path, qa_render, run_dir,
                                             source_ocr=ocr_res, render_ocr=ren_ocr)
             reps = repair.assess(load(A("design.json")), qa_partial, ocr_res, cfg)
             qa = {**qa_partial, "repairs": reps,
@@ -113,7 +120,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             dump(qa, A("qa.json"))
             _log(run_dir, f"qa → ssim={qa.get('ssim')} text_recall={qa.get('text_recall')} repairs={len(reps)}")
         elif stage("diff"):
-            _log(run_dir, "diff/qa skipped — no figma_export.png yet (run plugin import+export, then --resume qa)")
+            _log(run_dir, "diff/qa skipped — no render found (preview.png or figma_export.png)")
 
         _log(run_dir, f"done in {time.time()-t0:.1f}s")
         return {"ok": True, "run_dir": run_dir}

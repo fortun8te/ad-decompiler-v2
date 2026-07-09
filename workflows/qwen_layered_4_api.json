@@ -1,0 +1,74 @@
+{
+  "_note": "ComfyUI API-format graph for Qwen-Image-Layered (4 RGBA layers). Qwen-Image-Layered decomposes ONE input image into N stacked RGBA layers; the model treats the N layers as a short 'video' along the temporal axis, so EmptyHunyuanLatentVideo.length encodes the layer count via length = 5 + (N-1)*4  (4 layers -> 17). REQUIRED on the ComfyUI box: (1) update ComfyUI to a build with native Qwen-Image nodes (UNETLoader qwen_image weight type, CLIPLoader type 'qwen_image', ModelSamplingAuraFlow, ReferenceLatent, EmptyHunyuanLatentVideo, LatentCutToBatch, VAEDecode with RGBA out); (2) models from HF 'Comfy-Org/Qwen-Image-Layered_ComfyUI' -> diffusion_models/qwen_image_layered_bf16.safetensors (or fp8mixed) and vae/qwen_image_layered_vae.safetensors; (3) text encoder qwen_2.5_vl_7b_fp8_scaled.safetensors in models/text_encoders. Optional helper node pack: benjiyaya/ComfyUI-QwenImageLayeredToLength ('QwenImageLayered - Layer to Length Mapper') to compute length from a layer count instead of the hardcoded 17. qwen_worker.py sets node 5 (LoadImage) image, node 11 length, and reads PNGs from node 15 (SaveImage). If node names differ on your build, this file is the thing to edit.",
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": { "unet_name": "qwen_image_layered_bf16.safetensors", "weight_dtype": "default" }
+  },
+  "2": {
+    "class_type": "ModelSamplingAuraFlow",
+    "inputs": { "model": ["1", 0], "shift": 1.0 }
+  },
+  "3": {
+    "class_type": "CLIPLoader",
+    "inputs": { "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors", "type": "qwen_image", "device": "default" }
+  },
+  "4": {
+    "class_type": "VAELoader",
+    "inputs": { "vae_name": "qwen_image_layered_vae.safetensors" }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": { "image": "input.png" }
+  },
+  "6": {
+    "class_type": "VAEEncode",
+    "inputs": { "pixels": ["5", 0], "vae": ["4", 0] }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "clip": ["3", 0], "text": "" }
+  },
+  "8": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "clip": ["3", 0], "text": "" }
+  },
+  "9": {
+    "class_type": "ReferenceLatent",
+    "inputs": { "conditioning": ["7", 0], "latent": ["6", 0] }
+  },
+  "10": {
+    "class_type": "ReferenceLatent",
+    "inputs": { "conditioning": ["8", 0], "latent": ["6", 0] }
+  },
+  "11": {
+    "class_type": "EmptyHunyuanLatentVideo",
+    "inputs": { "width": 1024, "height": 1024, "length": 17, "batch_size": 1 }
+  },
+  "12": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 777,
+      "steps": 20,
+      "cfg": 2.5,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": ["2", 0],
+      "positive": ["9", 0],
+      "negative": ["10", 0],
+      "latent_image": ["11", 0]
+    }
+  },
+  "13": {
+    "class_type": "LatentCutToBatch",
+    "inputs": { "samples": ["12", 0], "dim": "t", "step": 1 }
+  },
+  "14": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["13", 0], "vae": ["4", 0] }
+  },
+  "15": {
+    "class_type": "SaveImage",
+    "inputs": { "images": ["14", 0], "filename_prefix": "qwen_layer" }
+  }
+}

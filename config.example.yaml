@@ -19,7 +19,10 @@ vectorize:
 upscale:
   enabled: true                       # Real-ESRGAN for compressed Meta Library assets
 
+preview: true                         # composite design.json -> preview.png + layers/ (no Figma needed)
+
 figma:
+  enabled: false                      # Figma export is OPTIONAL and can come later; preview is the default output
   mode: plugin                        # plugin | clipboard
   inbox: ~/figma-inbox                # plugin mode staging folder
   bridge_port: 8790

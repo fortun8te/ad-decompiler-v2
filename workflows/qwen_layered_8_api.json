@@ -1,0 +1,74 @@
+{
+  "_note": "ComfyUI API-format graph for Qwen-Image-Layered (8 RGBA layers). Identical topology to qwen_layered_4_api.json but EmptyHunyuanLatentVideo.length = 5 + (8-1)*4 = 33 to request 8 layers. See qwen_layered_4_api.json _note for the full install/model list (Comfy-Org/Qwen-Image-Layered_ComfyUI weights + qwen_image_layered_vae + qwen_2.5_vl_7b text encoder; native Qwen-Image ComfyUI nodes; optional benjiyaya/ComfyUI-QwenImageLayeredToLength mapper). qwen_worker.py sets node 5 image + node 11 length and downloads node 15 outputs.",
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": { "unet_name": "qwen_image_layered_bf16.safetensors", "weight_dtype": "default" }
+  },
+  "2": {
+    "class_type": "ModelSamplingAuraFlow",
+    "inputs": { "model": ["1", 0], "shift": 1.0 }
+  },
+  "3": {
+    "class_type": "CLIPLoader",
+    "inputs": { "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors", "type": "qwen_image", "device": "default" }
+  },
+  "4": {
+    "class_type": "VAELoader",
+    "inputs": { "vae_name": "qwen_image_layered_vae.safetensors" }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": { "image": "input.png" }
+  },
+  "6": {
+    "class_type": "VAEEncode",
+    "inputs": { "pixels": ["5", 0], "vae": ["4", 0] }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "clip": ["3", 0], "text": "" }
+  },
+  "8": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "clip": ["3", 0], "text": "" }
+  },
+  "9": {
+    "class_type": "ReferenceLatent",
+    "inputs": { "conditioning": ["7", 0], "latent": ["6", 0] }
+  },
+  "10": {
+    "class_type": "ReferenceLatent",
+    "inputs": { "conditioning": ["8", 0], "latent": ["6", 0] }
+  },
+  "11": {
+    "class_type": "EmptyHunyuanLatentVideo",
+    "inputs": { "width": 1024, "height": 1024, "length": 33, "batch_size": 1 }
+  },
+  "12": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 777,
+      "steps": 20,
+      "cfg": 2.5,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": ["2", 0],
+      "positive": ["9", 0],
+      "negative": ["10", 0],
+      "latent_image": ["11", 0]
+    }
+  },
+  "13": {
+    "class_type": "LatentCutToBatch",
+    "inputs": { "samples": ["12", 0], "dim": "t", "step": 1 }
+  },
+  "14": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["13", 0], "vae": ["4", 0] }
+  },
+  "15": {
+    "class_type": "SaveImage",
+    "inputs": { "images": ["14", 0], "filename_prefix": "qwen_layer" }
+  }
+}
