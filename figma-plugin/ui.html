@@ -497,6 +497,27 @@
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
     }
+
+    .upload-zone {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-height: 72px;
+      padding: 14px 16px;
+      border: 1px dashed var(--border-strong);
+      border-radius: var(--radius-lg);
+      background: var(--bg-secondary);
+      cursor: pointer;
+      transition: border-color 160ms ease, background-color 160ms ease;
+    }
+
+    .upload-zone:hover, .upload-zone:focus-visible { border-color: var(--brand); }
+    .upload-zone[data-dragover="true"] { border-color: var(--brand); background: var(--selected); }
+    .upload-zone[data-busy="true"] { cursor: default; }
+
+    .upload-idle, .upload-busy { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .upload-busy .empty-glyph { animation: spin 1.1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -556,6 +577,37 @@
                 <div><span class="metric-value" id="metricImages">0</span><span class="metric-label">images</span></div>
                 <div><span class="metric-value" id="metricGroups">0</span><span class="metric-label">groups</span></div>
               </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="uploadHeading">
+        <div class="section-header">
+          <h2 class="section-title" id="uploadHeading">Process a new image</h2>
+        </div>
+        <div class="upload-zone" id="uploadZone" tabindex="0" role="button" aria-label="Choose an image to process on the bridge">
+          <input type="file" id="uploadInput" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" hidden />
+          <div class="upload-idle" id="uploadIdle">
+            <div class="empty-glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3"/>
+              </svg>
+            </div>
+            <div>
+              <div class="empty-title">Drop an image, or click to choose</div>
+              <div class="empty-copy">PNG, JPG, or WEBP — runs the full pipeline on whatever this bridge is connected to.</div>
+            </div>
+          </div>
+          <div class="upload-busy hidden" id="uploadBusy">
+            <div class="empty-glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M12 3a9 9 0 100 18"/>
+              </svg>
+            </div>
+            <div>
+              <div class="empty-title" id="uploadBusyTitle">Processing…</div>
+              <div class="empty-copy" id="uploadBusyCopy">This can take a while on the GPU box — leave this open, or check back later and click Refresh.</div>
             </div>
           </div>
         </div>
@@ -651,6 +703,7 @@
       source: null,
       fileMap: new Map(),
       building: false,
+      uploading: false,
       previewUrl: null,
     };
 
@@ -913,6 +966,93 @@
       }
     }
 
+    function setUploadBusy(busy, title, copy) {
+      $("uploadZone").dataset.busy = busy ? "true" : "false";
+      $("uploadZone").setAttribute("aria-disabled", busy ? "true" : "false");
+      $("uploadIdle").classList.toggle("hidden", Boolean(busy));
+      $("uploadBusy").classList.toggle("hidden", !busy);
+      if (title) $("uploadBusyTitle").textContent = title;
+      if (copy) $("uploadBusyCopy").textContent = copy;
+    }
+
+    function formatElapsed(ms) {
+      const s = Math.round(ms / 1000);
+      if (s < 60) return s + "s";
+      return Math.floor(s / 60) + "m " + (s % 60) + "s";
+    }
+
+    async function pollProcessJob(base, jobId, filename, startedAt) {
+      // Self-scheduling setTimeout (not setInterval) so a slow/hung request can't stack
+      // overlapping polls, and a transient network hiccup doesn't kill the whole flow.
+      const maxWaitMs = 20 * 60 * 1000; // the job keeps running server-side regardless
+      let status;
+      try {
+        status = await fetchJson(base + "/process?job_id=" + encodeURIComponent(jobId), 8000);
+      } catch (error) {
+        if (Date.now() - startedAt > maxWaitMs) {
+          setUploadBusy(false);
+          state.uploading = false;
+          showIssues([{ title: "Lost contact with the bridge", detail: "\"" + filename + "\" may still be processing — check back and click Refresh." }], "warning");
+          return;
+        }
+        setTimeout(function () { pollProcessJob(base, jobId, filename, startedAt); }, 2500);
+        return;
+      }
+      if (status.status === "done") {
+        state.uploading = false;
+        setUploadBusy(false);
+        await refreshLatest({ silent: false });
+        setFooter("Processed \"" + filename + "\" — " + $("footerStatus").textContent);
+        return;
+      }
+      if (status.status === "failed") {
+        state.uploading = false;
+        setUploadBusy(false);
+        showIssues([{ title: "Processing failed", detail: status.error || "The pipeline reported a failure with no detail." }], "error");
+        return;
+      }
+      if (Date.now() - startedAt > maxWaitMs) {
+        setUploadBusy(false);
+        state.uploading = false;
+        showIssues([{ title: "Still running", detail: "\"" + filename + "\" is taking a while — it keeps running on the bridge; check back and click Refresh." }], "warning");
+        return;
+      }
+      setUploadBusy(true, "Processing " + filename + "…",
+        "Running the full pipeline (" + formatElapsed(Date.now() - startedAt) + " so far) — this can take a while on the GPU box.");
+      setTimeout(function () { pollProcessJob(base, jobId, filename, startedAt); }, 2000);
+    }
+
+    async function uploadImage(file) {
+      if (!file || state.uploading || state.building) return;
+      const base = cleanBase();
+      if (!validBridge(base)) {
+        showIssues([{ title: "Invalid bridge address", detail: base || "No address entered." }], "error");
+        return;
+      }
+      if (!/\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(file.name)) {
+        showIssues([{ title: "Unsupported file", detail: "\"" + file.name + "\" — choose a PNG, JPG, or WEBP image." }], "warning");
+        return;
+      }
+      state.uploading = true;
+      setUploadBusy(true, "Uploading " + file.name + "…", "Sending the image to the bridge.");
+      hideIssues();
+      try {
+        const bytes = await file.arrayBuffer();
+        const response = await fetch(base + "/process?filename=" + encodeURIComponent(file.name), {
+          method: "POST",
+          body: bytes,
+          headers: { "Content-Type": "application/octet-stream" },
+        });
+        const payload = await response.json().catch(function () { return {}; });
+        if (!response.ok) throw new Error(payload.error || (response.status + " " + response.statusText));
+        pollProcessJob(base, payload.job_id, file.name, Date.now());
+      } catch (error) {
+        state.uploading = false;
+        setUploadBusy(false);
+        showIssues([{ title: "Upload failed", detail: String((error && error.message) || error) }], "error");
+      }
+    }
+
     function showIssues(items, tone) {
       const list = $("issueList");
       list.innerHTML = "";
@@ -1138,6 +1278,36 @@
     $("loadFiles").addEventListener("click", function () { $("fileInput").click(); });
     $("loadFilesFooter").addEventListener("click", function () { $("fileInput").click(); });
     $("fileInput").addEventListener("change", function (event) { loadFiles(event.target.files); });
+    $("uploadZone").addEventListener("click", function () {
+      if (state.uploading) return;
+      $("uploadInput").click();
+    });
+    $("uploadZone").addEventListener("keydown", function (event) {
+      if ((event.key === "Enter" || event.key === " ") && !state.uploading) {
+        event.preventDefault();
+        $("uploadInput").click();
+      }
+    });
+    ["dragenter", "dragover"].forEach(function (type) {
+      $("uploadZone").addEventListener(type, function (event) {
+        event.preventDefault();
+        if (!state.uploading) $("uploadZone").dataset.dragover = "true";
+      });
+    });
+    ["dragleave", "dragend"].forEach(function (type) {
+      $("uploadZone").addEventListener(type, function () { $("uploadZone").dataset.dragover = "false"; });
+    });
+    $("uploadZone").addEventListener("drop", function (event) {
+      event.preventDefault();
+      $("uploadZone").dataset.dragover = "false";
+      const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+      if (file) uploadImage(file);
+    });
+    $("uploadInput").addEventListener("change", function (event) {
+      const file = event.target.files && event.target.files[0];
+      if (file) uploadImage(file);
+      event.target.value = "";
+    });
     $("bridge").addEventListener("change", function () {
       saveSettings();
       refreshLatest({ silent: false });

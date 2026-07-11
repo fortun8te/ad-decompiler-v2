@@ -1,23 +1,82 @@
 """figma_bridge.py — tiny local HTTP bridge so the Figma plugin can close the loop headlessly.
 
 Serves the staged inbox (design.json + assets) to the plugin and receives the exported PNG
-back into the run dir. Zero deps (http.server). Start it before clicking "Import latest":
+back into the run dir. Zero deps at rest (http.server) — start it before clicking "Import":
 
-    python -m src.figma_bridge --inbox ~/figma-inbox --port 8790
+    python -m src.figma_bridge --inbox ~/figma-inbox --port 8790 --config config.yaml
 
 Endpoints:
     GET  /inbox.json           -> manifest (design path, assets dir, export_to)
     GET  /design.json          -> the staged design.json
     GET  /asset?path=<rel>     -> an asset PNG (resolved under inbox/assets or run dir)
     POST /export               -> body = PNG bytes; written to manifest.export_to
+    POST /process?filename=x   -> body = raw image bytes (png/jpg/webp/whatever PIL reads);
+                                   runs the full pipeline on it in a background thread and
+                                   re-stages /inbox.json + /design.json when done. Returns
+                                   {job_id, status:"queued"} immediately — poll with:
+    GET  /process?job_id=x     -> {status:"running"|"done"|"failed", ...}
+                                   Requires the pipeline's own deps (torch, paddleocr, sam3,
+                                   ...) to be importable in this interpreter; the /process
+                                   routes lazy-import run_pipeline so the bridge itself still
+                                   starts with zero deps when those aren't installed — every
+                                   other endpoint keeps working either way.
 """
 from __future__ import annotations
-import argparse, json, os, tempfile
+import argparse, json, os, re, tempfile, threading, traceback, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 
-def make_handler(inbox):
+def _safe_name(name, fallback="upload"):
+    """Basename-only, alnum/dot/dash/underscore, non-empty — never a path component."""
+    base = os.path.basename(str(name or "").strip().replace("\\", "/"))
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "-", base).strip(".-") or fallback
+    return cleaned[:120]
+
+
+def _load_cfg(path):
+    """Mirrors run_pipeline.load_cfg without importing run_pipeline (and its heavy deps)
+    just to read a config file — this keeps the bridge itself zero-dep at rest."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        import yaml
+        with open(path, encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+    except Exception:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+
+def make_handler(inbox, config_path=None):
+    jobs = {}
+    jobs_lock = threading.Lock()
+    base_cfg = _load_cfg(config_path)
+    active_job = {"id": None}
+
+    def run_job(job_id, image_path, run_dir):
+        with jobs_lock:
+            jobs[job_id]["status"] = "running"
+        try:
+            import copy
+            import run_pipeline  # heavy: torch/paddleocr/sam3/... — only imported on first use
+            cfg = copy.deepcopy(base_cfg or {})
+            cfg["figma"] = {**cfg.get("figma", {}), "enabled": True, "mode": "plugin", "inbox": inbox}
+            result = run_pipeline.run_one(image_path, run_dir, cfg)
+            with jobs_lock:
+                jobs[job_id].update(
+                    status="done" if result.get("ok") else "failed",
+                    result=result, run_dir=run_dir,
+                    error=None if result.get("ok") else (result.get("error") or "pipeline reported failure"),
+                )
+        except Exception as exc:
+            with jobs_lock:
+                jobs[job_id].update(status="failed", error=str(exc), traceback=traceback.format_exc())
+        finally:
+            with jobs_lock:
+                if active_job["id"] == job_id:
+                    active_job["id"] = None
+
     class H(BaseHTTPRequestHandler):
         def _send(self, code, body=b"", ctype="application/octet-stream"):
             self.send_response(code)
@@ -95,6 +154,15 @@ def make_handler(inbox):
                              ".webp": "image/webp", ".svg": "image/svg+xml"}.get(ext, "application/octet-stream")
                     return self._send(200, open(p, "rb").read(), ctype)
                 return self._send(404)
+            if u.path == "/process":
+                job_id = parse_qs(u.query).get("job_id", [""])[0]
+                with jobs_lock:
+                    job = dict(jobs.get(job_id) or {})
+                if not job:
+                    return self._send(404, b'{"ok":false,"error":"unknown job_id"}', "application/json")
+                job.pop("traceback", None)
+                payload = {"ok": True, "job_id": job_id, **job}
+                return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
             return self._send(404)
 
         def do_POST(self):
@@ -139,6 +207,31 @@ def make_handler(inbox):
                         json.dump(report, fh, ensure_ascii=False, indent=2)
                     os.replace(temp_path, out)
                 return self._send(200, b'{"ok":true}', "application/json")
+            if route == "/process":
+                n = self._content_length(max_bytes=64 * 1024 * 1024)
+                if n is None:
+                    return self._send(400, b'{"ok":false,"error":"missing, invalid, or oversized Content-Length (64MB max)"}',
+                                       "application/json")
+                with jobs_lock:
+                    busy = active_job["id"] is not None
+                if busy:
+                    return self._send(409, b'{"ok":false,"error":"another image is already processing; wait for it to finish"}',
+                                       "application/json")
+                filename = _safe_name(parse_qs(urlparse(self.path).query).get("filename", [""])[0])
+                data = self.rfile.read(n)
+                job_id = uuid.uuid4().hex[:12]
+                job_dir = os.path.join(inbox, "uploads", job_id)
+                os.makedirs(job_dir, exist_ok=True)
+                image_path = os.path.join(job_dir, filename)
+                with open(image_path, "wb") as fh:
+                    fh.write(data)
+                run_dir = os.path.join(job_dir, "run")
+                with jobs_lock:
+                    jobs[job_id] = {"status": "queued", "filename": filename, "image_path": image_path}
+                    active_job["id"] = job_id
+                threading.Thread(target=run_job, args=(job_id, image_path, run_dir), daemon=True).start()
+                payload = {"ok": True, "job_id": job_id, "status": "queued", "filename": filename}
+                return self._send(202, json.dumps(payload).encode(), "application/json")
             return self._send(404)
 
         def log_message(self, *a):  # quiet
@@ -152,10 +245,12 @@ def main():
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--host", default="127.0.0.1",
                      help="bind address; use 0.0.0.0 to accept connections from other machines (e.g. over Tailscale)")
+    ap.add_argument("--config", default="config.yaml",
+                     help="pipeline config for POST /process (only read if that endpoint is used)")
     a = ap.parse_args()
     os.makedirs(a.inbox, exist_ok=True)
     print(f"ad-decompiler bridge on http://{a.host}:{a.port} serving {a.inbox}")
-    ThreadingHTTPServer((a.host, a.port), make_handler(a.inbox)).serve_forever()
+    ThreadingHTTPServer((a.host, a.port), make_handler(a.inbox, a.config)).serve_forever()
 
 
 if __name__ == "__main__":

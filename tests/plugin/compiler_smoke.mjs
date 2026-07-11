@@ -722,6 +722,23 @@ assert.ok(fs.existsSync("figma-plugin/icon.svg"), "plugin icon asset exists");
   assert.equal(validBridge("http://100.74.135.83:8790"), false, "raw tailscale IP is rejected");
 }
 
+{
+  // "Process a new image" upload zone: markup + the pure formatElapsed() helper.
+  ["uploadZone", "uploadInput", "uploadIdle", "uploadBusy", "uploadBusyTitle", "uploadBusyCopy"].forEach((id) => {
+    assert.ok(html.includes(`id="${id}"`), `ui.html defines #${id}`);
+  });
+  assert.ok(script[1].includes("async function uploadImage("), "ui.html defines uploadImage()");
+  assert.ok(script[1].includes("async function pollProcessJob("), "ui.html defines pollProcessJob()");
+  assert.ok(script[1].includes('base + "/process?filename="'), "uploadImage() posts to /process?filename=");
+  assert.ok(script[1].includes('"/process?job_id="'), "pollProcessJob() polls /process?job_id=");
+
+  const feMatch = script[1].match(/function formatElapsed\(ms\)[\s\S]*?\n {4}\}/);
+  assert.ok(feMatch, "ui.html defines formatElapsed()");
+  const formatElapsed = new Function(`${feMatch[0]}\nreturn formatElapsed;`)();
+  assert.equal(formatElapsed(45000), "45s");
+  assert.equal(formatElapsed(125000), "2m 5s");
+}
+
 console.log("plugin smoke passed", {
   v2Created: first.created,
   replaceRoots: roots(sceneV2.id).length,
