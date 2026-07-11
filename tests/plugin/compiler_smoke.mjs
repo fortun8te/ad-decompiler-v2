@@ -692,10 +692,13 @@ assert.ok(script, "plugin UI contains a script");
 new Function(script[1]);
 const manifest = JSON.parse(fs.readFileSync("figma-plugin/manifest.json", "utf8"));
 assert.deepEqual(manifest.networkAccess.allowedDomains, ["none"]);
-// Figma's manifest validator rejects IP-literal devAllowedDomains entries (e.g.
-// "http://127.0.0.1:8790" errors with "must be a valid URL"), so only localhost is
-// allow-listed; the UI script must normalize any 127.0.0.1 address a user types instead.
-assert.deepEqual(manifest.networkAccess.devAllowedDomains, ["http://localhost:8790"]);
+// Same-machine dev is plain http to loopback (a Secure-Context exemption). Cross-machine
+// must be HTTPS because Figma's plugin UI runs over HTTPS and Chromium blocks HTTPS->HTTP
+// fetches to any non-loopback host — the bridge is fronted by `tailscale serve`, so the
+// *.ts.net MagicDNS host is allow-listed over https, never plain http.
+assert.deepEqual(manifest.networkAccess.devAllowedDomains, ["http://localhost:8790", "https://*.ts.net"]);
+assert.ok(manifest.networkAccess.devAllowedDomains.every((d) => !/^https?:\/\/(127\.0\.0\.1|100\.)/.test(d)),
+  "no IP-literal hosts (Figma's manifest validator rejects them, and IPs aren't trustworthy for HTTPS)");
 assert.ok(fs.existsSync("figma-plugin/icon.svg"), "plugin icon asset exists");
 
 {
@@ -705,6 +708,18 @@ assert.ok(fs.existsSync("figma-plugin/icon.svg"), "plugin icon asset exists");
   const fn = new Function("$", "state", `${cleanBaseMatch[0]}\nreturn cleanBase();`);
   const normalized = fn(() => sandbox, { settings: {} });
   assert.equal(normalized, "http://localhost:8790", "cleanBase() rewrites 127.0.0.1 to the allow-listed localhost host");
+}
+
+{
+  // validBridge: loopback accepts http; a remote *.ts.net host must be https (mixed-content),
+  // plain http to it must be rejected so the user gets a clear message instead of a silent block.
+  const vbMatch = script[1].match(/function validBridge\(base\)[\s\S]*?\n {4}\}/);
+  assert.ok(vbMatch, "ui.html defines validBridge()");
+  const validBridge = new Function(`${vbMatch[0]}\nreturn validBridge;`)();
+  assert.equal(validBridge("http://localhost:8790"), true, "http loopback is allowed");
+  assert.equal(validBridge("https://degitaar.tail54b47e.ts.net"), true, "https ts.net is allowed");
+  assert.equal(validBridge("http://degitaar.tail54b47e.ts.net:8790"), false, "plain http to a remote ts.net host is rejected (mixed content)");
+  assert.equal(validBridge("http://100.74.135.83:8790"), false, "raw tailscale IP is rejected");
 }
 
 console.log("plugin smoke passed", {

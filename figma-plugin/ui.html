@@ -619,7 +619,7 @@
         <summary>Bridge settings</summary>
         <label class="field-label" for="bridge">Local bridge address</label>
         <input class="text-input" id="bridge" value="http://localhost:8790" spellcheck="false" autocomplete="off" />
-        <p class="field-help">Saved on this computer. Only localhost is allow-listed in the manifest (Figma rejects IP-literal hosts like 127.0.0.1) — 127.0.0.1 is normalized to localhost automatically if you type it.</p>
+        <p class="field-help">Same machine: <code>http://localhost:8790</code>. Another machine (bridge on an RTX box): run <code>tailscale serve --bg 8790</code> there, then use <code>https://&lt;host&gt;.ts.net</code> here — plain http to a remote host is blocked by Figma's HTTPS sandbox.</p>
       </details>
     </main>
 
@@ -812,14 +812,20 @@
     function validBridge(base) {
       try {
         const url = new URL(base);
-        if (url.protocol !== "http:") return false;
-        // Same-machine dev, plus Tailscale MagicDNS hostnames (e.g. running the bridge
-        // on a headless RTX box and Figma Desktop on another machine). Both forms are
-        // allow-listed in manifest.json's devAllowedDomains. Figma rejects IP-literal
-        // hosts, so a raw Tailscale 100.x address won't work — use the *.ts.net name.
-        return url.hostname === "127.0.0.1"
-          || url.hostname === "localhost"
-          || url.hostname.endsWith(".ts.net");
+        const host = url.hostname;
+        // Loopback is a Secure-Context exemption, so Figma's HTTPS plugin UI is allowed
+        // to fetch plain http://localhost — same-machine dev needs no cert.
+        if (host === "127.0.0.1" || host === "localhost") {
+          return url.protocol === "http:" || url.protocol === "https:";
+        }
+        // Cross-machine (bridge on a headless RTX box, Figma on another machine) MUST be
+        // HTTPS: the plugin UI runs over HTTPS and Chromium's mixed-content rule blocks
+        // HTTPS->HTTP fetches to any non-loopback host. Front the bridge with
+        // `tailscale serve` (real cert for the *.ts.net MagicDNS name) and use https://.
+        if (host.endsWith(".ts.net")) {
+          return url.protocol === "https:";
+        }
+        return false;
       } catch (_) {
         return false;
       }
@@ -830,7 +836,7 @@
       const base = cleanBase();
       if (!validBridge(base)) {
         setConnection("error", "Invalid address");
-        setEmpty("Bridge address is invalid", "Use localhost, 127.0.0.1, or a Tailscale *.ts.net host on the configured port.", false);
+        setEmpty("Bridge address is invalid", "Use http://localhost:8790 on the same machine, or https://<host>.ts.net for a remote bridge fronted by `tailscale serve`.", false);
         showIssues([{ title: "Invalid bridge address", detail: base || "No address entered." }], "error");
         return;
       }
