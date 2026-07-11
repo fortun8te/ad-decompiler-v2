@@ -195,8 +195,6 @@ def _otsu(values) -> float:
 
 
 def _minority_luminance_mask(crop):
-    import numpy as np
-
     lum = crop[..., 0] * 0.2126 + crop[..., 1] * 0.7152 + crop[..., 2] * 0.0722
     threshold = _otsu(lum)
     dark = lum < threshold

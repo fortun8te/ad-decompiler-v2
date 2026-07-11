@@ -526,7 +526,6 @@ if __name__ == "__main__":  # CPU-safe smoke: exercises parsing without a binary
     print("abs:", _abs_path(d_rel))
     svg = '<svg><path d="M0 0 L10 0 L10 10 Z" fill="#ff0000"/></svg>'
     print("parsed:", _parse_svg_paths(svg))
-    import numpy as _np  # noqa
     # no vtracer/potrace on this box -> graceful failure dict
     try:
         import numpy as np

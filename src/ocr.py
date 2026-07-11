@@ -1100,7 +1100,6 @@ def _reconcile(primary_lines, challenger_sets, iou_thresh=0.42, cfg=None):
         winner_index = max(range(len(members)), key=lambda index: (scores[index],
                                                                     _calibrated_confidence(members[index], cfg)))
         winner = copy.deepcopy(members[winner_index])
-        winner_key = normalized[winner_index]
         agreeing_indices = [
             index for index, member in enumerate(members)
             if _text_similarity(winner.get("text"), member.get("text")) >= agreement_threshold

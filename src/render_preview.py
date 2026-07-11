@@ -321,7 +321,7 @@ def _render_tile(layer, run_dir):
 
 def _blend(canvas, tile, point, mode):
     """Composite tile onto an opaque preview, including common non-normal Figma blends."""
-    from PIL import Image, ImageChops
+    from PIL import ImageChops
     x, y = point
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(canvas.width, x + tile.width), min(canvas.height, y + tile.height)

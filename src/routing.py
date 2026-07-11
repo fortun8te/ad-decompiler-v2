@@ -67,7 +67,6 @@ def _text_fidelity_fallback(c: dict, meta: dict, cfg: dict | None) -> dict | Non
 
 def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
     c = dict(candidate)
-    src = c.get("source", "")
     kind = c.get("kind")            # from element_detect / merge
     meta = c.setdefault("meta", {})
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import asdict
 from typing import Optional
 
 from .schema import DesignDoc, Layer, SCHEMA_VERSION, dump, validate_design
