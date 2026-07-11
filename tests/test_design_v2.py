@@ -47,11 +47,11 @@ def test_atomic_figma_staging_contains_manifest_and_assets(tmp_path):
         "meta": {"layer_count": 1, "editable_ratio": 0},
     }
     design_path = run / "design.json"
-    design_path.write_text(json.dumps(design))
+    design_path.write_text(encoding="utf-8", data=json.dumps(design))
     inbox = tmp_path / "inbox"
     result = figma_import.import_design(str(design_path), str(run),
                                         {"figma": {"mode": "plugin", "inbox": str(inbox)}})
-    manifest = json.loads((inbox / "inbox.json").read_text())
+    manifest = json.loads((inbox / "inbox.json").read_text(encoding="utf-8"))
     assert result["ok"] is True
     assert manifest["schema_version"] == 2
     assert (inbox / manifest["staged_dir"] / "assets" / "thing.png").exists()

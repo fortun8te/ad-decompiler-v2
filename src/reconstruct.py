@@ -513,7 +513,7 @@ def _write_asset(image, assets_dir, candidate_id):
     name = f"{candidate_id}_{digest}.png"
     path = os.path.join(assets_dir, name)
     image.save(path)
-    return os.path.join("assets", name)
+    return f"assets/{name}"
 
 
 def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,

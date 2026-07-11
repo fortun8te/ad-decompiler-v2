@@ -150,10 +150,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inbox", default=os.path.expanduser("~/figma-inbox"))
     ap.add_argument("--port", type=int, default=8790)
+    ap.add_argument("--host", default="127.0.0.1",
+                     help="bind address; use 0.0.0.0 to accept connections from other machines (e.g. over Tailscale)")
     a = ap.parse_args()
     os.makedirs(a.inbox, exist_ok=True)
-    print(f"ad-decompiler bridge on http://127.0.0.1:{a.port} serving {a.inbox}")
-    ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(a.inbox)).serve_forever()
+    print(f"ad-decompiler bridge on http://{a.host}:{a.port} serving {a.inbox}")
+    ThreadingHTTPServer((a.host, a.port), make_handler(a.inbox)).serve_forever()
 
 
 if __name__ == "__main__":

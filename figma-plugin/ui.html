@@ -812,7 +812,14 @@
     function validBridge(base) {
       try {
         const url = new URL(base);
-        return url.protocol === "http:" && (url.hostname === "127.0.0.1" || url.hostname === "localhost");
+        if (url.protocol !== "http:") return false;
+        // Same-machine dev, plus Tailscale MagicDNS hostnames (e.g. running the bridge
+        // on a headless RTX box and Figma Desktop on another machine). Both forms are
+        // allow-listed in manifest.json's devAllowedDomains. Figma rejects IP-literal
+        // hosts, so a raw Tailscale 100.x address won't work — use the *.ts.net name.
+        return url.hostname === "127.0.0.1"
+          || url.hostname === "localhost"
+          || url.hostname.endsWith(".ts.net");
       } catch (_) {
         return false;
       }
@@ -823,7 +830,7 @@
       const base = cleanBase();
       if (!validBridge(base)) {
         setConnection("error", "Invalid address");
-        setEmpty("Bridge address is invalid", "Use localhost or 127.0.0.1 on the configured port.", false);
+        setEmpty("Bridge address is invalid", "Use localhost, 127.0.0.1, or a Tailscale *.ts.net host on the configured port.", false);
         showIssues([{ title: "Invalid bridge address", detail: base || "No address entered." }], "error");
         return;
       }

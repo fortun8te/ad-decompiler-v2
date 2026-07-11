@@ -12,7 +12,7 @@ def test_required_sam_fallback_is_visible_and_invalidates_acceptance(tmp_path):
     report.degraded("sam3", "checkpoint missing")
     report.finish(qa_ok=False)
 
-    saved = json.loads((tmp_path / "runtime_report.json").read_text())
+    saved = json.loads((tmp_path / "runtime_report.json").read_text(encoding="utf-8"))
     assert saved["status"] == "degraded"
     assert saved["acceptable"] is False
     assert saved["violations"][0]["rule"] == "sam3-unavailable"
@@ -46,7 +46,7 @@ def test_inpaint_fallback_is_required_and_invalidates_acceptance_under_require_a
     report.degraded("inpaint", "Big-LaMa unavailable; used opencv-telea fallback for background plate")
     report.finish(qa_ok=False)
 
-    saved = json.loads((tmp_path / "runtime_report.json").read_text())
+    saved = json.loads((tmp_path / "runtime_report.json").read_text(encoding="utf-8"))
     assert saved["status"] == "degraded"
     assert saved["acceptable"] is False
     assert any(v["rule"] == "inpaint-unavailable" for v in saved["violations"])
@@ -75,7 +75,7 @@ def test_inpaint_explicit_opencv_mode_is_not_required_even_under_require_active_
     report.degraded("inpaint", "opencv-telea backend used for background plate")
     report.finish(qa_ok=True)
 
-    saved = json.loads((tmp_path / "runtime_report.json").read_text())
+    saved = json.loads((tmp_path / "runtime_report.json").read_text(encoding="utf-8"))
     assert saved["acceptable"] is True
     assert saved["violations"] == []
 
@@ -91,6 +91,6 @@ def test_inpaint_default_auto_mode_still_required_under_require_active_models(tm
     report.degraded("inpaint", "Big-LaMa unavailable; used opencv-telea fallback for background plate")
     report.finish(qa_ok=False)
 
-    saved = json.loads((tmp_path / "runtime_report.json").read_text())
+    saved = json.loads((tmp_path / "runtime_report.json").read_text(encoding="utf-8"))
     assert saved["acceptable"] is False
     assert any(v["rule"] == "inpaint-unavailable" for v in saved["violations"])

@@ -56,7 +56,7 @@ def test_end_to_end_cpu_vertical_slice_uses_clean_plate(monkeypatch, tmp_path):
     assert result["ok"] is True
     assert result["duration_s"] >= 0
     assert (run_dir / "input_manifest.json").exists()
-    design = json.loads((run_dir / "design.json").read_text())
+    design = json.loads((run_dir / "design.json").read_text(encoding="utf-8"))
     assert design["schema_version"] == 2
     assert design["layers"][0]["name"] == "Background — clean plate"
     assert design["layers"][0]["meta"]["source"] == "inpaint"
@@ -92,8 +92,8 @@ def test_required_sam_fallback_is_a_real_qa_failure(monkeypatch, tmp_path):
          "figma": {"enabled": False}, "qa_ocr": False},
     )
 
-    qa = json.loads((run_dir / "qa.json").read_text())
-    report = json.loads((run_dir / "runtime_report.json").read_text())
+    qa = json.loads((run_dir / "qa.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "runtime_report.json").read_text(encoding="utf-8"))
     assert result["ok"] is True
     assert result["runtime_ok"] is False
     assert "sam3-unavailable" in {item["rule"] for item in qa["hard_fails"]}
@@ -142,7 +142,7 @@ def test_qa_ok_is_false_when_edge_or_color_fidelity_fails_even_at_high_ssim(monk
     )
 
     assert result["ok"] is True  # the pipeline run itself completed
-    qa = json.loads((run_dir / "qa.json").read_text())
+    qa = json.loads((run_dir / "qa.json").read_text(encoding="utf-8"))
     assert qa["ssim"] >= 0.9
     assert qa["ok"] is False, "high ssim alone should not be sufficient to pass qa"
     assert "edge-fidelity" in {item["rule"] for item in qa["hard_fails"]}

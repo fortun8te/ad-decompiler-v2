@@ -389,6 +389,11 @@ def _stroke_from_mask(crop, mask) -> Optional[tuple[dict, str]]:
     max_depth = int(int_depth[mask].max()) if mask.any() else 0
     if max_depth < 2:
         return None
+    # A ring with only a handful of pixels (e.g. the tip of a single bowl/serif at
+    # the deepest depth) produces an unreliable median that can masquerade as a
+    # sharp colour "jump" against its neighbour. Require enough pixels per ring
+    # before trusting it as a boundary candidate.
+    min_ring_pixels = max(8, int(total * 0.01))
     profiles = []
     for d in range(min(max_depth, 40) + 1):
         ring = mask & (int_depth == d)
@@ -397,10 +402,13 @@ def _stroke_from_mask(crop, mask) -> Optional[tuple[dict, str]]:
         profiles.append((d, np.median(crop[ring].astype(np.float32), axis=0), int(ring.sum())))
     if len(profiles) < 3:
         return None
+    reliable = [p for p in profiles if p[2] >= min_ring_pixels]
+    if len(reliable) < 2:
+        return None
     best_jump, boundary_depth = 0.0, None
-    for i in range(1, len(profiles)):
-        d0, rgb0, _ = profiles[i - 1]
-        d1, rgb1, _ = profiles[i]
+    for i in range(1, len(reliable)):
+        d0, rgb0, _ = reliable[i - 1]
+        d1, rgb1, _ = reliable[i]
         jump = math.sqrt(float(np.sum((rgb0 - rgb1) ** 2)))
         if jump > best_jump:
             best_jump, boundary_depth = jump, d1

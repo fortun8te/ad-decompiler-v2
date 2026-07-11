@@ -8,7 +8,7 @@
   "documentAccess": "dynamic-page",
   "networkAccess": {
     "allowedDomains": ["none"],
-    "devAllowedDomains": ["http://localhost:8790"],
-    "reasoning": "Loads a local reconstruction run and its assets, then sends the finished Figma preview back to the local QA bridge. Figma's manifest validator rejects IP-literal hosts (e.g. 'http://127.0.0.1:8790') as an invalid devAllowedDomains URL, so only localhost is allow-listed here; ui.html normalizes any 127.0.0.1 address the user enters to localhost before making requests."
+    "devAllowedDomains": ["http://localhost:8790", "http://degitaar.tail54b47e.ts.net:8790"],
+    "reasoning": "Loads a local reconstruction run and its assets, then sends the finished Figma preview back to the local QA bridge. Figma's manifest validator rejects IP-literal hosts (e.g. 'http://127.0.0.1:8790') as an invalid devAllowedDomains URL, so localhost (same-machine dev) and the Windows box's Tailscale MagicDNS hostname (cross-machine, e.g. Figma Desktop on a Mac) are allow-listed; ui.html normalizes any 127.0.0.1 address the user enters to localhost before making requests."
   }
 }

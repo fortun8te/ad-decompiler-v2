@@ -11,14 +11,14 @@ def test_bridge_serves_staged_run_and_persists_plugin_report(tmp_path):
     inbox = tmp_path / "inbox"
     staged = inbox / "runs" / "demo"
     staged.mkdir(parents=True)
-    (staged / "design.json").write_text(json.dumps({"id": "demo", "canvas": {"w": 1, "h": 1}, "layers": []}))
+    (staged / "design.json").write_text(encoding="utf-8", data=json.dumps({"id": "demo", "canvas": {"w": 1, "h": 1}, "layers": []}))
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     manifest = {
         "schema_version": 2, "doc_id": "demo", "design": "design.json",
         "staged_dir": "runs/demo", "run_dir": str(run_dir), "summary": {"layers": 0},
     }
-    (inbox / "inbox.json").write_text(json.dumps(manifest))
+    (inbox / "inbox.json").write_text(encoding="utf-8", data=json.dumps(manifest))
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox)))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -32,7 +32,7 @@ def test_bridge_serves_staged_run_and_persists_plugin_report(tmp_path):
         request = Request(base + "/report", data=json.dumps(report).encode(), method="POST",
                           headers={"Content-Type": "application/json"})
         assert json.loads(urlopen(request, timeout=2).read())["ok"] is True
-        assert json.loads((run_dir / "figma_report.json").read_text())["doc_id"] == "demo"
+        assert json.loads((run_dir / "figma_report.json").read_text(encoding="utf-8"))["doc_id"] == "demo"
         try:
             urlopen(base + "/asset?path=../../etc/passwd", timeout=2)
             assert False, "path traversal should be rejected"

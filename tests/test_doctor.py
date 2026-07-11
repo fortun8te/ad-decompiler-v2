@@ -34,7 +34,7 @@ def test_doctor_accepts_a_minimal_cpu_configuration(tmp_path, monkeypatch):
 
 def test_doctor_makes_qwen_backend_a_blocker_only_when_explicitly_required(tmp_path, monkeypatch):
     workflow = tmp_path / "workflow.json"
-    workflow.write_text("{}")
+    workflow.write_text("{}", encoding="utf-8")
     monkeypatch.setattr("doctor._module", lambda name: True)
     monkeypatch.setattr("doctor._torch", lambda device: {"name": "torch", "ok": True, "required": False, "detail": "cpu"})
     monkeypatch.setattr("doctor._http", lambda url: False)

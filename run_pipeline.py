@@ -39,7 +39,7 @@ def load_cfg(path):
 def _log(run_dir, msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line, flush=True)
-    with open(os.path.join(run_dir, "pipeline.log"), "a") as f:
+    with open(os.path.join(run_dir, "pipeline.log"), "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
