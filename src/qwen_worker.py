@@ -273,7 +273,12 @@ def propose_layers(img_path: str, run_dir: str, cfg: Optional[dict] = None):
     schema = _load_schema()
     cfg = cfg or {}
     os.makedirs(run_dir, exist_ok=True)
-    mode = (cfg.get("qwen") or {}).get("mode", "comfyui")
+    qcfg = cfg.get("qwen") or {}
+    if qcfg.get("enabled", True) is False:
+        note = "qwen: disabled (SAM/residual pipeline remains active)"
+        _write_manifest(schema, [], run_dir, note)
+        return []
+    mode = qcfg.get("mode", "comfyui")
     try:
         if mode == "comfyui":
             return _run_comfyui(img_path, run_dir, cfg, schema)

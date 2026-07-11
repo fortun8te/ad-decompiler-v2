@@ -8,6 +8,7 @@ shapely>=2.0
 requests>=2.31
 pyyaml>=6.0
 cairosvg>=2.7          # rasterize vectorizer output for the fidelity gate
+fonttools>=4.55        # read local font family/style/weight metadata for render matching
 pytest>=8.0            # tests
 
 # GPU / vision backends (OCR, Qwen-Image-Layered, upscaler) live in requirements-gpu.txt —

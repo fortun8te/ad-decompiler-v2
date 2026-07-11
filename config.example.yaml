@@ -1,12 +1,60 @@
 # ad-decompiler config — copy to config.yaml and adjust for your Windows/RTX 5080 box.
 device: cuda                          # cuda | cpu
 
+# An RTX acceptance run must show which model actually ran. Disabled models remain valid for
+# CPU development, but enabled OCR/SAM fallbacks become QA failures instead of quiet boxes.
+runtime:
+  require_active_models: true
+  auto_retry:
+    sam_disable_compile: true         # one safe retry only when compile=true fails
+
 ocr:
   primary: ppocr-v6                   # ppocr-v6 | surya | doctr | tesseract
-  challengers: []                     # e.g. [surya] to run + reconcile by IoU
+  challengers: [surya]                # calibrated ensemble; unavailable engines are skipped
   lang: en
+  retry_2x:                           # targeted retry for small/low-confidence text
+    enabled: true
+    scale: 2.0
+    max_regions: 8
+
+text_analysis:
+  cap_height_ratio: 0.72
+  font_matching:
+    enabled: true                     # synthetic-render retrieval against locally installed fonts
+    max_fonts: 64
+    max_lines: 16
+    top_k: 5
+    font_dirs: []                     # add brand/font-library folders here
+
+sam3:
+  enabled: true
+  checkpoint: C:/models/sam3.pt        # image checkpoint, not the 3.1 video multiplex checkpoint
+  # bpe_path: C:/src/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  load_from_hf: false                 # local-only by default; no surprise downloads
+  confidence: 0.45
+  resolution: 1008
+  compile: false
+  # Every residual proposal is also box-refined; prompts find missed semantic elements.
+  prompts:
+    - {prompt: person, role: person, kind: photo-fragment}
+    - {prompt: product, role: product, kind: photo-fragment}
+    - {prompt: product package, role: product, kind: photo-fragment}
+    - {prompt: logo, role: logo, kind: icon}
+    - {prompt: icon, role: icon, kind: icon}
+    - {prompt: arrow, role: arrow, kind: icon}
+    - {prompt: badge, role: badge, kind: icon}
+    - {prompt: button, role: button, kind: shape}
+    - {prompt: illustration, role: illustration, kind: photo-fragment}
+
+element_fusion:
+  mask_iou: 0.68
+  bbox_iou: 0.78
+  containment: 0.92
+  nested_max_area_ratio: 0.62
 
 qwen:
+  enabled: true                        # advisory z/alpha observation; SAM owns element recall
+  required: false                      # set true only for an experiment that depends on its alpha layers
   mode: comfyui                       # comfyui | direct-diffusers
   workflow: workflows/qwen_layered_8_api.json
   layers: 8
@@ -15,6 +63,27 @@ backend_url: http://127.0.0.1:8188    # ComfyUI, only used when qwen.mode=comfyu
 vectorize:
   color_engine: vtracer               # resolved from PATH or .bin/vtracer(.exe)
   binary_engine: potrace
+
+reconstruct:
+  dedup_iou: 0.86
+  mask_dilate: 2
+  # Conservative primitive paint extraction for semantic shapes only.  It preserves
+  # source-provided paint facts and falls back to a plain fill for uncertain masks.
+  style_extraction:
+    gradient_min_range: 18
+    gradient_min_r2: 0.86
+    max_stroke_width: 8
+    detect_shadows: true
+
+inpaint:
+  mode: auto                           # Big-LaMa when installed, OpenCV fallback
+  allow_fallback: true
+  opencv_radius: 5
+  opencv_method: auto                  # auto picks the lower-seam Telea/NS fallback
+
+layout:
+  min_container_frac: 0.002
+  max_container_frac: 0.82
 
 upscale:
   enabled: true                       # Real-ESRGAN for compressed Meta Library assets

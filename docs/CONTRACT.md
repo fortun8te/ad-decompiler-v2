@@ -7,17 +7,18 @@ origin top-left. The orchestrating agent inspects and repairs over these JSON fi
 ```
 run_pipeline.py --input ad.png --output ./runs/run_001
   1 normalize.load_normalize(input, run_dir)        -> normalized.png, {w,h}
-  2 ocr.run_ocr(normalized, cfg)                     -> ocr.json     (schema.OcrResult)
-  3 element_detect.detect(normalized, ocr, cfg)      -> elements.json (list[schema.Element])
-  4 qwen_worker.propose_layers(normalized, cfg)      -> qwen_layers/*.png + qwen.json (list[schema.QwenLayer])
-  5 (qwen outputs saved as RGBA layers)
-  6 merge_layers.merge(ocr, elements, qwen, cfg)     -> merged.json  (list of routed candidates)
-  7 routing.route(candidate) applied inside merge     -> each candidate tagged target:text|shape|image|icon
-  8 build_design_json.build(merged, canvas, run_dir) -> design.json  (schema.DesignDoc)  [SOURCE OF TRUTH]
-  9 figma_import.import_design(design.json)           -> nodes in Figma (plugin or clipboard)
- 10 figma_import.export_screenshot()                  -> figma_export.png
- 11 pixel_diff.compare(normalized, figma_export)      -> diff.png + partial qa
- 12 repair.assess(design, qa, ocr)                    -> qa.json (schema.QaResult with repairs[])
+  2 ocr.run_ocr(normalized, cfg)                     -> ocr_raw.json
+  3 text_analysis.analyze_text(normalized, raw_ocr)  -> ocr.json (ink geometry/styles/blocks)
+  4 element_detect.detect(normalized, ocr, cfg)      -> residual.json + elements/*.png
+  5 qwen_worker.propose_layers(normalized, cfg)      -> qwen.json (optional advisory observations)
+  6 sam3_detect.detect(normalized, residual, cfg)    -> sam3.json + sam3_masks/*.png
+  7 element_fusion.fuse(sam3,residual,qwen,...)      -> fused_elements.json + canonical masks
+  8 merge_layers.merge(...) + routing.route(...)     -> merged.json
+  9 reconstruct.reconstruct(...)                     -> ownership/removal/background/assets
+ 10 layout.infer(...)                                -> layout.json (nested scene graph)
+ 11 build_design_json.build(...)                     -> design.json v2 [SOURCE OF TRUTH]
+ 12 figma_import/import plugin                       -> native Figma nodes + figma_export.png
+ 13 pixel_diff + structural QA                       -> diff.png + qa.json
 ```
 
 ## Routing rules (routing.py — the crown jewel, ported from the validated Node harness)
@@ -40,6 +41,10 @@ run_pipeline.py --input ad.png --output ./runs/run_001
    agent orchestrates tools over JSON and must not hallucinate visual structure.
 4. Every stage is idempotent and writes its artifact; a failed stage degrades (writes a
    note) rather than aborting the run, so the agent can retry a single stage.
+5. The untouched source image can never be the rebuilt background when foreground layers exist.
+   Canonical entities create one union removal mask and one inpainted background plate.
+6. Raw model observations never become Figma layers directly. Mask-aware fusion assigns each
+   observation to one canonical entity before assets, inpainting, or grouping.
 
 ## Config keys (config.yaml) the modules read
 ```yaml

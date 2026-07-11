@@ -19,7 +19,12 @@ from typing import Optional
 # thresholds (overridable via cfg.repair)
 DEFAULTS = {
     "text_recall_min": 0.85,
+    "editable_text_recall_min": 0.80,
     "ssim_min": 0.80,
+    "visual_score_min": 0.80,
+    "edge_f1_min": 0.68,
+    "color_similarity_min": 0.82,
+    "editable_ratio_min": 0.15,
     "composite_min": 85.0,
     "layer_score_min": 0.80,
     "vectorize_score_min": 0.90,
@@ -38,7 +43,16 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
     out = []
 
     qa = qa or {}
-    hard_fails = qa.get("hard_fails", []) or []
+    structural = qa.get("structural", {}) or {}
+    hard_fails = list(qa.get("hard_fails", []) or [])
+    # Some callers append/replace top-level hard failures after pixel_diff.compare(). Keep
+    # the structural copy authoritative too, so missing assets/leakage cannot disappear.
+    seen_hard = {(h.get("rule"), h.get("detail")) for h in hard_fails if isinstance(h, dict)}
+    for failure in structural.get("hard_fails", []) or []:
+        key = (failure.get("rule"), failure.get("detail")) if isinstance(failure, dict) else None
+        if key and key not in seen_hard:
+            hard_fails.append(failure)
+            seen_hard.add(key)
     per_layer = qa.get("per_layer", []) or []
 
     # ── global text recall ────────────────────────────────────────────────────────────
@@ -54,6 +68,20 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             }
         )
 
+    editable_text_recall = qa.get("editable_text_recall")
+    if editable_text_recall is None:
+        editable_text_recall = structural.get("editable_text_recall")
+    if editable_text_recall is not None and editable_text_recall < t["editable_text_recall_min"]:
+        out.append(
+            {
+                "stage": "text-analysis",
+                "action": "restore-editable-text",
+                "reason": f"editable text recall {editable_text_recall:.2f} < "
+                          f"{t['editable_text_recall_min']:.2f}",
+                "severity": "high",
+            }
+        )
+
     # ── structural similarity / composite ─────────────────────────────────────────────
     ssim = qa.get("ssim")
     if ssim is not None and ssim < t["ssim_min"]:
@@ -63,6 +91,38 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
                 "action": "retry",
                 "reason": f"ssim {ssim:.2f} < {t['ssim_min']} (layering likely off)",
                 "params": {"layers": (cfg.get("qwen") or {}).get("layers", 8)},
+                "severity": "medium",
+            }
+        )
+    visual_score = qa.get("visual_score")
+    if visual_score is not None and visual_score < t["visual_score_min"]:
+        out.append(
+            {
+                "stage": "reconstruct",
+                "action": "inspect-worst-regions",
+                "reason": f"visual score {visual_score:.2f} < {t['visual_score_min']:.2f}",
+                "params": {"regions": ((qa.get("per_region") or {}).get("worst") or [])[:4]},
+                "severity": "medium",
+            }
+        )
+    edge_f1 = qa.get("edge_f1")
+    if edge_f1 is not None and edge_f1 < t["edge_f1_min"]:
+        out.append(
+            {
+                "stage": "layout",
+                "action": "refit-geometry",
+                "reason": f"edge fidelity {edge_f1:.2f} < {t['edge_f1_min']:.2f}",
+                "severity": "medium",
+            }
+        )
+    color_similarity = qa.get("color_similarity")
+    if color_similarity is not None and color_similarity < t["color_similarity_min"]:
+        out.append(
+            {
+                "stage": "text-analysis",
+                "action": "refit-colors-effects",
+                "reason": f"color fidelity {color_similarity:.2f} < "
+                          f"{t['color_similarity_min']:.2f}",
                 "severity": "medium",
             }
         )
@@ -81,7 +141,28 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
     for hf in hard_fails:
         rule = hf.get("rule", "")
         detail = hf.get("detail", "")
-        if "overlap" in rule:
+        if rule in ("background-leakage", "unclean-background"):
+            out.append({"stage": "inpaint", "action": "rebuild-clean-plate", "reason": detail,
+                        "severity": "high"})
+        elif rule == "missing-assets":
+            out.append({"stage": "reconstruct", "action": "restage-assets", "reason": detail,
+                        "severity": "high"})
+        elif rule == "missing-fonts":
+            out.append({"stage": "text-analysis", "action": "resolve-fonts", "reason": detail,
+                        "severity": "high"})
+        elif rule == "figma-compiler-errors":
+            out.append({"stage": "figma", "action": "fix-compiler-report", "reason": detail,
+                        "severity": "high"})
+        elif rule in ("low-editable-ratio", "no-editable-content"):
+            out.append({"stage": "design", "action": "restore-native-nodes", "reason": detail,
+                        "severity": "high"})
+        elif rule == "missing-editable-text":
+            out.append({"stage": "text-analysis", "action": "restore-editable-text", "reason": detail,
+                        "severity": "high"})
+        elif rule == "duplicate-ownership":
+            out.append({"stage": "merge", "action": "enforce-single-owner", "reason": detail,
+                        "severity": "high"})
+        elif "overlap" in rule:
             out.append({"stage": "merge", "action": "dedup", "reason": detail,
                         "params": {"raise_dedup_iou": True}, "severity": "high"})
         elif "text" in rule:
@@ -93,6 +174,30 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
         else:
             out.append({"stage": "pipeline", "action": "review",
                         "reason": f"{rule}: {detail}", "severity": "medium"})
+
+    # Consume structural scalars even when a caller did not ask pixel_diff to convert them
+    # into hard-fail records.
+    editable_ratio = structural.get("editable_ratio")
+    if editable_ratio is not None and editable_ratio < t["editable_ratio_min"]:
+        out.append(
+            {
+                "stage": "design",
+                "action": "restore-native-nodes",
+                "reason": f"editable ratio {editable_ratio:.2f} < {t['editable_ratio_min']:.2f}",
+                "severity": "high",
+            }
+        )
+    if structural.get("duplicate_ownership") and not any(
+        r.get("action") == "enforce-single-owner" for r in out
+    ):
+        out.append(
+            {
+                "stage": "merge",
+                "action": "enforce-single-owner",
+                "reason": f"{len(structural['duplicate_ownership'])} duplicate ownership conflict(s)",
+                "severity": "high",
+            }
+        )
 
     # ── per-layer diagnostics ─────────────────────────────────────────────────────────
     for pl in per_layer:
@@ -167,6 +272,16 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             }
         )
 
+    # One underlying failure can arrive both as a scalar and a hard-fail record. Remove exact
+    # duplicate repair actions while retaining distinct evidence/reasons.
+    unique = []
+    seen = set()
+    for item in out:
+        key = (item.get("stage"), item.get("action"), item.get("target_id"), item.get("reason"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    out = unique
     out.sort(key=lambda r: _sev(r.get("severity")), reverse=True)
 
     run_dir = cfg.get("run_dir")

@@ -112,6 +112,22 @@ def estimate_border_color(rgb):
     return np.median(ring_px, axis=0).astype(np.float64)
 
 
+def _edge_gradient_magnitude(gray):
+    """Edge-clamped gradient magnitude ``|dI/dx| + |dI/dy|`` for a 2-D array.
+
+    Uses replicate-edge padding rather than circular wraparound (``np.roll``), so an
+    outermost row/column pixel is differenced against its own edge neighbor instead of
+    against the pixel at the OPPOSITE edge of the image. Circular wraparound skews
+    edge_density -- and can misclassify -- border-touching elements.
+    """
+    np = _require_np()
+    gray_x_pad = np.pad(gray, ((0, 0), (1, 1)), mode="edge")
+    gray_y_pad = np.pad(gray, ((1, 1), (0, 0)), mode="edge")
+    gx = np.abs(gray_x_pad[:, 2:] - gray_x_pad[:, :-2])
+    gy = np.abs(gray_y_pad[2:, :] - gray_y_pad[:-2, :])
+    return gx + gy
+
+
 def _explained(rgb, background):
     """Return an HxWx3 float background estimate matching rgb's size."""
     np = _require_np()
@@ -262,14 +278,9 @@ def detect(
     photo_hit = np.bincount(flat, weights=in_photo.ravel(), minlength=count + 1)
     slices = ndimage.find_objects(labels)
 
-    # precompute a padded gradient magnitude field for edge density
-    gx = np.abs(
-        np.roll(gray, -1, axis=1) - np.roll(gray, 1, axis=1)
-    )
-    gy = np.abs(
-        np.roll(gray, -1, axis=0) - np.roll(gray, 1, axis=0)
-    )
-    grad = gx + gy
+    # precompute a padded gradient magnitude field for edge density (edge-clamped, see
+    # _edge_gradient_magnitude docstring for why this must not use np.roll).
+    grad = _edge_gradient_magnitude(gray)
 
     candidates = []
     for L in range(1, count + 1):
@@ -383,6 +394,7 @@ def detect(
                 "area": float(e["area"]),
                 "coverage": e["coverage"],
                 "source": "residual-cc",
+                "mask": os.path.join("elements", f"{eid}.png") if run_dir else None,
             }
         )
         masks.append((eid, e["_mask"]))
@@ -401,7 +413,7 @@ def _write_artifacts(schema, elements, run_dir, masks=None):
             mdir = os.path.join(run_dir, "elements")
             os.makedirs(mdir, exist_ok=True)
             for eid, m in masks:
-                Image.fromarray(m, mode="L").save(os.path.join(mdir, f"{eid}.png"))
+                Image.fromarray(m).save(os.path.join(mdir, f"{eid}.png"))
         except ImportError:
             pass  # masks are optional; elements.json still written
 

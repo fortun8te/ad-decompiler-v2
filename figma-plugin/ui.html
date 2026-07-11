@@ -1,70 +1,1162 @@
-<style>
-  body { font: 12px -apple-system, system-ui, sans-serif; margin: 12px; color: #222; }
-  button { width: 100%; padding: 8px; margin: 4px 0; border: 0; border-radius: 6px; background: #18a0fb; color: #fff; font-weight: 600; cursor: pointer; }
-  button.sec { background: #eee; color: #333; }
-  input { width: 100%; box-sizing: border-box; padding: 6px; margin: 2px 0 8px; }
-  .row { font-size: 11px; color: #666; margin: 6px 0; }
-</style>
-<div class="row">Bridge (ad-decompiler serves inbox here):</div>
-<input id="bridge" value="http://127.0.0.1:8790" />
-<button id="fetch">Import latest from bridge</button>
-<button id="pick" class="sec">…or load a design.json file</button>
-<input id="file" type="file" accept="application/json" style="display:none" />
-<div class="row" id="status">idle</div>
-<script>
-const $ = (id) => document.getElementById(id);
-const status = (m) => ($("status").textContent = m);
-let EXPORT_TO = null;
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ad Decompiler</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: var(--figma-color-bg, #ffffff);
+      --bg-secondary: var(--figma-color-bg-secondary, #f7f7f7);
+      --bg-tertiary: var(--figma-color-bg-tertiary, #eeeeee);
+      --bg-hover: var(--figma-color-bg-hover, #f2f2f2);
+      --brand: var(--figma-color-bg-brand, #0d99ff);
+      --brand-hover: var(--figma-color-bg-brand-hover, #007be5);
+      --brand-pressed: var(--figma-color-bg-brand-pressed, #006ecb);
+      --selected: var(--figma-color-bg-selected, #e5f4ff);
+      --danger-bg: var(--figma-color-bg-danger-tertiary, #ffe2e0);
+      --warning-bg: var(--figma-color-bg-warning-tertiary, #fff4cc);
+      --success-bg: var(--figma-color-bg-success-tertiary, #e3f5e5);
+      --text: var(--figma-color-text, #1e1e1e);
+      --text-secondary: var(--figma-color-text-secondary, #6e6e6e);
+      --text-tertiary: var(--figma-color-text-tertiary, #9b9b9b);
+      --text-onbrand: var(--figma-color-text-onbrand, #ffffff);
+      --text-danger: var(--figma-color-text-danger, #c4381c);
+      --text-warning: var(--figma-color-text-warning, #7a5b00);
+      --text-success: var(--figma-color-text-success, #287a38);
+      --border: var(--figma-color-border, #e5e5e5);
+      --border-strong: var(--figma-color-border-strong, #c7c7c7);
+      --radius-sm: 5px;
+      --radius-md: 8px;
+      --radius-lg: 12px;
+      font-family: "SF Pro Text", "Segoe UI", ui-sans-serif, -apple-system, BlinkMacSystemFont, sans-serif;
+      font-synthesis: none;
+    }
 
-async function fetchAssets(base, doc) {
-  const assets = {};
-  for (const L of doc.layers) {
-    if (L.type === "image" && L.src) {
+    * { box-sizing: border-box; }
+
+    html, body { height: 100%; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow: hidden;
+    }
+
+    button, input { font: inherit; }
+
+    button {
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+      transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease, transform 120ms ease, opacity 160ms ease;
+    }
+
+    button:active:not(:disabled) { transform: translateY(1px); }
+
+    button:focus-visible, input:focus-visible, summary:focus-visible, label.mode-option:has(input:focus-visible) {
+      outline: 2px solid var(--brand);
+      outline-offset: 2px;
+    }
+
+    button:disabled { cursor: default; opacity: 0.42; }
+
+    .app {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      height: 100%;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 58px;
+      padding: 12px 14px 11px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+
+    .brand-mark {
+      position: relative;
+      width: 28px;
+      height: 28px;
+      flex: 0 0 auto;
+      border-radius: 8px;
+      background: var(--text);
+      color: var(--bg);
+      overflow: hidden;
+    }
+
+    .brand-mark::before,
+    .brand-mark::after {
+      content: "";
+      position: absolute;
+      border: 1.5px solid currentColor;
+      border-radius: 3px;
+    }
+
+    .brand-mark::before { inset: 6px 10px 10px 6px; }
+    .brand-mark::after { inset: 10px 6px 6px 10px; background: var(--text); }
+
+    .brand-copy { min-width: 0; }
+
+    .brand-title {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 650;
+      line-height: 1.1;
+      letter-spacing: -0.015em;
+    }
+
+    .brand-subtitle {
+      margin-top: 3px;
+      color: var(--text-secondary);
+      font-size: 10.5px;
+      white-space: nowrap;
+    }
+
+    .connection {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-secondary);
+      font-size: 10.5px;
+      white-space: nowrap;
+    }
+
+    .connection-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-tertiary);
+      box-shadow: 0 0 0 3px var(--bg-tertiary);
+    }
+
+    .connection[data-state="connected"] .connection-dot { background: #36a852; box-shadow: 0 0 0 3px var(--success-bg); }
+    .connection[data-state="error"] .connection-dot { background: #e0573e; box-shadow: 0 0 0 3px var(--danger-bg); }
+
+    main {
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-width: thin;
+      padding: 14px 14px 20px;
+    }
+
+    .section + .section { margin-top: 15px; }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 7px;
+    }
+
+    .section-title {
+      margin: 0;
+      color: var(--text-secondary);
+      font-size: 10px;
+      font-weight: 650;
+      letter-spacing: 0.055em;
+      text-transform: uppercase;
+    }
+
+    .text-action {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 0;
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 10.5px;
+    }
+
+    .text-action:hover { color: var(--text); }
+
+    .source-card {
+      min-height: 118px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      background: var(--bg-secondary);
+      overflow: hidden;
+    }
+
+    .source-empty {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-height: 116px;
+      padding: 16px;
+    }
+
+    .empty-glyph {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      flex: 0 0 auto;
+      border: 1px dashed var(--border-strong);
+      border-radius: 11px;
+      color: var(--text-tertiary);
+    }
+
+    .empty-glyph svg { width: 19px; height: 19px; }
+
+    .empty-title { font-weight: 600; }
+    .empty-copy { margin-top: 3px; color: var(--text-secondary); font-size: 10.5px; max-width: 235px; }
+
+    .source-loaded {
+      display: grid;
+      grid-template-columns: 104px minmax(0, 1fr);
+      min-height: 116px;
+    }
+
+    .preview {
+      position: relative;
+      display: grid;
+      place-items: center;
+      min-height: 116px;
+      overflow: hidden;
+      border-right: 1px solid var(--border);
+      background-color: var(--bg-tertiary);
+      background-image:
+        linear-gradient(45deg, color-mix(in srgb, var(--text) 5%, transparent) 25%, transparent 25%),
+        linear-gradient(-45deg, color-mix(in srgb, var(--text) 5%, transparent) 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, color-mix(in srgb, var(--text) 5%, transparent) 75%),
+        linear-gradient(-45deg, transparent 75%, color-mix(in srgb, var(--text) 5%, transparent) 75%);
+      background-size: 14px 14px;
+      background-position: 0 0, 0 7px, 7px -7px, -7px 0;
+    }
+
+    .preview img { display: none; width: 100%; height: 100%; object-fit: contain; }
+    .preview.has-image img { display: block; }
+
+    .preview-fallback {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      color: var(--text-tertiary);
+      background: color-mix(in srgb, var(--bg) 86%, transparent);
+    }
+
+    .preview.has-image .preview-fallback { display: none; }
+
+    .source-info { min-width: 0; padding: 12px 12px 10px; }
+
+    .source-name-row { display: flex; align-items: flex-start; gap: 8px; }
+
+    .source-name {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12.5px;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+    }
+
+    .schema-badge {
+      flex: 0 0 auto;
+      padding: 2px 5px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-secondary);
+      font: 9px/1.3 "SFMono-Regular", Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .source-meta {
+      margin-top: 3px;
+      color: var(--text-secondary);
+      font-size: 10.5px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 7px;
+      margin-top: 12px;
+    }
+
+    .metric-value {
+      display: block;
+      font: 600 11px/1.1 "SFMono-Regular", Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .metric-label { display: block; margin-top: 3px; color: var(--text-tertiary); font-size: 9px; white-space: nowrap; }
+
+    .mode-switch {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2px;
+      padding: 2px;
+      border-radius: 8px;
+      background: var(--bg-tertiary);
+    }
+
+    .mode-option {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 30px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-weight: 550;
+      transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease;
+    }
+
+    .mode-option:hover { color: var(--text); }
+    .mode-option:has(input:checked) { border-color: var(--border); background: var(--bg); color: var(--text); }
+    .mode-option input { position: absolute; opacity: 0; pointer-events: none; }
+
+    .mode-note { margin: 6px 2px 0; color: var(--text-secondary); font-size: 10.5px; }
+
+    .progress-panel, .result-panel, .issue-panel {
+      border-radius: var(--radius-md);
+      padding: 10px 11px;
+    }
+
+    .progress-panel { border: 1px solid var(--border); background: var(--bg-secondary); }
+
+    .progress-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .progress-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }
+    .progress-count { color: var(--text-secondary); font: 10px "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
+
+    .progress-track {
+      height: 4px;
+      margin-top: 9px;
+      overflow: hidden;
+      border-radius: 3px;
+      background: var(--bg-tertiary);
+    }
+
+    .progress-bar { width: 0; height: 100%; border-radius: inherit; background: var(--brand); transition: width 180ms ease; }
+
+    .cancel-button { margin-top: 8px; padding: 2px 0; background: transparent; color: var(--text-secondary); font-size: 10.5px; }
+    .cancel-button:hover { color: var(--text); }
+
+    .issue-panel { border: 1px solid color-mix(in srgb, var(--text-warning) 25%, var(--border)); background: var(--warning-bg); }
+    .issue-panel[data-tone="error"] { border-color: color-mix(in srgb, var(--text-danger) 25%, var(--border)); background: var(--danger-bg); }
+
+    .issue-title { color: var(--text-warning); font-weight: 650; }
+    .issue-panel[data-tone="error"] .issue-title { color: var(--text-danger); }
+
+    .issue-list { margin: 7px 0 0; padding: 0; list-style: none; }
+    .issue-list li + li { margin-top: 6px; }
+    .issue-item-title { font-weight: 550; }
+    .issue-item-detail { margin-top: 1px; color: var(--text-secondary); font-size: 10.5px; overflow-wrap: anywhere; }
+
+    .result-panel { border: 1px solid var(--border); background: var(--bg-secondary); }
+    .result-panel[data-tone="success"] { border-color: color-mix(in srgb, var(--text-success) 22%, var(--border)); background: var(--success-bg); }
+    .result-panel[data-tone="error"] { border-color: color-mix(in srgb, var(--text-danger) 22%, var(--border)); background: var(--danger-bg); }
+
+    .result-head { display: flex; align-items: center; gap: 9px; }
+
+    .result-icon {
+      display: grid;
+      place-items: center;
+      width: 24px;
+      height: 24px;
+      flex: 0 0 auto;
+      border-radius: 7px;
+      background: var(--bg);
+    }
+
+    .result-icon svg { width: 14px; height: 14px; }
+    .result-title { font-weight: 650; }
+    .result-copy { margin-top: 2px; color: var(--text-secondary); font-size: 10.5px; }
+
+    .result-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1px;
+      margin-top: 10px;
+      overflow: hidden;
+      border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+      border-radius: 6px;
+      background: var(--border);
+    }
+
+    .result-stat { padding: 6px 7px; background: color-mix(in srgb, var(--bg) 92%, transparent); }
+    .result-stat strong { display: block; font: 600 10.5px "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .result-stat span { display: block; margin-top: 2px; color: var(--text-secondary); font-size: 9px; }
+
+    details.settings { margin-top: 16px; border-top: 1px solid var(--border); }
+
+    details.settings summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 36px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+
+    details.settings summary::-webkit-details-marker { display: none; }
+    details.settings summary::after { content: "+"; font: 15px/1 "SFMono-Regular", Consolas, monospace; }
+    details.settings[open] summary::after { content: "−"; }
+
+    .field-label { display: block; margin-bottom: 5px; color: var(--text-secondary); font-size: 10.5px; }
+
+    .text-input {
+      width: 100%;
+      height: 31px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 0 8px;
+      background: var(--bg);
+      color: var(--text);
+      font: 10.5px "SFMono-Regular", Consolas, monospace;
+      outline: 0;
+    }
+
+    .field-help { margin: 5px 0 10px; color: var(--text-tertiary); font-size: 9.5px; }
+
+    footer {
+      padding: 10px 14px 12px;
+      border-top: 1px solid var(--border);
+      background: color-mix(in srgb, var(--bg) 94%, transparent);
+    }
+
+    .action-row { display: grid; grid-template-columns: minmax(0, 1fr) 34px; gap: 7px; }
+
+    .primary-button {
+      min-height: 34px;
+      border-radius: 7px;
+      background: var(--brand);
+      color: var(--text-onbrand);
+      font-weight: 650;
+      letter-spacing: -0.005em;
+    }
+
+    .primary-button:hover:not(:disabled) { background: var(--brand-hover); }
+    .primary-button:active:not(:disabled) { background: var(--brand-pressed); }
+
+    .icon-button {
+      display: grid;
+      place-items: center;
+      min-height: 34px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: var(--bg-secondary);
+    }
+
+    .icon-button:hover:not(:disabled) { background: var(--bg-hover); }
+    .icon-button svg { width: 15px; height: 15px; }
+
+    .footer-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 7px;
+      color: var(--text-tertiary);
+      font-size: 9.5px;
+    }
+
+    .file-button { padding: 0; background: transparent; color: var(--text-secondary); font-size: 9.5px; }
+    .file-button:hover { color: var(--text); }
+
+    .hidden { display: none !important; }
+
+    .skeleton {
+      position: relative;
+      overflow: hidden;
+      color: transparent !important;
+      border-radius: 4px;
+      background: var(--bg-tertiary);
+    }
+
+    .skeleton::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--bg) 65%, transparent), transparent);
+      transform: translateX(-100%);
+      animation: shimmer 1.15s ease-in-out infinite;
+    }
+
+    @keyframes shimmer { to { transform: translateX(100%); } }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div class="brand-copy">
+          <h1 class="brand-title">Ad Decompiler</h1>
+          <div class="brand-subtitle">Image → native Figma scene</div>
+        </div>
+      </div>
+      <div class="connection" id="connection" data-state="idle" title="Local bridge status">
+        <span class="connection-dot" aria-hidden="true"></span>
+        <span id="connectionText">Checking</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="section" aria-labelledby="sourceHeading">
+        <div class="section-header">
+          <h2 class="section-title" id="sourceHeading">Source run</h2>
+          <button class="text-action" id="loadFiles" type="button">Open files</button>
+        </div>
+
+        <div class="source-card" id="sourceCard">
+          <div class="source-empty" id="sourceEmpty">
+            <div class="empty-glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M5 4.5h10.5L19 8v11.5H5z"/><path d="M15.5 4.5V8H19"/><path d="M8 15l2.4-2.4 2 2 1.5-1.5L16 15.2"/>
+              </svg>
+            </div>
+            <div>
+              <div class="empty-title" id="emptyTitle">Looking for the latest run</div>
+              <div class="empty-copy" id="emptyCopy">The local bridge should be running on this computer.</div>
+            </div>
+          </div>
+
+          <div class="source-loaded hidden" id="sourceLoaded">
+            <div class="preview" id="preview">
+              <img id="previewImage" alt="Source ad preview" />
+              <div class="preview-fallback" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <rect x="3.5" y="4" width="17" height="16" rx="2"/><circle cx="8.5" cy="9" r="1.5"/><path d="M5.5 17l4.2-4.3 3.1 3 2.2-2.2 3.5 3.5"/>
+                </svg>
+              </div>
+            </div>
+            <div class="source-info">
+              <div class="source-name-row">
+                <div class="source-name" id="sourceName">Run</div>
+                <span class="schema-badge" id="schemaBadge">v1</span>
+              </div>
+              <div class="source-meta" id="sourceMeta">1080 × 1350 · bridge</div>
+              <div class="metrics" aria-label="Run summary">
+                <div><span class="metric-value" id="metricText">0</span><span class="metric-label">text</span></div>
+                <div><span class="metric-value" id="metricGraphics">0</span><span class="metric-label">graphics</span></div>
+                <div><span class="metric-value" id="metricImages">0</span><span class="metric-label">images</span></div>
+                <div><span class="metric-value" id="metricGroups">0</span><span class="metric-label">groups</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="modeHeading">
+        <div class="section-header">
+          <h2 class="section-title" id="modeHeading">Import behavior</h2>
+        </div>
+        <div class="mode-switch" role="radiogroup" aria-labelledby="modeHeading">
+          <label class="mode-option">
+            <input type="radio" name="importMode" value="replace" checked />
+            <span>Replace existing</span>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="importMode" value="copy" />
+            <span>Create a copy</span>
+          </label>
+        </div>
+        <p class="mode-note" id="modeNote">Updates the latest matching import without stacking duplicates.</p>
+      </section>
+
+      <section class="section hidden" id="progressSection" aria-live="polite">
+        <div class="progress-panel">
+          <div class="progress-top">
+            <div class="progress-label" id="progressLabel">Preparing layers…</div>
+            <div class="progress-count" id="progressCount">0 / 0</div>
+          </div>
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressTrack">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+          <button class="cancel-button" id="cancelImport" type="button">Cancel import</button>
+        </div>
+      </section>
+
+      <section class="section hidden" id="issueSection" aria-live="polite">
+        <div class="issue-panel" id="issuePanel" data-tone="warning">
+          <div class="issue-title" id="issueTitle">Review these details</div>
+          <ul class="issue-list" id="issueList"></ul>
+        </div>
+      </section>
+
+      <section class="section hidden" id="resultSection" aria-live="polite">
+        <div class="result-panel" id="resultPanel" data-tone="success">
+          <div class="result-head">
+            <div class="result-icon" id="resultIcon" aria-hidden="true"></div>
+            <div>
+              <div class="result-title" id="resultTitle">Import complete</div>
+              <div class="result-copy" id="resultCopy">The frame is selected on canvas.</div>
+            </div>
+          </div>
+          <div class="result-stats">
+            <div class="result-stat"><strong id="resultCreated">0</strong><span>created</span></div>
+            <div class="result-stat"><strong id="resultFonts">0</strong><span>font swaps</span></div>
+            <div class="result-stat"><strong id="resultWarnings">0</strong><span>warnings</span></div>
+          </div>
+        </div>
+      </section>
+
+      <details class="settings">
+        <summary>Bridge settings</summary>
+        <label class="field-label" for="bridge">Local bridge address</label>
+        <input class="text-input" id="bridge" value="http://localhost:8790" spellcheck="false" autocomplete="off" />
+        <p class="field-help">Saved on this computer. Only localhost is allow-listed in the manifest (Figma rejects IP-literal hosts like 127.0.0.1) — 127.0.0.1 is normalized to localhost automatically if you type it.</p>
+      </details>
+    </main>
+
+    <footer>
+      <div class="action-row">
+        <button class="primary-button" id="importButton" type="button" disabled>Import into Figma</button>
+        <button class="icon-button" id="refreshButton" type="button" title="Refresh latest run" aria-label="Refresh latest run">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <path d="M19 7v5h-5"/><path d="M18.1 12a6.5 6.5 0 10-1.6 4.3"/>
+          </svg>
+        </button>
+      </div>
+      <div class="footer-meta">
+        <span id="footerStatus">Waiting for a run</span>
+        <button class="file-button" id="loadFilesFooter" type="button">design.json + assets</button>
+      </div>
+    </footer>
+
+    <input id="fileInput" type="file" accept=".json,application/json,image/png,image/jpeg,image/webp,image/gif,image/svg+xml" multiple hidden />
+    <div id="liveStatus" class="hidden" aria-live="assertive"></div>
+  </div>
+
+  <script>
+    const $ = function (id) { return document.getElementById(id); };
+    const state = {
+      settings: { bridge: "http://localhost:8790", importMode: "replace" },
+      doc: null,
+      manifest: null,
+      source: null,
+      fileMap: new Map(),
+      building: false,
+      previewUrl: null,
+    };
+
+    function send(type, payload) {
+      parent.postMessage({ pluginMessage: Object.assign({ type: type }, payload || {}) }, "*");
+    }
+
+    function cleanBase() {
+      const raw = String($("bridge").value || state.settings.bridge || "").trim().replace(/\/$/, "");
+      // Only "localhost" is allow-listed in manifest.json (Figma's manifest validator
+      // rejects IP-literal devAllowedDomains entries), so normalize 127.0.0.1 -> localhost
+      // here rather than requiring the user to type it correctly.
       try {
-        const r = await fetch(base + "/asset?path=" + encodeURIComponent(L.src));
-        const buf = await r.arrayBuffer();
-        assets[L.src] = Array.from(new Uint8Array(buf));
-      } catch (e) { status("asset miss: " + L.src); }
+        const url = new URL(raw);
+        if (url.hostname === "127.0.0.1") {
+          url.hostname = "localhost";
+          return url.toString().replace(/\/$/, "");
+        }
+      } catch (_) {
+        // fall through and return the raw value; validBridge() will flag it
+      }
+      return raw;
     }
-  }
-  return assets;
-}
 
-$("fetch").onclick = async () => {
-  const base = $("bridge").value.replace(/\/$/, "");
-  status("fetching inbox…");
-  try {
-    const man = await (await fetch(base + "/inbox.json")).json();
-    EXPORT_TO = man.export_to || null;
-    const doc = await (await fetch(base + "/design.json")).json();
-    status("building " + doc.layers.length + " layers…");
-    const assets = await fetchAssets(base, doc);
-    parent.postMessage({ pluginMessage: { type: "build", design: doc, assets, export_to: EXPORT_TO } }, "*");
-  } catch (e) { status("bridge error: " + e.message + " — try the file loader"); }
-};
+    function setConnection(status, text) {
+      $("connection").dataset.state = status;
+      $("connectionText").textContent = text;
+    }
 
-$("pick").onclick = () => $("file").click();
-$("file").onchange = async (e) => {
-  const doc = JSON.parse(await e.target.files[0].text());
-  status("building " + doc.layers.length + " layers (no assets — image layers blank)…");
-  parent.postMessage({ pluginMessage: { type: "build", design: doc, assets: {}, export_to: null } }, "*");
-};
+    function setFooter(text) {
+      $("footerStatus").textContent = text;
+      $("liveStatus").textContent = text;
+    }
 
-onmessage = async (e) => {
-  const m = e.data.pluginMessage;
-  if (m && m.type === "exported") {
-    const bytes = new Uint8Array(m.bytes);
-    // POST back to the bridge so run_pipeline picks up figma_export.png, else download.
-    const base = $("bridge").value.replace(/\/$/, "");
-    try {
-      await fetch(base + "/export", { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: bytes });
-      status("exported → bridge (run_pipeline --resume qa)");
-    } catch (err) {
+    function setEmpty(title, copy, loading) {
+      $("sourceEmpty").classList.remove("hidden");
+      $("sourceLoaded").classList.add("hidden");
+      $("emptyTitle").textContent = title;
+      $("emptyCopy").textContent = copy;
+      $("emptyTitle").classList.toggle("skeleton", Boolean(loading));
+      $("emptyCopy").classList.toggle("skeleton", Boolean(loading));
+    }
+
+    function normalizeType(layer) {
+      const raw = String(layer.type || layer.node_type || layer.nodeType || "").toLowerCase();
+      const shape = String(layer.shape_kind || layer.shapeKind || "").toLowerCase();
+      if (raw === "shape" && shape === "path") return "vector";
+      if (["svg", "icon", "path"].indexOf(raw) >= 0) return "vector";
+      if (raw === "container") return "frame";
+      return raw || (Array.isArray(layer.children) && layer.children.length ? "frame" : "unknown");
+    }
+
+    function visit(layers, callback) {
+      (layers || []).forEach(function (layer) {
+        callback(layer);
+        visit(layer.children || [], callback);
+      });
+    }
+
+    function summarize(doc) {
+      const summary = { total: 0, text: 0, graphics: 0, images: 0, groups: 0 };
+      visit(doc.layers || [], function (layer) {
+        const type = normalizeType(layer);
+        summary.total += 1;
+        if (type === "text") summary.text += 1;
+        else if (type === "image") summary.images += 1;
+        else if (["shape", "vector"].indexOf(type) >= 0) summary.graphics += 1;
+        else if (["group", "frame"].indexOf(type) >= 0) summary.groups += 1;
+      });
+      return summary;
+    }
+
+    function assetReferences(doc) {
+      const refs = new Map();
+      visit(doc.layers || [], function (layer) {
+        const source = layer.src || layer.source || layer.asset || layer.asset_path || layer.assetPath;
+        if (normalizeType(layer) === "image" && source) refs.set(String(source), true);
+        const mask = layer.mask || {};
+        const maskSource = mask.src || mask.source || mask.asset || mask.asset_path || mask.assetPath;
+        if (maskSource && !refs.has(String(maskSource))) refs.set(String(maskSource), false);
+      });
+      return refs;
+    }
+
+    function previewSource(doc) {
+      let candidate = null;
+      visit(doc.layers || [], function (layer) {
+        if (candidate) return;
+        const source = layer.src || layer.source || layer.asset || layer.asset_path || layer.assetPath;
+        if (normalizeType(layer) === "image" && source && (layer.id === "base" || /background|base/i.test(String(layer.name || "")))) candidate = String(source);
+      });
+      if (candidate) return candidate;
+      visit(doc.layers || [], function (layer) {
+        if (candidate) return;
+        const source = layer.src || layer.source || layer.asset || layer.asset_path || layer.assetPath;
+        if (normalizeType(layer) === "image" && source) candidate = String(source);
+      });
+      return candidate;
+    }
+
+    function releasePreview() {
+      if (state.previewUrl && state.previewUrl.indexOf("blob:") === 0) URL.revokeObjectURL(state.previewUrl);
+      state.previewUrl = null;
+      $("preview").classList.remove("has-image");
+      $("previewImage").removeAttribute("src");
+    }
+
+    function setPreview(doc) {
+      releasePreview();
+      const source = previewSource(doc);
+      if (!source) return;
+      if (state.source === "bridge") {
+        state.previewUrl = cleanBase() + "/asset?path=" + encodeURIComponent(source);
+      } else {
+        const file = findFile(source);
+        if (file) state.previewUrl = URL.createObjectURL(file);
+      }
+      if (!state.previewUrl) return;
+      $("previewImage").src = state.previewUrl;
+      $("previewImage").onload = function () { $("preview").classList.add("has-image"); };
+      $("previewImage").onerror = function () { $("preview").classList.remove("has-image"); };
+    }
+
+    function renderDoc(doc, sourceLabel) {
+      state.doc = doc;
+      const summary = summarize(doc);
+      const canvas = doc.canvas || {};
+      const width = Number(canvas.w || canvas.width || 0);
+      const height = Number(canvas.h || canvas.height || 0);
+      const version = Number(doc.schema_version || doc.schemaVersion || 1);
+      $("sourceEmpty").classList.add("hidden");
+      $("sourceLoaded").classList.remove("hidden");
+      $("sourceName").textContent = String(doc.name || doc.id || "Untitled reconstruction");
+      $("schemaBadge").textContent = "v" + version;
+      $("sourceMeta").textContent = width + " × " + height + " · " + sourceLabel;
+      $("metricText").textContent = summary.text;
+      $("metricGraphics").textContent = summary.graphics;
+      $("metricImages").textContent = summary.images;
+      $("metricGroups").textContent = summary.groups;
+      $("importButton").disabled = false;
+      setFooter(summary.total + " source layers ready");
+      setPreview(doc);
+      hideIssues();
+      $("resultSection").classList.add("hidden");
+    }
+
+    async function fetchJson(url, timeoutMs) {
+      const controller = new AbortController();
+      const timeout = setTimeout(function () { controller.abort(); }, timeoutMs || 6000);
+      try {
+        const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+        if (!response.ok) throw new Error(response.status + " " + response.statusText);
+        return await response.json();
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    function validBridge(base) {
+      try {
+        const url = new URL(base);
+        return url.protocol === "http:" && (url.hostname === "127.0.0.1" || url.hostname === "localhost");
+      } catch (_) {
+        return false;
+      }
+    }
+
+    async function refreshLatest(options) {
+      if (state.building) return;
+      const base = cleanBase();
+      if (!validBridge(base)) {
+        setConnection("error", "Invalid address");
+        setEmpty("Bridge address is invalid", "Use localhost or 127.0.0.1 on the configured port.", false);
+        showIssues([{ title: "Invalid bridge address", detail: base || "No address entered." }], "error");
+        return;
+      }
+      $("refreshButton").disabled = true;
+      $("importButton").disabled = true;
+      setConnection("idle", "Checking");
+      setEmpty("Loading the latest run", "Reading design.json and its asset manifest…", true);
+      setFooter("Connecting to the local bridge");
+      try {
+        const manifest = await fetchJson(base + "/inbox.json", 5000);
+        const doc = await fetchJson(base + "/design.json", 7000);
+        if (!doc || !doc.canvas || !Array.isArray(doc.layers)) throw new Error("design.json is missing canvas or layers");
+        state.manifest = manifest;
+        state.source = "bridge";
+        state.fileMap = new Map();
+        setConnection("connected", "Bridge ready");
+        renderDoc(doc, "local bridge");
+      } catch (error) {
+        state.doc = null;
+        state.manifest = null;
+        setConnection("error", "Bridge offline");
+        setEmpty("No run found", "Start the local bridge, or open design.json with its assets.", false);
+        setFooter("Bridge unavailable");
+        if (!(options && options.silent)) showIssues([{ title: "Connection failed", detail: String(error && error.message || error) }], "error");
+      } finally {
+        $("refreshButton").disabled = false;
+      }
+    }
+
+    function normalizePath(value) {
+      return String(value || "").replace(/\\/g, "/").replace(/^\.\//, "");
+    }
+
+    function basename(value) {
+      const parts = normalizePath(value).split("/");
+      return parts[parts.length - 1];
+    }
+
+    function findFile(source) {
+      const normalized = normalizePath(source);
+      return state.fileMap.get(normalized) || state.fileMap.get(basename(normalized)) || null;
+    }
+
+    async function loadFiles(fileList) {
+      const files = Array.from(fileList || []);
+      const jsonFile = files.find(function (file) { return file.name.toLowerCase().endsWith(".json"); });
+      if (!jsonFile) {
+        showIssues([{ title: "design.json not selected", detail: "Choose design.json and any referenced PNG, JPG, WebP, GIF, or SVG assets together." }], "error");
+        return;
+      }
+      try {
+        const doc = JSON.parse(await jsonFile.text());
+        if (!doc.canvas || !Array.isArray(doc.layers)) throw new Error("The JSON file needs canvas and layers.");
+        const map = new Map();
+        files.filter(function (file) { return file !== jsonFile; }).forEach(function (file) {
+          map.set(normalizePath(file.webkitRelativePath || file.name), file);
+          map.set(file.name, file);
+        });
+        state.fileMap = map;
+        state.source = "files";
+        state.manifest = null;
+        setConnection("idle", "Files loaded");
+        renderDoc(doc, "local files");
+        const refs = assetReferences(doc);
+        const missing = [];
+        refs.forEach(function (required, source) {
+          if (required && !findFile(source)) missing.push({ title: "Asset not selected", detail: source });
+        });
+        if (missing.length) showIssues(missing, "warning");
+      } catch (error) {
+        showIssues([{ title: "File could not be read", detail: String(error && error.message || error) }], "error");
+      } finally {
+        $("fileInput").value = "";
+      }
+    }
+
+    function showIssues(items, tone) {
+      const list = $("issueList");
+      list.innerHTML = "";
+      (items || []).slice(0, 12).forEach(function (item) {
+        const li = document.createElement("li");
+        const title = document.createElement("div");
+        const detail = document.createElement("div");
+        title.className = "issue-item-title";
+        detail.className = "issue-item-detail";
+        title.textContent = item.title || "Notice";
+        detail.textContent = item.detail || "";
+        li.appendChild(title);
+        if (item.detail) li.appendChild(detail);
+        list.appendChild(li);
+      });
+      if ((items || []).length > 12) {
+        const li = document.createElement("li");
+        li.className = "issue-item-detail";
+        li.textContent = "+ " + ((items || []).length - 12) + " more";
+        list.appendChild(li);
+      }
+      $("issuePanel").dataset.tone = tone === "error" ? "error" : "warning";
+      $("issueTitle").textContent = tone === "error" ? "Import needs attention" : "Imported with substitutions";
+      $("issueSection").classList.remove("hidden");
+    }
+
+    function hideIssues() {
+      $("issueSection").classList.add("hidden");
+      $("issueList").innerHTML = "";
+    }
+
+    function setProgress(message, current, total) {
+      const safeTotal = Math.max(1, Number(total || 1));
+      const safeCurrent = Math.max(0, Number(current || 0));
+      const percent = Math.min(100, Math.round(safeCurrent / safeTotal * 100));
+      $("progressLabel").textContent = message || "Building layers…";
+      $("progressCount").textContent = safeCurrent + " / " + safeTotal;
+      $("progressBar").style.width = percent + "%";
+      $("progressTrack").setAttribute("aria-valuenow", String(percent));
+    }
+
+    function setBuilding(building) {
+      state.building = building;
+      $("progressSection").classList.toggle("hidden", !building);
+      $("importButton").disabled = building || !state.doc;
+      $("refreshButton").disabled = building;
+      $("loadFiles").disabled = building;
+      $("loadFilesFooter").disabled = building;
+      document.querySelectorAll('input[name="importMode"]').forEach(function (input) { input.disabled = building; });
+      if (building) {
+        $("resultSection").classList.add("hidden");
+        hideIssues();
+      }
+    }
+
+    async function fileBytes(file) {
+      return Array.from(new Uint8Array(await file.arrayBuffer()));
+    }
+
+    async function bridgeBytes(source) {
+      const response = await fetch(cleanBase() + "/asset?path=" + encodeURIComponent(source), { cache: "no-store" });
+      if (!response.ok) throw new Error(response.status + " " + response.statusText);
+      return Array.from(new Uint8Array(await response.arrayBuffer()));
+    }
+
+    async function gatherAssets(doc) {
+      const refs = Array.from(assetReferences(doc).entries());
+      const assets = {};
+      const missingRequired = [];
+      const optionalWarnings = [];
+      for (let i = 0; i < refs.length; i += 1) {
+        const source = refs[i][0];
+        const required = refs[i][1];
+        setProgress("Loading " + basename(source) + "…", i, Math.max(1, refs.length));
+        try {
+          if (state.source === "bridge") assets[source] = await bridgeBytes(source);
+          else {
+            const file = findFile(source);
+            if (!file) throw new Error("not selected");
+            assets[source] = await fileBytes(file);
+          }
+        } catch (error) {
+          const item = { title: required ? "Required asset missing" : "Optional mask missing", detail: source + " — " + String(error && error.message || error) };
+          if (required) missingRequired.push(item);
+          else optionalWarnings.push(item);
+        }
+      }
+      setProgress("Assets ready", refs.length, Math.max(1, refs.length));
+      return { assets: assets, missingRequired: missingRequired, optionalWarnings: optionalWarnings };
+    }
+
+    async function startImport() {
+      if (!state.doc || state.building) return;
+      setBuilding(true);
+      setFooter("Preparing assets");
+      setProgress("Preparing assets…", 0, Math.max(1, assetReferences(state.doc).size));
+      saveSettings();
+      try {
+        const gathered = await gatherAssets(state.doc);
+        if (gathered.missingRequired.length) {
+          setBuilding(false);
+          showIssues(gathered.missingRequired.concat(gathered.optionalWarnings), "error");
+          setFooter("Import stopped — assets missing");
+          return;
+        }
+        if (gathered.optionalWarnings.length) showIssues(gathered.optionalWarnings, "warning");
+        setProgress("Sending the scene to Figma…", 0, Math.max(1, summarize(state.doc).total));
+        setFooter("Building native Figma layers");
+        send("build", {
+          design: state.doc,
+          assets: gathered.assets,
+          export_to: state.manifest && state.manifest.export_to || null,
+          import_mode: state.settings.importMode,
+        });
+      } catch (error) {
+        setBuilding(false);
+        showIssues([{ title: "Assets could not be prepared", detail: String(error && error.message || error) }], "error");
+        setFooter("Import failed before compilation");
+      }
+    }
+
+    function resultIcon(ok) {
+      return ok
+        ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.5l4.2 4L19 7"/></svg>'
+        : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 7v6"/><path d="M12 17.2v.1"/><circle cx="12" cy="12" r="9"/></svg>';
+    }
+
+    function renderResult(report) {
+      const ok = Boolean(report && report.ok);
+      $("resultPanel").dataset.tone = ok ? "success" : "error";
+      $("resultIcon").innerHTML = resultIcon(ok);
+      $("resultTitle").textContent = ok ? (report.replaced ? "Existing frame updated" : "Import complete") : (report.cancelled ? "Import cancelled" : "Import rolled back");
+      $("resultCopy").textContent = ok
+        ? (report.mode === "copy" ? "A new editable copy is selected on canvas." : "The editable frame is selected on canvas.")
+        : (report.cancelled ? "No Figma layers were changed." : "The previous import was kept intact. Review the errors below.");
+      $("resultCreated").textContent = Number(report.created || 0);
+      $("resultFonts").textContent = Number(report.fonts && report.fonts.substituted || 0);
+      $("resultWarnings").textContent = Number(report.warnings && report.warnings.length || 0);
+      $("resultSection").classList.remove("hidden");
+      const issues = (report.errors || []).concat(report.warnings || []);
+      if (issues.length) showIssues(issues, report.errors && report.errors.length ? "error" : "warning");
+      else hideIssues();
+      setFooter(ok ? Number(report.created || 0) + " editable layers imported" : (report.cancelled ? "Import cancelled" : "No changes made"));
+    }
+
+    async function postBuildReport(report) {
+      if (state.source !== "bridge") return;
+      const payload = {
+        version: 1,
+        doc_id: String(state.doc && (state.doc.id || state.doc.name) || report.docId || "unknown"),
+        run_id: String(state.manifest && (state.manifest.run_id || state.manifest.run_dir) || state.doc && (state.doc.id || state.doc.name) || "unknown"),
+        schema_version: Number(state.doc && (state.doc.schema_version || state.doc.schemaVersion) || 1),
+        reported_at: new Date().toISOString(),
+        report: report,
+      };
+      try {
+        const response = await fetch(cleanBase() + "/report", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) throw new Error(response.status + " " + response.statusText);
+      } catch (error) {
+        const issues = (report.errors || []).concat(report.warnings || [], [{
+          title: "Compiler report was not saved",
+          detail: "The bridge /report endpoint did not accept it: " + String(error && error.message || error),
+        }]);
+        showIssues(issues, report.errors && report.errors.length ? "error" : "warning");
+      }
+    }
+
+    async function handleExport(message) {
+      const bytes = new Uint8Array(message.bytes || []);
+      if (!bytes.length) return;
+      const shouldPost = state.source === "bridge" || message.export_to;
+      if (shouldPost) {
+        try {
+          const response = await fetch(cleanBase() + "/export", {
+            method: "POST",
+            headers: { "Content-Type": "application/octet-stream" },
+            body: bytes,
+          });
+          if (!response.ok) throw new Error(response.status + " " + response.statusText);
+          setFooter("Imported and sent to QA");
+          return;
+        } catch (error) {
+          showIssues([{ title: "QA export downloaded instead", detail: "The bridge could not receive the PNG: " + String(error && error.message || error) }], "warning");
+        }
+      }
       const blob = new Blob([bytes], { type: "image/png" });
-      const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-      a.download = "figma_export.png"; a.click();
-      status("exported → downloaded figma_export.png (drop into the run dir)");
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "figma_export.png";
+      anchor.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
     }
-  }
-};
-</script>
+
+    function saveSettings() {
+      state.settings.bridge = cleanBase();
+      const selected = document.querySelector('input[name="importMode"]:checked');
+      state.settings.importMode = selected ? selected.value : "replace";
+      send("save-settings", { settings: state.settings });
+    }
+
+    function applyMode(mode) {
+      const value = mode === "copy" ? "copy" : "replace";
+      const input = document.querySelector('input[name="importMode"][value="' + value + '"]');
+      if (input) input.checked = true;
+      state.settings.importMode = value;
+      $("modeNote").textContent = value === "copy"
+        ? "Places a separate frame beside earlier imports."
+        : "Updates the latest matching import without stacking duplicates.";
+    }
+
+    $("importButton").addEventListener("click", startImport);
+    $("refreshButton").addEventListener("click", function () { refreshLatest({ silent: false }); });
+    $("cancelImport").addEventListener("click", function () {
+      send("cancel");
+      $("cancelImport").disabled = true;
+      $("progressLabel").textContent = "Cancelling safely…";
+    });
+    $("loadFiles").addEventListener("click", function () { $("fileInput").click(); });
+    $("loadFilesFooter").addEventListener("click", function () { $("fileInput").click(); });
+    $("fileInput").addEventListener("change", function (event) { loadFiles(event.target.files); });
+    $("bridge").addEventListener("change", function () {
+      saveSettings();
+      refreshLatest({ silent: false });
+    });
+    $("bridge").addEventListener("keydown", function (event) {
+      if (event.key === "Enter") { event.preventDefault(); saveSettings(); refreshLatest({ silent: false }); }
+    });
+    document.querySelectorAll('input[name="importMode"]').forEach(function (input) {
+      input.addEventListener("change", function () { applyMode(input.value); saveSettings(); });
+    });
+
+    onmessage = function (event) {
+      const message = event.data && event.data.pluginMessage;
+      if (!message) return;
+      if (message.type === "init") {
+        state.settings = Object.assign({}, state.settings, message.settings || {});
+        $("bridge").value = state.settings.bridge;
+        applyMode(state.settings.importMode);
+        refreshLatest({ silent: true });
+      } else if (message.type === "progress") {
+        setProgress(message.message, message.current, message.total);
+      } else if (message.type === "build-result") {
+        setBuilding(false);
+        $("cancelImport").disabled = false;
+        renderResult(message.report || {});
+        postBuildReport(message.report || {});
+      } else if (message.type === "exported") {
+        handleExport(message);
+      }
+    };
+
+    send("ui-ready");
+  </script>
+</body>
+</html>

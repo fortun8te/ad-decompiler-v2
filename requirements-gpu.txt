@@ -1,13 +1,9 @@
 # requirements-gpu.txt — ad-decompiler GPU/CV stack for Windows + CUDA 12.x (RTX 5080)
 # =============================================================================
-# TORCH — install FIRST from the CUDA 12.1 wheel index, NOT from PyPI, e.g.:
+# Use Python 3.12 for the GPU pipeline. SAM 3 requires PyTorch >=2.7 and CUDA >=12.6;
+# Blackwell is best served by current cu128 wheels. Install torch FIRST, e.g.:
 #
-#     pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
-#
-# NOTE (RTX 5080 / Blackwell / sm_120): the cu121 wheels above cover most setups.
-# If you hit "no kernel image is available for execution on the device", the 5080
-# needs a newer CUDA build — use the cu124 (or nightly cu128) index instead:
-#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#     pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
 # Then install the rest of this file with:  pip install -r requirements-gpu.txt
 # =============================================================================
 
@@ -46,3 +42,12 @@ cairosvg>=2.7             # rasterize traced SVG for the fidelity check
 # inside ComfyUI, OR install standalone:
 #   pip install realesrgan basicsr        # may need basicsr patched for torchvision>=0.17
 # If realesrgan won't build, skip it and set cfg.upscale.enabled=false.
+
+# ── SAM 3 (install the official repository after this file) ──
+#   git clone https://github.com/facebookresearch/sam3.git C:\src\sam3
+#   pip install -e C:\src\sam3
+# Request/download the official checkpoint once and set sam3.checkpoint in config.yaml.
+
+# ── background inpainting ──
+# Big-LaMa is optional; OpenCV is the deterministic fallback:
+#   pip install simple-lama-inpainting

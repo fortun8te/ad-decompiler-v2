@@ -78,6 +78,46 @@ def test_flat_image_no_elements():
     assert els == []
 
 
+def test_edge_gradient_is_clamped_not_wrapped():
+    """Regression: the border gradient must be edge-clamped, not circular (np.roll).
+
+    With np.roll, column 0's "left" neighbor wraps to the LAST column and column -1's
+    "right" neighbor wraps to the FIRST column, so a bright value on one edge leaks into
+    the gradient of the opposite edge. Edge-clamped (replicate) padding keeps each
+    border's gradient local to its own side.
+    """
+    row = np.array([100.0, 50.0, 50.0, 200.0])
+    gray_x = np.tile(row, (2, 1))  # shape (2, 4): flat along axis 0, varying along axis 1
+    gx_gy = element_detect._edge_gradient_magnitude(gray_x)
+    # Edge-clamped forward/backward differences at the boundaries:
+    # col0: |col1 - col0| = |50-100| = 50   (NOT the wrapped |col1 - col_last| = |50-200| = 150)
+    # col3: |col_last - col2| = |200-50| = 150 (NOT the wrapped |col0 - col2| = |100-50| = 50)
+    expected_row = np.array([50.0, 50.0, 150.0, 150.0])
+    for row_result in gx_gy:
+        assert row_result.tolist() == expected_row.tolist()
+
+    col = np.array([[100.0], [50.0], [50.0], [200.0]])
+    gray_y = np.tile(col, (1, 2))  # shape (4, 2): flat along axis 1, varying along axis 0
+    grad_y = element_detect._edge_gradient_magnitude(gray_y)
+    expected_col = np.array([50.0, 50.0, 150.0, 150.0])
+    for col_idx in range(2):
+        assert grad_y[:, col_idx].tolist() == expected_col.tolist()
+
+
+def test_border_touching_icon_is_not_misclassified_by_wrapped_gradient():
+    """A high-contrast icon-like shape that touches the canvas edge must not have its
+    edge_density skewed by wraparound diffing against the opposite border."""
+    img = np.full((200, 200, 3), 240, np.uint8)
+    # Small checkerboard-ish icon-like patch touching the LEFT edge (x=0), with a
+    # deliberately different color sitting at the RIGHT edge so a circular-wrap bug
+    # would leak that unrelated color into this patch's edge-density measurement.
+    cv2.rectangle(img, (0, 80), (30, 110), (10, 200, 10), -1)
+    cv2.rectangle(img, (198, 0), (200, 200), (0, 0, 250), -1)  # unrelated bright right border
+    path, _ = _write(img)
+    els = element_detect.detect(path, {"lines": []}, {})
+    assert any(_contains(e["box"], 10, 95) for e in els), "border-touching element missing"
+
+
 def test_writes_artifacts(tmp_path):
     img = _make_ad()
     path, _ = _write(img)

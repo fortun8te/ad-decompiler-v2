@@ -59,56 +59,116 @@ def _inside_frac(a, b):
 
 # ── conservative inline router (fallback only) ───────────────────────────────────────
 def _fallback_route(candidate: dict, canvas: dict, cfg: dict) -> dict:
-    """Minimal port of the routing intent. Real routing.py supersedes this."""
-    src = candidate.get("meta", {}).get("source")
-    kind = candidate.get("meta", {}).get("kind")
-    if src == "ocr":
-        candidate["target"] = "text"
+    """Minimal port of routing intent, used ONLY if src.routing is unimportable.
+    Reads the same top-level fields the real router does. Returns a copy."""
+    c = dict(candidate)
+    meta = c.setdefault("meta", {})
+    kind = c.get("kind")
+    if c.get("text") is not None and kind in (None, "text"):
+        if c.get("kept_in_photo") or meta.get("origin") == "scene":
+            c["target"] = "drop"
+            meta["kept_in_photo"] = True
+        else:
+            c["target"] = "text"
+    elif kind == "photo-fragment" or meta.get("role") in ("photo", "product", "person"):
+        c["target"] = "image"
+    elif kind == "icon" or meta.get("role") in ("icon", "badge", "logo", "arrow"):
+        c["target"] = "icon"
     elif kind == "shape":
-        candidate["target"] = "shape"
-    elif kind == "icon":
-        candidate["target"] = "icon"
-    elif kind in ("photo-fragment", "photo", "image"):
-        candidate["target"] = "image"
+        c["target"] = "shape"
     else:
-        candidate["target"] = candidate.get("target", "image")
-    return candidate
+        c["target"] = "image"
+        meta["fallback"] = True
+    return c
 
 
 # ── candidate builders ───────────────────────────────────────────────────────────────
 def _text_candidate(line):
+    meta = dict(line.get("meta") or {})
+    meta.update({
+        "source": "ocr",
+        "role": line.get("role") or meta.get("role") or "text",
+        "confidence": round(float(line.get("conf", meta.get("confidence", 1.0))), 4),
+        "ocr_id": line["id"],
+        "line_ids": line.get("line_ids") or [line["id"]],
+        "quad": line.get("quad"),
+        "hierarchy": line.get("hierarchy"),
+        "style_id": line.get("repeated_style_id") or line.get("style_id"),
+    })
     return {
         "id": f"c_{line['id']}",
         "box": dict(line["box"]),
         "z": 0,
         "text": line.get("text", ""),
-        "style": {},
-        "meta": {
-            "source": "ocr",
-            "role": "text",
-            "confidence": round(float(line.get("conf", 1.0)), 4),
-            "ocr_id": line["id"],
-        },
+        "style": dict(line.get("style") or {}),
+        "visible_box": dict(line.get("ink_box") or line.get("painted_box") or line["box"]),
+        "rotation": float(line.get("rotation", 0.0) or 0.0),
+        "quad": line.get("quad"),
+        "meta": meta,
     }
 
 
+def _text_sources(ocr):
+    if not isinstance(ocr, dict):
+        return ocr or []
+    blocks = ocr.get("blocks") or []
+    if not blocks:
+        return ocr.get("lines", [])
+    styles = {style.get("id"): style for style in (ocr.get("styles") or [])}
+    lines = {line.get("id"): line for line in (ocr.get("lines") or [])}
+    out = []
+    for raw in blocks:
+        block = dict(raw)
+        members = [lines[line_id] for line_id in block.get("line_ids", []) if line_id in lines]
+        style_id = block.get("style_id")
+        block_style = dict(block.get("style") or styles.get(style_id) or
+                           (members[0].get("style") if members else {}) or {})
+        if members:
+            representative = members[0].get("style") or {}
+            for key in ("fontCandidates", "fontSizeCandidates", "fontWeightCandidates",
+                        "fontStyleCandidates", "confidence"):
+                if key in representative:
+                    block_style.setdefault(key, representative[key])
+        block["style"] = block_style
+        block["ink_box"] = block.get("painted_box") or block.get("box")
+        block["conf"] = (sum(float(line.get("conf", 1)) for line in members) / len(members)
+                         if members else float(block.get("conf", 1)))
+        block["rotation"] = (sum(float(line.get("rotation", 0)) for line in members) / len(members)
+                             if members else float(block.get("rotation", 0)))
+        block["repeated_style_id"] = style_id
+        out.append(block)
+    return out
+
+
 def _element_candidate(el):
-    kind = el.get("kind", "shape")
-    role = {"shape": "shape", "icon": "icon", "photo-fragment": "photo"}.get(kind, "shape")
+    kind = el.get("kind", "shape")  # top-level kind -> routing.route reads this
+    role = el.get("role") or {"shape": "shape", "icon": "icon", "photo-fragment": "photo"}.get(kind, "shape")
+    raw_mask = el.get("mask")
+    mask_src = (raw_mask.get("src") if isinstance(raw_mask, dict) else raw_mask)
+    mask_src = mask_src or el.get("mask_src") or el.get("mask_path")
     return {
         "id": f"c_{el['id']}",
         "box": dict(el["box"]),
         "z": 0,
+        "kind": kind,
         # box-local mask written by element_detect at elements/<id>.png (by convention)
-        "mask": {"kind": "alpha", "src": os.path.join("elements", f"{el['id']}.png")},
+        "mask": {
+            "kind": "alpha",
+            "src": mask_src or os.path.join("elements", f"{el['id']}.png"),
+        },
+        "src": el.get("asset_src"),
         "source_crop": {"element_id": el["id"]},
         "meta": {
             "source": "element",
             "role": role,
             "kind": kind,
-            "confidence": round(float(el.get("coverage", 0.0)), 4),
+            "confidence": round(float(el.get("score", el.get("coverage", 0.0))), 4),
             "element_id": el["id"],
             "area": el.get("area"),
+            "prompt": el.get("prompt"),
+            "parent_id": el.get("parent_id"),
+            "observations": el.get("observation_ids") or [],
+            "provenance": el.get("provenance") or {},
         },
     }
 
@@ -121,9 +181,16 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
         run_dir = cfg.get("run_dir")
     dedup_iou = float((cfg.get("merge") or {}).get("dedup_iou", 0.6))
     match_iou = float((cfg.get("merge") or {}).get("qwen_match_iou", 0.3))
-    photo_inside = float((cfg.get("merge") or {}).get("photo_inside_frac", 0.6))
+    photo_inside = float((cfg.get("merge") or {}).get("photo_inside_frac", 0.82))
+    scene_roles = set((cfg.get("merge") or {}).get(
+        "scene_text_roles", ["product", "package", "bottle", "jar", "tube", "device", "sign"]
+    ))
+    overlay_text_roles = {"headline", "title", "subtitle", "subheadline", "eyebrow",
+                          "cta", "button", "price", "offer"}
 
-    ocr_lines = ocr.get("lines", []) if isinstance(ocr, dict) else (ocr or [])
+    # text_analysis emits paragraph/headline blocks. Prefer those over one Figma node per
+    # OCR line so wrapping, hierarchy, and repeated text styles survive downstream.
+    ocr_lines = _text_sources(ocr)
     elements = elements or []
     qwen = qwen or []
 
@@ -132,7 +199,7 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
 
     # ── qwen z-order + alpha: match each qwen layer to overlapping candidates ──────────
     # qwen list is back-to-front; index = z (lower index = further back).
-    photo_regions = []  # regions where scene text should stay baked in
+    scene_regions = []  # product/package regions where printed text should stay baked in
     for zi, ql in enumerate(qwen):
         qbox = ql.get("box", {})
         if not (qbox.get("w", 0) > 0 and qbox.get("h", 0) > 0):
@@ -149,10 +216,11 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             best["src"] = ql.get("png")  # clean RGBA alpha from qwen
             best["meta"]["qwen_id"] = ql.get("id")
             best["meta"]["source"] = "element+qwen"
-            if best["meta"].get("role") == "photo":
-                photo_regions.append(qbox)
+            if best["meta"].get("role") in scene_roles:
+                scene_regions.append(qbox)
         else:
-            # qwen-only layer with no element match -> raw image candidate
+            # qwen-only layer with no element match -> raster image candidate.
+            # meta.role='photo' makes routing.route pick target='image' + alpha mask.
             elem_cands.append(
                 {
                     "id": f"c_{ql['id']}",
@@ -161,38 +229,47 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                     "src": ql.get("png"),
                     "meta": {
                         "source": "qwen",
-                        "role": "image",
-                        "kind": "image",
+                        "role": "photo",
                         "confidence": 0.5,
                         "qwen_id": ql.get("id"),
                     },
                 }
             )
-    # also treat detected photo-fragments as photo regions for scene-text detection
+    # Only product/package-like rasters own printed scene text. Generic photos/backgrounds
+    # often have intentional editable overlay copy, so containment alone is not enough.
     for c in elem_cands:
-        if c["meta"].get("role") == "photo":
-            photo_regions.append(c["box"])
+        if c["meta"].get("role") in scene_roles or c["meta"].get("contains_scene_text"):
+            scene_regions.append(c["box"])
 
     # ── assemble + route ──────────────────────────────────────────────────────────────
     candidates = text_cands + elem_cands
 
-    # scene text: OCR line inside a photo region -> keep baked in the base
+    # scene text: OCR line inside a photo region -> keep baked in the base.
+    # Flag with top-level kept_in_photo + meta.origin='scene' so routing.route drops it.
     for c in text_cands:
-        for pr in photo_regions:
+        if c["meta"].get("role") in overlay_text_roles:
+            continue
+        for pr in scene_regions:
             if _inside_frac(c["box"], pr) >= photo_inside:
-                c["meta"]["kept_in_photo"] = True
+                c["kept_in_photo"] = True
+                c["meta"]["origin"] = "scene"
                 c["meta"]["role"] = "scene-text"
                 break
 
+    # routing.route returns a NEW dict (shallow copy) — capture it.
+    routed = []
     for c in candidates:
         try:
-            route(c, canvas, cfg)
+            rc = route(c, canvas, cfg)
         except Exception as e:  # a bad router must not sink the whole stage
             print(f"[merge] routing error on {c.get('id')}: {e}; defaulting")
-            _fallback_route(c, canvas, cfg)
+            rc = _fallback_route(c, canvas, cfg)
         # enforce scene-text -> drop regardless of router (contract hard rule)
-        if c["meta"].get("kept_in_photo"):
-            c["target"] = "drop"
+        if rc.get("kept_in_photo") or rc.get("meta", {}).get("kept_in_photo"):
+            rc["target"] = "drop"
+        routed.append(rc)
+    candidates = routed
+    text_cands = [c for c in candidates if c["meta"].get("source") == "ocr"]
 
     # ── dedup: shape/icon that is really an OCR text box -> drop (prefer text) ─────────
     kept = []
@@ -202,7 +279,7 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             "icon",
         ):
             covered = any(
-                t.get("target") == "text"
+                t.get("target") != "drop"
                 and _inside_frac(t["box"], c["box"]) >= 0.9
                 and _iou(t["box"], c["box"]) >= dedup_iou
                 for t in text_cands

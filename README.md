@@ -1,82 +1,137 @@
 # ad-decompiler
 
-**Flat Meta ad → editable Figma layers.** A scriptable, headless Python pipeline built to run
-on a Windows RTX 5080. Deterministic CV + OCR extract the *facts*; Qwen-Image-Layered proposes
-RGBA layers; the harness routes every element to the right Figma primitive; a screenshot
-diff proves the reconstruction is close. An OpenCode agent orchestrates the stages over JSON.
+**Any flat image → a duplicate-free, editable, Figma-native scene graph.**
 
-> Milestone: **one ad in → editable Figma out → screenshot diff proves it's close.**
-> This is a backend pipeline. There is no SaaS UI and none is planned here.
+The old repo was an unvalidated three-commit scaffold. It kept the original image as the
+background and then placed extracted elements on top, so duplicates were unavoidable and an
+empty decomposition could score perfectly. The v2 pipeline removes that architecture.
 
+```text
+image
+  → OCR ensemble + font/style/paragraph analysis
+  → residual proposals + SAM 3 on every proposal + semantic prompt sweep
+  → mask-aware canonical entities
+  → vector/native/raster routing
+  → one ownership map + one inpainted clean background
+  → nested frames, selective Auto Layout, constraints and repeats
+  → recursive Figma compiler + structural/visual QA
 ```
-input ad → OCR + element detect → Qwen layers → merge → design.json → Figma import → screenshot → pixel-diff QA
-```
 
-## Why this shape
-- **Qwen is only the layer-proposal engine.** OCR + `element_detect` own text and boxes; Qwen
-  owns z-order and clean alpha. The harness stays in control so the agent can't hallucinate
-  visual structure.
-- **The routing rules are the crown jewel** (`src/routing.py`, ported from a validated Mac
-  harness): text → real Figma text, photos/products/people → raster + mask, only
-  icons/badges/logos/arrows/simple graphics → vectorized (VTracer/Potrace). Never vectorize the
-  whole ad. Scene text stays baked in the base (`kept_in_photo`); wordmarks stay as artwork.
-- **`design.json` is the single source of truth** (`src/schema.py`). Every stage reads/writes
-  JSON so the agent can inspect and repair without touching pixels.
+## What is implemented
+
+- Current PaddleOCR 3/PP-OCRv6 parsing, Surya/docTR challengers, calibrated reconciliation,
+  word geometry, and targeted 2× retries for small/uncertain text.
+- Painted glyph boxes, baseline/rotation/color estimates, paragraph grouping, hierarchy,
+  shared style IDs, and bounded local font retrieval with ranked candidates.
+- Official local SAM 3 image adapter. It prompt-sweeps products, people, logos, icons, arrows,
+  badges, buttons, and illustrations, then box-refines every deterministic residual proposal.
+- Mask-aware SAM/residual/Qwen fusion with one canonical ID per entity and meaningful nesting.
+- Asset extraction, native shape/color inference, wired VTracer/Potrace with full SVG and a
+  color+silhouette render gate, plus honest raster fallback.
+- One union removal mask and one background inpaint. The untouched source is explicitly
+  rejected as a rebuilt background.
+- Conservative frame/Auto Layout inference, relative child coordinates, constraints, and safe
+  repeat/component markers.
+- Recursive, idempotent Figma import with native text, SVG, masks, effects, styles, groups,
+  font fitting, replace/create-copy modes, progress, warnings, and a real plugin UI.
+- Atomic local Figma bridge staging with asset checksums, previews, run summaries, and honest
+  compiler preflight warnings.
+
+GPU model quality still needs to be benchmarked on the target RTX workstation. The Mac can run
+the deterministic stages and full test suite, but it cannot prove SAM/OCR/inpainting quality.
 
 ## Run
-```bash
-python run_pipeline.py --input ad.png --output ./runs/run_001
-python run_pipeline.py --input ./ads/ --batch
-python run_pipeline.py --input ad.png --output ./runs/run_001 --resume qa   # re-run from a stage
-```
-Artifacts land in `runs/<id>/`: `normalized.png ocr.json elements.json qwen_layers/ merged.json
-design.json figma_export.png diff.png qa.json`.
 
-## Windows RTX 5080 setup
 ```bash
-# CPU-side (any machine)
+cp config.example.yaml config.yaml
+python3 run_pipeline.py --input image.png --output runs/example
+```
+
+Main artifacts:
+
+```text
+ocr_raw.json          raw OCR observations
+ocr.json              text geometry, font candidates, blocks and hierarchy
+sam3.json             SAM prompt/box observations
+fused_elements.json   canonical elements after mask-aware fusion
+ownership.png         exclusive pixel-owner map
+removal_mask.png      the single final removal mask
+background_clean.png  the only allowed reconstructed background
+reconstruction.json   assets/vector/inpaint diagnostics
+layout.json           nested frame tree
+design.json           Figma scene graph v2
+design_preflight.json missing asset/compiler warnings
+preview.png / qa.json render and QA output
+runtime_report.json   exact model/fallback/retry evidence and acceptance policy
+```
+
+Resume from any stage:
+
+```bash
+python3 run_pipeline.py --input image.png --output runs/example --resume sam
+python3 run_pipeline.py --input image.png --output runs/example --resume reconstruct
+python3 run_pipeline.py --input image.png --output runs/example --resume qa
+```
+
+## RTX 5080 setup
+
+On Windows, the easiest path is:
+
+```powershell
+.\setup_rtx.ps1
+.\start_rtx.ps1 -InputDir C:\images\benchmark
+```
+
+`start_rtx.bat` can be double-clicked. It starts the local bridge, checks the machine, and runs
+the benchmark. Figma Desktop still needs the development plugin manifest imported once.
+
+Use Python 3.12 and current CUDA 12.8/PyTorch wheels. Keep ComfyUI/Qwen in its own process.
+
+```bash
 pip install -r requirements.txt
-# GPU backends (Windows/CUDA 12.x) — see the header of requirements-gpu.txt for the torch cu121 line
+pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements-gpu.txt
+
+git clone https://github.com/facebookresearch/sam3.git C:\src\sam3
+pip install -e C:\src\sam3
 ```
-Default vision stack (benchmark and pick per ad):
-- OCR: **PaddleOCR / PP-OCRv6** (primary), **Surya** (challenger), **docTR** (fallback), Tesseract (baseline only)
-- Layers: **Qwen-Image-Layered** (RGBA proposals) — via ComfyUI worker or direct diffusers
-- Vectorize: **VTracer** (color), **Potrace** (binary icons/masks)
-- Upscale: **Real-ESRGAN** for compressed Meta Library assets
-- Optional: **SAM2** mask refinement when Qwen edges are rough
 
-`config.yaml` (copy from `config.example.yaml`) selects device, backends, and Figma mode.
+Download the official SAM checkpoint once, put its local path in `config.yaml`, and install
+Big-LaMa if wanted. Automatic SAM downloads are disabled by default. OpenCV remains a visibly
+lower-quality fallback.
 
-## Figma import (the one interactive seam)
-Figma can't create nodes fully headlessly, so a companion plugin builds them:
-1. `python -m src.figma_bridge --inbox ~/figma-inbox --port 8790`  (serves the staged run)
-2. Import `figma-plugin/` in Figma desktop (Plugins → Development → Import from manifest).
-3. Run it → **Import latest from bridge** → real editable nodes appear; the exported PNG is
-   POSTed back to the run dir as `figma_export.png`.
-4. `python run_pipeline.py … --resume qa` scores it.
+## Figma
 
-`figma.mode: clipboard` is an alternative that reuses the Mac harness's proven kiwi clipboard
-encoder (80/80 roundtrip) — paste straight into Figma, no plugin.
-
-## Orchestrator agent
-`AGENTS.md` + `opencode.jsonc` define an OpenCode agent that runs stages, reads the JSON
-artifacts, and drives `qa.json.repairs[]` until QA passes. It never processes images itself.
-
-## Benchmark (10 real Meta ads)
-Track per ad: OCR accuracy, bbox accuracy, layer usefulness, runtime, VRAM/RAM, SVG path count,
-Figma editability, manual cleanup time. See `docs/CONTRACT.md` for the stage contract.
-
-## Repo layout
+```bash
+python3 -m src.figma_bridge --inbox ~/figma-inbox --port 8790
 ```
-run_pipeline.py            CLI orchestrator (stage runner, --resume, --batch)
-config.example.yaml        copy to config.yaml
-AGENTS.md / opencode.jsonc OpenCode orchestrator agent
-src/                       normalize ocr element_detect qwen_worker merge_layers routing
-                           wordmark vectorize build_design_json figma_import figma_bridge
-                           pixel_diff repair schema
-workflows/                 ComfyUI API graphs for Qwen-Image-Layered (4 / 8 layer)
-figma-plugin/              design.json → editable Figma nodes + PNG export
-docs/CONTRACT.md           stage dataflow + routing + config keys
-runs/                      per-ad outputs (gitignored)
+
+Import `figma-plugin/manifest.json` as a Figma development plugin. It includes `figma-plugin/icon.svg`
+and the UI shows the same mark. The plugin shows the staged
+preview and warnings, then imports as a new copy or replaces the previous generated frame.
+Reimporting no longer stacks overlapping frames at `(0,0)`.
+
+## Verification
+
+```bash
+pytest -q
 ```
+
+On the RTX machine, put representative images in one folder and run:
+
+```bash
+python3 doctor.py --config config.yaml
+python3 benchmark.py --input-dir benchmark-images --output runs/benchmark
+```
+
+`doctor.py` stops a run that would silently fall back because SAM, OCR, or CUDA is missing.
+The benchmark runs that doctor preflight itself, records `doctor.json`, and fails if any image
+has a real reconstruction/import failure or an enabled required model fell back. Qwen remains
+advisory unless `qwen.required: true`; its outage is still visible in `runtime_report.json`.
+
+The CPU suite covers OCR normalization/retries, SAM fallback and box-refinement contracts,
+mask fusion/nesting, one-time inpainting, duplicate removal, Qwen asset resolution, hierarchy,
+scene-graph compilation, atomic Figma staging, and an end-to-end vertical slice.
+
+See [docs/ARCHITECTURE-V2.md](docs/ARCHITECTURE-V2.md) for the benchmark gate and GPU-only next
+decisions. Do not call the system Codia-quality until the representative benchmark passes.

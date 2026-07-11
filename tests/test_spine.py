@@ -19,6 +19,26 @@ def test_overlay_text_is_text():
     assert routing.route(c, CANVAS)["target"] == "text"
 
 
+def test_low_fidelity_text_falls_back_to_masked_pixel_layer_not_guessed_text():
+    c = {
+        "id": "L9", "text": "muddled copy", "box": {"x": 120, "y": 500, "w": 400, "h": 60},
+        "style": {"confidence": 0.12},
+        "meta": {"origin": "overlay", "low_fidelity": True, "fidelity_confidence": 0.12,
+                 "fidelity_reason": "ink_confidence:0.12<0.30", "fallback_src": "text_fallback/L9.png"},
+    }
+    r = routing.route(c, CANVAS)
+    assert r["target"] == "image"
+    assert r["src"] == "text_fallback/L9.png"
+    assert r["meta"]["substitution"]["from"] == "text"
+    assert r["meta"]["substitution"]["to"] == "image"
+
+
+def test_confident_text_style_confidence_alone_does_not_trigger_fallback():
+    c = {"id": "L10", "text": "Save 30% today", "box": {"x": 120, "y": 500, "w": 400, "h": 60},
+         "style": {"confidence": 0.91}, "meta": {"origin": "overlay"}}
+    assert routing.route(c, CANVAS)["target"] == "text"
+
+
 def test_wordmark_becomes_artwork_not_text():
     c = {"id": "L3", "text": "grüns", "box": {"x": 460, "y": 40, "w": 160, "h": 70}}
     r = routing.route(c, CANVAS)
@@ -62,6 +82,43 @@ def test_build_design_json_orders_and_keeps_scene():
         assert doc.layers[-1].type == "text"                # text painted last (front)
         assert os.path.exists(os.path.join(d, "design.json"))
         assert all(t in ("text", "image", "shape") for t in types)
+
+
+def test_build_design_json_wires_gradient_fill_and_stroke_for_text_layer():
+    cands = [
+        {"id": "L5", "text": "OFF", "target": "text", "box": {"x": 10, "y": 10, "w": 200, "h": 80},
+         "style": {
+             "fontSize": 60, "color": "#0f0f0f",
+             "fill": {"kind": "linear", "angle": 90.0,
+                      "stops": [{"offset": 0.0, "color": "#eb3c14"}, {"offset": 1.0, "color": "#1446eb"}]},
+             "stroke": {"kind": "flat", "color": "#0f0f0f", "width": 2.0},
+         },
+         "meta": {"role": "headline", "origin": "overlay"}},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        doc = build_design_json.build(cands, CANVAS, d)
+        text_layer = next(L for L in doc.layers if L.type == "text")
+        assert text_layer.fill["kind"] == "linear"
+        assert text_layer.fill["stops"][0]["color"] == "#eb3c14"
+        assert text_layer.stroke["color"] == "#0f0f0f"
+        # the paint description is not duplicated inside the style dict
+        assert "fill" not in text_layer.style
+        assert "stroke" not in text_layer.style
+
+
+def test_build_design_json_records_text_fidelity_substitution_warning():
+    cands = [
+        {"id": "L6", "text": "muddled copy", "target": "image", "box": {"x": 10, "y": 10, "w": 200, "h": 40},
+         "meta": {"low_fidelity": True,
+                  "substitution": {"from": "text", "to": "image",
+                                    "reason": "ink_confidence:0.10<0.30", "confidence": 0.10}}},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        doc = build_design_json.build(cands, CANVAS, d)
+        image_layer = next(L for L in doc.layers if L.type == "image")
+        assert "fallback" in image_layer.name.lower() or "Text (fallback)" in image_layer.name
+        warning_codes = [w.get("code") for w in doc.meta["warnings"]]
+        assert "text-fidelity-fallback" in warning_codes
 
 
 def test_partition_wordmarks():

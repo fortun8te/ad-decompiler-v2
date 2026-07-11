@@ -36,7 +36,7 @@ def _elements():
         # the product photo region (scene text lives inside it)
         {"id": "E1", "box": {"x": 300, "y": 300, "w": 240, "h": 260},
          "kind": "photo-fragment", "area": 40000, "coverage": 0.2,
-         "source": "residual-cc"},
+         "source": "residual-cc", "role": "product"},
         # a small icon
         {"id": "E2", "box": {"x": 500, "y": 40, "w": 40, "h": 40}, "kind": "icon",
          "area": 1200, "coverage": 0.006, "source": "residual-cc"},
@@ -106,3 +106,51 @@ def test_qwen_only_layer_becomes_image():
 
 def test_empty_inputs():
     assert merge_layers.merge({"lines": []}, [], [], CANVAS, {}) == []
+
+
+def test_low_fidelity_block_meta_survives_the_block_path_into_the_candidate():
+    """Regression for the block-path fidelity drop: production OCR always carries a
+    non-empty "blocks" array (text_analysis._make_blocks emits >=1 block per line), so
+    _text_sources always prefers blocks over lines. A block produced by a real
+    low-fidelity line must still carry meta.low_fidelity/fallback_src through to the
+    merged candidate so routing.py can gate it to a masked-pixel fallback instead of
+    guessed text."""
+    line = {
+        "id": "L0", "text": "SALE", "conf": 0.9,
+        "box": {"x": 40, "y": 30, "w": 220, "h": 60},
+        "meta": {
+            "fidelity_confidence": 0.1,
+            "low_fidelity": True,
+            "fidelity_reason": "ink_confidence:0.10<0.30",
+            "fallback_src": "fallback_crops/L0.png",
+            "substitution": {"from": "text", "to": "masked-pixel-fallback",
+                              "reason": "ink_confidence:0.10<0.30", "confidence": 0.1},
+        },
+    }
+    block = {
+        "id": "B0", "type": "text", "line_ids": ["L0"], "text": "SALE",
+        "box": dict(line["box"]), "painted_box": dict(line["box"]),
+        "alignment": "left", "line_height": 20.0, "role": "text",
+        "hierarchy": {"level": 0, "parent_id": None}, "style_id": None,
+        "meta": {
+            "fidelity_confidence": 0.1,
+            "low_fidelity": True,
+            "fidelity_reason": "ink_confidence:0.10<0.30",
+            "fallback_src": "fallback_crops/L0.png",
+            "substitution": {"from": "text", "to": "masked-pixel-fallback",
+                              "reason": "ink_confidence:0.10<0.30", "confidence": 0.1},
+        },
+    }
+    ocr = {"lines": [line], "blocks": [block], "styles": []}
+
+    cands = merge_layers.merge(ocr, [], [], CANVAS, {})
+    m = _by_id(cands)
+    assert "c_B0" in m
+    meta = m["c_B0"]["meta"]
+    assert meta.get("low_fidelity") is True
+    assert meta.get("fallback_src") == "fallback_crops/L0.png"
+    # routing.py must gate this to the masked-pixel fallback, not guessed text, and it
+    # must use the real saved crop (src) rather than falling into the genericmask-only
+    # "else" branch that loses the actual pixels.
+    assert m["c_B0"]["target"] == "image"
+    assert m["c_B0"].get("src") == "fallback_crops/L0.png"

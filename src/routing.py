@@ -18,10 +18,51 @@ from .wordmark import is_wordmark_candidate
 ICON_MAX_AREA_FRAC = 0.06
 EMOJI_RE_HINT = ("emoji", "pictograph")
 
+# Below this combined ink/font-match confidence, a text candidate cannot be faithfully
+# reproduced as editable text (glyph too hard to isolate, or the closest font/effect
+# match is a poor fit) — it is routed to a masked-pixel fallback layer instead of
+# emitting a guessed rendering. Overridable via cfg["routing"]["min_text_fidelity"].
+MIN_TEXT_FIDELITY = 0.30
+
 
 def _area_frac(box, canvas):
     W = max(1, canvas.get("w", 1)); H = max(1, canvas.get("h", 1))
     return (box.get("w", 0) * box.get("h", 0)) / (W * H)
+
+
+def _num(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _text_fidelity_fallback(c: dict, meta: dict, cfg: dict | None) -> dict | None:
+    """If this text candidate's ink/font-match confidence is below the fidelity gate,
+    return a routed masked-pixel-fallback candidate; otherwise None (route as text)."""
+    threshold = _num((cfg or {}).get("routing", {}).get("min_text_fidelity"), MIN_TEXT_FIDELITY)
+    style = c.get("style") or {}
+    fidelity_conf = meta.get("fidelity_confidence")
+    if fidelity_conf is None:
+        fidelity_conf = style.get("confidence")
+    low_conf = bool(meta.get("low_fidelity")) or (fidelity_conf is not None and fidelity_conf < threshold)
+    if not low_conf:
+        return None
+    c["target"] = "image"
+    fallback_src = meta.get("fallback_src")
+    if fallback_src:
+        c["src"] = fallback_src
+    else:
+        mask = c.get("mask") if isinstance(c.get("mask"), dict) else {}
+        mask.setdefault("kind", "alpha")
+        c["mask"] = mask
+    meta.setdefault("substitution", {
+        "from": "text", "to": "image",
+        "reason": meta.get("fidelity_reason") or "low-confidence font/effect match",
+        "confidence": fidelity_conf,
+    })
+    meta["fallback"] = True
+    return c
 
 
 def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
@@ -42,6 +83,11 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
             meta["wordmark"] = True
             meta["role"] = meta.get("role") or "logo"
             return c
+        # confidence/fidelity gate: a font/effect we cannot faithfully reproduce as
+        # editable text falls back to the original painted pixels instead of a guess.
+        fallback = _text_fidelity_fallback(c, meta, cfg)
+        if fallback is not None:
+            return fallback
         # emoji → keep as character in the text run, never vectorize (handled in build step)
         c["target"] = "text"
         return c
