@@ -257,3 +257,32 @@ def test_process_missing_content_length_returns_400(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_process_reports_eta_from_history_after_a_prior_run(tmp_path, monkeypatch):
+    """First upload has no history -> no eta_s. Second upload sees the first run's recorded
+    duration and gets a real (median-based) eta_s while running."""
+    _install_fake_run_pipeline(monkeypatch, sleep_s=0.15)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        first = json.loads(urlopen(Request(base + "/process?filename=a.png", data=b"x", method="POST"), timeout=2).read())
+        during_first = json.loads(urlopen(f"{base}/process?job_id={first['job_id']}", timeout=2).read())
+        assert "eta_s" not in during_first, "no history yet -> no fabricated ETA"
+        _poll_job(base, first["job_id"])
+        assert (inbox / ".process_history.json").exists()
+
+        second = json.loads(urlopen(Request(base + "/process?filename=b.png", data=b"y", method="POST"), timeout=2).read())
+        time.sleep(0.05)
+        during_second = json.loads(urlopen(f"{base}/process?job_id={second['job_id']}", timeout=2).read())
+        assert during_second["status"] == "running"
+        assert "eta_s" in during_second and during_second["eta_s"] >= 0
+        assert during_second["eta_sample_size"] == 1
+        assert during_second.get("elapsed_s") is not None
+        _poll_job(base, second["job_id"])
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -981,6 +981,24 @@
       return Math.floor(s / 60) + "m " + (s % 60) + "s";
     }
 
+    const STAGE_LABELS = {
+      normalize: "Reading image", ocr: "Reading text", text: "Analyzing typography",
+      residual: "Detecting elements", qwen: "Layer proposals", sam: "Segmenting",
+      elements: "Merging elements", merge: "Merging layers", reconstruct: "Rebuilding background",
+      layout: "Building layout", design: "Compiling scene", preview: "Rendering preview",
+      figma: "Staging for Figma", export: "Awaiting export", qa: "Quality check",
+    };
+
+    function progressLine(status) {
+      const stage = STAGE_LABELS[status.stage] || "Starting up";
+      if (typeof status.eta_s === "number") {
+        const eta = status.eta_s <= 2 ? "almost done" : "~" + formatElapsed(status.eta_s * 1000) + " left";
+        return stage + " · " + eta;
+      }
+      const elapsed = typeof status.elapsed_s === "number" ? formatElapsed(status.elapsed_s * 1000) : "0s";
+      return stage + " · " + elapsed + " so far (first run — no ETA yet)";
+    }
+
     async function pollProcessJob(base, jobId, filename, startedAt) {
       // Self-scheduling setTimeout (not setInterval) so a slow/hung request can't stack
       // overlapping polls, and a transient network hiccup doesn't kill the whole flow.
@@ -1017,8 +1035,7 @@
         showIssues([{ title: "Still running", detail: "\"" + filename + "\" is taking a while — it keeps running on the bridge; check back and click Refresh." }], "warning");
         return;
       }
-      setUploadBusy(true, "Processing " + filename + "…",
-        "Running the full pipeline (" + formatElapsed(Date.now() - startedAt) + " so far) — this can take a while on the GPU box.");
+      setUploadBusy(true, "Processing " + filename + "…", progressLine(status));
       setTimeout(function () { pollProcessJob(base, jobId, filename, startedAt); }, 2000);
     }
 

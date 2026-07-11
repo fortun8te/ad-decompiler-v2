@@ -737,6 +737,18 @@ assert.ok(fs.existsSync("figma-plugin/icon.svg"), "plugin icon asset exists");
   const formatElapsed = new Function(`${feMatch[0]}\nreturn formatElapsed;`)();
   assert.equal(formatElapsed(45000), "45s");
   assert.equal(formatElapsed(125000), "2m 5s");
+
+  // progressLine: real ETA once the bridge has history, honest "no ETA yet" on the first
+  // run ever (never fabricates a number it doesn't have).
+  const slMatch = script[1].match(/const STAGE_LABELS = \{[\s\S]*?\n {4}\};/);
+  const plMatch = script[1].match(/function progressLine\(status\)[\s\S]*?\n {4}\}/);
+  assert.ok(slMatch, "ui.html defines STAGE_LABELS");
+  assert.ok(plMatch, "ui.html defines progressLine()");
+  const progressLine = new Function(`${feMatch[0]}\n${slMatch[0]}\n${plMatch[0]}\nreturn progressLine;`)();
+  assert.equal(progressLine({ stage: "sam", eta_s: 42 }), "Segmenting · ~42s left");
+  assert.equal(progressLine({ stage: "qa", eta_s: 1 }), "Quality check · almost done");
+  assert.equal(progressLine({ stage: "ocr", elapsed_s: 12 }), "Reading text · 12s so far (first run — no ETA yet)");
+  assert.equal(progressLine({}), "Starting up · 0s so far (first run — no ETA yet)");
 }
 
 console.log("plugin smoke passed", {

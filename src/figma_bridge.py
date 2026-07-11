@@ -22,7 +22,7 @@ Endpoints:
                                    other endpoint keeps working either way.
 """
 from __future__ import annotations
-import argparse, json, os, re, tempfile, threading, traceback, uuid
+import argparse, json, os, re, statistics, tempfile, threading, time, traceback, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -48,6 +48,59 @@ def _load_cfg(path):
             return json.load(fh)
 
 
+_STAGE_MARKERS = [
+    ("normalize", "normalize →"), ("ocr", "ocr["), ("text", "text analysis →"),
+    ("residual", "residual proposals →"), ("qwen", "qwen →"), ("sam", "sam3["),
+    ("elements", "element fusion →"), ("merge", "merge →"), ("reconstruct", "reconstruct →"),
+    ("layout", "layout →"), ("design", "design.json →"), ("preview", "preview →"),
+    ("figma", "figma import:"), ("export", "export:"), ("qa", "qa →"),
+]
+
+
+def _tail_stage(run_dir):
+    """Best-effort read of pipeline.log's last matched stage — purely informational, never
+    raises (a half-written line or a run_dir that doesn't exist yet just means 'no stage yet')."""
+    try:
+        with open(os.path.join(run_dir, "pipeline.log"), encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    current = None
+    for line in lines:
+        for name, marker in _STAGE_MARKERS:
+            if marker in line:
+                current = name
+    return current
+
+
+def _history_path(inbox):
+    return os.path.join(inbox, ".process_history.json")
+
+
+def _read_history(inbox):
+    try:
+        with open(_history_path(inbox), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return [float(d) for d in data.get("durations_s") or [] if isinstance(d, (int, float))]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def _record_history(inbox, duration_s):
+    durations = (_read_history(inbox) + [duration_s])[-10:]  # a short rolling window adapts to a changed machine/config
+    try:
+        _atomic_write(_history_path(inbox), json.dumps({"durations_s": durations}).encode())
+    except OSError:
+        pass
+
+
+def _atomic_write(path, data: bytes):
+    fd, temp_path = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path) or ".")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    os.replace(temp_path, path)
+
+
 def make_handler(inbox, config_path=None):
     jobs = {}
     jobs_lock = threading.Lock()
@@ -55,8 +108,10 @@ def make_handler(inbox, config_path=None):
     active_job = {"id": None}
 
     def run_job(job_id, image_path, run_dir):
+        started = time.time()
         with jobs_lock:
             jobs[job_id]["status"] = "running"
+            jobs[job_id]["started_at"] = started
         try:
             import copy
             import run_pipeline  # heavy: torch/paddleocr/sam3/... — only imported on first use
@@ -69,6 +124,8 @@ def make_handler(inbox, config_path=None):
                     result=result, run_dir=run_dir,
                     error=None if result.get("ok") else (result.get("error") or "pipeline reported failure"),
                 )
+            if result.get("ok"):
+                _record_history(inbox, time.time() - started)
         except Exception as exc:
             with jobs_lock:
                 jobs[job_id].update(status="failed", error=str(exc), traceback=traceback.format_exc())
@@ -161,6 +218,18 @@ def make_handler(inbox, config_path=None):
                 if not job:
                     return self._send(404, b'{"ok":false,"error":"unknown job_id"}', "application/json")
                 job.pop("traceback", None)
+                if job.get("status") == "running" and job.get("run_dir"):
+                    job["stage"] = _tail_stage(job["run_dir"])
+                if job.get("started_at") and job.get("status") in ("running", "queued"):
+                    elapsed = time.time() - job["started_at"]
+                    job["elapsed_s"] = round(elapsed, 1)
+                    history = _read_history(inbox)
+                    if history:
+                        # Median, not mean: one very slow/cold-start run shouldn't blow out
+                        # every ETA after it, and a short rolling window (see
+                        # _record_history) already adapts if the machine/config changes.
+                        job["eta_s"] = max(0, round(statistics.median(history) - elapsed, 1))
+                        job["eta_sample_size"] = len(history)
                 payload = {"ok": True, "job_id": job_id, **job}
                 return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
             return self._send(404)
