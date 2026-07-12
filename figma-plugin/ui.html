@@ -67,88 +67,56 @@
 
     .app {
       display: grid;
-      grid-template-rows: auto minmax(0, 1fr) auto;
+      grid-template-rows: minmax(0, 1fr) auto;
       height: 100%;
     }
 
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      min-height: 58px;
-      padding: 12px 14px 11px;
-      border-bottom: 1px solid var(--border);
-    }
-
-    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-
-    .brand-mark {
-      position: relative;
-      width: 28px;
-      height: 28px;
-      flex: 0 0 auto;
-      border-radius: 8px;
-      background: var(--text);
-      color: var(--bg);
-      overflow: hidden;
-    }
-
-    .brand-mark::before,
-    .brand-mark::after {
-      content: "";
-      position: absolute;
-      border: 1.5px solid currentColor;
-      border-radius: 3px;
-    }
-
-    .brand-mark::before { inset: 6px 10px 10px 6px; }
-    .brand-mark::after { inset: 10px 6px 6px 10px; background: var(--text); }
-
-    .brand-copy { min-width: 0; }
-
-    .brand-title {
-      margin: 0;
-      font-size: 13px;
-      font-weight: 650;
-      line-height: 1.1;
-      letter-spacing: -0.015em;
-    }
-
-    .brand-subtitle {
-      margin-top: 3px;
-      color: var(--text-secondary);
-      font-size: 10.5px;
-      white-space: nowrap;
-    }
+    .header-actions { display: flex; align-items: center; gap: 12px; min-width: 0; }
 
     .connection {
-      display: flex;
+      display: inline-flex;
       align-items: center;
       gap: 6px;
+      padding: 3px 9px 3px 7px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--bg-secondary);
       color: var(--text-secondary);
-      font-size: 10.5px;
+      font-size: 10px;
+      font-weight: 550;
       white-space: nowrap;
+      transition: background-color 200ms ease, border-color 200ms ease, color 200ms ease;
     }
 
     .connection-dot {
-      width: 7px;
-      height: 7px;
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
       background: var(--text-tertiary);
-      box-shadow: 0 0 0 3px var(--bg-tertiary);
+      transition: background-color 200ms ease;
     }
 
-    .connection[data-state="connected"] .connection-dot { background: #36a852; box-shadow: 0 0 0 3px var(--success-bg); }
-    .connection[data-state="error"] .connection-dot { background: #e0573e; box-shadow: 0 0 0 3px var(--danger-bg); }
+    .connection[data-state="connected"] {
+      border-color: color-mix(in srgb, var(--text-success) 30%, transparent);
+      background: var(--success-bg);
+      color: var(--text-success);
+    }
+    .connection[data-state="connected"] .connection-dot { background: #36a852; }
+    .connection[data-state="error"] {
+      border-color: color-mix(in srgb, var(--text-danger) 30%, transparent);
+      background: var(--danger-bg);
+      color: var(--text-danger);
+    }
+    .connection[data-state="error"] .connection-dot { background: #e0573e; }
 
     main {
       overflow-y: auto;
       overscroll-behavior: contain;
       scrollbar-width: thin;
-      padding: 14px 14px 20px;
+      padding: 15px 14px 20px;
     }
 
-    .section + .section { margin-top: 15px; }
+    .section + .section { margin-top: 17px; }
 
     .section-header {
       display: flex;
@@ -450,26 +418,29 @@
       background: color-mix(in srgb, var(--bg) 94%, transparent);
     }
 
-    .action-row { display: grid; grid-template-columns: minmax(0, 1fr) 34px; gap: 7px; }
+    .action-row { display: grid; grid-template-columns: minmax(0, 1fr) 36px; gap: 7px; }
 
     .primary-button {
-      min-height: 34px;
-      border-radius: 7px;
+      min-height: 36px;
+      border-radius: 8px;
       background: var(--brand);
       color: var(--text-onbrand);
       font-weight: 650;
       letter-spacing: -0.005em;
+      box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 16%, transparent),
+                  0 1px 2px color-mix(in srgb, var(--brand) 30%, transparent);
     }
 
     .primary-button:hover:not(:disabled) { background: var(--brand-hover); }
-    .primary-button:active:not(:disabled) { background: var(--brand-pressed); }
+    .primary-button:active:not(:disabled) { background: var(--brand-pressed); box-shadow: none; }
+    .primary-button:disabled { box-shadow: none; }
 
     .icon-button {
       display: grid;
       place-items: center;
-      min-height: 34px;
+      min-height: 36px;
       border: 1px solid var(--border);
-      border-radius: 7px;
+      border-radius: 8px;
       background: var(--bg-secondary);
     }
 
@@ -541,25 +512,17 @@
 </head>
 <body>
   <div class="app">
-    <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark" aria-hidden="true"></div>
-        <div class="brand-copy">
-          <h1 class="brand-title">Ad Decompiler</h1>
-          <div class="brand-subtitle">Image → native Figma scene</div>
-        </div>
-      </div>
-      <div class="connection" id="connection" data-state="idle" title="Local bridge status">
-        <span class="connection-dot" aria-hidden="true"></span>
-        <span id="connectionText">Checking</span>
-      </div>
-    </header>
-
     <main>
       <section class="section" aria-labelledby="sourceHeading">
         <div class="section-header">
           <h2 class="section-title" id="sourceHeading">Source run</h2>
-          <button class="text-action" id="loadFiles" type="button">Open files</button>
+          <div class="header-actions">
+            <div class="connection" id="connection" data-state="idle" title="Local bridge status">
+              <span class="connection-dot" aria-hidden="true"></span>
+              <span id="connectionText">Checking</span>
+            </div>
+            <button class="text-action" id="loadFiles" type="button">Open files</button>
+          </div>
         </div>
 
         <div class="source-card" id="sourceCard">
@@ -1083,6 +1046,11 @@
           headers: { "Content-Type": "application/octet-stream" },
         });
         const payload = await response.json().catch(function () { return {}; });
+        if (response.status === 404) {
+          // A bridge without POST /process (older build) 404s here — tell the user how
+          // to fix it instead of surfacing a bare status code.
+          throw new Error("This bridge doesn't support uploads yet — update it (git pull) and restart it, then try again.");
+        }
         if (!response.ok) throw new Error(payload.error || (response.status + " " + response.statusText));
         pollProcessJob(base, payload.job_id, file.name, Date.now());
       } catch (error) {
