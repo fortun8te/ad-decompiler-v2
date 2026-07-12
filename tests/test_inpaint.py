@@ -130,14 +130,38 @@ def test_auto_prefers_big_lama_when_comfyui_healthy(monkeypatch):
     assert np.all(output[mask == 0] == source[mask == 0])
 
 
-def test_auto_skips_big_lama_when_comfyui_down(monkeypatch):
+def test_auto_uses_big_lama_even_when_comfyui_down(monkeypatch):
+    # Big-LaMa is a local pip package; ComfyUI (Qwen's advisory backend) being offline
+    # must never downgrade the background plate to OpenCV. The old comfy-gated behavior
+    # silently failed all 16 real benchmark images as "inpaint-unavailable" runtime
+    # violations on the RTX box, where ComfyUI is routinely off.
+    source = np.full((8, 8, 3), 90, dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+    lama_out = np.full_like(source, 42)
+
+    monkeypatch.setattr(inpaint, "comfyui_healthy", lambda cfg, probe=None: False)
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: True)
+    monkeypatch.setattr(inpaint, "_simple_lama", lambda rgb, inner_mask: lama_out)
+
+    output, backend, diagnostics = inpaint.inpaint_array(
+        source, mask, {"inpaint": {"mode": "auto"}},
+        return_diagnostics=True,
+    )
+
+    assert backend == "big-lama"
+    assert "auto_skip_reason" not in diagnostics
+    assert diagnostics["comfyui_healthy"] is False  # recorded, but not load-bearing
+
+
+def test_auto_skips_big_lama_only_when_lama_itself_is_missing(monkeypatch):
     source = np.full((8, 8, 3), 90, dtype=np.uint8)
     mask = np.zeros((8, 8), dtype=np.uint8)
     mask[2:6, 2:6] = 255
     telea = np.full_like(source, 11)
 
-    monkeypatch.setattr(inpaint, "comfyui_healthy", lambda cfg, probe=None: False)
-    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: True)
+    monkeypatch.setattr(inpaint, "comfyui_healthy", lambda cfg, probe=None: True)
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: False)
     monkeypatch.setattr(inpaint, "_opencv_inpaint", lambda rgb, inner_mask, radius, method: telea)
 
     output, backend, diagnostics = inpaint.inpaint_array(
@@ -146,8 +170,7 @@ def test_auto_skips_big_lama_when_comfyui_down(monkeypatch):
     )
 
     assert backend == "opencv-telea"
-    assert diagnostics["auto_skip_reason"] == "comfyui_down"
-    assert diagnostics["comfyui_healthy"] is False
+    assert diagnostics["auto_skip_reason"] == "big_lama_missing"
 
 
 def test_multipass_inpaint_runs_coarse_then_fine(monkeypatch):

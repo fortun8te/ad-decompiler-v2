@@ -105,6 +105,27 @@ def _http(url, timeout=0.3):
         return False
 
 
+def _vlm_model_loaded(base: str, model: str, timeout=0.5) -> tuple[bool, str]:
+    """True only when the OpenAI-compatible server is up AND lists the configured model.
+
+    Liveness goes through _http first so tests (and any future probe policy) keep a single
+    seam to stub; only a live server gets the follow-up model-list read."""
+    if not _http(f"{base}/models"):
+        return False, f"{base} unreachable"
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{base}/models", timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        return False, f"{base} model list unreadable ({exc})"
+    ids = [str(item.get("id", "")) for item in (data.get("data") or [])]
+    if not ids:
+        return False, f"{base} up but NO model loaded (e.g. `lms load {model or '<model>'}`)"
+    if model and model not in ids:
+        return False, f"{base} up but '{model}' not loaded (loaded: {', '.join(ids[:4])})"
+    return True, f"{base} ({model or ids[0]} loaded)"
+
+
 def _required_qwen(cfg: dict) -> bool:
     """Qwen is advisory unless a particular benchmark explicitly makes it required."""
     qwen = cfg.get("qwen") or {}
@@ -248,7 +269,13 @@ def inspect(cfg, root: Path) -> dict:
     vlm = cfg.get("vlm") or {}
     if _vlm_feature_enabled(cfg):
         base = str(vlm.get("base_url", "http://127.0.0.1:1234/v1")).rstrip("/")
-        checks.append(_check("VLM server", _http(f"{base}/models"), base, required=False))
+        model = str(vlm.get("model", ""))
+        # /models answering 200 does NOT mean the configured model is loaded — LM Studio
+        # returns an empty list after it idles a model out, and then every VLM call 400s
+        # ("No models loaded"). That exact failure silently zeroed all VLM corrections in
+        # a 16-image benchmark, so check for the model by id, not just server liveness.
+        loaded, detail = _vlm_model_loaded(base, model)
+        checks.append(_check("VLM server", loaded, detail, required=False))
 
     try:
         from src.vectorize import check_binaries as _vectorize_binaries

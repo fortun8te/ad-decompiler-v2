@@ -342,11 +342,13 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
     used = mode
     try_lama = mode in ("lama", "big-lama", "simple-lama")
     if mode == "auto":
-        # Prefer Big-LaMa on the GPU workstation; skip it on a laptop where ComfyUI is down.
-        try_lama = comfy_ok and lama_ok
-        if not comfy_ok:
-            diagnostics["auto_skip_reason"] = "comfyui_down"
-        elif not lama_ok:
+        # Big-LaMa is a local pip package; whether it can run has nothing to do with
+        # ComfyUI (the Qwen layered-diffusion backend, advisory per run_report._required).
+        # Gating on comfy_ok here silently downgraded every run on this RTX box to the
+        # OpenCV fallback whenever ComfyUI was off — which then failed all 16 benchmark
+        # images as "inpaint-unavailable" runtime violations under require_active_models.
+        try_lama = lama_ok
+        if not lama_ok:
             diagnostics["auto_skip_reason"] = "big_lama_missing"
 
     if try_lama:

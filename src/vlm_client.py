@@ -10,6 +10,13 @@ _DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
 _DEFAULT_MODEL = "google/gemma-4-e4b"
 _DEFAULT_TIMEOUT_S = 20
 _DEFAULT_MAX_TOKENS = 500
+# Reasoning models (e.g. gemma-4-e4b in LM Studio) burn part of the token
+# budget on hidden "reasoning_content" before emitting the final answer in
+# "content". If max_tokens is too small, generation can hit the length limit
+# while still inside the reasoning block, leaving content empty. Enforce a
+# floor so callers that pass a small max_tokens don't silently get truncated
+# before any real answer is produced.
+_MIN_MAX_TOKENS = 500
 
 
 def crop_box_bytes(image, box: dict, padding: int):
@@ -44,7 +51,7 @@ def ask_vlm(
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
             ],
         }],
-        "max_tokens": max_tokens,
+        "max_tokens": max(max_tokens, _MIN_MAX_TOKENS),
         "temperature": 0.0,
     }
     req = urllib.request.Request(
@@ -54,8 +61,19 @@ def ask_vlm(
     )
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-    return content.strip()
+    message = (data.get("choices") or [{}])[0].get("message", {})
+    content = (message.get("content") or "").strip()
+    if not content and message.get("reasoning_content"):
+        # The model spent its whole budget on hidden reasoning and never
+        # emitted a final answer. Returning the reasoning text as if it were
+        # the answer would silently corrupt downstream comparisons, so treat
+        # this as a hard failure instead.
+        raise RuntimeError(
+            "VLM returned only reasoning_content with no final content "
+            "(finish_reason=%r); increase max_tokens or inspect the prompt."
+            % (data.get("choices") or [{}])[0].get("finish_reason")
+        )
+    return content
 
 
 def multi_pass_answer(
