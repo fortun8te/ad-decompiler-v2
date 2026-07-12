@@ -329,16 +329,32 @@ class _OfficialSam3Backend:
             )
         except Exception as exc:
             raise Sam3Unavailable(f"SAM 3 model load failed: {exc}") from exc
+        self.device = device
         self.state = None
         self.size = None
 
+    def _autocast(self):
+        # SAM 3's vision backbone runs its activations in bfloat16 while the
+        # checkpoint weights load as float32; without an autocast context the two
+        # meet in an F.linear and raise "mat1 and mat2 must have the same dtype"
+        # (BFloat16 vs Float). Every official example enters
+        # torch.autocast("cuda", dtype=bfloat16) before set_image/predict — mirror
+        # that here so the matmuls agree. No-op (nullcontext) on CPU.
+        import torch
+        if str(self.device).startswith("cuda") and torch.cuda.is_available():
+            return torch.autocast("cuda", dtype=torch.bfloat16)
+        import contextlib
+        return contextlib.nullcontext()
+
     def set_image(self, image):
         self.size = image.size
-        self.state = self.processor.set_image(image)
+        with self._autocast():
+            self.state = self.processor.set_image(image)
 
     def predict_text(self, prompt: str):
         self.processor.reset_all_prompts(self.state)
-        return self.processor.set_text_prompt(state=self.state, prompt=prompt)
+        with self._autocast():
+            return self.processor.set_text_prompt(state=self.state, prompt=prompt)
 
     def predict_box(self, box: dict):
         if not self.size:
@@ -349,9 +365,10 @@ class _OfficialSam3Backend:
         bw = float(box["w"]) / max(1, width)
         bh = float(box["h"]) / max(1, height)
         self.processor.reset_all_prompts(self.state)
-        return self.processor.add_geometric_prompt(
-            state=self.state, box=[cx, cy, bw, bh], label=True
-        )
+        with self._autocast():
+            return self.processor.add_geometric_prompt(
+                state=self.state, box=[cx, cy, bw, bh], label=True
+            )
 
 
 def _cached_official_backend(cfg: dict):

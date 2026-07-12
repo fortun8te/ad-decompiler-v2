@@ -72,10 +72,14 @@ def _cudnn(device):
         return _check("cudnn", False, f"probe failed: {exc}", required=False)
 
 
-def _http(url):
+def _http(url, timeout=0.5):
+    # Short timeout on purpose: this is a liveness probe (e.g. ComfyUI on :8188), and
+    # /health calls it. A refused port fails instantly; a firewall-*dropped* port would
+    # otherwise hang for the full timeout, so keep it small — a real local backend
+    # answers in well under 0.5s.
     try:
         import urllib.request
-        with urllib.request.urlopen(url, timeout=3) as response:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
             return 200 <= response.status < 500
     except Exception:
         return False
@@ -221,9 +225,13 @@ def inspect(cfg, root: Path) -> dict:
     }
 
 
-def ocr_ready_summary(cfg, root: Path) -> dict:
-    """Compact OCR readiness for bridge /health — module/CUDA checks only, no model loads."""
-    report = inspect(cfg, root)
+def ocr_ready_summary(cfg, root: Path, report=None) -> dict:
+    """Compact OCR readiness for bridge /health — module/CUDA checks only, no model loads.
+
+    Pass an already-computed ``inspect()`` result as ``report`` to avoid a second
+    inspection (which re-imports torch and re-probes ComfyUI)."""
+    if report is None:
+        report = inspect(cfg, root)
     primary = str((cfg.get("ocr") or {}).get("primary", "ppocr-v6")).lower()
     ocr_blockers = [item for item in report["blockers"] if item["name"].startswith("ocr")]
     if str(cfg.get("device", "cpu")).lower() == "cuda":

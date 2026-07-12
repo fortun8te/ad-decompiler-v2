@@ -183,6 +183,8 @@ def _health_payload(inbox, base_cfg):
     if manifest:
         payload["schema_version"] = manifest.get("schema_version")
     try:
+        # doctor._http's short timeout keeps the ComfyUI liveness probe from stalling
+        # /health, so this stays cheap enough to compute per request.
         from doctor import inspect as _doctor_inspect, ocr_ready_summary as _ocr_ready_summary
         from pathlib import Path
         repo_root = Path(_repo_root())

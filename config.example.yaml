@@ -9,9 +9,13 @@ runtime:
     sam_disable_compile: true         # one safe retry only when compile=true fails
 
 ocr:
-  primary: ppocr-v6                   # ppocr-v6 | surya | doctr | tesseract
-  challengers: [surya]                # calibrated ensemble; unavailable engines are skipped
-  fallback_engines: [tesseract]       # tried only when primary + challengers all fail
+  # doctr is the working in-process GPU OCR on RTX 50-series (Blackwell / sm_120):
+  # paddlepaddle-gpu 3.0 ships no sm_120 kernels and its cu126 CUDA libs also collide
+  # with torch's cu128 DLLs in a shared venv, so ppocr-v6 can't use the GPU here (it
+  # only auto-retries on CPU, which is slow). Kept ppocr-v6 + tesseract as fallbacks.
+  primary: doctr                      # ppocr-v6 | surya | doctr | tesseract
+  challengers: []                     # surya is Docker-based in this repo; add it back with Docker running
+  fallback_engines: [ppocr-v6, tesseract]  # tried only when primary + challengers all fail
   auto_fallback_tesseract: true        # also auto-try tesseract when binary is on PATH
   lang: en
   retry_2x:                           # targeted retry for small/low-confidence text
