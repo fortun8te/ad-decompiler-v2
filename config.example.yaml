@@ -11,6 +11,8 @@ runtime:
 ocr:
   primary: ppocr-v6                   # ppocr-v6 | surya | doctr | tesseract
   challengers: [surya]                # calibrated ensemble; unavailable engines are skipped
+  fallback_engines: [tesseract]       # tried only when primary + challengers all fail
+  auto_fallback_tesseract: true        # also auto-try tesseract when binary is on PATH
   lang: en
   retry_2x:                           # targeted retry for small/low-confidence text
     enabled: true

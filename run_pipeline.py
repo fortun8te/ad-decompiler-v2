@@ -149,9 +149,11 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
     def stage(name):
         return STAGES.index(name) >= begin
 
+    current_stage = "normalize"
     try:
         # 1 normalize
         if stage("normalize") or not exists("normalized.png"):
+            current_stage = "normalize"
             norm_path, canvas = normalize.load_normalize(input_path, run_dir, cfg)
             _log(run_dir, f"normalize → {canvas['w']}x{canvas['h']}")
         else:
@@ -161,11 +163,13 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
 
         # 2 OCR facts, followed by painted-text/style/hierarchy analysis.
         if stage("ocr") or not exists("ocr_raw.json"):
+            current_stage = "ocr"
             raw_ocr = ocr.run_ocr(norm_path, cfg, run_dir=run_dir)
             dump(raw_ocr, A("ocr_raw.json"))
             _log(run_dir, f"ocr[{raw_ocr.get('engine')}] → {len(raw_ocr.get('lines', []))} lines")
         raw_ocr = load(A("ocr_raw.json")) if exists("ocr_raw.json") else load(A("ocr.json"))
         if stage("text") or not exists("ocr.json"):
+            current_stage = "text"
             ocr_res = text_analysis.analyze_text(norm_path, raw_ocr, cfg)
             dump(ocr_res, A("ocr.json"))
             _log(run_dir, f"text analysis → {len(ocr_res.get('blocks', []))} blocks, {len(ocr_res.get('styles', []))} styles")
@@ -173,6 +177,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
 
         # 3 deterministic residual proposals. This also writes box-local masks.
         if stage("residual") or not exists("residual.json"):
+            current_stage = "residual"
             residual = element_detect.detect(norm_path, ocr_res, cfg, run_dir=run_dir)
             dump(residual, A("residual.json"))
             _log(run_dir, f"residual proposals → {len(residual)}")
@@ -180,12 +185,14 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
 
         # 4 optional Qwen layers are advisory observations/assets, never the scene graph.
         if stage("qwen") or not exists("qwen.json"):
+            current_stage = "qwen"
             qwen = qwen_worker.propose_layers(norm_path, run_dir, cfg)
             dump(qwen, A("qwen.json")); _log(run_dir, f"qwen → {len(qwen)} layers")
         qwen = load(A("qwen.json"))
 
         # 5 SAM 3 image prompt sweep + box-refine every residual, then mask-aware fusion.
         if stage("sam") or not exists("sam3.json"):
+            current_stage = "sam"
             sam = _sam_with_safe_retry(norm_path, residual, cfg, run_dir, report)
             _log(run_dir, f"sam3[{sam.get('status')}] → {len(sam.get('elements', []))} observations")
         sam = load(A("sam3.json"))
@@ -258,7 +265,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         qa_render = A("figma_export.png") if exists("figma_export.png") else \
             (A("preview.png") if exists("preview.png") else None)
         if (stage("diff") or stage("qa")) and qa_render:
-            ren_ocr = ocr.run_ocr(qa_render, cfg) if cfg.get("qa_ocr", True) else None
+            ren_ocr = ocr.run_ocr(qa_render, cfg, run_dir=run_dir) if cfg.get("qa_ocr", True) else None
             qa_partial = pixel_diff.compare(norm_path, qa_render, run_dir,
                                             source_ocr=ocr_res, render_ocr=ren_ocr)
             design_data = load(A("design.json"))
@@ -315,7 +322,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         _log(run_dir, f"ERROR: {e}\n{traceback.format_exc()}")
         report.stage("pipeline", "failed", detail=str(e))
         report.finish(error=str(e))
-        return {"ok": False, "run_dir": run_dir, "error": str(e),
+        return {"ok": False, "run_dir": run_dir, "error": str(e), "failed_stage": current_stage,
                 "duration_s": round(time.time() - t0, 3), "runtime_ok": False,
                 "runtime_status": "failed"}
 

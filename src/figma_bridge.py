@@ -30,6 +30,7 @@ from urllib.parse import urlparse, parse_qs
 
 from src.console_io import configure_stdio, safe_print
 from src.agent_debug import log as _agent_log, tail as _agent_debug_tail
+from src.error_messages import classify_processing_error, detect_failed_stage
 
 
 def _safe_name(name, fallback="upload"):
@@ -53,29 +54,10 @@ def _load_cfg(path):
             return json.load(fh)
 
 
-_STAGE_MARKERS = [
-    ("normalize", "normalize →"), ("ocr", "ocr["), ("text", "text analysis →"),
-    ("residual", "residual proposals →"), ("qwen", "qwen →"), ("sam", "sam3["),
-    ("elements", "element fusion →"), ("merge", "merge →"), ("reconstruct", "reconstruct →"),
-    ("layout", "layout →"), ("design", "design.json →"), ("preview", "preview →"),
-    ("figma", "figma import:"), ("export", "export:"), ("qa", "qa →"),
-]
-
-
 def _tail_stage(run_dir):
     """Best-effort read of pipeline.log's last matched stage — purely informational, never
     raises (a half-written line or a run_dir that doesn't exist yet just means 'no stage yet')."""
-    try:
-        with open(os.path.join(run_dir, "pipeline.log"), encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return None
-    current = None
-    for line in lines:
-        for name, marker in _STAGE_MARKERS:
-            if marker in line:
-                current = name
-    return current
+    return detect_failed_stage(run_dir)
 
 
 def _history_path(inbox):
@@ -116,6 +98,19 @@ def _resolve_config_path(path: str) -> str:
     if os.path.isabs(path):
         return path
     return os.path.join(_repo_root(), path)
+
+
+def _ocr_preflight(cfg, repo_root):
+    """Doctor OCR readiness without importing run_pipeline."""
+    from pathlib import Path
+    from doctor import inspect as doctor_inspect
+    doctor = doctor_inspect(cfg or {}, Path(repo_root))
+    ocr_blockers = [
+        item for item in doctor.get("blockers", [])
+        if str(item.get("name", "")).startswith("ocr")
+    ]
+    fallback_ready = bool((doctor.get("ocr_fallback") or {}).get("ready"))
+    return doctor, ocr_blockers, fallback_ready
 
 
 def _append_plugin_logs(inbox, events, manifest=None):
@@ -175,6 +170,55 @@ def _read_plugin_client(inbox):
     return data if isinstance(data, dict) else None
 
 
+def _health_payload(inbox, base_cfg):
+    payload = {
+        "ok": True,
+        "service": "ad-decompiler-bridge",
+        "has_run": bool(_read_json_file(os.path.join(inbox, "inbox.json"))),
+        "supports_process": True,
+        "bridge_build": _read_bridge_build(),
+        "plugin_client": _read_plugin_client(inbox),
+    }
+    manifest = _read_json_file(os.path.join(inbox, "inbox.json"))
+    if manifest:
+        payload["schema_version"] = manifest.get("schema_version")
+    try:
+        from doctor import inspect as _doctor_inspect, ocr_ready_summary as _ocr_ready_summary
+        from pathlib import Path
+        repo_root = Path(_repo_root())
+        cfg = base_cfg or {}
+        doctor = _doctor_inspect(cfg, repo_root)
+        payload["machine_ready"] = doctor.get("ok")
+        payload["machine_blockers"] = doctor.get("blockers") or []
+        payload["ocr_ready"] = _ocr_ready_summary(cfg, repo_root)
+    except Exception as exc:
+        payload["machine_ready"] = False
+        payload["machine_blockers"] = [{"name": "doctor", "detail": str(exc)}]
+        payload["ocr_ready"] = {"ok": False, "error": str(exc)}
+    return payload
+
+
+def _preflight_blockers(base_cfg):
+    """Return doctor blockers for early pipeline rejection, or None if ready.
+
+    OCR module blockers are waived when a configured fallback engine is runnable
+    (e.g. tesseract on PATH) so a cuDNN-broken Paddle GPU install can still process.
+    """
+    try:
+        doctor, ocr_blockers, fallback_ready = _ocr_preflight(base_cfg, _repo_root())
+        blockers = list(doctor.get("blockers") or [])
+        if ocr_blockers and fallback_ready:
+            ocr_names = {item.get("name") for item in ocr_blockers}
+            blockers = [item for item in blockers if item.get("name") not in ocr_names]
+        return blockers if blockers else None
+    except Exception as exc:
+        return [{"name": "doctor", "detail": str(exc)}]
+
+
+def _format_blockers(blockers):
+    return "; ".join(f"{item.get('name', 'check')}: {item.get('detail', '')}" for item in blockers[:4])
+
+
 def _save_plugin_client(inbox, build_info):
     if not isinstance(build_info, dict):
         return
@@ -226,15 +270,28 @@ def make_handler(inbox, config_path=None):
                 sys.path.insert(0, repo_root)
             # #region agent log
             try:
-                from doctor import inspect as _doctor_inspect
-                from pathlib import Path
-                doctor = _doctor_inspect(base_cfg or {}, Path(repo_root))
-                ocr_blockers = [b for b in doctor.get("blockers", []) if str(b.get("name", "")).startswith("ocr")]
+                doctor, ocr_blockers, fallback_ready = _ocr_preflight(base_cfg, repo_root)
                 _agent_log(
                     "figma_bridge.py:run_job", "doctor preflight",
-                    data={"ok": doctor.get("ok"), "ocr_blockers": ocr_blockers, "blockers": doctor.get("blockers")},
+                    data={
+                        "ok": doctor.get("ok"),
+                        "ocr_blockers": ocr_blockers,
+                        "blockers": doctor.get("blockers"),
+                        "ocr_fallback_ready": fallback_ready,
+                    },
                     hypothesis_id="H4", run_dir=run_dir,
                 )
+                blockers = list(doctor.get("blockers") or [])
+                if ocr_blockers and fallback_ready:
+                    ocr_names = {item.get("name") for item in ocr_blockers}
+                    blockers = [item for item in blockers if item.get("name") not in ocr_names]
+                if blockers:
+                    raise RuntimeError(
+                        "Machine not ready — run doctor.py on the bridge host. "
+                        + _format_blockers(blockers)
+                    )
+            except RuntimeError:
+                raise
             except Exception as doctor_error:
                 _agent_log(
                     "figma_bridge.py:run_job", "doctor preflight failed",
@@ -253,6 +310,7 @@ def make_handler(inbox, config_path=None):
                     status="done" if result.get("ok") else "failed",
                     result=result, run_dir=run_dir,
                     error=None if result.get("ok") else (result.get("error") or "pipeline reported failure"),
+                    failed_stage=None if result.get("ok") else result.get("failed_stage"),
                 )
             if result.get("ok"):
                 _record_history(inbox, time.time() - started)
@@ -274,7 +332,13 @@ def make_handler(inbox, config_path=None):
         except Exception as exc:
             with jobs_lock:
                 if not _job_cancelled(job_id):
-                    jobs[job_id].update(status="failed", error=str(exc), traceback=traceback.format_exc(), run_dir=run_dir)
+                    jobs[job_id].update(
+                        status="failed",
+                        error=str(exc),
+                        traceback=traceback.format_exc(),
+                        run_dir=run_dir,
+                        failed_stage=getattr(exc, "failed_stage", None),
+                    )
             if _job_cancelled(job_id):
                 return
             _append_plugin_logs(inbox, [{
@@ -336,12 +400,12 @@ def make_handler(inbox, config_path=None):
             u = urlparse(self.path)
             manifest = self._manifest()
             if u.path == "/health":
-                payload = {"ok": True, "service": "ad-decompiler-bridge",
-                           "has_run": bool(manifest), "schema_version": (manifest or {}).get("schema_version"),
-                           "supports_process": True,
-                           "bridge_build": _read_bridge_build(),
-                           "plugin_client": _read_plugin_client(inbox)}
-                return self._send(200, json.dumps(payload).encode(), "application/json")
+                manifest = self._manifest()
+                payload = _health_payload(inbox, base_cfg)
+                payload["has_run"] = bool(manifest)
+                if manifest:
+                    payload["schema_version"] = manifest.get("schema_version")
+                return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
             if u.path == "/inbox.json":
                 p = os.path.join(inbox, "inbox.json")
                 return self._send(200, open(p, "rb").read(), "application/json") if os.path.exists(p) else self._send(404)
@@ -380,9 +444,26 @@ def make_handler(inbox, config_path=None):
                     if tb:
                         lines = [ln for ln in str(tb).strip().splitlines() if ln.strip()]
                         job["error_detail"] = "\n".join(lines[-5:])
+                    agent_debug = _agent_debug_tail(job.get("run_dir"))
+                    job["agent_debug"] = agent_debug
                     if job.get("run_dir"):
-                        job["failed_stage"] = _tail_stage(job["run_dir"])
-                    job["agent_debug"] = _agent_debug_tail(job.get("run_dir"))
+                        job["failed_stage"] = detect_failed_stage(
+                            job["run_dir"],
+                            error_text=str(job.get("error") or ""),
+                            explicit_stage=job.get("failed_stage"),
+                            agent_debug=agent_debug,
+                        )
+                    classified = classify_processing_error(
+                        error=str(job.get("error") or ""),
+                        traceback_text=tb,
+                        failed_stage=job.get("failed_stage"),
+                        agent_debug=agent_debug,
+                    )
+                    job["failed_stage"] = classified.get("failed_stage")
+                    job["error_code"] = classified.get("error_code")
+                    job["error_hint"] = classified.get("error_hint")
+                    job["user_title"] = classified.get("user_title")
+                    job["user_detail"] = classified.get("user_detail")
                 job.pop("traceback", None)
                 if job.get("status") == "running" and job.get("run_dir"):
                     job["stage"] = _tail_stage(job["run_dir"])
@@ -483,6 +564,19 @@ def make_handler(inbox, config_path=None):
                 return self._send(200, json.dumps({"ok": True, "job_id": job_id, "status": "cancelled"}).encode(),
                                    "application/json")
             if route == "/process":
+                blockers = _preflight_blockers(base_cfg)
+                if blockers:
+                    detail = _format_blockers(blockers)
+                    return self._send(
+                        503,
+                        json.dumps({
+                            "ok": False,
+                            "error": "bridge machine not ready — fix doctor.py blockers before uploading",
+                            "detail": detail,
+                            "blockers": blockers,
+                        }).encode(),
+                        "application/json",
+                    )
                 n = self._content_length(max_bytes=64 * 1024 * 1024)
                 if n is None:
                     return self._send(400, b'{"ok":false,"error":"missing, invalid, or oversized Content-Length (64MB max)"}',
@@ -542,6 +636,8 @@ def main():
         status = prepare(config_path=config_path, inbox=inbox)
         config_path = status["config_path"]
         inbox = status["inbox"]
+        for warning in status.get("gpu_warnings") or []:
+            safe_print(f"WARNING: {warning}")
     else:
         os.makedirs(inbox, exist_ok=True)
     host_label = "localhost" if a.host in ("127.0.0.1", "localhost") else a.host

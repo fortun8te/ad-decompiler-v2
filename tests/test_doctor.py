@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from doctor import inspect
+from doctor import inspect, ocr_ready_summary
 
 
 def test_doctor_marks_active_missing_sam_and_primary_ocr_as_blockers(tmp_path, monkeypatch):
@@ -73,3 +73,41 @@ def test_doctor_leaves_big_lama_optional_without_require_active_models(tmp_path,
 
     assert any(item["name"] == "Big-LaMa" for item in report["warnings"])
     assert not any(item["name"] == "Big-LaMa" for item in report["blockers"])
+
+
+def test_ocr_ready_summary_flags_primary_blockers(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: name != "paddleocr")
+    monkeypatch.setattr("doctor._torch", lambda device: {"name": "cuda", "ok": True, "required": True, "detail": "fake"})
+    monkeypatch.setattr("doctor._cudnn", lambda device: {"name": "cudnn", "ok": False, "required": False, "detail": "missing"})
+
+    summary = ocr_ready_summary(
+        {"device": "cuda", "ocr": {"primary": "ppocr-v6"}, "qwen": {"enabled": False}},
+        Path(tmp_path),
+    )
+
+    assert summary["ok"] is False
+    assert summary["primary"] == "ppocr-v6"
+    assert any(item["name"] == "ocr:ppocr-v6" for item in summary["blockers"])
+    assert any(item["name"] == "cudnn" for item in summary["warnings"])
+
+
+def test_doctor_reports_tesseract_fallback_when_binary_present(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: name == "pytesseract")
+    monkeypatch.setattr("doctor._torch", lambda device: {"name": "torch", "ok": True, "required": False, "detail": "cpu"})
+    monkeypatch.setattr("doctor.shutil.which", lambda name: "/usr/bin/tesseract" if name == "tesseract" else None)
+
+    report = inspect({
+        "device": "cuda",
+        "ocr": {"primary": "ppocr-v6", "fallback_engines": ["tesseract"]},
+        "qwen": {"enabled": False},
+    }, Path(tmp_path))
+
+    assert report["ocr_fallback"]["ready"] is True
+    assert any(item["engine"] == "tesseract" for item in report["ocr_fallback"]["available"])
+    summary = ocr_ready_summary({
+        "device": "cuda",
+        "ocr": {"primary": "ppocr-v6"},
+        "qwen": {"enabled": False},
+    }, Path(tmp_path))
+    if not report["blockers"]:
+        assert summary["ok"] is True

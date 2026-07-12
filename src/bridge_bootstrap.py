@@ -43,6 +43,28 @@ def _save_yaml(path: Path, data: dict[str, Any]) -> None:
         yaml.safe_dump(data, fh, sort_keys=False, default_flow_style=False)
 
 
+def _cuda_cudnn_warnings(cfg: dict[str, Any]) -> list[str]:
+    """Surface likely GPU/OCR failures before the first upload."""
+    device = str(cfg.get("device", "cpu")).lower()
+    if device != "cuda":
+        return []
+    warnings: list[str] = []
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            warnings.append(
+                "config device is cuda but PyTorch cannot see a GPU — run doctor.py before processing"
+            )
+        elif not torch.backends.cudnn.is_available():
+            warnings.append(
+                "CUDA is available but cuDNN is missing — PaddleOCR GPU on Windows often fails; "
+                "reinstall paddlepaddle-gpu with a matching cuDNN build"
+            )
+    except ImportError:
+        warnings.append("config device is cuda but torch is not installed — run setup_rtx.ps1")
+    return warnings
+
+
 def prepare(
     config_path: str | os.PathLike[str] | None = None,
     inbox: str | os.PathLike[str] | None = None,
@@ -90,6 +112,7 @@ def prepare(
         font_enabled = font_raw
     else:
         font_enabled = False
+    gpu_warnings = _cuda_cudnn_warnings(cfg)
 
     return {
         "root": str(root_path),
@@ -99,6 +122,7 @@ def prepare(
         "patched_figma": patched_figma,
         "inbox": inbox_path,
         "font_matching_enabled": font_enabled,
+        "gpu_warnings": gpu_warnings,
     }
 
 
@@ -122,6 +146,8 @@ def main() -> int:
         print(f"Inbox: {status['inbox']}")
         if status["config_exists"] and not status["font_matching_enabled"]:
             print("Note: text_analysis.font_matching is disabled — edit config.yaml for real font recognition.")
+        for warning in status.get("gpu_warnings") or []:
+            print(f"WARNING: {warning}")
     return 0
 
 

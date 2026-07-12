@@ -30,3 +30,16 @@ def test_bridge_bootstrap_resolves_config_relative_to_root_not_cwd(tmp_path, mon
     assert (root / "config.yaml").exists()
     assert not (tmp_path / "config.yaml").exists()
     assert status["config_path"] == str(root / "config.yaml")
+
+
+def test_bridge_bootstrap_reports_cuda_cudnn_warnings(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "config.yaml").write_text("device: cuda\nfigma:\n  enabled: true\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "src.bridge_bootstrap._cuda_cudnn_warnings",
+        lambda cfg: ["CUDA is available but cuDNN is missing — PaddleOCR GPU on Windows often fails"],
+    )
+    status = prepare(config_path=root / "config.yaml", inbox=str(root / "inbox"), root=str(root))
+    assert status["gpu_warnings"]
+    assert "cuDNN" in status["gpu_warnings"][0]

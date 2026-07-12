@@ -11,6 +11,27 @@ from urllib.request import Request, urlopen
 from src.figma_bridge import make_handler
 
 
+def _write_passing_config(tmp_path):
+    """Minimal config that passes doctor when modules are monkeypatched."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "device: cpu\nocr:\n  primary: doctr\nqwen:\n  enabled: false\nsam3:\n  enabled: false\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def _allow_machine_ready(monkeypatch):
+    monkeypatch.setattr(
+        "doctor.inspect",
+        lambda cfg, root: {"ok": True, "blockers": [], "warnings": [], "checks": []},
+    )
+    monkeypatch.setattr(
+        "doctor.ocr_ready_summary",
+        lambda cfg, root: {"ok": True, "primary": "doctr", "blockers": [], "warnings": []},
+    )
+
+
 def test_bridge_serves_staged_run_and_persists_plugin_report(tmp_path):
     inbox = tmp_path / "inbox"
     staged = inbox / "runs" / "demo"
@@ -48,8 +69,8 @@ def test_bridge_serves_staged_run_and_persists_plugin_report(tmp_path):
         server.server_close()
 
 
-def _start_server(inbox):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox)))
+def _start_server(inbox, config_path=None):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config_path))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -183,6 +204,24 @@ def test_plugin_log_endpoint_appends_text_and_json(tmp_path):
         server.server_close()
 
 
+def test_health_includes_ocr_ready_summary(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = _start_server(inbox, config_path=config)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        health = json.loads(urlopen(base + "/health", timeout=2).read())
+        assert health["ok"] is True
+        assert health["ocr_ready"]["ok"] is True
+        assert health["ocr_ready"]["primary"] == "doctr"
+        assert health["machine_ready"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_health_includes_bridge_and_plugin_client_build(tmp_path):
     inbox = tmp_path / "inbox"
     inbox.mkdir()
@@ -222,10 +261,12 @@ def test_log_endpoint_records_plugin_build_client(tmp_path):
 
 
 def test_process_uploads_runs_pipeline_and_stages_inbox(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
     calls = _install_fake_run_pipeline(monkeypatch)
     inbox = tmp_path / "inbox"
     inbox.mkdir()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
@@ -261,10 +302,12 @@ def test_process_uploads_runs_pipeline_and_stages_inbox(tmp_path, monkeypatch):
 
 
 def test_process_rejects_concurrent_uploads(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
     _install_fake_run_pipeline(monkeypatch, sleep_s=0.3)
     inbox = tmp_path / "inbox"
     inbox.mkdir()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
@@ -286,10 +329,12 @@ def test_process_rejects_concurrent_uploads(tmp_path, monkeypatch):
 
 
 def test_process_cancel_endpoint_marks_job_cancelled(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
     _install_fake_run_pipeline(monkeypatch, sleep_s=0.5)
     inbox = tmp_path / "inbox"
     inbox.mkdir()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
@@ -305,10 +350,12 @@ def test_process_cancel_endpoint_marks_job_cancelled(tmp_path, monkeypatch):
 
 
 def test_process_reports_pipeline_failure_without_crashing_the_bridge(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
     _install_fake_run_pipeline(monkeypatch, ok=False)
     inbox = tmp_path / "inbox"
     inbox.mkdir()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
@@ -326,6 +373,7 @@ def test_process_reports_pipeline_failure_without_crashing_the_bridge(tmp_path, 
 
 
 def test_process_failed_job_includes_error_detail(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
     calls = []
 
     def run_one(image_path, run_dir, cfg):
@@ -341,7 +389,8 @@ def test_process_failed_job_includes_error_detail(tmp_path, monkeypatch):
 
     inbox = tmp_path / "inbox"
     inbox.mkdir()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
@@ -352,17 +401,108 @@ def test_process_failed_job_includes_error_detail(tmp_path, monkeypatch):
         assert "CUDA out of memory" in status["error"]
         assert status.get("error_detail")
         assert status.get("failed_stage") == "ocr"
+        assert status.get("error_code") == "cuda_unavailable"
+        assert status.get("error_hint")
+        assert status.get("user_title")
         assert "traceback" not in status
     finally:
         server.shutdown()
         server.server_close()
 
 
+def test_process_failed_job_reports_ocr_stage_after_normalize(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
+
+    def run_one(image_path, run_dir, cfg):
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, "pipeline.log"), "w", encoding="utf-8") as fh:
+            fh.write("[12:00:00] normalize → 1080x1080\n")
+        return {
+            "ok": False,
+            "run_dir": run_dir,
+            "error": "no configured OCR backend completed (ppocr-v6: cudnn not found)",
+            "failed_stage": "ocr",
+        }
+
+    fake = types.ModuleType("run_pipeline")
+    fake.run_one = run_one
+    monkeypatch.setitem(sys.modules, "run_pipeline", fake)
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        request = Request(base + "/process?filename=broken.jpg", data=b"z", method="POST")
+        queued = json.loads(urlopen(request, timeout=2).read())
+        status = _poll_job(base, queued["job_id"])
+        assert status["status"] == "failed"
+        assert status.get("failed_stage") == "ocr"
+        assert status.get("error_code") == "cudnn_unavailable"
+        assert "cuDNN" in status.get("error_hint", "")
+        assert status.get("user_title") == "GPU library (cuDNN) issue"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_process_rejects_upload_when_machine_not_ready(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.figma_bridge._preflight_blockers",
+        lambda cfg: [{"name": "ocr:ppocr-v6", "detail": "python module paddleocr"}],
+    )
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        request = Request(base + "/process?filename=a.png", data=b"x", method="POST")
+        try:
+            urlopen(request, timeout=2)
+            assert False, "upload should be rejected when doctor reports blockers"
+        except HTTPError as error:
+            assert error.code == 503
+            payload = json.loads(error.read())
+            assert "not ready" in payload["error"]
+            assert payload["blockers"][0]["name"] == "ocr:ppocr-v6"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_process_allows_ocr_blockers_when_tesseract_fallback_ready(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
+    monkeypatch.setattr("src.figma_bridge._preflight_blockers", lambda cfg: None)
+    calls = _install_fake_run_pipeline(monkeypatch)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        request = Request(base + "/process?filename=a.png", data=b"x", method="POST")
+        queued = json.loads(urlopen(request, timeout=2).read())
+        assert queued["status"] == "queued"
+        status = _poll_job(base, queued["job_id"])
+        assert status["status"] == "done"
+        assert len(calls) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_process_missing_content_length_returns_400(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
     _install_fake_run_pipeline(monkeypatch)
     inbox = tmp_path / "inbox"
     inbox.mkdir()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
@@ -379,12 +519,14 @@ def test_process_missing_content_length_returns_400(tmp_path, monkeypatch):
 
 
 def test_process_reports_eta_from_history_after_a_prior_run(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
     """First upload has no history -> no eta_s. Second upload sees the first run's recorded
     duration and gets a real (median-based) eta_s while running."""
     _install_fake_run_pipeline(monkeypatch, sleep_s=0.15)
     inbox = tmp_path / "inbox"
     inbox.mkdir()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:

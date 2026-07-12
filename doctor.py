@@ -15,7 +15,17 @@ import shutil
 import sys
 from pathlib import Path
 
-from run_pipeline import load_cfg
+def load_cfg(path):
+    """Lightweight config loader — avoids importing run_pipeline (heavy torch/paddle deps)."""
+    if path and os.path.exists(path):
+        try:
+            import yaml
+            with open(path, encoding="utf-8") as fh:
+                return yaml.safe_load(fh) or {}
+        except Exception:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+    return {}
 
 
 def _check(name, ok, detail, required=False):
@@ -43,6 +53,25 @@ def _torch(device):
         return _check("torch", device != "cuda", f"unavailable: {exc}", required=device == "cuda")
 
 
+def _cudnn(device):
+    """Lightweight cuDNN probe — PaddleOCR GPU on Windows often fails without it."""
+    if device != "cuda":
+        return _check("cudnn", True, "not required (cpu)", required=False)
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return _check("cudnn", False, "CUDA unavailable — cuDNN cannot be used", required=False)
+        available = bool(torch.backends.cudnn.is_available())
+        detail = (
+            f"cuDNN available (version {torch.backends.cudnn.version()})"
+            if available
+            else "cuDNN missing — PaddleOCR GPU on Windows often fails; reinstall paddlepaddle-gpu + matching cuDNN"
+        )
+        return _check("cudnn", available, detail, required=False)
+    except Exception as exc:
+        return _check("cudnn", False, f"probe failed: {exc}", required=False)
+
+
 def _http(url):
     try:
         import urllib.request
@@ -58,24 +87,82 @@ def _required_qwen(cfg: dict) -> bool:
     return bool(qwen.get("enabled", True) and qwen.get("required", False))
 
 
+def _tesseract_binary() -> str | None:
+    return shutil.which("tesseract")
+
+
+def _ocr_engine_module(name: str) -> str:
+    return {"ppocr-v6": "paddleocr", "ppocr": "paddleocr", "surya": "surya",
+            "doctr": "doctr", "tesseract": "pytesseract"}.get(str(name).lower(), str(name).lower())
+
+
+def _ocr_fallback_ready(engine: str) -> tuple[bool, str]:
+    """Return whether a configured OCR fallback can run on this machine."""
+    name = str(engine).lower()
+    if name == "tesseract":
+        binary = _tesseract_binary()
+        if not binary:
+            return False, "tesseract binary not on PATH"
+        if not _module("pytesseract"):
+            return False, "pip install pytesseract"
+        return True, binary
+    module = _ocr_engine_module(name)
+    if not _module(module):
+        return False, f"python module {module}"
+    return True, f"python module {module}"
+
+
+def ocr_fallback_status(cfg: dict) -> dict:
+    """Summarize configured OCR fallbacks that are actually runnable."""
+    ocr_cfg = cfg.get("ocr") or {}
+    configured = [str(name).lower() for name in (ocr_cfg.get("fallback_engines") or [])]
+    auto = ocr_cfg.get("auto_fallback_tesseract", True)
+    if auto and "tesseract" not in configured:
+        configured.append("tesseract")
+    available, unavailable = [], []
+    for name in configured:
+        ok, detail = _ocr_fallback_ready(name)
+        item = {"engine": name, "detail": detail}
+        if ok:
+            available.append(item)
+        else:
+            unavailable.append(item)
+    return {
+        "configured": configured,
+        "available": available,
+        "unavailable": unavailable,
+        "ready": bool(available),
+    }
+
+
 def inspect(cfg, root: Path) -> dict:
     """Return JSON-friendly readiness evidence without importing heavyweight models."""
     checks = []
     device = str(cfg.get("device", "cpu")).lower()
     checks.append(_check("python", sys.version_info >= (3, 10), sys.version.split()[0], required=True))
     checks.append(_torch(device))
+    cudnn = _cudnn(device)
+    checks.append(cudnn)
 
     ocr_cfg = cfg.get("ocr") or {}
     primary = str(ocr_cfg.get("primary", "ppocr-v6")).lower()
-    module_for_ocr = {"ppocr-v6": "paddleocr", "ppocr": "paddleocr", "surya": "surya",
-                      "doctr": "doctr", "tesseract": "pytesseract"}.get(primary, primary)
+    module_for_ocr = _ocr_engine_module(primary)
     checks.append(_check(f"ocr:{primary}", _module(module_for_ocr),
                          f"python module {module_for_ocr}", required=True))
+    if primary == "tesseract":
+        checks.append(_check("tesseract binary", bool(_tesseract_binary()),
+                             _tesseract_binary() or "not on PATH", required=True))
     for challenger in ocr_cfg.get("challengers") or []:
         name = str(challenger).lower()
-        module = {"ppocr-v6": "paddleocr", "ppocr": "paddleocr", "surya": "surya",
-                  "doctr": "doctr", "tesseract": "pytesseract"}.get(name, name)
+        module = _ocr_engine_module(name)
         checks.append(_check(f"ocr challenger:{name}", _module(module), f"python module {module}"))
+        if name == "tesseract":
+            checks.append(_check("tesseract binary", bool(_tesseract_binary()),
+                                 _tesseract_binary() or "not on PATH"))
+    fallback = ocr_fallback_status(cfg)
+    for item in fallback["configured"]:
+        ok, detail = _ocr_fallback_ready(item)
+        checks.append(_check(f"ocr fallback:{item}", ok, detail))
 
     runtime = cfg.get("runtime") or {}
     sam = cfg.get("sam3") or {}
@@ -127,9 +214,36 @@ def inspect(cfg, root: Path) -> dict:
             "require_active_models": bool(runtime.get("require_active_models", False)),
             "qwen_required": _required_qwen(cfg),
         },
+        "ocr_fallback": fallback,
         "checks": checks,
         "blockers": blockers,
         "warnings": warnings,
+    }
+
+
+def ocr_ready_summary(cfg, root: Path) -> dict:
+    """Compact OCR readiness for bridge /health — module/CUDA checks only, no model loads."""
+    report = inspect(cfg, root)
+    primary = str((cfg.get("ocr") or {}).get("primary", "ppocr-v6")).lower()
+    ocr_blockers = [item for item in report["blockers"] if item["name"].startswith("ocr")]
+    if str(cfg.get("device", "cpu")).lower() == "cuda":
+        cuda_check = next((item for item in report["checks"] if item["name"] == "cuda"), None)
+        if cuda_check and not cuda_check["ok"]:
+            ocr_blockers.append(cuda_check)
+    ocr_warnings = [item for item in report["warnings"] if item["name"].startswith("ocr")]
+    cudnn_check = next((item for item in report["checks"] if item["name"] == "cudnn"), None)
+    if cudnn_check and not cudnn_check["ok"]:
+        ocr_warnings.append(cudnn_check)
+    fallback = report.get("ocr_fallback") or ocr_fallback_status(cfg)
+    ocr_ok = not ocr_blockers or bool(fallback.get("ready"))
+    return {
+        "ok": ocr_ok,
+        "primary": primary,
+        "device": report.get("device"),
+        "blockers": ocr_blockers,
+        "warnings": ocr_warnings,
+        "fallback": fallback,
+        "machine_ok": report.get("ok"),
     }
 
 

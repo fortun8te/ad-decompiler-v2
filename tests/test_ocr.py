@@ -277,3 +277,70 @@ def test_primary_failure_uses_challenger_but_exposes_partial_status(tmp_path, mo
     assert result["engine"] == "surya"
     assert result["errors"][0]["engine"] == "ppocr-v6"
     assert result["lines"][0]["text"] == "SALE"
+
+
+def test_paddle_gpu_failure_retries_cpu_once(monkeypatch):
+    calls = []
+
+    class _Engine:
+        def predict(self, path):
+            return []
+
+    def fake_engine(cfg, *, device_override=None):
+        device = device_override or str(cfg.get("device", "cpu"))
+        calls.append(device)
+        if device.startswith("cuda") or device == "gpu":
+            raise OSError("[WinError 127] cudnn_cnn64_9.dll not found")
+        return _Engine(), "v3"
+
+    monkeypatch.setattr(ocr, "_paddle_engine", fake_engine)
+    monkeypatch.setattr(ocr, "_parse_paddle_result", lambda result: [
+        _line("CPU OK", 0.9, _box(1, 2, 30, 10), "ppocr-v6"),
+    ])
+
+    lines, engine = ocr._paddle("fake.png", {"device": "cuda"})
+
+    assert engine == "ppocr-v6"
+    assert lines[0]["text"] == "CPU OK"
+    assert calls == ["cuda", "cpu"]
+
+
+def test_run_ocr_uses_tesseract_fallback_when_all_configured_fail(tmp_path, monkeypatch):
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (160, 80), "white").save(image_path)
+    calls = []
+
+    def fake_backend(name, path, cfg, use_cache=True):
+        calls.append(name)
+        if name in ("ppocr-v6", "surya"):
+            raise RuntimeError(f"{name} unavailable")
+        return {"engine": "tesseract", "lines": [
+            _line("FALLBACK", 0.7, _box(5, 5, 40, 12), "tesseract"),
+        ]}
+
+    monkeypatch.setattr(ocr, "_run_backend", fake_backend)
+    monkeypatch.setattr(ocr, "_fallback_engine_names", lambda cfg: ["tesseract"])
+    result = ocr.run_ocr(
+        str(image_path),
+        {"ocr": {"primary": "ppocr-v6", "challengers": ["surya"], "retry_2x": False}},
+    )
+
+    assert "tesseract" in calls
+    assert result["engine"] == "tesseract"
+    assert result["lines"][0]["text"] == "FALLBACK"
+    assert any(item.get("role") == "fallback" for item in result["errors"])
+
+
+def test_run_ocr_failure_message_includes_cudnn_guidance(tmp_path, monkeypatch):
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (80, 40), "white").save(image_path)
+
+    def fake_backend(name, path, cfg, use_cache=True):
+        raise OSError("Could not load cudnn_cnn64_9.dll")
+
+    monkeypatch.setattr(ocr, "_run_backend", fake_backend)
+    monkeypatch.setattr(ocr, "_fallback_engine_names", lambda cfg: [])
+    monkeypatch.setattr(ocr, "_tesseract_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="cuDNN"):
+        ocr.run_ocr(str(image_path), {"ocr": {"primary": "ppocr-v6", "challengers": []}})

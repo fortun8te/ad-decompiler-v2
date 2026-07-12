@@ -28,6 +28,7 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 import time
 import unicodedata
@@ -514,10 +515,11 @@ def _parse_paddle_result(result: Any) -> list:
     return current if current else _parse_paddle_legacy(result)
 
 
-def _paddle_engine(cfg: dict):
+def _paddle_engine(cfg: dict, *, device_override: Optional[str] = None):
     ocr_cfg = cfg.get("ocr") or {}
     lang = ocr_cfg.get("lang", "en")
-    device = "gpu" if str(cfg.get("device", "cpu")).startswith("cuda") else "cpu"
+    device_key = device_override if device_override is not None else str(cfg.get("device", "cpu"))
+    device = "gpu" if device_key.startswith("cuda") else "cpu"
     key = (
         lang, device, ocr_cfg.get("text_detection_model_name"),
         ocr_cfg.get("text_recognition_model_name"), bool(ocr_cfg.get("textline_orientation", True)),
@@ -562,26 +564,60 @@ def _paddle_engine(cfg: dict):
     return engine, api
 
 
-def _paddle(img_path, cfg):
-    device = str(cfg.get("device", "cpu"))
+def _is_paddle_gpu_failure(error: Exception) -> bool:
+    """True when Paddle likely failed because of CUDA/cuDNN, not bad input."""
+    message = str(error).lower()
+    error_type = type(error).__name__.lower()
+    if error_type in {"oserror", "runtimeerror", "importerror"} and any(
+        token in message for token in ("cudnn", "cuda", "cublas", "gpu", "winerror 127", ".dll")
+    ):
+        return True
+    return any(token in message for token in (
+        "cudnn_cnn", "could not load", "no cuda gpus", "cuda driver",
+        "cudnn version", "gpu is not supported",
+    ))
+
+
+def _paddle(img_path, cfg, *, device_override: Optional[str] = None):
+    device = device_override or str(cfg.get("device", "cpu"))
     # #region agent log
     _agent_log("ocr.py:_paddle", "paddle backend start", data={"device": device, "path": os.path.basename(img_path)}, hypothesis_id="H1")
     # #endregion
     try:
-        engine, api = _paddle_engine(cfg)
+        engine, api = _paddle_engine(cfg, device_override=device_override)
         if api == "v3" and hasattr(engine, "predict"):
             result = engine.predict(img_path)
         else:
             result = engine.ocr(img_path, cls=True)
         lines = _parse_paddle_result(result)
         # #region agent log
-        _agent_log("ocr.py:_paddle", "paddle backend ok", data={"api": api, "lines": len(lines)}, hypothesis_id="H1")
+        _agent_log("ocr.py:_paddle", "paddle backend ok", data={"api": api, "lines": len(lines), "device": device}, hypothesis_id="H1")
         # #endregion
         return lines, "ppocr-v6"
     except Exception as error:
         # #region agent log
         _agent_log("ocr.py:_paddle", "paddle backend failed", data={"device": device, "error": str(error), "error_type": type(error).__name__}, hypothesis_id="H1")
         # #endregion
+        configured = str(cfg.get("device", "cpu"))
+        if (
+            device_override is None
+            and configured.startswith("cuda")
+            and _is_paddle_gpu_failure(error)
+        ):
+            print(f"[ocr] paddle GPU failed ({error}); retrying once on CPU")
+            # #region agent log
+            _agent_log(
+                "ocr.py:_paddle", "paddle gpu failed; retrying cpu",
+                data={"error": str(error), "error_type": type(error).__name__},
+                hypothesis_id="H1",
+            )
+            # #endregion
+            try:
+                return _paddle(img_path, cfg, device_override="cpu")
+            except Exception as cpu_error:
+                raise RuntimeError(
+                    f"Paddle GPU failed ({error}) and CPU retry also failed ({cpu_error})"
+                ) from cpu_error
         raise
 
 
@@ -837,6 +873,46 @@ _BACKENDS = {
     "doctr": _doctr,
     "tesseract": _tesseract,
 }
+
+
+def _tesseract_available() -> bool:
+    if not shutil.which("tesseract"):
+        return False
+    return importlib.util.find_spec("pytesseract") is not None
+
+
+def _fallback_engine_names(cfg: dict) -> list[str]:
+    ocr_cfg = cfg.get("ocr") or {}
+    names = [str(name).lower() for name in (ocr_cfg.get("fallback_engines") or [])]
+    if ocr_cfg.get("auto_fallback_tesseract", True) and "tesseract" not in names:
+        if _tesseract_available():
+            names.append("tesseract")
+    return names
+
+
+def _format_ocr_failure(errors: list[dict], *, fallback_errors: Optional[list[dict]] = None) -> str:
+    details = "; ".join(f"{item['engine']}: {item['error']}" for item in errors)
+    messages = [f"no configured OCR backend completed ({details})"]
+    combined = " ".join(str(item.get("error", "")) for item in errors + (fallback_errors or []))
+    lowered = combined.lower()
+    if any(token in lowered for token in ("cudnn", "winerror 127", "cudnn_cnn")):
+        messages.append(
+            "Paddle GPU could not load cuDNN — install cuDNN 9.x matching your paddlepaddle-gpu "
+            "wheel, or set device: cpu in config.yaml (paddle will auto-retry CPU once)."
+        )
+    elif "cuda" in lowered and any(item.get("engine", "").startswith("ppocr") for item in errors):
+        messages.append("Paddle CUDA failed — verify GPU drivers or set device: cpu in config.yaml.")
+    if fallback_errors:
+        fb = "; ".join(f"{item['engine']}: {item['error']}" for item in fallback_errors)
+        messages.append(f"fallback OCR also failed ({fb})")
+    elif not _tesseract_available():
+        messages.append(
+            "For automatic recovery, install the tesseract binary on PATH and pip install pytesseract, "
+            "or set ocr.fallback_engines in config.yaml."
+        )
+    else:
+        messages.append("tesseract is installed but fallback did not run or also failed.")
+    return " ".join(messages)
 
 
 def _run_backend(name, img_path, cfg, use_cache=True):
@@ -1364,6 +1440,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
     # #endregion
 
     errors = []
+    fallback_errors: list[dict] = []
     try:
         primary_payload = _run_backend(primary_name, img_path, cfg)
         primary_engine = primary_payload.get("engine", primary_name)
@@ -1407,7 +1484,45 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         engines_used.append(payload.get("engine", name))
 
     if not engines_used:
-        details = "; ".join(f"{item['engine']}: {item['error']}" for item in errors)
+        configured = {primary_name, *challenger_names}
+        for name in _fallback_engine_names(cfg):
+            if name in configured:
+                continue
+            try:
+                payload = _run_backend(name, img_path, cfg)
+            except Exception as error:
+                print(f"[ocr] fallback '{name}' unavailable: {error}")
+                fallback_errors.append({"engine": name, "error": str(error), "role": "fallback"})
+                # #region agent log
+                _agent_log(
+                    "ocr.py:run_ocr", "fallback backend failed",
+                    data={"engine": name, "error": str(error), "error_type": type(error).__name__},
+                    hypothesis_id="H3", run_dir=run_dir,
+                )
+                # #endregion
+                continue
+            primary_engine = payload.get("engine", name)
+            primary_lines = _targeted_retry(
+                img_path, payload.get("lines", []), name, cfg
+            )
+            engines_used = [primary_engine]
+            errors.append({
+                "engine": name,
+                "detail": "recovered via fallback after configured engines failed",
+                "role": "fallback",
+            })
+            print(f"[ocr] using fallback engine '{primary_engine}' after configured backends failed")
+            # #region agent log
+            _agent_log(
+                "ocr.py:run_ocr", "fallback backend recovered ocr",
+                data={"engine": primary_engine, "lines": len(primary_lines)},
+                hypothesis_id="H3", run_dir=run_dir,
+            )
+            # #endregion
+            break
+
+    if not engines_used:
+        message = _format_ocr_failure(errors, fallback_errors=fallback_errors)
         # #region agent log
         _agent_log(
             "ocr.py:run_ocr", "all ocr backends failed",
@@ -1415,7 +1530,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
             hypothesis_id="H3", run_dir=run_dir,
         )
         # #endregion
-        raise RuntimeError(f"no configured OCR backend completed ({details})")
+        raise RuntimeError(message)
 
     merged = _reconcile(primary_lines, challenger_sets, cfg=cfg) if challenger_sets else _reconcile(
         primary_lines, [], cfg=cfg

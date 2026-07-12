@@ -757,10 +757,7 @@
     }
 
     .scan-segments {
-      display: grid;
-      grid-template-columns: repeat(15, minmax(0, 1fr));
-      gap: 2px;
-      margin-bottom: 6px;
+      display: none;
     }
 
     .scan-segment {
@@ -810,6 +807,28 @@
       color: var(--text-secondary);
       font-size: 10px;
       line-height: 1.4;
+    }
+
+    .issue-debug {
+      margin-top: 6px;
+      font-size: 10px;
+      color: var(--text-tertiary);
+    }
+    .issue-debug summary {
+      cursor: pointer;
+      user-select: none;
+      color: var(--text-secondary);
+    }
+    .issue-debug pre {
+      margin: 6px 0 0;
+      padding: 6px 7px;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--bg) 65%, transparent);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 9.5px;
+      line-height: 1.35;
     }
 
     .scan-stage {
@@ -1048,7 +1067,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.0.0","build":13,"commit":"f8dbb7c","dirty":true,"built_at":"2026-07-12T00:34:56Z","label":"v2.0.0+b13.f8dbb7c-dirty","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.0.0","build":15,"commit":"7bcebf0","dirty":true,"built_at":"2026-07-12T00:41:46Z","label":"v2.0.0+b15.7bcebf0-dirty","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -1437,6 +1456,7 @@
       $("uploadZone").setAttribute("aria-disabled", busy ? "true" : "false");
       $("uploadIdle").classList.toggle("hidden", Boolean(busy));
       $("uploadBusy").classList.toggle("hidden", !busy);
+      if (busy) $("progressSection").classList.add("hidden");
       if (busy && status) renderProcessStatus(status);
       // #region agent log
       agentDebugLog("ui.html:setUploadBusy", "upload busy state", progressVisibilitySnapshot("setUploadBusy:" + Boolean(busy)), "H6");
@@ -1615,43 +1635,81 @@
       return stage + " · " + elapsed + " so far (first run — no ETA yet)";
     }
 
-    function errorHint(text) {
+    function errorHint(text, errorCode) {
       const blob = String(text || "");
-      if (/ModuleNotFoundError|No module named/i.test(blob)) {
-        return "A Python dependency is missing on the bridge machine. Run setup_rtx.ps1 or pip install -r requirements-gpu.txt, then restart the bridge.";
+      const code = String(errorCode || "");
+      if (code === "dependency_missing" || /ModuleNotFoundError|No module named/i.test(blob)) {
+        return "A Python package is missing on the bridge PC. Close the bridge, run .\\setup_rtx.ps1 in PowerShell, then restart Start Bridge.bat.";
       }
-      if (/cuda|CUDA|torch\.cuda/i.test(blob)) {
-        return "GPU/CUDA issue on the bridge machine. Check NVIDIA drivers, config.yaml device: cuda, and run doctor.py.";
+      if (code === "windows_encoding" || /charmap|codec can't encode|UnicodeEncodeError/i.test(blob)) {
+        return "Windows encoding issue. Always use Start Bridge.bat (sets UTF-8). Manual start: run $env:PYTHONUTF8=1 in PowerShell first.";
       }
-      if (/config\.yaml|config file/i.test(blob)) {
-        return "Bridge config problem. Double-click Start Bridge.bat to auto-create config.yaml, or copy config.example.yaml.";
+      if (code === "docker_not_supported" || (/docker|container/i.test(blob) && !/ModuleNotFoundError/i.test(blob))) {
+        return "Run the bridge directly on your Windows GPU PC with Start Bridge.bat — not inside Docker.";
       }
-      if (/paddle|ppocr|ocr/i.test(blob)) {
-        return "OCR engine failed. Install requirements-gpu.txt on the bridge machine and verify doctor.py shows OCR ready.";
+      if (code === "cudnn_unavailable" || /cudnn|CUDNN/i.test(blob)) {
+        return "cuDNN is missing or wrong for your GPU build. Update NVIDIA drivers, run .\\setup_rtx.ps1, then python doctor.py on the bridge PC.";
       }
-      if (/sam3|checkpoint/i.test(blob)) {
-        return "SAM model issue. Set the local checkpoint path in config.yaml on the bridge machine.";
+      if (code === "cuda_unavailable" || /cuda|CUDA|torch\.cuda|out of memory/i.test(blob)) {
+        return "GPU/CUDA issue on the bridge PC. Check drivers, set device: cuda in config.yaml, run doctor.py. CPU fallback: device: cpu.";
       }
-      if (/ECONNREFUSED|Failed to fetch|NetworkError|health check/i.test(blob)) {
-        return "Can't reach the bridge. Double-click Start Bridge.bat on the processing PC, then confirm http://localhost:8790/health opens.";
+      if (code === "ocr_failed" || (/paddle|ppocr|paddleocr|tesseract|surya|no configured OCR backend/i.test(blob) && !/sam3/i.test(blob))) {
+        if (/tesseract/i.test(blob)) {
+          return "Install Tesseract for Windows, add it to PATH, then restart Start Bridge.bat.";
+        }
+        return "OCR failed on the bridge PC. Run python doctor.py, fix OCR blockers, restart Start Bridge.bat. Try device: cpu if GPU OCR fails.";
       }
-      if (/409|already processing/i.test(blob)) {
-        return "Wait for the current image to finish, or restart the bridge if a job is stuck.";
+      if (code === "config_missing" || /config\.yaml|config file/i.test(blob)) {
+        return "Bridge config problem. Double-click Start Bridge.bat to create config.yaml, or copy config.example.yaml.";
+      }
+      if (code === "sam_checkpoint" || /sam3|checkpoint/i.test(blob)) {
+        return "SAM model issue. Set the local checkpoint path in config.yaml on the bridge PC.";
+      }
+      if (code === "bridge_unreachable" || /ECONNREFUSED|Failed to fetch|NetworkError|health check/i.test(blob)) {
+        return "Can't reach the bridge. Double-click Start Bridge.bat, then open http://localhost:8790/health in a browser.";
+      }
+      if (code === "job_busy" || /409|already processing/i.test(blob)) {
+        return "Wait for the current image to finish, or restart Start Bridge.bat if a job is stuck.";
       }
       return "";
     }
 
+    function summarizeAgentDebug(entries, limit) {
+      const maxLines = Math.max(1, Number(limit || 3));
+      if (!entries || !entries.length) return [];
+      return entries.slice(-maxLines).map(function (entry) {
+        const loc = entry.location || "bridge";
+        const msg = entry.message || "debug";
+        const data = entry.data || {};
+        const bits = [];
+        if (data.error) bits.push(String(data.error));
+        else if (data.error_type) bits.push(String(data.error_type));
+        else if (data.engine) bits.push(String(data.engine));
+        return loc + ": " + msg + (bits.length ? " — " + bits.join(", ") : "");
+      });
+    }
+
     function formatProcessingError(status) {
-      const parts = [];
-      if (status.error) parts.push(String(status.error));
-      if (status.failed_stage) {
-        parts.push("Failed during: " + (STAGE_LABELS[status.failed_stage] || status.failed_stage));
+      const blob = [status.error, status.error_detail, status.user_detail].filter(Boolean).join("\n");
+      const hint = status.error_hint || errorHint(blob, status.error_code);
+      const title = status.user_title || "Processing failed";
+      const detailParts = [];
+      if (status.user_detail) {
+        detailParts.push(String(status.user_detail));
+      } else if (status.error) {
+        detailParts.push(String(status.error));
       }
-      if (status.error_detail) parts.push(String(status.error_detail));
-      if (!parts.length) parts.push("The pipeline reported a failure with no detail.");
-      const body = parts.join("\n\n");
-      const hint = errorHint(body);
-      return { title: "Processing failed", detail: body, hint: hint };
+      if (status.failed_stage) {
+        detailParts.push("Step: " + (STAGE_LABELS[status.failed_stage] || status.failed_stage));
+      }
+      const debugLines = summarizeAgentDebug(status.agent_debug, 3);
+      return {
+        title: title,
+        detail: detailParts.filter(Boolean).join("\n\n") || "The pipeline reported a failure with no detail.",
+        hint: hint,
+        debugLines: debugLines,
+        errorCode: status.error_code || "",
+      };
     }
 
     function formatUploadError(error, response, payload) {
@@ -1821,6 +1879,17 @@
           hint.textContent = item.hint;
           li.appendChild(hint);
         }
+        if (item.debugLines && item.debugLines.length) {
+          const debug = document.createElement("details");
+          debug.className = "issue-debug";
+          const summary = document.createElement("summary");
+          summary.textContent = "Support details";
+          debug.appendChild(summary);
+          const pre = document.createElement("pre");
+          pre.textContent = item.debugLines.join("\n");
+          debug.appendChild(pre);
+          li.appendChild(debug);
+        }
         list.appendChild(li);
       });
       $("issuePanel").dataset.tone = isError ? "error" : "warning";
@@ -1845,7 +1914,7 @@
 
     function setBuilding(building) {
       state.building = building;
-      $("progressSection").classList.toggle("hidden", !building);
+      $("progressSection").classList.toggle("hidden", !building || state.uploading);
       // #region agent log
       agentDebugLog("ui.html:setBuilding", "import progress section", progressVisibilitySnapshot("setBuilding:" + Boolean(building)), "H7");
       // #endregion
