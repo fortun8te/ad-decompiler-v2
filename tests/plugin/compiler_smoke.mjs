@@ -380,10 +380,24 @@ const sceneV2 = {
       type: "group",
       name: "Badge",
       box: { x: 50, y: 420, w: 160, h: 60 },
+      meta: { role: "button" },
       component: {},
       children: [
         { id: "pill", type: "shape", name: "Pill", box: { x: 0, y: 0, w: 160, h: 60 }, fill: "#111111", radius: 30 },
-        { id: "label", type: "text", name: "Label", box: { x: 20, y: 14, w: 120, h: 28 }, text: "BUY NOW", style: { fontFamily: "Inter", fontSize: 18, color: "#ffffff", align: "center" } },
+        { id: "label", type: "text", name: "Label", box: { x: 20, y: 14, w: 120, h: 28 }, text: "BUY NOW", meta: { role: "cta" }, style: { fontFamily: "Inter", fontSize: 18, color: "#ffffff", align: "center" } },
+      ],
+    },
+    {
+      id: "cta-button",
+      type: "group",
+      name: "CTA button",
+      box: { x: 230, y: 420, w: 180, h: 56 },
+      meta: { role: "button" },
+      style: { radius: 14 },
+      layout: { mode: "horizontal", padding: 16, align: "center", counterAlign: "center" },
+      children: [
+        { id: "cta-bg", type: "shape", name: "CTA bg", box: { x: 0, y: 0, w: 180, h: 56 }, fill: "#3366ff" },
+        { id: "cta-label", type: "text", name: "CTA label", box: { x: 16, y: 14, w: 148, h: 28 }, text: "Shop now", meta: { role: "cta" }, style: { fontFamily: "Inter", fontSize: 18, color: "#ffffff" } },
       ],
     },
     {
@@ -575,7 +589,32 @@ assert.deepEqual(nodeForLayer(firstRoot, "headline").fontName, { family: "Inter"
 assert.equal(first.fonts.selections.find((selection) => selection.label === "Headline").rank, 2);
 assert.equal(nodeForLayer(firstRoot, "gradient-copy").fills[0].type, "GRADIENT_LINEAR");
 assert.equal(nodeForLayer(firstRoot, "gradient-copy").strokes[0].color.r > 0, true);
-assert.equal(nodeForLayer(firstRoot, "badge").type, "GROUP", "empty schema component object does not promote normal groups to frames");
+assert.equal(nodeForLayer(firstRoot, "badge").type, "FRAME", "shape+text button groups promote to autolayout frames");
+const badge = nodeForLayer(firstRoot, "badge");
+assert.equal(badge.layoutMode, "HORIZONTAL");
+assert.equal(badge.primaryAxisAlignItems, "CENTER");
+assert.equal(badge.counterAxisAlignItems, "CENTER");
+assert.equal(badge.paddingTop, 14);
+assert.equal(badge.paddingLeft, 20);
+assert.equal(badge.cornerRadius, 30);
+assert.equal(nodeForLayer(firstRoot, "pill"), null, "button background shape is hoisted onto the frame");
+const badgeLabel = nodeForLayer(firstRoot, "label");
+assert.equal(badgeLabel.layoutAlign, "CENTER");
+assert.equal(badgeLabel.layoutGrow, 0);
+assert.equal(badgeLabel.layoutSizingHorizontal, "HUG");
+assert.equal(badgeLabel.x, 0, "CTA labels in autolayout frames skip absolute x positioning");
+assert.equal(badgeLabel.y, 0, "CTA labels in autolayout frames skip absolute y positioning");
+const ctaButton = nodeForLayer(firstRoot, "cta-button");
+assert.equal(ctaButton.type, "FRAME");
+assert.equal(ctaButton.layoutMode, "HORIZONTAL");
+assert.equal(ctaButton.primaryAxisAlignItems, "CENTER");
+assert.equal(ctaButton.counterAxisAlignItems, "CENTER");
+assert.equal(ctaButton.paddingTop, 16);
+assert.equal(ctaButton.paddingLeft, 16);
+assert.equal(ctaButton.cornerRadius, 14, "corner radius can come from layer.style");
+const ctaLabel = nodeForLayer(firstRoot, "cta-label");
+assert.equal(ctaLabel.layoutAlign, "CENTER");
+assert.equal(ctaLabel.layoutGrow, 0);
 const styledCard = nodeForLayer(firstRoot, "styled-gradient-card");
 assert.equal(styledCard.fills[0].type, "GRADIENT_LINEAR");
 assert.equal(styledCard.fills[0].gradientStops[1].position, 1, "percentage gradient stop is normalized");

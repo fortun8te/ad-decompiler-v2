@@ -63,6 +63,7 @@ def _vram_cfg(cfg: Optional[dict]) -> dict:
         empty_cache = device == "cuda"
     return {
         "unload_ocr_before_sam": bool(vram.get("unload_ocr_before_sam", True)),
+        "unload_ocr_before_vlm": bool(vram.get("unload_ocr_before_vlm", vram.get("unload_ocr_before_sam", True))),
         "empty_cache_between_stages": bool(empty_cache),
     }
 
@@ -83,7 +84,9 @@ def stage_boundary(
 
     if to_stage == "sam" and opts["unload_ocr_before_sam"]:
         unload_ocr_engines()
-    if to_stage in {"reconstruct", "inpaint"}:
+    if to_stage in {"vlm-proofread", "vlm-font-judge"} and opts["unload_ocr_before_vlm"]:
+        unload_ocr_engines()
+    if to_stage in {"reconstruct", "inpaint", "vlm-segment-filter"}:
         unload_sam_backend()
 
     if opts["empty_cache_between_stages"]:

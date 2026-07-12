@@ -7,15 +7,54 @@ def test_button_becomes_native_frame_with_relative_child():
          "fill": {"kind": "flat", "color": "#111111"}, "style": {"radius": 12},
          "meta": {"role": "button"}},
         {"id": "label", "target": "text", "box": {"x": 60, "y": 44, "w": 80, "h": 24},
+         "visible_box": {"x": 62, "y": 47, "w": 76, "h": 18},
          "text": "Buy now", "meta": {"role": "cta"}},
     ]
     tree = layout.infer(candidates, {"w": 400, "h": 300}, {})
     assert len(tree) == 1
     frame = tree[0]
     assert frame["target"] == "group"
+    assert frame["meta"]["role"] == "button"
+    assert frame["meta"]["cornerRadius"] == 12
     assert frame["layout"]["mode"] == "HORIZONTAL"
-    assert frame["children"][0]["box"]["x"] == 40
-    assert frame["children"][0]["box"]["y"] == 14
+    assert frame["layout"]["padding"] == {"left": 42, "right": 42, "top": 17, "bottom": 17}
+    assert frame["layout"]["primaryAxisAlignItems"] == "CENTER"
+    assert frame["layout"]["counterAxisAlignItems"] == "CENTER"
+    assert frame["layout"]["itemSpacing"] == 0
+    assert frame["children"][0]["id"] == "label"
+    assert frame["children"][0]["box"]["x"] == 42
+    assert frame["children"][0]["box"]["y"] == 17
+    assert frame["children"][0]["layout"]["layoutAlign"] == "CENTER"
+
+
+def test_inferred_cta_shell_becomes_button_frame():
+    candidates = [
+        {"id": "shell", "target": "shape", "box": {"x": 20, "y": 30, "w": 160, "h": 52},
+         "fill": {"kind": "flat", "color": "#111111"}, "style": {"radius": 24}},
+        {"id": "label", "target": "text", "box": {"x": 60, "y": 44, "w": 80, "h": 24},
+         "text": "Buy now", "meta": {"role": "cta"}},
+    ]
+    tree = layout.infer(candidates, {"w": 400, "h": 300}, {})
+    frame = tree[0]
+    assert frame["meta"]["role"] == "button"
+    assert frame["meta"]["cornerRadius"] == 24
+    assert frame["layout"]["mode"] == "HORIZONTAL"
+    assert frame["layout"]["counterAxisAlignItems"] == "CENTER"
+    assert frame["children"][0]["id"] == "label"
+
+
+def test_vertical_pill_button_uses_vertical_centered_layout():
+    candidates = [
+        {"id": "pill", "target": "shape", "box": {"x": 40, "y": 20, "w": 48, "h": 120},
+         "fill": {"kind": "flat", "color": "#222222"}, "style": {"radius": 24},
+         "meta": {"role": "button"}},
+        {"id": "label", "target": "text", "box": {"x": 44, "y": 68, "w": 40, "h": 24},
+         "text": "Go", "meta": {"role": "cta"}},
+    ]
+    tree = layout.infer(candidates, {"w": 400, "h": 300}, {})
+    frame = tree[0]
+    assert frame["layout"]["mode"] == "VERTICAL"
+    assert frame["layout"]["primaryAxisAlignItems"] == "CENTER"
 
 
 def test_overlapping_artistic_children_do_not_force_auto_layout():

@@ -70,29 +70,102 @@ def _consistent(values, max_cv=0.28):
     return math.sqrt(variance) / mean <= max_cv
 
 
+def _paint_box(node):
+    """Prefer ink/painted bounds over loose OCR boxes for padding + centering."""
+    return (node.get("visible_box") or node.get("ink_box") or node.get("box") or {})
+
+
+def _is_centered(child_box, parent_box, tol_x=None, tol_y=None):
+    pb = parent_box or {}
+    cb = child_box or {}
+    tol_x = tol_x if tol_x is not None else max(3.0, pb.get("w", 0) * 0.04)
+    tol_y = tol_y if tol_y is not None else max(3.0, pb.get("h", 0) * 0.08)
+    cx = cb.get("x", 0) + cb.get("w", 0) / 2
+    cy = cb.get("y", 0) + cb.get("h", 0) / 2
+    pcx = pb.get("x", 0) + pb.get("w", 0) / 2
+    pcy = pb.get("y", 0) + pb.get("h", 0) / 2
+    return abs(cx - pcx) <= tol_x and abs(cy - pcy) <= tol_y
+
+
+_BUTTON_TEXT_ROLES = {"cta", "button", "offer", "price"}
+_BUTTON_CONTAINER_ROLES = {"button", "badge", "chip", "card"}
+
+
+def _is_button_pattern(container, children):
+    """Shape/card shell with a single centered CTA-style label from text_analysis."""
+    if len(children) != 1:
+        return False
+    child = children[0]
+    if child.get("target") != "text":
+        return False
+    child_role = (child.get("meta") or {}).get("role", "text")
+    host_role = (container.get("meta") or {}).get("role")
+    if child_role not in _BUTTON_TEXT_ROLES and host_role not in _BUTTON_CONTAINER_ROLES:
+        return False
+    if host_role == "card" and child_role not in _BUTTON_TEXT_ROLES:
+        return False
+    if not _is_centered(_paint_box(child), container.get("box") or {}):
+        return False
+    if host_role in _BUTTON_CONTAINER_ROLES or child_role in _BUTTON_TEXT_ROLES:
+        return _has_surface(container) or host_role in {"button", "badge", "chip"}
+    return False
+
+
+def _layout_padding(container_box, children):
+    pb = container_box or {}
+    boxes = [_paint_box(child) for child in children]
+    return {
+        "left": max(0.0, min(b.get("x", 0) for b in boxes) - pb.get("x", 0)),
+        "right": max(0.0, pb.get("x", 0) + pb.get("w", 0) - max(b.get("x", 0) + b.get("w", 0) for b in boxes)),
+        "top": max(0.0, min(b.get("y", 0) for b in boxes) - pb.get("y", 0)),
+        "bottom": max(0.0, pb.get("y", 0) + pb.get("h", 0) - max(b.get("y", 0) + b.get("h", 0) for b in boxes)),
+    }
+
+
+def _emit_figma_layout_aliases(layout):
+    if layout.get("mode") not in ("HORIZONTAL", "VERTICAL"):
+        return layout
+    layout.setdefault("itemSpacing", layout.get("gap", 0))
+    if layout.get("align") is not None:
+        layout.setdefault("primaryAxisAlignItems", layout["align"])
+    if layout.get("counterAlign") is not None:
+        layout.setdefault("counterAxisAlignItems", layout["counterAlign"])
+    return layout
+
+
+def _passthrough_corner_radius(node):
+    radius = node.get("radius")
+    if radius is None:
+        radius = (node.get("style") or {}).get("radius")
+    if radius is None:
+        return
+    node.setdefault("meta", {})["cornerRadius"] = radius
+    if node.get("radius") is None and isinstance(radius, (int, float)):
+        node["radius"] = radius
+
+
 def infer_auto_layout(container, children):
     """Return Figma layout intent or NONE when geometry should remain absolute."""
     pb = container["box"]
     if not children:
         return {"mode": "NONE", "confidence": 0.0}
     boxes = [c["box"] for c in children]
-    padding = {
-        "left": max(0.0, min(b["x"] for b in boxes) - pb["x"]),
-        "right": max(0.0, pb["x"] + pb["w"] - max(b["x"] + b["w"] for b in boxes)),
-        "top": max(0.0, min(b["y"] for b in boxes) - pb["y"]),
-        "bottom": max(0.0, pb["y"] + pb["h"] - max(b["y"] + b["h"] for b in boxes)),
-    }
+    padding = _layout_padding(pb, children)
     if len(children) == 1:
-        child = boxes[0]
-        centered_x = abs((child["x"] + child["w"] / 2) - (pb["x"] + pb["w"] / 2)) <= max(3, pb["w"] * .04)
-        centered_y = abs((child["y"] + child["h"] / 2) - (pb["y"] + pb["h"] / 2)) <= max(3, pb["h"] * .08)
+        paint = _paint_box(children[0])
         role = (container.get("meta") or {}).get("role")
-        if centered_x and centered_y and (role in ("button", "badge", "chip") or container.get("target") == "shape"):
-            return {
-                "mode": "HORIZONTAL", "confidence": 0.92, "gap": 0,
+        is_button = _is_button_pattern(container, children)
+        if is_button or (
+            _is_centered(paint, pb)
+            and role in ("button", "badge", "chip")
+        ):
+            mode = "VERTICAL" if pb.get("h", 0) > pb.get("w", 0) * 1.35 else "HORIZONTAL"
+            return _emit_figma_layout_aliases({
+                "mode": mode, "confidence": 0.92, "gap": 0, "itemSpacing": 0,
                 "padding": padding, "align": "CENTER", "counterAlign": "CENTER",
+                "primaryAxisAlignItems": "CENTER", "counterAxisAlignItems": "CENTER",
                 "primarySizing": "FIXED", "counterSizing": "FIXED",
-            }
+            })
         return {"mode": "NONE", "confidence": 0.3}
 
     if any(_overlap(a, b) > 0.06 for i, a in enumerate(boxes) for b in boxes[i + 1:]):
@@ -109,23 +182,23 @@ def infer_auto_layout(container, children):
         gaps = [ordered[i + 1]["x"] - (ordered[i]["x"] + ordered[i]["w"])
                 for i in range(len(ordered) - 1)]
         if _consistent(gaps):
-            return {
+            return _emit_figma_layout_aliases({
                 "mode": "HORIZONTAL", "confidence": round(0.95 - min(.2, row_spread * .2), 3),
                 "gap": round(median(gaps), 2) if gaps else 0, "padding": padding,
                 "align": "MIN", "counterAlign": "CENTER",
                 "primarySizing": "FIXED", "counterSizing": "FIXED",
-            }
+            })
     if col_spread <= 0.35:
         ordered = sorted(boxes, key=lambda b: b["y"])
         gaps = [ordered[i + 1]["y"] - (ordered[i]["y"] + ordered[i]["h"])
                 for i in range(len(ordered) - 1)]
         if _consistent(gaps):
-            return {
+            return _emit_figma_layout_aliases({
                 "mode": "VERTICAL", "confidence": round(0.95 - min(.2, col_spread * .2), 3),
                 "gap": round(median(gaps), 2) if gaps else 0, "padding": padding,
                 "align": "MIN", "counterAlign": "MIN",
                 "primarySizing": "FIXED", "counterSizing": "FIXED",
-            }
+            })
     return {"mode": "NONE", "confidence": 0.25}
 
 
@@ -284,6 +357,19 @@ def _wrap_repeated_card_grids(roots):
     return out
 
 
+def _order_button_children(children):
+    """Keep editable labels above painted shells in the frame tree."""
+    def _rank(child):
+        target = child.get("target")
+        role = (child.get("meta") or {}).get("role", "")
+        if target == "text" or role in _BUTTON_TEXT_ROLES:
+            return 1
+        if target in ("shape", "image", "icon"):
+            return 0
+        return 0
+    return sorted(children, key=lambda child: (_rank(child), float(child.get("z", 0)), child.get("id", "")))
+
+
 def _finalize_layout(nodes):
     for node in nodes:
         children = node.get("children") or []
@@ -291,8 +377,15 @@ def _finalize_layout(nodes):
             _finalize_layout(children)
         _normalize_group_surface(node)
         _hoist_background_surface(node)
+        _passthrough_corner_radius(node)
         layout = node.get("layout") or {}
         if layout.get("mode") in ("HORIZONTAL", "VERTICAL"):
+            role = (node.get("meta") or {}).get("role")
+            if role == "button" or _is_button_pattern(node, children):
+                ordered = _order_button_children(children)
+                if ordered != children:
+                    node["children"] = ordered
+                    children = ordered
             _annotate_stack_children(node, children)
 
 
@@ -318,13 +411,14 @@ def _component_signature(node):
 
 
 def _relativize(node, parent_abs=None):
-    absolute = dict(node.get("box") or {})
-    node.setdefault("meta", {})["absolute_box"] = absolute
+    logical = dict(node.get("box") or {})
+    painted = _paint_box(node)
+    node.setdefault("meta", {})["absolute_box"] = logical
     if parent_abs:
         node["box"] = {
-            **absolute,
-            "x": absolute.get("x", 0) - parent_abs.get("x", 0),
-            "y": absolute.get("y", 0) - parent_abs.get("y", 0),
+            **logical,
+            "x": painted.get("x", logical.get("x", 0)) - parent_abs.get("x", 0),
+            "y": painted.get("y", logical.get("y", 0)) - parent_abs.get("y", 0),
         }
         visible = node.get("visible_box")
         if visible:
@@ -334,7 +428,7 @@ def _relativize(node, parent_abs=None):
                 "y": visible.get("y", 0) - parent_abs.get("y", 0),
             }
     for child in node.get("children") or []:
-        _relativize(child, absolute)
+        _relativize(child, logical)
 
 
 def _union(boxes):
@@ -511,9 +605,13 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
 
     for host in containers:
         direct = host.get("children") or []
+        if _is_button_pattern(host, direct):
+            host.setdefault("meta", {})["role"] = "button"
         host["layout"] = infer_auto_layout(host, direct)
         host.setdefault("meta", {})["layout_confidence"] = host["layout"].get("confidence")
         host["meta"]["role"] = host["meta"].get("role") or "container"
+        if host["meta"]["role"] == "button":
+            _passthrough_corner_radius(host)
 
     roots = [n for n in nodes if n.get("id") not in parent and n.get("id") not in dropped]
     roots = _semantic_text_stacks(roots)

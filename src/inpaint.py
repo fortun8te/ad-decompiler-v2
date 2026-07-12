@@ -123,6 +123,67 @@ def text_ink_mask(rgb, box: dict, quad: Optional[list] = None):
     return out
 
 
+def solidify_mask(mask, threshold: int = 16):
+    """Turn soft segmentation alpha into a binary removal footprint."""
+    _, np, _ = _deps()
+    return np.where(np.asarray(mask) > threshold, 255, 0).astype(np.uint8)
+
+
+def resolve_mask_dilate(candidate: dict, cfg: Optional[dict] = None) -> int:
+    """Per-target inpaint dilation radius in pixels.
+
+    ``inpaint.mask_dilate`` may be a scalar or a mapping with keys such as
+    ``default``, ``button``, ``shape``, ``text``, ``photo``, and ``image``.
+    Falls back to ``reconstruct.mask_dilate`` when unset.
+    """
+    cfg = cfg or {}
+    icfg = cfg.get("inpaint") or {}
+    rcfg = cfg.get("reconstruct") or {}
+    mcfg = icfg.get("mask_dilate")
+    legacy = int(rcfg.get("mask_dilate", 2))
+
+    target = str(candidate.get("target") or "image")
+    role = str((candidate.get("meta") or {}).get("role") or "")
+
+    if isinstance(mcfg, dict):
+        default = int(mcfg.get("default", legacy))
+        if target == "text":
+            return int(mcfg.get("text", default))
+        if target == "shape":
+            if role in ("button", "badge", "chip", "card"):
+                return int(mcfg.get("button", mcfg.get("shape", default)))
+            return int(mcfg.get("shape", default))
+        if target == "icon":
+            return int(mcfg.get("icon", default))
+        if target == "image":
+            if role in ("product", "person", "photo"):
+                return int(mcfg.get("photo", mcfg.get("image", default)))
+            return int(mcfg.get("image", default))
+        return default
+
+    base = int(mcfg) if isinstance(mcfg, (int, float)) else legacy
+    if target == "text":
+        return max(1, base - 1) if mcfg is None else base
+    if target == "shape":
+        return base + 1 if mcfg is None else base
+    if target == "image" and role in ("product", "person", "photo") and mcfg is None:
+        return max(1, base - 1)
+    return base
+
+
+def default_mask_dilate(cfg: Optional[dict] = None) -> int:
+    """Fallback dilation when an observation omits an explicit ``dilate`` value."""
+    cfg = cfg or {}
+    icfg = cfg.get("inpaint") or {}
+    mcfg = icfg.get("mask_dilate")
+    rcfg = cfg.get("reconstruct") or {}
+    if isinstance(mcfg, dict):
+        return int(mcfg.get("default", rcfg.get("mask_dilate", 2)))
+    if isinstance(mcfg, (int, float)):
+        return int(mcfg)
+    return int(rcfg.get("mask_dilate", 2))
+
+
 def build_union_mask(canvas: tuple[int, int], observations: Iterable[dict],
                      run_dir: Optional[str] = None, default_dilate: int = 2):
     """Return one uint8 union mask from canonical (already deduplicated) entities."""

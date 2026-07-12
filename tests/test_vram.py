@@ -111,6 +111,31 @@ def test_empty_cache_defaults_false_on_cpu():
     assert vram._vram_cfg({"device": "cpu"})["empty_cache_between_stages"] is False
 
 
+def test_stage_boundary_pre_vlm_segment_filter_unloads_sam(monkeypatch):
+    events = []
+    monkeypatch.setattr(vram, "unload_ocr_engines", lambda: events.append("ocr"))
+    monkeypatch.setattr(vram, "unload_sam_backend", lambda: events.append("sam"))
+    monkeypatch.setattr(vram, "optional_torch_cuda_empty_cache", lambda: events.append("cache"))
+    monkeypatch.setattr(vram, "log_vram", lambda label, log_fn=None: None)
+
+    cfg = {"device": "cuda", "runtime": {"vram": {"empty_cache_between_stages": False}}}
+    vram.stage_boundary("fusion", "vlm-segment-filter", cfg, "/tmp/run")
+
+    assert events == ["sam"]
+
+
+def test_unload_ocr_before_vlm_can_be_disabled(monkeypatch):
+    events = []
+    monkeypatch.setattr(vram, "unload_ocr_engines", lambda: events.append("ocr"))
+    monkeypatch.setattr(vram, "optional_torch_cuda_empty_cache", lambda: events.append("cache"))
+    monkeypatch.setattr(vram, "log_vram", lambda label, log_fn=None: None)
+
+    cfg = {"device": "cuda", "runtime": {"vram": {"unload_ocr_before_vlm": False}}}
+    vram.stage_boundary("ocr", "vlm-proofread", cfg, "/tmp/run")
+
+    assert "ocr" not in events
+
+
 def test_unload_ocr_before_sam_can_be_disabled(monkeypatch):
     events = []
     monkeypatch.setattr(vram, "unload_ocr_engines", lambda: events.append("ocr"))

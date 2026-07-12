@@ -132,6 +132,19 @@ def test_execute_repairs_stops_without_actionable_repairs(tmp_path):
     assert summary["iterations"] == 0
 
 
+def test_harness_layout_and_inpaint_patches():
+    inpaint = harness.config_patches_for({
+        "stage": "inpaint", "action": "rebuild-clean-plate", "params": {},
+    })
+    assert inpaint["inpaint"]["mode"] == "auto"
+
+    layout = harness.config_patches_for({
+        "stage": "layout", "action": "refit-geometry",
+        "params": {"tighten_containers": True},
+    })
+    assert layout["layout"]["min_container_frac"] == 0.001
+
+
 def test_repair_assess_pairs_with_recommended_resume(tmp_path):
     qa = {
         "text_recall": 0.6,

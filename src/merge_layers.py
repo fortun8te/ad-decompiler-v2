@@ -278,6 +278,10 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             "shape",
             "icon",
         ):
+            role = c["meta"].get("role")
+            if role in ("button", "badge", "chip"):
+                kept.append(c)
+                continue
             covered = any(
                 t.get("target") != "drop"
                 and _inside_frac(t["box"], c["box"]) >= 0.9
@@ -286,6 +290,16 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             )
             if covered:
                 continue  # the "shape" is just the text's bounding box
+            # Button shells are larger than the CTA label — keep the painted backdrop.
+            if role in ("shape", "card", "container", None) and any(
+                t.get("target") != "drop"
+                and (t.get("meta") or {}).get("role") in ("cta", "button", "offer", "price")
+                and 0.55 <= _inside_frac(t["box"], c["box"]) < 0.98
+                for t in text_cands
+            ):
+                c.setdefault("meta", {})["role"] = "button"
+                kept.append(c)
+                continue
         kept.append(c)
 
     # stable z: keep qwen-derived z, then order remaining by area (large=back)

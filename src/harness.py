@@ -83,6 +83,25 @@ def config_patches_for(repair: dict) -> dict:
 
     elif stage == "text-analysis" and action == "resolve-fonts":
         patches["text_analysis"] = {"font_matching": {"enabled": True}}
+        if params.get("enable_vlm_font_judge"):
+            patches["vlm"] = {"font_judge": {"enabled": True}}
+
+    elif stage == "inpaint" and action == "rebuild-clean-plate":
+        patches["inpaint"] = {
+            "mode": params.get("mode", "auto"),
+            "allow_fallback": bool(params.get("allow_fallback", True)),
+        }
+
+    elif stage == "layout" and action == "refit-geometry":
+        layout_patch: dict[str, Any] = {}
+        if params.get("tighten_containers"):
+            layout_patch["min_container_frac"] = 0.001
+        if "min_container_frac" in params:
+            layout_patch["min_container_frac"] = params["min_container_frac"]
+        if "max_container_frac" in params:
+            layout_patch["max_container_frac"] = params["max_container_frac"]
+        if layout_patch:
+            patches["layout"] = layout_patch
 
     elif stage == "reconstruct" and action == "inspect-worst-regions":
         regions = params.get("regions") or []

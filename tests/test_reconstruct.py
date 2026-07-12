@@ -235,3 +235,54 @@ def test_style_extraction_refuses_shadow_on_non_uniform_scene(tmp_path):
         {"inpaint": {"mode": "opencv"}},
     )
     assert not result["candidates"][0].get("effects")
+
+
+def test_button_and_text_both_removed_while_text_stays_editable(tmp_path):
+    """Button shell + label must leave a clean plate; text remains an editable layer."""
+    source = tmp_path / "cta.png"
+    image = Image.new("RGB", (200, 100), (245, 240, 230))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((40, 30, 159, 69), radius=10, fill=(32, 96, 220))
+    draw.rectangle((70, 42, 130, 58), fill=(255, 255, 255))
+    image.save(source)
+
+    masks = tmp_path / "cta_masks"
+    masks.mkdir()
+    button_mask = Image.new("L", (120, 40), 0)
+    ImageDraw.Draw(button_mask).rounded_rectangle((0, 0, 119, 39), radius=10, fill=200)
+    button_mask.save(masks / "button.png")
+
+    candidates = [
+        {
+            "id": "btn", "target": "shape", "z": 1,
+            "box": {"x": 40, "y": 30, "w": 120, "h": 40},
+            "mask": {"src": "cta_masks/button.png"},
+            "meta": {"role": "button", "source": "sam3", "confidence": .95},
+        },
+        {
+            "id": "label", "target": "text", "text": "SHOP", "z": 3,
+            "box": {"x": 70, "y": 42, "w": 60, "h": 16},
+            "visible_box": {"x": 70, "y": 42, "w": 60, "h": 16},
+            "meta": {"role": "cta", "source": "ocr", "line_ids": []},
+        },
+    ]
+    cfg = {"inpaint": {"mode": "opencv", "opencv_radius": 8,
+                       "mask_dilate": {"button": 4, "text": 2}}}
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates, str(tmp_path), cfg)
+    by_id = {item["id"]: item for item in result["candidates"]}
+
+    assert by_id["label"]["target"] == "text"
+    assert by_id["btn"]["target"] == "shape"
+
+    removal = np.asarray(Image.open(tmp_path / result["removal_mask"]).convert("L"))
+    clean = np.asarray(Image.open(tmp_path / result["background"]).convert("RGB"))
+    source_rgb = np.asarray(Image.open(source).convert("RGB"))
+
+    assert removal[50, 100] > 0  # button + label overlap in removal union
+    plate = source_rgb[5, 5]
+    button_px = source_rgb[50, 100]
+    clean_px = clean[50, 100]
+    assert np.linalg.norm(clean_px.astype(float) - plate.astype(float)) < (
+        np.linalg.norm(button_px.astype(float) - plate.astype(float)) * 0.55
+    )
+    assert np.all(clean[removal == 0] == source_rgb[removal == 0])

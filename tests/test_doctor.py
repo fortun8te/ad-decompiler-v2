@@ -148,3 +148,18 @@ def test_doctor_blocks_when_doctr_primary_but_cuda_unavailable(tmp_path, monkeyp
     }, Path(tmp_path))
 
     assert any(item["name"] == "doctr gpu" and not item["ok"] for item in report["blockers"])
+
+
+def test_doctor_warns_when_vlm_enabled_but_server_unreachable(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: True)
+    monkeypatch.setattr("doctor._torch", lambda device: {"name": "torch", "ok": True, "required": False, "detail": "cpu"})
+    monkeypatch.setattr("doctor._http", lambda url: False)
+
+    report = inspect({
+        "device": "cpu",
+        "ocr": {"primary": "doctr"},
+        "qwen": {"enabled": False},
+        "vlm": {"enabled": True, "base_url": "http://127.0.0.1:1234/v1"},
+    }, Path(tmp_path))
+
+    assert any(item["name"] == "VLM server" and not item["ok"] for item in report["warnings"])

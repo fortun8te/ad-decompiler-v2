@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.0.0","build":20,"commit":"4bc116f","dirty":true,"built_at":"2026-07-12T01:35:57Z","label":"v2.0.0+b20.4bc116f-dirty","source":"git"};
+const PLUGIN_BUILD = {"version":"2.0.0","build":21,"commit":"649d673","dirty":true,"built_at":"2026-07-12T01:42:29Z","label":"v2.0.0+b21.649d673-dirty","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,
@@ -423,8 +423,9 @@ function applyEffects(node, layer, context) {
 
 function applyRadius(node, layer, context) {
   const style = layer.style || {};
+  const meta = layer.meta || {};
   const radius = pick(layer, "radius", "corner_radius", "cornerRadius");
-  const value = radius !== undefined ? radius : pick(style, "radius", "corner_radius", "cornerRadius");
+  const value = radius !== undefined ? radius : pick(style, "radius", "corner_radius", "cornerRadius") ?? pick(meta, "radius", "corner_radius", "cornerRadius");
   if (value === undefined || value === null) return;
   if (typeof value === "number") {
     safeSet(node, "cornerRadius", Math.max(0, value), context);
@@ -825,6 +826,29 @@ async function fitTextToVisibleBox(node, layer, style, context, hasRuns) {
   }
   const overflows = node.width > target.w * 1.015 || node.height > target.h * 1.015;
   const shouldFit = explicitFit !== false && normalizedToken(explicitFit) !== "NONE" && (!hasExplicitSize || explicitFit === true || hasVisibleBox || overflows);
+  const role = layerRole(layer);
+  const buttonText = context.inAutoLayout && (isButtonLikeRole(role) || role === "LABEL");
+  if (buttonText) {
+    if (!multiline) node.textAutoResize = "WIDTH_AND_HEIGHT";
+    if (shouldFit && !hasRuns && content.length) {
+      if (hasVisibleBox) {
+        await binaryFitFontSize(node, target, multiline);
+        if (multiline && normalizedToken(pick(style, "lockLineHeight", "lock_line_height")) !== "TRUE") {
+          await binaryFitMultilineLineHeight(node, target);
+        }
+      } else {
+        const dimensions = await renderedTextDimensions(node);
+        const widthRatio = multiline ? 1 : target.w / Math.max(0.01, dimensions.width);
+        const heightRatio = target.h / Math.max(0.01, dimensions.height);
+        const ratio = clamp(Math.min(widthRatio, heightRatio), 0.35, 2.5);
+        node.fontSize = clamp(finite(node.fontSize, 12) * ratio * 0.995, 1, 1000);
+        if (multiline) node.resize(Math.max(1, target.w), Math.max(1, node.height));
+      }
+    }
+    node.x = 0;
+    node.y = 0;
+    return;
+  }
   if (shouldFit && !hasRuns && content.length) {
     if (hasVisibleBox) {
       await binaryFitFontSize(node, target, multiline);
@@ -1227,6 +1251,158 @@ function orderedContainerChildren(layer) {
   return sortLayers(children);
 }
 
+function layerRole(layer) {
+  return normalizedToken(layer.meta && pick(layer.meta, "role", "hierarchy")) || "";
+}
+
+function isButtonLikeRole(role) {
+  return ["BUTTON", "CTA", "BADGE", "CHIP"].indexOf(role) >= 0;
+}
+
+function childHasSurface(child) {
+  return fillSpecs(child).length > 0 || strokeSpecs(child).length > 0 ||
+    pick(child, "radius", "corner_radius", "cornerRadius") !== undefined ||
+    pick(child.style || {}, "radius", "corner_radius", "cornerRadius") !== undefined;
+}
+
+function boxInsideFraction(inner, outer) {
+  const x1 = Math.max(inner.x, outer.x);
+  const y1 = Math.max(inner.y, outer.y);
+  const x2 = Math.min(inner.x + inner.w, outer.x + outer.w);
+  const y2 = Math.min(inner.y + inner.h, outer.y + outer.h);
+  if (x2 <= x1 || y2 <= y1) return 0;
+  const overlap = (x2 - x1) * (y2 - y1);
+  return overlap / Math.max(0.01, inner.w * inner.h);
+}
+
+function localGroupBox(layer) {
+  const box = boxOf(layer);
+  return { x: 0, y: 0, w: box.w, h: box.h };
+}
+
+function isShapeTextGroup(layer) {
+  const children = childrenOf(layer);
+  if (children.length < 2) return false;
+  const shapes = children.filter(function (child) { return canonicalType(child) === "shape"; });
+  const texts = children.filter(function (child) { return canonicalType(child) === "text"; });
+  if (!shapes.length || !texts.length) return false;
+  const groupBox = localGroupBox(layer);
+  return shapes.some(function (shape) {
+    return childHasSurface(shape) && boxInsideFraction(boxOf(shape), groupBox) >= 0.88;
+  });
+}
+
+function hoistBackgroundShape(layer) {
+  const children = childrenOf(layer);
+  const groupBox = localGroupBox(layer);
+  let best = null;
+  let bestArea = 0;
+  children.forEach(function (child) {
+    if (canonicalType(child) !== "shape" || !childHasSurface(child)) return;
+    const childBox = boxOf(child);
+    if (boxInsideFraction(childBox, groupBox) < 0.88) return;
+    const area = childBox.w * childBox.h;
+    if (area < groupBox.w * groupBox.h * 0.72) return;
+    if (area > bestArea) {
+      bestArea = area;
+      best = child;
+    }
+  });
+  if (!best) return layer;
+  const copy = Object.assign({}, layer);
+  if (!fillSpecs(copy).length) {
+    const fills = fillSpecs(best);
+    if (fills.length === 1) copy.fill = fills[0];
+    else if (fills.length) copy.fills = fills;
+  }
+  if (pick(copy, "radius", "corner_radius", "cornerRadius") === undefined) {
+    const radius = pick(best, "radius", "corner_radius", "cornerRadius") ||
+      pick(best.style || {}, "radius", "corner_radius", "cornerRadius");
+    if (radius !== undefined) copy.radius = radius;
+  }
+  if (!strokeSpecs(copy).length && strokeSpecs(best).length) {
+    const strokes = strokeSpecs(best);
+    if (strokes.length === 1) copy.stroke = strokes[0];
+    else copy.strokes = strokes;
+  }
+  copy.children = children.filter(function (child) { return layerId(child) !== layerId(best); });
+  return copy;
+}
+
+function inferButtonLayout(layer) {
+  const children = childrenOf(layer);
+  if (!children.length) return null;
+  const parentBox = localGroupBox(layer);
+  const boxes = children.map(boxOf);
+  const padding = {
+    left: Math.max(0, Math.min.apply(null, boxes.map(function (box) { return box.x; }))),
+    right: Math.max(0, parentBox.w - Math.max.apply(null, boxes.map(function (box) { return box.x + box.w; }))),
+    top: Math.max(0, Math.min.apply(null, boxes.map(function (box) { return box.y; }))),
+    bottom: Math.max(0, parentBox.h - Math.max.apply(null, boxes.map(function (box) { return box.y + box.h; }))),
+  };
+  const centersY = boxes.map(function (box) { return box.y + box.h / 2; });
+  const centersX = boxes.map(function (box) { return box.x + box.w / 2; });
+  const rowSpread = Math.max.apply(null, centersY) - Math.min.apply(null, centersY);
+  const colSpread = Math.max.apply(null, centersX) - Math.min.apply(null, centersX);
+  const mode = children.length === 1 || rowSpread <= colSpread ? "HORIZONTAL" : "VERTICAL";
+  return {
+    mode: mode,
+    gap: 0,
+    padding: padding,
+    align: "CENTER",
+    counterAlign: "CENTER",
+  };
+}
+
+function prepareButtonFrame(layer) {
+  let prepared = isShapeTextGroup(layer) ? hoistBackgroundShape(layer) : layer;
+  const layout = prepared.layout || {};
+  const rawMode = normalizedToken(pick(layout, "mode", "direction", "layoutMode", "layout_mode"));
+  if (["HORIZONTAL", "VERTICAL", "GRID", "ROW", "COLUMN"].indexOf(rawMode) < 0) {
+    const inferred = inferButtonLayout(prepared);
+    if (inferred) prepared = Object.assign({}, prepared, { layout: Object.assign({}, layout, inferred) });
+  }
+  return Object.assign({}, prepared, { type: "frame" });
+}
+
+function groupHasSurface(layer) {
+  return fillSpecs(layer).length || strokeSpecs(layer).length ||
+    (Array.isArray(layer.effects) && layer.effects.length) ||
+    pick(layer, "radius", "corner_radius", "cornerRadius") !== undefined ||
+    pick(layer.style || {}, "radius", "corner_radius", "cornerRadius") !== undefined ||
+    pick(layer.meta || {}, "radius", "corner_radius", "cornerRadius") !== undefined;
+}
+
+function shouldPromoteGroupToFrame(layer) {
+  const layoutMode = normalizedToken(pick(layer.layout || {}, "mode", "direction", "layoutMode", "layout_mode"));
+  if (["HORIZONTAL", "VERTICAL", "GRID", "ROW", "COLUMN"].indexOf(layoutMode) >= 0) return true;
+  if (componentIntent(layer)) return true;
+  if (groupHasSurface(layer)) return true;
+  if (isButtonLikeRole(layerRole(layer))) return true;
+  if (isShapeTextGroup(layer)) return true;
+  return false;
+}
+
+function isButtonFrame(layer) {
+  if (isButtonLikeRole(layerRole(layer))) return true;
+  const layout = layer.layout || {};
+  const mode = normalizedToken(pick(layout, "mode", "direction", "layoutMode", "layout_mode"));
+  if (mode !== "HORIZONTAL" && mode !== "VERTICAL" && mode !== "ROW" && mode !== "COLUMN") return false;
+  const align = axisAlignment(pick(layout, "align", "primary_align", "primaryAlign"), "");
+  const counter = axisAlignment(pick(layout, "counter_align", "counterAlign", "counterAxisAlignItems"), align);
+  return align === "CENTER" && counter === "CENTER";
+}
+
+function applyButtonTextLayout(node, layer, context) {
+  const layout = layer.layout || {};
+  const positioning = normalizedToken(pick(layout, "positioning", "position", "layoutPositioning", "layout_positioning"));
+  if (positioning === "ABSOLUTE" || layout.absolute === true) return;
+  safeSet(node, "layoutAlign", "CENTER", context);
+  safeSet(node, "layoutGrow", 0, context);
+  safeSet(node, "layoutSizingHorizontal", "HUG", context);
+  safeSet(node, "layoutSizingVertical", "HUG", context);
+}
+
 function applyChildLayout(node, layer, context) {
   const layout = layer.layout || {};
   const positioning = normalizedToken(pick(layout, "positioning", "position", "layoutPositioning", "layout_positioning"));
@@ -1266,14 +1442,20 @@ function applyAutoLayout(node, layer, childResults, context) {
     node.paddingBottom = padding.bottom;
     node.paddingLeft = padding.left;
     node.itemSpacing = finite(pick(layout, "gap", "spacing", "itemSpacing", "item_spacing"), 0);
-    const primary = axisAlignment(pick(layout, "primary_align", "primaryAlign", "justify", "primaryAxisAlignItems", "align"), "MIN");
-    const counter = axisAlignment(pick(layout, "counter_align", "counterAlign", "align", "counterAxisAlignItems"), "MIN");
+    const buttonFrame = isButtonFrame(layer);
+    const primaryDefault = buttonFrame ? "CENTER" : "MIN";
+    const counterDefault = buttonFrame ? "CENTER" : "MIN";
+    const primary = axisAlignment(pick(layout, "primary_align", "primaryAlign", "justify", "primaryAxisAlignItems", "align"), primaryDefault);
+    const counter = axisAlignment(pick(layout, "counter_align", "counterAlign", "counterAxisAlignItems", buttonFrame ? "align" : "align"), counterDefault);
     safeSet(node, "primaryAxisAlignItems", primary, context);
     safeSet(node, "counterAxisAlignItems", counter, context);
     const wrap = normalizedToken(pick(layout, "wrap", "layoutWrap", "layout_wrap"));
     if (wrap) safeSet(node, "layoutWrap", wrap === "TRUE" || wrap === "WRAP" ? "WRAP" : "NO_WRAP", context);
     if (layout.strokes_included === true || layout.strokesIncluded === true) safeSet(node, "strokesIncludedInLayout", true, context);
-    childResults.forEach(function (entry) { applyChildLayout(entry.node, entry.layer, context); });
+    childResults.forEach(function (entry) {
+      applyChildLayout(entry.node, entry.layer, context);
+      if (buttonFrame && canonicalType(entry.layer) === "text") applyButtonTextLayout(entry.node, entry.layer, context);
+    });
     node.resize(Math.max(0.01, original.w), Math.max(0.01, original.h));
   } catch (error) {
     context.warn("Auto Layout partially applied", (layer.name || layerId(layer)) + ": " + String(error && error.message || error));
@@ -1295,10 +1477,13 @@ async function createFrameLayer(layer, parent, context) {
   applyCommon(node, layer, context);
   const intent = componentIntent(layer);
   if (intent && intent.kind === "component") context.components.set(intent.ref, node);
+  const layoutMode = normalizedToken(pick(layer.layout || {}, "mode", "direction", "layoutMode", "layout_mode"));
+  const hasAutoLayout = ["HORIZONTAL", "VERTICAL", "GRID", "ROW", "COLUMN"].indexOf(layoutMode) >= 0;
   const childContext = Object.assign({}, context, {
     sourceOrigin: childSourceOrigin(layer, context),
     localOffset: { x: 0, y: 0 },
     depth: context.depth + 1,
+    inAutoLayout: hasAutoLayout,
   });
   const childResults = [];
   const children = orderedContainerChildren(layer);
@@ -1311,11 +1496,12 @@ async function createFrameLayer(layer, parent, context) {
 }
 
 async function createGroupLayer(layer, parent, context) {
-  const layoutMode = normalizedToken(pick(layer.layout || {}, "mode", "direction", "layoutMode", "layout_mode"));
-  const hasSurface = fillSpecs(layer).length || strokeSpecs(layer).length || (Array.isArray(layer.effects) && layer.effects.length) || pick(layer, "radius", "corner_radius", "cornerRadius") !== undefined;
-  if (["HORIZONTAL", "VERTICAL", "GRID", "ROW", "COLUMN"].indexOf(layoutMode) >= 0 || componentIntent(layer) || hasSurface) {
+  if (shouldPromoteGroupToFrame(layer)) {
     context.warn("Group promoted to frame", (layer.name || layerId(layer)) + " carries layout or component intent.");
-    return createFrameLayer(Object.assign({}, layer, { type: "frame" }), parent, context);
+    const prepared = isShapeTextGroup(layer) || isButtonLikeRole(layerRole(layer))
+      ? prepareButtonFrame(layer)
+      : Object.assign({}, layer, { type: "frame" });
+    return createFrameLayer(prepared, parent, context);
   }
   const children = sortLayers(childrenOf(layer));
   if (!children.length) {

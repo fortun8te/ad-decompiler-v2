@@ -17,7 +17,7 @@ from src.console_io import configure_stdio, safe_print
 from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  element_fusion, qwen_worker, merge_layers, reconstruct, layout,
                  build_design_json, figma_import, pixel_diff, repair, render_preview,
-                 vlm_proofread, vram)
+                 vlm_proofread, vlm_font_judge, vlm_segment_filter, vram)
 from src.run_report import RunReport, qwen_degradation
 from src.schema import dump, load
 from src.harness import execute_repairs, recommended_resume
@@ -168,6 +168,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         if stage("ocr") or not exists("ocr_raw.json"):
             current_stage = "ocr"
             raw_ocr = ocr.run_ocr(norm_path, cfg, run_dir=run_dir)
+            if (cfg.get("vlm") or {}).get("enabled"):
+                vram.stage_boundary("ocr", "vlm-proofread", cfg, run_dir,
+                                    log_fn=lambda msg: _log(run_dir, msg))
             raw_ocr = vlm_proofread.proofread_lines(norm_path, raw_ocr, cfg)
             dump(raw_ocr, A("ocr_raw.json"))
             vp = raw_ocr.get("vlm_proofread")
@@ -181,8 +184,20 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         if stage("text") or not exists("ocr.json"):
             current_stage = "text"
             ocr_res = text_analysis.analyze_text(norm_path, raw_ocr, cfg)
+            font_judge = ((cfg.get("vlm") or {}).get("font_judge") or {})
+            font_matching = ((cfg.get("text_analysis") or {}).get("font_matching"))
+            fm_on = font_matching if isinstance(font_matching, bool) else bool((font_matching or {}).get("enabled"))
+            if font_judge.get("enabled") and fm_on:
+                vram.stage_boundary("text", "vlm-font-judge", cfg, run_dir,
+                                    log_fn=lambda msg: _log(run_dir, msg))
+                ocr_res = vlm_font_judge.judge_fonts(norm_path, ocr_res, cfg)
             dump(ocr_res, A("ocr.json"))
-            _log(run_dir, f"text analysis → {len(ocr_res.get('blocks', []))} blocks, {len(ocr_res.get('styles', []))} styles")
+            fj = ocr_res.get("vlm_font_judge")
+            fj_note = ""
+            if fj:
+                fj_note = f", vlm-font-judge promoted {fj.get('styles_promoted', 0)}/{fj.get('styles_checked', 0)}"
+            _log(run_dir, f"text analysis → {len(ocr_res.get('blocks', []))} blocks, "
+                 f"{len(ocr_res.get('styles', []))} styles{fj_note}")
         ocr_res = load(A("ocr.json"))
 
         # 3 deterministic residual proposals. This also writes box-local masks.
@@ -215,12 +230,19 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         report.stage("sam", str(sam.get("status") or "ok"), detail=sam.get("note"),
                      artifacts=["sam3.json", "sam3_masks"])
         runtime_violations = _model_health(raw_ocr, sam, run_dir, cfg, report)
-        if stage("elements") or not exists("fused_elements.json"):
-            els = element_fusion.fuse(sam3=sam, residual=residual, qwen=qwen,
-                                      canvas=canvas, cfg=cfg, run_dir=run_dir)
+        if stage("elements") or not exists("elements.json"):
+            current_stage = "elements"
+            fused = element_fusion.fuse(sam3=sam, residual=residual, qwen=qwen,
+                                        canvas=canvas, cfg=cfg, run_dir=run_dir)
+            dump(fused, A("fused_elements.json"))
+            seg_filter = ((cfg.get("vlm") or {}).get("segment_filter") or {})
+            if seg_filter.get("enabled"):
+                vram.stage_boundary("fusion", "vlm-segment-filter", cfg, run_dir,
+                                    log_fn=lambda msg: _log(run_dir, msg))
+            els = vlm_segment_filter.filter_elements(norm_path, fused, cfg)
             dump(els, A("elements.json"))
-            _log(run_dir, f"element fusion → {len(els)} canonical elements")
-        els = load(A("fused_elements.json")) if exists("fused_elements.json") else load(A("elements.json"))
+            _log(run_dir, f"element fusion → {len(fused)} canonical → {len(els)} after filter")
+        els = load(A("elements.json")) if exists("elements.json") else load(A("fused_elements.json"))
 
         # 6 merge/routing creates semantic candidates; reconstruction gives pixels one owner.
         if stage("merge") or not exists("merged.json"):

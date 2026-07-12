@@ -110,6 +110,17 @@ def _required_qwen(cfg: dict) -> bool:
     return bool(qwen.get("enabled", True) and qwen.get("required", False))
 
 
+def _vlm_feature_enabled(cfg: dict) -> bool:
+    vlm = cfg.get("vlm") or {}
+    if vlm.get("enabled"):
+        return True
+    if (vlm.get("segment_filter") or {}).get("enabled"):
+        return True
+    if (vlm.get("font_judge") or {}).get("enabled"):
+        return True
+    return False
+
+
 def _tesseract_binary() -> str | None:
     return shutil.which("tesseract")
 
@@ -215,6 +226,11 @@ def inspect(cfg, root: Path) -> dict:
         else:
             checks.append(_check("Qwen layered pipeline", _module("diffusers"), "git diffusers build",
                                  required=_required_qwen(cfg)))
+
+    vlm = cfg.get("vlm") or {}
+    if _vlm_feature_enabled(cfg):
+        base = str(vlm.get("base_url", "http://127.0.0.1:1234/v1")).rstrip("/")
+        checks.append(_check("VLM server", _http(f"{base}/models"), base, required=False))
 
     for binary in ("vtracer", "potrace"):
         checks.append(_check(binary, bool(shutil.which(binary)), "on PATH"))

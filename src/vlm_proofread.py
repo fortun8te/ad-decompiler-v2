@@ -16,10 +16,7 @@ found at that location; it does not invent lines.
 """
 from __future__ import annotations
 
-import base64
-import io
-import json
-import urllib.request
+from src import vlm_client
 
 _DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
 _DEFAULT_MODEL = "google/gemma-4-e4b"
@@ -39,42 +36,35 @@ _PROMPT = (
 )
 
 
-def _crop_bytes(image, box: dict, padding: int):
-    x0 = max(0, int(box["x"]) - padding)
-    y0 = max(0, int(box["y"]) - padding)
-    x1 = min(image.width, int(box["x"] + box["w"]) + padding)
-    y1 = min(image.height, int(box["y"] + box["h"]) + padding)
-    if x1 <= x0 or y1 <= y0:
-        return None
-    crop = image.crop((x0, y0, x1, y1)).convert("RGB")
-    buf = io.BytesIO()
-    crop.save(buf, format="PNG")
-    return buf.getvalue()
-
-
 def _ask_vlm(image_bytes: bytes, base_url: str, model: str, timeout_s: float, max_tokens: int):
-    b64 = base64.b64encode(image_bytes).decode()
-    payload = {
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": _PROMPT},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
-            ],
-        }],
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-    }
-    req = urllib.request.Request(
-        base_url.rstrip("/") + "/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+    return vlm_client.ask_vlm(
+        image_bytes,
+        _PROMPT,
+        base_url=base_url,
+        model=model,
+        timeout_s=timeout_s,
+        max_tokens=max_tokens,
     )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-    return content.strip()
+
+
+def _multi_pass_answer(
+    crop: bytes,
+    *,
+    base_url: str,
+    model: str,
+    timeout_s: float,
+    max_tokens: int,
+    passes: int,
+) -> tuple[str | None, str | None]:
+    answers: list[str | None] = []
+    for _ in range(max(1, passes)):
+        try:
+            answers.append(_ask_vlm(crop, base_url, model, timeout_s, max_tokens))
+        except Exception:
+            return None, "vlm_error"
+    if len(set(answers)) != 1:
+        return None, "vlm_disagreement"
+    return answers[0], None
 
 
 def _looks_plausible(original: str, candidate: str) -> bool:
@@ -89,31 +79,6 @@ def _looks_plausible(original: str, candidate: str) -> bool:
     if len(candidate) > max(40, len(original) * 3):
         return False
     return True
-
-
-def _multi_pass_answer(
-    crop: bytes,
-    *,
-    base_url: str,
-    model: str,
-    timeout_s: float,
-    max_tokens: int,
-    passes: int,
-) -> tuple[str | None, str | None]:
-    """Run the VLM up to `passes` times. Returns (accepted_answer, note).
-
-    accepted_answer is set only when every pass succeeded and all answers match.
-    note is vlm_disagreement when passes succeeded but disagreed, or vlm_error when
-    any pass raised."""
-    answers: list[str | None] = []
-    for _ in range(max(1, passes)):
-        try:
-            answers.append(_ask_vlm(crop, base_url, model, timeout_s, max_tokens))
-        except Exception:
-            return None, "vlm_error"
-    if len(set(answers)) != 1:
-        return None, "vlm_disagreement"
-    return answers[0], None
 
 
 def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
@@ -177,7 +142,7 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
             and float(line.get("conf", 0.0)) >= threshold
             and bool((line.get("meta") or {}).get("disagreement"))
         )
-        crop = _crop_bytes(image, line["box"], padding)
+        crop = vlm_client.crop_box_bytes(image, line["box"], padding)
         if crop is None:
             continue
         checked += 1

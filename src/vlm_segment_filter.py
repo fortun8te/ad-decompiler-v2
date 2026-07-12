@@ -1,0 +1,173 @@
+"""vlm_segment_filter.py — optional VLM crop review for fused SAM3 elements.
+
+After mask-aware fusion, each canonical element can be cropped from the normalized ad
+and sent to a local vision-language model for a keep/drop/review decision. Two independent
+passes must agree before a decision is applied. Disabled by default and never raises:
+LM Studio outages or parse failures leave elements unchanged.
+"""
+from __future__ import annotations
+
+import copy
+import json
+import re
+
+from src import vlm_client
+
+_DEFAULT_PADDING = 8
+_DEFAULT_PASSES = 2
+_DEFAULT_MAX_TOKENS = 120
+
+_LABELS = frozenset({
+    "product",
+    "person",
+    "text_artifact",
+    "background_bleed",
+    "icon",
+    "button",
+    "badge",
+    "junk",
+})
+_DECISIONS = frozenset({"keep", "drop", "review"})
+
+_PROMPT = (
+    "This crop shows one segmented element from a digital advertisement. "
+    "Classify whether it is a real ad element worth preserving.\n\n"
+    "Reply with ONLY valid JSON on one line, no markdown, no explanation:\n"
+    '{"decision": "keep"|"drop"|"review", "label": "<label>"}\n\n'
+    "Labels: product, person, text_artifact, background_bleed, icon, button, badge, junk\n\n"
+    "- keep: real semantic element (product, person, icon, button, badge)\n"
+    "- drop: segmentation noise (junk, background bleed, stray text artifact)\n"
+    "- review: uncertain or borderline"
+)
+
+
+def _vlm_cfg(cfg: dict) -> dict:
+    root = (cfg or {}).get("vlm") or {}
+    seg = root.get("segment_filter") or {}
+    merged = {
+        "base_url": root.get("base_url"),
+        "model": root.get("model"),
+        "timeout_s": root.get("timeout_s"),
+        "max_tokens": root.get("max_tokens"),
+    }
+    merged.update({k: v for k, v in seg.items() if k != "enabled"})
+    return merged
+
+
+def _parse_classification(raw: str) -> dict | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[^{}]+\}", text)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    decision = str(data.get("decision", "")).strip().lower()
+    label = str(data.get("label", "")).strip().lower()
+    if decision not in _DECISIONS or label not in _LABELS:
+        return None
+    return {"decision": decision, "label": label}
+
+
+def _annotate(element: dict, *, decision: str, label: str, note: str | None = None) -> dict:
+    out = copy.deepcopy(element)
+    meta = dict(out.get("meta") or {})
+    meta["vlm_segment"] = {"decision": decision, "label": label}
+    if note:
+        meta["vlm_segment"]["note"] = note
+    out["meta"] = meta
+    if decision == "review":
+        meta["vlm_uncertain"] = True
+    if decision == "drop":
+        meta["vlm_rejected"] = True
+    return out
+
+
+def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[dict]:
+    """Return fused elements after optional VLM crop filtering. Never raises."""
+    seg = ((cfg or {}).get("vlm") or {}).get("segment_filter") or {}
+    if not seg.get("enabled", False):
+        return elements
+    if not elements:
+        return elements
+
+    vcfg = _vlm_cfg(cfg)
+    base_url = str(vcfg.get("base_url") or vlm_client._DEFAULT_BASE_URL)
+    model = str(vcfg.get("model") or vlm_client._DEFAULT_MODEL)
+    timeout_s = float(vcfg.get("timeout_s") or vlm_client._DEFAULT_TIMEOUT_S)
+    max_tokens = int(vcfg.get("max_tokens") or _DEFAULT_MAX_TOKENS)
+    padding = int(vcfg.get("padding", _DEFAULT_PADDING))
+    passes = int(vcfg.get("passes", _DEFAULT_PASSES))
+    max_elements = vcfg.get("max_elements")
+    reject_mode = str(vcfg.get("reject_mode", "remove")).strip().lower()
+
+    candidates = [el for el in elements if el.get("box")]
+    if max_elements is not None:
+        candidates = candidates[: int(max_elements)]
+
+    try:
+        from PIL import Image
+
+        image = Image.open(image_path)
+    except Exception:
+        return elements
+
+    candidate_ids = {id(el) for el in candidates}
+    results: list[dict] = []
+
+    for element in elements:
+        if id(element) not in candidate_ids:
+            results.append(element)
+            continue
+
+        crop = vlm_client.crop_box_bytes(image, element["box"], padding)
+        if crop is None:
+            results.append(element)
+            continue
+
+        answer, note = vlm_client.multi_pass_answer(
+            crop,
+            _PROMPT,
+            base_url=base_url,
+            model=model,
+            timeout_s=timeout_s,
+            max_tokens=max_tokens,
+            passes=passes,
+        )
+
+        if note == "vlm_error":
+            results.append(element)
+            continue
+        if note == "vlm_disagreement":
+            results.append(_annotate(element, decision="review", label="junk", note="vlm_disagreement"))
+            continue
+
+        parsed = _parse_classification(answer or "")
+        if parsed is None:
+            results.append(element)
+            continue
+
+        decision = parsed["decision"]
+        label = parsed["label"]
+        if decision == "drop":
+            if reject_mode == "mark":
+                results.append(_annotate(element, decision=decision, label=label))
+            continue
+        if decision == "review":
+            results.append(_annotate(element, decision=decision, label=label))
+            continue
+
+        results.append(_annotate(element, decision=decision, label=label))
+
+    return results

@@ -69,3 +69,30 @@ def test_build_union_mask_excludes_is_background_flagged_entities():
     union = inpaint.build_union_mask(canvas, observations, default_dilate=0)
 
     assert not np.any(union)
+
+
+def test_resolve_mask_dilate_maps_buttons_photos_and_text():
+    cfg = {"inpaint": {"mask_dilate": {
+        "default": 2, "button": 5, "shape": 4, "text": 2, "photo": 1, "image": 2,
+    }}}
+    assert inpaint.resolve_mask_dilate({"target": "shape", "meta": {"role": "button"}}, cfg) == 5
+    assert inpaint.resolve_mask_dilate({"target": "shape", "meta": {"role": "card"}}, cfg) == 5
+    assert inpaint.resolve_mask_dilate({"target": "shape", "meta": {"role": "sticker"}}, cfg) == 4
+    assert inpaint.resolve_mask_dilate({"target": "text"}, cfg) == 2
+    assert inpaint.resolve_mask_dilate({"target": "image", "meta": {"role": "product"}}, cfg) == 1
+    assert inpaint.resolve_mask_dilate({"target": "image", "meta": {"role": "logo"}}, cfg) == 2
+
+
+def test_big_lama_compositing_only_replaces_masked_pixels(monkeypatch):
+    source = np.full((8, 8, 3), 90, dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+    hallucination = np.zeros_like(source)
+
+    monkeypatch.setattr(inpaint, "_simple_lama", lambda rgb, inner_mask: hallucination)
+
+    output, backend = inpaint.inpaint_array(source, mask, {"inpaint": {"mode": "lama"}})
+
+    assert backend == "big-lama"
+    assert np.all(output[mask == 0] == source[mask == 0])
+    assert np.all(output[mask > 0] == 0)

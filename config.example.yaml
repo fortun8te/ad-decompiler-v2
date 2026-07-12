@@ -11,6 +11,19 @@ vlm:
   model: google/gemma-4-e4b            # any vision-capable local model works
   confidence_threshold: 0.85           # only lines below this OCR confidence get checked
   passes: 2                           # both passes must agree before OCR text is replaced
+  segment_filter:                    # optional VLM crop review for fused SAM elements
+    enabled: false
+    padding: 8
+    passes: 2
+    max_elements: 24                  # cap VLM calls per run
+    reject_mode: remove               # remove | mark (mark keeps element with meta.vlm_rejected)
+  font_judge:                        # optional VLM re-rank after local font matching
+    enabled: false
+    score_threshold: 7                # 0-10; below this tries the next candidate (max 3)
+    max_candidates: 3
+    passes: 2                         # both passes must agree on winner/score
+    padding: 4
+    max_styles: 12
 
 # An RTX acceptance run must show which model actually ran. Disabled models remain valid for
 # CPU development, but enabled OCR/SAM fallbacks become QA failures instead of quiet boxes.
@@ -104,6 +117,16 @@ inpaint:
   allow_fallback: true
   opencv_radius: 5
   opencv_method: auto                  # auto picks the lower-seam Telea/NS fallback
+  # Per-target removal-mask dilation (pixels). Buttons/shapes need more bleed so anti-aliased
+  # shells and re-edits do not leave halos; photos stay tighter to protect surroundings.
+  mask_dilate:
+    default: 2
+    button: 4
+    shape: 3
+    text: 2
+    photo: 1
+    image: 2
+    icon: 2
 
 layout:
   min_container_frac: 0.002

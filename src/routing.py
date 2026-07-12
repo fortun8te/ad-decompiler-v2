@@ -114,6 +114,16 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
     # 5. Shapes / cards / buttons → primitive when fill is solid/gradient -----------
     if kind == "shape":
         c["target"] = "shape"
+        if meta.get("role") in ("button", "badge", "chip", "card"):
+            radius = c.get("radius")
+            if radius is None:
+                radius = (c.get("style") or {}).get("radius")
+            if radius is not None:
+                meta.setdefault("cornerRadius", radius)
+                if c.get("radius") is None and isinstance(radius, (int, float)):
+                    c["radius"] = radius
+            if meta.get("role") == "button":
+                meta["button_shell"] = True
         return c
 
     # 6. Fallback: unknown residual → raster crop (never a placeholder, never a trace)

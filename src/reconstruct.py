@@ -125,7 +125,10 @@ def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None):
             candidate.get("visible_box") or candidate.get("ink_box") or candidate.get("box", {}),
             candidate.get("quad") or meta.get("quad"),
         )
-    return inpaint.mask_on_canvas(_mask_path(candidate), candidate.get("box", {}), (w, h), run_dir)
+    mask = inpaint.mask_on_canvas(_mask_path(candidate), candidate.get("box", {}), (w, h), run_dir)
+    if candidate.get("target") in ("shape", "icon"):
+        mask = inpaint.solidify_mask(mask)
+    return mask
 
 
 def _crop_rgba(rgb, mask, box):
@@ -639,9 +642,11 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "box": box,
             "mask_array": masks.get(c.get("id")),
             "is_background": is_background,
-            "dilate": 1 if c.get("target") == "text" else int(rcfg.get("mask_dilate", 2)),
+            "dilate": inpaint.resolve_mask_dilate(c, cfg),
         })
-    union = inpaint.build_union_mask((w, h), removal, run_dir, default_dilate=2)
+    union = inpaint.build_union_mask(
+        (w, h), removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg),
+    )
     mask_path = os.path.join(run_dir, "removal_mask.png")
     Image.fromarray(union).save(mask_path)
     background_path = os.path.join(run_dir, "background_clean.png")
