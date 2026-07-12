@@ -82,10 +82,29 @@ def _record_history(inbox, duration_s):
 
 
 def _atomic_write(path, data: bytes):
-    fd, temp_path = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path) or ".")
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
-    os.replace(temp_path, path)
+    """Atomic replace with one retry on Windows transient file locks."""
+    for attempt in range(2):
+        fd, temp_path = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path) or ".")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(temp_path, path)
+            return
+        except PermissionError:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            if attempt == 0:
+                time.sleep(0.05)
+                continue
+            raise
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
 
 
 def _repo_root():
@@ -316,6 +335,27 @@ def make_handler(inbox, config_path=None):
                 )
             if result.get("ok"):
                 _record_history(inbox, time.time() - started)
+                staged = _read_json_file(os.path.join(inbox, "inbox.json"))
+                with jobs_lock:
+                    jobs[job_id]["staged"] = bool(staged)
+                    if staged:
+                        jobs[job_id]["doc_id"] = staged.get("doc_id")
+                        jobs[job_id]["layer_count"] = (staged.get("summary") or {}).get("layers")
+                if not staged:
+                    design_path = os.path.join(run_dir, "design.json")
+                    if os.path.exists(design_path):
+                        try:
+                            from src import figma_import
+                            figma_import.import_design(design_path, run_dir, cfg)
+                            staged = _read_json_file(os.path.join(inbox, "inbox.json"))
+                            with jobs_lock:
+                                jobs[job_id]["staged"] = bool(staged)
+                                if staged:
+                                    jobs[job_id]["doc_id"] = staged.get("doc_id")
+                                    jobs[job_id]["layer_count"] = (staged.get("summary") or {}).get("layers")
+                        except Exception as stage_error:
+                            with jobs_lock:
+                                jobs[job_id]["staging_error"] = str(stage_error)
                 _append_plugin_logs(inbox, [{
                     "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "level": "info",

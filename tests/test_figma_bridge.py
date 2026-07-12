@@ -344,6 +344,7 @@ def test_process_cancel_endpoint_marks_job_cancelled(tmp_path, monkeypatch):
         assert payload["status"] == "cancelled"
         status = json.loads(urlopen(base + "/process?job_id=" + queued["job_id"], timeout=2).read())
         assert status["status"] == "cancelled"
+        time.sleep(0.65)
     finally:
         server.shutdown()
         server.server_close()
