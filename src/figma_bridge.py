@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from src.console_io import configure_stdio, safe_print
-from src.agent_debug import log as _agent_log, tail as _agent_debug_tail
+from src.agent_debug import log as _agent_log, session_id as _debug_session_id, tail as _agent_debug_tail
 from src.error_messages import (
     STAGE_ORDER,
     classify_processing_error,
@@ -372,6 +372,9 @@ def _health_payload(inbox, base_cfg):
     manifest = _read_json_file(os.path.join(inbox, "inbox.json"))
     if manifest:
         payload["schema_version"] = manifest.get("schema_version")
+    debug_sid = _debug_session_id(cfg=base_cfg)
+    if debug_sid:
+        payload["debug_session"] = debug_sid
     try:
         # doctor._http's short timeout keeps the ComfyUI liveness probe from stalling
         # /health, so this stays cheap enough to compute per request.
@@ -435,21 +438,41 @@ def _upload_cfg(base_cfg, inbox):
     return cfg
 
 
-def _harness_summary_fields(loop_result):
-    """Normalize harness_loop output for job poll responses."""
-    loop_result = loop_result or {}
-    repair = loop_result.get("repair") or {}
-    pipeline_result = loop_result.get("pipeline_result") or {}
-    if loop_result.get("repaired"):
+def _load_harness_loop_summary(run_dir):
+    """Read harness_loop.json written by src.harness_loop."""
+    return _read_json_file(os.path.join(run_dir, "harness_loop.json"))
+
+
+def _run_one_already_ran_harness(result, run_dir):
+    """True when run_pipeline.run_one already executed the full harness loop."""
+    result = result or {}
+    if result.get("repair") is not None or result.get("harness") is not None:
+        return True
+    if result.get("harness_rounds") is not None:
+        return True
+    return os.path.exists(os.path.join(run_dir, "harness_loop.json"))
+
+
+def _harness_summary_fields(harness_summary=None, *, run_dir=None, pipeline_result=None):
+    """Normalize harness_loop.json / run_harness_after_pipeline output for poll responses."""
+    summary = harness_summary
+    if summary is None and run_dir:
+        summary = _load_harness_loop_summary(run_dir)
+    summary = summary or {}
+    pipeline_result = pipeline_result or {}
+    if "rounds_completed" in summary or "stopped" in summary:
+        qa_ok = summary.get("qa_ok")
+        if qa_ok is None:
+            qa_ok = pipeline_result.get("qa_ok")
         return {
-            "harness_rounds": repair.get("iterations", 0),
-            "harness_stopped": repair.get("stopped"),
-            "final_qa_ok": pipeline_result.get("qa_ok"),
+            "harness_rounds": summary.get("rounds_completed", 0),
+            "harness_stopped": summary.get("stopped"),
+            "final_qa_ok": qa_ok,
         }
     return {
-        "harness_rounds": 0,
-        "harness_stopped": loop_result.get("reason", "ok"),
-        "final_qa_ok": pipeline_result.get("qa_ok"),
+        "harness_rounds": summary.get("harness_rounds", 0),
+        "harness_stopped": summary.get("harness_stopped") or summary.get("reason", "ok"),
+        "final_qa_ok": summary.get("qa_ok", pipeline_result.get("qa_ok")),
     }
 
 
@@ -467,7 +490,7 @@ def _stage_job_output(inbox, run_dir, cfg):
         _agent_log(
             "figma_bridge.py:_stage_job_output", "figma_import after pipeline",
             data={"inbox": _bridge_inbox_path(inbox), "run_dir": run_dir, "design_path": design_path},
-            hypothesis_id="H1", run_dir=run_dir,
+            hypothesis_id="H1", run_dir=run_dir, cfg=cfg,
         )
         # #endregion
     except Exception as exc:
@@ -476,7 +499,7 @@ def _stage_job_output(inbox, run_dir, cfg):
         _agent_log(
             "figma_bridge.py:_stage_job_output", "figma_import failed",
             data={"error": staging_error},
-            hypothesis_id="H1", run_dir=run_dir,
+            hypothesis_id="H1", run_dir=run_dir, cfg=cfg,
         )
         # #endregion
     manifest = _read_json_file(os.path.join(inbox, "inbox.json"))
@@ -552,7 +575,7 @@ def make_handler(inbox, config_path=None):
                             "blockers": doctor.get("blockers"),
                             "ocr_fallback_ready": fallback_ready,
                         },
-                        hypothesis_id="H4", run_dir=run_dir,
+                        hypothesis_id="H4", run_dir=run_dir, cfg=base_cfg,
                     )
                     blockers = list(doctor.get("blockers") or [])
                     if ocr_blockers and fallback_ready:
@@ -569,18 +592,19 @@ def make_handler(inbox, config_path=None):
                     _agent_log(
                         "figma_bridge.py:run_job", "doctor preflight failed",
                         data={"error": str(doctor_error)},
-                        hypothesis_id="H4", run_dir=run_dir,
+                        hypothesis_id="H4", run_dir=run_dir, cfg=base_cfg,
                     )
                 # #endregion
                 import run_pipeline  # heavy: torch/paddleocr/sam3/... — only imported on first use
-                from src.harness import harness_loop, harness_should_repair, load_qa
+                from src.harness import harness_should_repair, load_qa
+                from src.harness_loop import max_harness_rounds, run_harness_after_pipeline
                 cfg = _upload_cfg(base_cfg, inbox)
                 result = run_pipeline.run_one(image_path, run_dir, cfg)
                 with jobs_lock:
                     if _job_cancelled(job_id):
                         return
                 staging = None
-                loop_result = None
+                harness_summary = None
                 if result.get("ok"):
                     staging = _stage_job_output(inbox, run_dir, cfg)
                     qa_path = os.path.join(run_dir, "qa.json")
@@ -588,7 +612,9 @@ def make_handler(inbox, config_path=None):
                     should_repair, repair_reason = harness_should_repair(
                         result, qa=qa, staging=staging,
                     )
-                    if should_repair:
+                    already_ran_harness = _run_one_already_ran_harness(result, run_dir)
+                    skip_harness = already_ran_harness and repair_reason != "staging_failed"
+                    if should_repair and not skip_harness:
                         with jobs_lock:
                             if _job_cancelled(job_id):
                                 return
@@ -605,25 +631,30 @@ def make_handler(inbox, config_path=None):
                             },
                         }], manifest)
                         try:
-                            loop_result = harness_loop(
+                            harness_summary = run_harness_after_pipeline(
+                                image_path,
                                 run_dir,
                                 cfg,
-                                pipeline_result=result,
-                                staging=staging,
+                                max_rounds=max_harness_rounds(cfg),
+                                run_one=run_pipeline.run_one,
                             )
-                            if loop_result.get("repaired"):
-                                result = loop_result["pipeline_result"]
+                            result["repair"] = harness_summary
+                            result["qa_ok"] = harness_summary.get("qa_ok")
+                            result["harness_rounds"] = harness_summary.get("rounds_completed")
+                            result["harness_stopped"] = harness_summary.get("stopped")
+                            if harness_summary.get("qa_ok") or repair_reason == "staging_failed":
                                 staging = _stage_job_output(inbox, run_dir, cfg)
-                                _agent_log(
-                                    "figma_bridge.py:run_job", "harness repair loop",
-                                    data={
-                                        "reason": loop_result.get("reason"),
-                                        "stopped": (loop_result.get("repair") or {}).get("stopped"),
-                                        "qa_ok": result.get("qa_ok"),
-                                        "staged": (staging or {}).get("staged"),
-                                    },
-                                    hypothesis_id="H5", run_dir=run_dir,
-                                )
+                            _agent_log(
+                                "figma_bridge.py:run_job", "harness repair loop",
+                                data={
+                                    "reason": repair_reason,
+                                    "stopped": harness_summary.get("stopped"),
+                                    "rounds": harness_summary.get("rounds_completed"),
+                                    "qa_ok": result.get("qa_ok"),
+                                    "staged": (staging or {}).get("staged"),
+                                },
+                                hypothesis_id="H5", run_dir=run_dir, cfg=cfg,
+                            )
                         finally:
                             with jobs_lock:
                                 jobs[job_id]["harness_running"] = False
@@ -635,15 +666,29 @@ def make_handler(inbox, config_path=None):
                             "extra": {
                                 "job_id": job_id,
                                 "run_dir": run_dir,
-                                "harness": _harness_summary_fields(loop_result),
+                                "harness": _harness_summary_fields(
+                                    harness_summary, pipeline_result=result,
+                                ),
                             },
                         }], manifest)
                     else:
-                        loop_result = {
-                            "repaired": False,
-                            "reason": repair_reason,
-                            "pipeline_result": result,
-                        }
+                        harness_summary = (
+                            result.get("repair")
+                            or result.get("harness")
+                            or _load_harness_loop_summary(run_dir)
+                        )
+                        if harness_summary is None and already_ran_harness:
+                            harness_summary = {
+                                "rounds_completed": result.get("harness_rounds", 0),
+                                "stopped": result.get("harness_stopped"),
+                                "qa_ok": result.get("qa_ok"),
+                            }
+                        if harness_summary is None:
+                            harness_summary = {
+                                "rounds_completed": 0,
+                                "stopped": repair_reason,
+                                "qa_ok": (qa or {}).get("ok"),
+                            }
                 with jobs_lock:
                     if _job_cancelled(job_id):
                         return
@@ -661,8 +706,10 @@ def make_handler(inbox, config_path=None):
                             staging_error=staging.get("staging_error"),
                             design_url=staging.get("design_url"),
                         )
-                    if loop_result is not None:
-                        jobs[job_id].update(_harness_summary_fields(loop_result))
+                    if harness_summary is not None:
+                        jobs[job_id].update(_harness_summary_fields(
+                            harness_summary, run_dir=run_dir, pipeline_result=result,
+                        ))
                 if result.get("ok"):
                     _record_history(inbox, time.time() - started, run_dir)
                     _append_plugin_logs(inbox, [{
@@ -817,16 +864,19 @@ def make_handler(inbox, config_path=None):
                     if not job:
                         return self._send(404, b'{"ok":false,"error":"unknown job_id"}', "application/json")
                     snapshot = dict(job)
+                    debug_sid = _debug_session_id(cfg=base_cfg)
+                    if debug_sid:
+                        snapshot["debug_session"] = debug_sid
                     status = snapshot.get("status")
                     if status == "running" and snapshot.get("run_dir"):
                         snapshot["stage"] = tail_running_stage(snapshot["run_dir"])
-                        snapshot["agent_debug"] = _agent_debug_tail(snapshot.get("run_dir"))
+                        snapshot["agent_debug"] = _agent_debug_tail(snapshot.get("run_dir"), cfg=base_cfg)
                     if status == "failed":
                         tb = snapshot.get("traceback") or ""
                         if tb:
                             lines = [ln for ln in str(tb).strip().splitlines() if ln.strip()]
                             snapshot["error_detail"] = "\n".join(lines[-5:])
-                        agent_debug = _agent_debug_tail(snapshot.get("run_dir"))
+                        agent_debug = _agent_debug_tail(snapshot.get("run_dir"), cfg=base_cfg)
                         snapshot["agent_debug"] = agent_debug
                         if snapshot.get("run_dir"):
                             snapshot["failed_stage"] = detect_failed_stage(

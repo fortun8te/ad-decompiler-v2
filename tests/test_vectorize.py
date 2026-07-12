@@ -1,9 +1,128 @@
 import os
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 from src import vectorize
+
+
+def test_gate_limits_role_based_defaults():
+    score, paths = vectorize._gate_limits("badge", {})
+    assert score == 0.80 and paths == 35
+    score, paths = vectorize._gate_limits("logo", {})
+    assert score == 0.82 and paths == 50
+    score, paths = vectorize._gate_limits(None, {})
+    assert score == 0.85 and paths == 40
+
+
+def test_gate_limits_respects_config_override():
+    cfg = {"vectorize": {"score_min": {"badge": 0.75}, "max_paths": {"badge": 80}}}
+    score, paths = vectorize._gate_limits("badge", cfg)
+    assert score == 0.75 and paths == 80
+
+
+def test_preprocess_upscales_tiny_icons(tmp_path):
+    tiny = tmp_path / "tiny.png"
+    Image.new("RGBA", (16, 16), (255, 0, 0, 255)).save(tiny)
+    out, cleanup = vectorize._preprocess_crop(str(tiny), {}, role="icon")
+    try:
+        with Image.open(out) as im:
+            assert min(im.size) >= 48
+    finally:
+        if cleanup:
+            os.unlink(out)
+
+
+def test_check_binaries_reports_paths(monkeypatch):
+    monkeypatch.setattr(vectorize.shutil, "which", lambda name: f"/bin/{name}")
+    status = vectorize.check_binaries({})
+    assert status["vtracer"]["ok"] is True
+    assert status["potrace"]["ok"] is True
+    assert "path" in status["vtracer"]
+
+
+def test_evaluate_trace_applies_role_gate(monkeypatch):
+    svg = '<svg><path d="M0 0 L10 0 L10 10 Z" fill="#ff0000"/></svg>'
+    monkeypatch.setattr(vectorize, "_score_render", lambda _s, _p: 0.81)
+    result, _ = vectorize._evaluate_trace(svg, "x.png", "vtracer", {}, "badge", 3)
+    assert result["ok"] is True
+    assert result["gate"]["score_min"] == 0.80
+
+
+def test_vtracer_tries_multiple_presets(tmp_path, monkeypatch):
+    src = tmp_path / "icon.png"
+    Image.new("RGBA", (32, 32), (0, 128, 255, 255)).save(src)
+    calls = []
+
+    def fake_vtracer(path, cfg, preset=None):
+        calls.append(dict(preset or {}))
+        if len(calls) < 2:
+            return None, "fail"
+        svg = '<svg><path d="M0 0 L32 0 L32 32 Z" fill="#0080ff"/></svg>'
+        return svg, None
+
+    monkeypatch.setattr(vectorize.shutil, "which", lambda _: "vtracer")
+    monkeypatch.setattr(vectorize, "_run_vtracer", fake_vtracer)
+    monkeypatch.setattr(vectorize, "_run_potrace", lambda *a, **k: (None, "skip"))
+    monkeypatch.setattr(vectorize, "_run_contour_simplify", lambda *a, **k: (None, "skip"))
+    monkeypatch.setattr(vectorize, "_score_render", lambda _s, _p: 0.95)
+
+    result = vectorize.vectorize_crop(str(src), {"vectorize": {"vtracer_presets": [
+        {"mode": "spline", "colormode": "color"},
+        {"mode": "polygon", "colormode": "binary", "filter_speckle": 2},
+    ]}}, role="icon")
+    assert result["ok"] is True
+    assert result["engine"] == "vtracer"
+    assert len(calls) == 2
+
+
+def test_potrace_threshold_chain_for_monochrome(tmp_path, monkeypatch):
+    src = tmp_path / "mono.png"
+    Image.new("RGBA", (24, 24), (255, 255, 255, 0)).save(src)
+    thresholds = []
+
+    def fake_potrace(path, cfg, alpha_threshold=8, lum_threshold=128):
+        thresholds.append(alpha_threshold)
+        if alpha_threshold < 16:
+            return None, "empty"
+        svg = (
+            '<svg><g transform="translate(0,24) scale(0.1,-0.1)">'
+            '<path d="M0 0L100 0L100 100Z" fill="#000"/></g></svg>'
+        )
+        return svg, None
+
+    monkeypatch.setattr(vectorize.shutil, "which", lambda _: "potrace")
+    monkeypatch.setattr(vectorize, "_run_vtracer", lambda *a, **k: (None, "skip"))
+    monkeypatch.setattr(vectorize, "_run_potrace", fake_potrace)
+    monkeypatch.setattr(vectorize, "_run_contour_simplify", lambda *a, **k: (None, "skip"))
+    monkeypatch.setattr(vectorize, "_score_render", lambda _s, _p: 0.92)
+    monkeypatch.setattr(vectorize, "_count_colors", lambda _p: 1)
+
+    result = vectorize.vectorize_crop(str(src), {"vectorize": {"potrace_thresholds": [8, 16, 32]}},
+                                      role="arrow")
+    assert result["ok"] is True
+    assert result["engine"] == "potrace"
+    assert thresholds == [8, 16]
+
+
+def test_contour_fallback_builds_paths(tmp_path, monkeypatch):
+    src = tmp_path / "flat.png"
+    icon = Image.new("RGBA", (20, 20), (255, 255, 255, 0))
+    ImageDraw.Draw(icon).rectangle((4, 4, 16, 16), fill=(10, 20, 30, 255))
+    icon.save(src)
+
+    monkeypatch.setattr(vectorize, "_run_vtracer", lambda *a, **k: (None, "skip"))
+    monkeypatch.setattr(vectorize, "_run_potrace", lambda *a, **k: (None, "skip"))
+    monkeypatch.setattr(vectorize, "_score_render", lambda _s, _p: 0.88)
+    monkeypatch.setattr(vectorize, "_count_colors", lambda _p: 2)
+
+    result = vectorize.vectorize_crop(str(src), {}, role="badge")
+    if result.get("engine") == "contour":
+        assert result["ok"] is True
+        assert result["paths"]
+    else:
+        assert result.get("note")
 
 
 def test_parse_svg_paths_applies_enclosing_g_transform_to_path_coordinates():

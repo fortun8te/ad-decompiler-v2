@@ -431,7 +431,7 @@ def analyze(run_dir: str, *, write: bool = True, cfg: Optional[dict] = None) -> 
         repairs = list(qa.get("repairs") or [])
     runtime = _load_json(os.path.join(run_dir, "runtime_report.json"), {})
     log_tail = _tail_log(run_dir)
-    agent_debug = agent_debug_tail(run_dir)
+    agent_debug = agent_debug_tail(run_dir, cfg=cfg)
 
     scores = _score_categories(qa, runtime, log_tail, agent_debug)
     blockers = _collect_blockers(qa, runtime, repairs, log_tail, agent_debug)

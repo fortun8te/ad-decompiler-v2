@@ -286,3 +286,51 @@ def test_button_and_text_both_removed_while_text_stays_editable(tmp_path):
         np.linalg.norm(button_px.astype(float) - plate.astype(float)) * 0.55
     )
     assert np.all(clean[removal == 0] == source_rgb[removal == 0])
+
+
+def test_photo_mask_uses_zero_dilate_to_protect_surroundings(tmp_path):
+    source = tmp_path / "source.png"
+    _source(source, (100, 100))
+    qwen = tmp_path / "qwen_layers"
+    qwen.mkdir()
+    layer = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).ellipse((30, 30, 69, 69), fill=(200, 40, 40, 255))
+    layer.save(qwen / "product.png")
+    candidate = {
+        "id": "product", "target": "image", "src": "qwen_layers/product.png",
+        "box": {"x": 30, "y": 30, "w": 40, "h": 40},
+        "mask": {"kind": "alpha", "src": "qwen_layers/product.png"},
+        "meta": {"role": "product", "source": "qwen", "confidence": .8},
+    }
+    cfg = {"inpaint": {"mode": "opencv", "mask_dilate": {"photo": 0, "image": 2}, "mask_feather": 0}}
+    result = reconstruct.reconstruct(str(source), {"lines": []}, [candidate], str(tmp_path), cfg)
+    removal = np.asarray(Image.open(tmp_path / result["removal_mask"]).convert("L"))
+
+    assert removal[50, 50] > 0
+    assert removal[25, 50] == 0
+    assert removal[75, 50] == 0
+
+
+def test_soft_product_alpha_is_solidified_before_inpaint(tmp_path):
+    source = tmp_path / "source.png"
+    _source(source, (80, 80))
+    qwen = tmp_path / "qwen_layers"
+    qwen.mkdir()
+    layer = Image.new("RGBA", (80, 80), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    draw.ellipse((20, 20, 59, 59), fill=(180, 30, 30, 80))
+    layer.save(qwen / "soft.png")
+    candidate = {
+        "id": "product", "target": "image", "src": "qwen_layers/soft.png",
+        "box": {"x": 20, "y": 20, "w": 40, "h": 40},
+        "mask": {"kind": "alpha", "src": "qwen_layers/soft.png"},
+        "meta": {"role": "product", "source": "qwen", "confidence": .8},
+    }
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, [candidate], str(tmp_path),
+        {"inpaint": {"mode": "opencv", "mask_dilate": {"photo": 0}, "mask_feather": 0}},
+    )
+    removal = np.asarray(Image.open(tmp_path / result["removal_mask"]).convert("L"))
+
+    assert set(np.unique(removal)).issubset({0, 255})
+    assert removal[40, 40] == 255

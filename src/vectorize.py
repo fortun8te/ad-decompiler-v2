@@ -1,14 +1,15 @@
 """vectorize.py — stage: crop -> SVG paths for icons / simple graphics / masks.
 
-vectorize_crop(png_path_or_array, cfg) traces a small raster crop into absolute
+vectorize_crop(png_path_or_array, cfg, role=None) traces a small raster crop into absolute
 M/L/C/Z path d-strings with fills:
 
-  * VTracer (color, stacked mode) is primary — the `vtracer` binary via subprocess.
-  * Potrace (binary/monochrome) handles 1-color icons + masks.
+  * VTracer (multiple presets: color/cutout/binary, varying filter_speckle) is primary.
+  * Potrace (binary/monochrome, multiple alpha thresholds) handles 1-color icons + masks.
+  * OpenCV contour simplify is a last-resort fallback for flat single-color icons.
 
-Output: {'ok', 'paths':[{'d','fill'}], 'engine', 'score'}. A quality gate rasterizes
-the traced result and compares alpha to the source; ok=False when score < 0.90 or
-paths > 40 (too complex to be a clean vector — caller keeps the raster crop instead).
+Output: {'ok', 'paths':[{'d','fill'}], 'engine', 'score', 'gate'}. Role-based quality gate
+rasterizes the traced result and compares alpha to the source; ok=False when score or path
+count exceeds role-specific limits (caller keeps the raster crop instead).
 
 NEVER throws: on a missing binary / trace failure it returns ok=False with a note.
 Binaries: vtracer (`cargo install vtracer` or download release), potrace (`choco
@@ -316,36 +317,166 @@ def _parse_svg_paths(svg_text):
     return paths
 
 
+# ── config helpers ───────────────────────────────────────────────────────────────────
+_DEFAULT_VTRACER_PRESETS = [
+    {"mode": "spline", "colormode": "color", "hierarchical": "stacked", "filter_speckle": 4},
+    {"mode": "spline", "colormode": "color", "hierarchical": "cutout", "filter_speckle": 2},
+    {"mode": "polygon", "colormode": "color", "hierarchical": "stacked", "filter_speckle": 8},
+    {"mode": "spline", "colormode": "binary", "hierarchical": "stacked", "filter_speckle": 2},
+]
+
+_DEFAULT_SCORE_MIN = {
+    "default": 0.85, "icon": 0.82, "logo": 0.82, "badge": 0.80,
+    "arrow": 0.82, "mask": 0.78, "chip": 0.80, "shape": 0.88,
+}
+_DEFAULT_MAX_PATHS = {
+    "default": 40, "icon": 60, "logo": 50, "badge": 35,
+    "arrow": 30, "mask": 20, "chip": 35, "shape": 45,
+}
+
+
+def _vz_cfg(cfg):
+    return (cfg or {}).get("vectorize") or {}
+
+
+def _gate_limits(role, cfg):
+    vz = _vz_cfg(cfg)
+    role_key = str(role or "default").lower()
+    score_cfg = vz.get("score_min") or _DEFAULT_SCORE_MIN
+    paths_cfg = vz.get("max_paths") or _DEFAULT_MAX_PATHS
+    score_min = float(score_cfg.get(role_key, score_cfg.get("default", 0.85)))
+    max_paths = int(paths_cfg.get(role_key, paths_cfg.get("default", 40)))
+    return score_min, max_paths
+
+
+def _vtracer_presets(cfg):
+    presets = _vz_cfg(cfg).get("vtracer_presets")
+    return presets if presets else _DEFAULT_VTRACER_PRESETS
+
+
+def _potrace_thresholds(cfg):
+    thresholds = _vz_cfg(cfg).get("potrace_thresholds")
+    return thresholds if thresholds else [8, 16, 32, 64]
+
+
+def _resolve_binary(cfg, key, default):
+    binary = _vz_cfg(cfg).get(key, default)
+    return shutil.which(binary) or (binary if os.path.exists(binary) else None)
+
+
+def check_binaries(cfg=None):
+    """Report vtracer/potrace/cairosvg availability for doctor / health probes."""
+    cfg = cfg or {}
+    vtracer = _resolve_binary(cfg, "color_engine", "vtracer")
+    potrace = _resolve_binary(cfg, "binary_engine", "potrace")
+    try:
+        import cairosvg  # noqa: F401
+        gate = True
+    except ImportError:
+        gate = False
+    return {
+        "vtracer": {"ok": bool(vtracer), "path": vtracer or "not on PATH (cargo install vtracer)"},
+        "potrace": {"ok": bool(potrace), "path": potrace or "not on PATH (brew/choco install potrace)"},
+        "cairosvg": {"ok": gate, "path": "installed" if gate else "pip install cairosvg (quality gate)"},
+    }
+
+
+# ── preprocess ───────────────────────────────────────────────────────────────────────
+def _preprocess_crop(png_path, cfg, role=None):
+    """Return (processed_png_path, cleanup_bool). Quantize, de-fringe, upscale small icons."""
+    np = _require_np()
+    from PIL import Image
+
+    pre = _vz_cfg(cfg).get("preprocess") or {}
+    if pre.get("enabled", True) is False:
+        return png_path, False
+
+    with Image.open(png_path) as im:
+        rgba = im.convert("RGBA")
+        original_arr = np.array(rgba, dtype=np.uint8, copy=True)
+        arr = original_arr.copy()
+        h, w = arr.shape[:2]
+
+        # Upscale tiny icons so tracers have enough pixels to work with.
+        min_dim = min(w, h)
+        upscale_below = int(pre.get("upscale_below", 48))
+        upscale_target = int(pre.get("upscale_target", 96))
+        if min_dim < upscale_below and min_dim > 0:
+            scale = upscale_target / float(min_dim)
+            nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+            rgba = rgba.resize((nw, nh), Image.Resampling.NEAREST)
+            arr = np.array(rgba, dtype=np.uint8, copy=True)
+            h, w = arr.shape[:2]
+
+        # Remove anti-alias fringe: tighten alpha then restore RGB at hard edge.
+        if pre.get("denoise_fringe", True):
+            alpha = arr[:, :, 3].astype(np.float32)
+            hard = np.where(alpha >= 200, 255, np.where(alpha <= 40, 0, alpha)).astype(np.uint8)
+            arr[:, :, 3] = hard
+
+        # Quantize colors for cleaner multi-color traces (skip for near-monochrome).
+        if pre.get("quantize_colors", True):
+            opaque = arr[:, :, 3] > 8
+            if opaque.any():
+                rgb = arr[:, :, :3].reshape(-1, 3)
+                mask = opaque.reshape(-1)
+                pixels = rgb[mask]
+                n_unique = len(np.unique((pixels // 16) * 16, axis=0))
+                max_colors = int(pre.get("max_colors", 16))
+                role_key = str(role or "").lower()
+                if role_key in ("icon", "badge", "logo", "arrow", "chip"):
+                    max_colors = min(max_colors, 12)
+                if n_unique > 2 and n_unique <= max_colors * 4:
+                    step = max(8, 256 // max_colors)
+                    quant = (arr[:, :, :3].astype(np.uint16) // step) * step
+                    arr[:, :, :3] = quant.astype(np.uint8)
+
+        if np.array_equal(arr, original_arr):
+            return png_path, False
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        Image.fromarray(arr, mode="RGBA").save(tmp.name)
+        return tmp.name, True
+
+
 # ── engines ──────────────────────────────────────────────────────────────────────────
-def _run_vtracer(png_path, cfg):
-    binary = (cfg.get("vectorize") or {}).get("color_engine", "vtracer")
-    exe = shutil.which(binary) or (binary if os.path.exists(binary) else None)
+def _run_vtracer(png_path, cfg, preset=None):
+    exe = _resolve_binary(cfg, "color_engine", "vtracer")
     if not exe:
         return None, "vtracer binary not found (cargo install vtracer)"
+    preset = preset or {}
     out_svg = tempfile.NamedTemporaryFile(suffix=".svg", delete=False).name
     cmd = [
         exe, "--input", png_path, "--output", out_svg,
-        "--mode", "spline", "--colormode", "color", "--hierarchical", "stacked",
+        "--mode", str(preset.get("mode", "spline")),
+        "--colormode", str(preset.get("colormode", "color")),
+        "--hierarchical", str(preset.get("hierarchical", "stacked")),
     ]
+    if "filter_speckle" in preset:
+        cmd.extend(["--filter_speckle", str(preset["filter_speckle"])])
+    if "color_precision" in preset:
+        cmd.extend(["--color_precision", str(preset["color_precision"])])
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=120)
     except Exception as e:
+        try:
+            os.unlink(out_svg)
+        except OSError:
+            pass
         return None, f"vtracer failed: {e}"
     try:
         with open(out_svg, encoding="utf-8") as f:
-            return f.read(), None
+            text = f.read()
+        os.unlink(out_svg)
+        return text, None
     except Exception as e:
         return None, f"vtracer output unreadable: {e}"
 
 
-def _run_potrace(png_path, cfg):
-    binary = (cfg.get("vectorize") or {}).get("binary_engine", "potrace")
-    exe = shutil.which(binary) or (binary if os.path.exists(binary) else None)
+def _run_potrace(png_path, cfg, alpha_threshold=8, lum_threshold=128):
+    exe = _resolve_binary(cfg, "binary_engine", "potrace")
     if not exe:
         return None, "potrace binary not found (choco/brew install potrace)"
-    # Potrace needs a bitmap (PBM/PGM).  For a transparent icon, alpha is the silhouette:
-    # converting RGBA directly to L makes transparent white pixels become foreground and traces
-    # the entire crop.  Keep the old luminance route only for genuinely opaque source images.
     pbm = None
     out_svg = None
     try:
@@ -358,10 +489,13 @@ def _run_potrace(png_path, cfg):
                 )
                 if has_alpha:
                     alpha = np.asarray(image.convert("RGBA"), dtype=np.uint8)[:, :, 3]
-                    # PBM convention: black (0) is foreground, white (255) background.
-                    bitmap = Image.fromarray(np.where(alpha > 8, 0, 255).astype(np.uint8))
+                    bitmap = Image.fromarray(
+                        np.where(alpha > alpha_threshold, 0, 255).astype(np.uint8)
+                    )
                 else:
-                    bitmap = image.convert("L").point(lambda p: 255 if p > 128 else 0)
+                    bitmap = image.convert("L").point(
+                        lambda p, t=lum_threshold: 255 if p > t else 0
+                    )
             fd, pbm = tempfile.mkstemp(suffix=".pbm")
             os.close(fd)
             bitmap.convert("1").save(pbm)
@@ -378,14 +512,67 @@ def _run_potrace(png_path, cfg):
         except Exception as e:
             return None, f"potrace failed: {e}"
     finally:
-        # One finally around both stages guarantees the .pbm is removed even when the
-        # bitmap save (first stage) throws after mkstemp already created the file on disk.
         for path in (pbm, out_svg):
             if path:
                 try:
                     os.unlink(path)
                 except OSError:
                     pass
+
+
+def _contour_paths_to_svg(paths, w, h):
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+        f'viewBox="0 0 {w} {h}">'
+    ]
+    for item in paths:
+        lines.append(f'<path d="{item["d"]}" fill="{item["fill"]}"/>')
+    lines.append("</svg>")
+    return "".join(lines)
+
+
+def _run_contour_simplify(png_path, cfg):
+    """OpenCV contour + approxPolyDP fallback for flat single-color icons."""
+    if not _vz_cfg(cfg).get("contour_fallback", True):
+        return None, "contour fallback disabled"
+    np = _require_np()
+    try:
+        import cv2
+    except ImportError:
+        return None, "opencv not available (pip install opencv-python-headless)"
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            rgba = np.asarray(im.convert("RGBA"), dtype=np.uint8)
+        h, w = rgba.shape[:2]
+        alpha = rgba[:, :, 3]
+        mask = (alpha > 32).astype(np.uint8) * 255
+        if not mask.any():
+            return None, "contour: empty mask"
+        fill = _opaque_fill(png_path)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, "contour: no contours"
+        epsilon_frac = float(_vz_cfg(cfg).get("contour_epsilon", 0.02))
+        paths = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 4:
+                continue
+            eps = epsilon_frac * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, eps, True)
+            if len(approx) < 3:
+                continue
+            pts = approx.reshape(-1, 2)
+            d_parts = [f"M{pts[0][0]:.1f} {pts[0][1]:.1f}"]
+            for x, y in pts[1:]:
+                d_parts.append(f"L{x:.1f} {y:.1f}")
+            d_parts.append("Z")
+            paths.append({"d": "".join(d_parts), "fill": fill})
+        if not paths:
+            return None, "contour: no simplified paths"
+        return _contour_paths_to_svg(paths, w, h), None
+    except Exception as e:
+        return None, f"contour failed: {e}"
 
 
 def _opaque_fill(png_path):
@@ -472,8 +659,31 @@ def _score_render(svg_text, png_path):
 
 
 # ── public API ───────────────────────────────────────────────────────────────────────
-def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None):
+def _evaluate_trace(svg, png_path, engine, cfg, role, n_colors, preset_note=""):
+    score_min, max_paths = _gate_limits(role, cfg)
+    paths = _parse_svg_paths(svg)
+    if not paths:
+        return None, f"{engine}: no paths parsed"
+    score = _score_render(svg, png_path)
+    note = f"paths={len(paths)} colors={n_colors}"
+    if preset_note:
+        note = f"{preset_note} {note}"
+    return {
+        "ok": score >= score_min and len(paths) <= max_paths,
+        "paths": paths,
+        "svg": svg,
+        "engine": engine,
+        "score": score,
+        "note": note,
+        "gate": {"score_min": score_min, "max_paths": max_paths},
+    }, None
+
+
+def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional[str] = None):
     cfg = cfg or {}
+    if _vz_cfg(cfg).get("force_raster_fallback"):
+        return _fail("none", "force_raster_fallback")
+
     try:
         png_path, cleanup = _to_png_path(png_path_or_array)
     except ImportError as e:
@@ -481,44 +691,85 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None):
     except Exception as e:
         return _fail("none", f"bad input: {e}")
 
+    pre_path, pre_cleanup = None, False
     try:
-        n_colors = _count_colors(png_path)
+        pre_path, pre_cleanup = _preprocess_crop(png_path, cfg, role)
+        work_path = pre_path
+        n_colors = _count_colors(work_path)
         prefer_potrace = n_colors <= 2
-        order = (["potrace", "vtracer"] if prefer_potrace else ["vtracer", "potrace"])
 
         best = None
-        for eng in order:
-            svg, err = (_run_vtracer if eng == "vtracer" else _run_potrace)(png_path, cfg)
-            if not svg:
-                note = err
-                continue
-            if eng == "potrace":
-                svg = _recolor_potrace_svg(svg, _opaque_fill(png_path))
-            paths = _parse_svg_paths(svg)
-            if not paths:
-                note = f"{eng}: no paths parsed"
-                continue
-            score = _score_render(svg, png_path)
-            result = {
-                "ok": score >= 0.90 and len(paths) <= 40,
-                "paths": paths,
-                "svg": svg,
-                "engine": eng,
-                "score": score,
-                "note": f"paths={len(paths)} colors={n_colors}",
-            }
+        note = "no engine produced output"
+
+        def consider(result):
+            nonlocal best
+            if result is None:
+                return False
             if result["ok"]:
-                return result
-            # remember the best-scoring attempt even if it fails the gate
-            if best is None or score > best["score"]:
                 best = result
-        return best or _fail(order[0], locals().get("note", "no engine produced output"))
+                return True
+            if best is None or result["score"] > best["score"]:
+                best = result
+            return False
+
+        def try_vtracer():
+            nonlocal note
+            for i, preset in enumerate(_vtracer_presets(cfg)):
+                svg, err = _run_vtracer(work_path, cfg, preset)
+                if not svg:
+                    note = err
+                    continue
+                result, _ = _evaluate_trace(
+                    svg, work_path, "vtracer", cfg, role, n_colors,
+                    preset_note=f"preset={i}",
+                )
+                if result and consider(result):
+                    return True
+            return False
+
+        def try_potrace():
+            nonlocal note
+            for thr in _potrace_thresholds(cfg):
+                svg, err = _run_potrace(work_path, cfg, alpha_threshold=thr, lum_threshold=thr)
+                if not svg:
+                    note = err
+                    continue
+                svg = _recolor_potrace_svg(svg, _opaque_fill(work_path))
+                result, _ = _evaluate_trace(
+                    svg, work_path, "potrace", cfg, role, n_colors,
+                    preset_note=f"thr={thr}",
+                )
+                if result and consider(result):
+                    return True
+            return False
+
+        if prefer_potrace:
+            if try_potrace():
+                return best
+            if try_vtracer():
+                return best
+        else:
+            if try_vtracer():
+                return best
+            if try_potrace():
+                return best
+
+        svg, err = _run_contour_simplify(work_path, cfg)
+        if svg:
+            result, _ = _evaluate_trace(svg, work_path, "contour", cfg, role, n_colors)
+            if result and consider(result):
+                return result
+        else:
+            note = err or note
+
+        return best or _fail("none", note)
     finally:
-        if cleanup:
-            try:
-                os.unlink(png_path)
-            except OSError:
-                pass
+        for path, do_cleanup in ((pre_path, pre_cleanup), (png_path, cleanup)):
+            if do_cleanup and path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":  # CPU-safe smoke: exercises parsing without a binary

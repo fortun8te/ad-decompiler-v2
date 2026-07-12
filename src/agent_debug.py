@@ -6,19 +6,34 @@ import os
 import time
 from typing import Any
 
-SESSION_ID = "0bad44"
-DEFAULT_LOG = os.environ.get(
-    "AD_AGENT_DEBUG_LOG",
-    os.path.expanduser("~/.cursor/debug-0bad44.log"),
-)
+
+def session_id(*, cfg: dict[str, Any] | None = None, run_dir: str | None = None) -> str | None:
+    env_sid = os.environ.get("AD_DEBUG_SESSION", "").strip()
+    if env_sid:
+        return env_sid
+    if cfg:
+        sid = str((cfg.get("runtime") or {}).get("debug_session") or "").strip()
+        if sid:
+            return sid
+    return None
 
 
-def _targets(run_dir: str | None) -> list[str]:
+def enabled(*, cfg: dict[str, Any] | None = None, run_dir: str | None = None) -> bool:
+    return bool(session_id(cfg=cfg, run_dir=run_dir))
+
+
+def _default_log_path(sid: str) -> str:
+    override = os.environ.get("AD_AGENT_DEBUG_LOG", "").strip()
+    if override:
+        return override
+    return os.path.expanduser(f"~/.cursor/debug-{sid}.log")
+
+
+def _targets(sid: str, run_dir: str | None) -> list[str]:
     paths: list[str] = []
     if run_dir:
-        paths.append(os.path.join(run_dir, f"debug-{SESSION_ID}.jsonl"))
-    if DEFAULT_LOG:
-        paths.append(DEFAULT_LOG)
+        paths.append(os.path.join(run_dir, f"debug-{sid}.jsonl"))
+    paths.append(_default_log_path(sid))
     return paths
 
 
@@ -29,9 +44,13 @@ def log(
     data: dict[str, Any] | None = None,
     hypothesis_id: str = "",
     run_dir: str | None = None,
+    cfg: dict[str, Any] | None = None,
 ) -> None:
+    sid = session_id(cfg=cfg, run_dir=run_dir)
+    if not sid:
+        return
     entry = {
-        "sessionId": SESSION_ID,
+        "sessionId": sid,
         "timestamp": int(time.time() * 1000),
         "location": location,
         "message": message,
@@ -39,7 +58,7 @@ def log(
         "hypothesisId": hypothesis_id,
     }
     line = json.dumps(entry, ensure_ascii=False) + "\n"
-    for path in _targets(run_dir):
+    for path in _targets(sid, run_dir):
         try:
             parent = os.path.dirname(path)
             if parent:
@@ -50,10 +69,16 @@ def log(
             pass
 
 
-def tail(run_dir: str | None, limit: int = 30) -> list[dict[str, Any]]:
-    if not run_dir:
+def tail(
+    run_dir: str | None,
+    limit: int = 30,
+    *,
+    cfg: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    sid = session_id(cfg=cfg, run_dir=run_dir)
+    if not sid or not run_dir:
         return []
-    path = os.path.join(run_dir, f"debug-{SESSION_ID}.jsonl")
+    path = os.path.join(run_dir, f"debug-{sid}.jsonl")
     try:
         with open(path, encoding="utf-8") as handle:
             lines = handle.readlines()

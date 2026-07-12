@@ -126,7 +126,7 @@ def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None):
             candidate.get("quad") or meta.get("quad"),
         )
     mask = inpaint.mask_on_canvas(_mask_path(candidate), candidate.get("box", {}), (w, h), run_dir)
-    if candidate.get("target") in ("shape", "icon"):
+    if candidate.get("target") in ("shape", "icon", "image"):
         mask = inpaint.solidify_mask(mask)
     return mask
 
@@ -611,7 +611,8 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         owned = (ownership == owner_number.get(cid, 0)).astype(np.uint8) * 255
         image = _apply_owned_alpha(image, owned, c.get("box", {}))
         if target == "icon":
-            traced = vectorize.vectorize_crop(np.asarray(image), cfg)
+            role = (c.get("meta") or {}).get("role")
+            traced = vectorize.vectorize_crop(np.asarray(image), cfg, role=role)
             c["meta"]["vectorize"] = {
                 k: traced.get(k) for k in ("ok", "engine", "score", "note")
             }
@@ -645,7 +646,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "dilate": inpaint.resolve_mask_dilate(c, cfg),
         })
     union = inpaint.build_union_mask(
-        (w, h), removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg),
+        (w, h), removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg), cfg=cfg,
     )
     mask_path = os.path.join(run_dir, "removal_mask.png")
     Image.fromarray(union).save(mask_path)

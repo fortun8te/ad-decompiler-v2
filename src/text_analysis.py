@@ -53,6 +53,12 @@ _FONT_MATCH_CACHE: "OrderedDict[tuple, list[dict]]" = OrderedDict()
 _FONT_MATCH_CACHE_LIMIT = 128
 
 _DEFAULT_FAMILIES = ["Inter", "Arial", "Helvetica", "Roboto", "DejaVu Sans"]
+_DEFAULT_LOCAL_SCORE_THRESHOLD = 0.55
+_GOOGLE_FONTS_CACHE_DIRS = [
+    "~/.cache/google-fonts",
+    "~/.local/share/fonts/google-fonts",
+    "~/.fonts/google-fonts",
+]
 _CTA_RE = re.compile(
     r"\b(shop|buy|order|get|try|learn|discover|download|book|join|start|sign up|"
     r"subscribe|claim|apply|contact|swipe|tap|click)(\s+now|\s+today)?\b",
@@ -633,7 +639,7 @@ def _estimate_tracking(text: str, painted_box: dict, font_size: float) -> float:
     return round(max(-font_size * 0.08, min(font_size * 0.20, tracking)), 3)
 
 
-def _fallback_font_candidates(weight: int, options: dict, top_k: int) -> list[dict]:
+def _fallback_font_candidates(weight: int, options: dict, top_k: int, italic: bool = False) -> list[dict]:
     families = options.get("fallback_families") or options.get("families") or _DEFAULT_FAMILIES
     if isinstance(families, str):
         families = [families]
@@ -641,7 +647,7 @@ def _fallback_font_candidates(weight: int, options: dict, top_k: int) -> list[di
     for index, family in enumerate(families):
         out.append({
             "family": str(family),
-            "style": _style_name(weight),
+            "style": _style_name(weight, italic=italic),
             "weight": int(weight),
             "score": round(max(0.25, 0.62 - index * 0.07), 3),
             "source": "fallback",
@@ -649,6 +655,76 @@ def _fallback_font_candidates(weight: int, options: dict, top_k: int) -> list[di
         if len(out) >= top_k:
             break
     return out
+
+
+def _typography_profile(geo: dict) -> dict:
+    shear = geo.get("shear_angle")
+    return {
+        "weight": int(geo.get("weight", 400)),
+        "italic": bool(shear is not None and abs(shear) >= 6.0),
+        "font_size": float(geo.get("font_size", 16.0)),
+    }
+
+
+def _meta_alignment_adjustment(meta: dict, profile: dict) -> float:
+    weight_delta = abs(int(meta.get("weight", 400)) - profile["weight"])
+    adjustment = max(0.0, 1.0 - weight_delta / 500.0) * 0.12
+    meta_italic = "italic" in str(meta.get("style") or "").lower()
+    if meta_italic == profile["italic"]:
+        adjustment += 0.08
+    else:
+        adjustment -= 0.06
+    return adjustment
+
+
+def _google_fonts_cache_dirs(options: dict) -> list[str]:
+    explicit = options.get("google_fonts_cache") or options.get("google_fonts_dir")
+    dirs = []
+    if explicit:
+        if isinstance(explicit, str):
+            explicit = [explicit]
+        dirs.extend(os.path.expanduser(path) for path in explicit)
+    for path in _GOOGLE_FONTS_CACHE_DIRS:
+        expanded = os.path.expanduser(path)
+        if expanded not in dirs:
+            dirs.append(expanded)
+    return [path for path in dirs if os.path.isdir(path)]
+
+
+def _discover_google_fonts(options: dict) -> list[dict]:
+    dirs = _google_fonts_cache_dirs(options)
+    if not dirs:
+        return []
+    cache_options = dict(options)
+    cache_options["font_dirs"] = dirs
+    cache_options["font_files"] = []
+    return _discover_fonts(cache_options)
+
+
+def _candidate_key(item: dict) -> tuple:
+    return (
+        str(item.get("family", "")).lower(),
+        str(item.get("style", "")).lower(),
+        int(item.get("weight", 400) or 400),
+        str(item.get("source", "")).lower(),
+    )
+
+
+def _merge_font_candidates(*groups: Iterable[dict], top_k: int) -> list[dict]:
+    merged = []
+    seen = set()
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, dict):
+                continue
+            key = _candidate_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(dict(item))
+            if len(merged) >= top_k:
+                return merged
+    return merged
 
 
 def _font_options(config: dict) -> dict:
@@ -862,26 +938,34 @@ def _font_similarity(source, rendered) -> float:
     return round(max(0.0, min(1.0, 1.0 - loss)), 4)
 
 
-def _match_fonts(text: str, source_mask, estimated_size: float, options: dict) -> list[dict]:
+def _match_fonts(text: str, source_mask, estimated_size: float, options: dict,
+                 profile: Optional[dict] = None, fonts: Optional[list[dict]] = None,
+                 source_label: str = "local-render") -> list[dict]:
     import numpy as np
 
     tight = _tight_mask(source_mask)
     if tight is None or not text.strip():
         return []
+    profile = profile or {"weight": 400, "italic": False, "font_size": estimated_size}
     max_fonts = max(1, min(256, int(options.get("max_fonts", 48))))
     top_k = max(1, min(12, int(options.get("top_k", 5))))
-    fonts = _discover_fonts(options)[:max_fonts]
+    if fonts is None:
+        fonts = _discover_fonts(options)[:max_fonts]
+    else:
+        fonts = fonts[:max_fonts]
     if not fonts:
         return []
 
     fingerprint_mask = _resize_mask(tight, 48, 20)
     fingerprint = hashlib.sha1((fingerprint_mask * 255).astype(np.uint8).tobytes()).hexdigest()[:16]
     cache_key = (text, fingerprint, round(float(estimated_size), 1),
-                 tuple((item["path"], item["weight"]) for item in fonts), top_k)
-    cached = _FONT_MATCH_CACHE.get(cache_key)
-    if cached is not None:
-        _FONT_MATCH_CACHE.move_to_end(cache_key)
-        return [dict(item) for item in cached]
+                 tuple((item["path"], item["weight"]) for item in fonts), top_k, source_label,
+                 profile.get("weight"), profile.get("italic"))
+    if not options.get("repair_pass") and not options.get("force_rematch"):
+        cached = _FONT_MATCH_CACHE.get(cache_key)
+        if cached is not None:
+            _FONT_MATCH_CACHE.move_to_end(cache_key)
+            return [dict(item) for item in cached]
 
     scored = []
     target_height = tight.shape[0]
@@ -892,12 +976,13 @@ def _match_fonts(text: str, source_mask, estimated_size: float, options: dict) -
         adjusted = estimated_size * target_height / max(1.0, rendered.shape[0])
         rendered = _render_font_mask(text, meta["path"], adjusted)
         score = _font_similarity(tight, rendered)
+        score = round(max(0.0, min(1.0, score + _meta_alignment_adjustment(meta, profile))), 4)
         scored.append({
             "family": meta["family"],
             "style": meta["style"],
             "weight": meta["weight"],
             "score": score,
-            "source": "local-render",
+            "source": source_label,
             "path": meta["path"],
         })
     scored.sort(key=lambda item: (-item["score"], item["family"], item["weight"]))
@@ -912,11 +997,63 @@ def _match_fonts(text: str, source_mask, estimated_size: float, options: dict) -
         if len(deduped) >= top_k:
             break
 
-    _FONT_MATCH_CACHE[cache_key] = [dict(item) for item in deduped]
-    _FONT_MATCH_CACHE.move_to_end(cache_key)
-    while len(_FONT_MATCH_CACHE) > _FONT_MATCH_CACHE_LIMIT:
-        _FONT_MATCH_CACHE.popitem(last=False)
+    if not options.get("repair_pass") and not options.get("force_rematch"):
+        _FONT_MATCH_CACHE[cache_key] = [dict(item) for item in deduped]
+        _FONT_MATCH_CACHE.move_to_end(cache_key)
+        while len(_FONT_MATCH_CACHE) > _FONT_MATCH_CACHE_LIMIT:
+            _FONT_MATCH_CACHE.popitem(last=False)
     return deduped
+
+
+def _resolve_font_candidates(text: str, source_mask, geo: dict, options: dict) -> list[dict]:
+    top_k = max(1, min(12, int(options.get("top_k", 5))))
+    profile = _typography_profile(geo)
+    estimated_size = profile["font_size"]
+    if options.get("repair_pass") or options.get("force_rematch"):
+        _FONT_MATCH_CACHE.clear()
+
+    local = _match_fonts(text, source_mask, estimated_size, options, profile=profile)
+    google = []
+    if _google_fonts_cache_dirs(options):
+        google_fonts = _discover_google_fonts(options)[:max(1, min(256, int(options.get("max_fonts", 48))))]
+        if google_fonts:
+            google = _match_fonts(
+                text, source_mask, estimated_size, options, profile=profile,
+                fonts=google_fonts, source_label="google-cache",
+            )
+    fallback_slots = max(0, top_k - len(local) - len(google))
+    fallback = _fallback_font_candidates(
+        profile["weight"], options, max(1, fallback_slots or top_k), italic=profile["italic"],
+    )
+    return _merge_font_candidates(local, google, fallback, top_k=top_k)
+
+
+def local_score_threshold(cfg: Optional[dict]) -> float:
+    options = _font_options(_text_cfg(cfg))
+    raw = options.get("local_score_threshold", _DEFAULT_LOCAL_SCORE_THRESHOLD)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_LOCAL_SCORE_THRESHOLD
+
+
+def needs_vlm_font_judge(ocr_result: dict, cfg: Optional[dict] = None) -> bool:
+    """True when font matching ran but the best local/google render score is weak."""
+    if not _font_options(_text_cfg(cfg)).get("enabled"):
+        return False
+    threshold = local_score_threshold(cfg)
+    for line in ocr_result.get("lines") or []:
+        style = line.get("style") or {}
+        render_candidates = [
+            item for item in (style.get("fontCandidates") or [])
+            if isinstance(item, dict) and item.get("source") in {"local-render", "google-cache"}
+        ]
+        if not render_candidates:
+            continue
+        top_score = max(float(item.get("score", 0.0) or 0.0) for item in render_candidates)
+        if top_score < threshold:
+            return True
+    return False
 
 
 def _pre_font_signals(line: dict, painted: dict, mask, config: dict) -> dict:
@@ -953,7 +1090,10 @@ def _base_style(line: dict, painted: dict, colour: str, ink_confidence: float,
     top_k = max(1, min(12, int(font_options.get("top_k", 5))))
     candidates = list(preset_candidates) if preset_candidates else []
     if not candidates:
-        candidates = _fallback_font_candidates(weight, font_options, top_k)
+        candidates = _fallback_font_candidates(
+            geo["weight"], font_options, top_k,
+            italic=bool(geo.get("shear_angle") is not None and abs(geo["shear_angle"]) >= 6.0),
+        )
     chosen = candidates[0]
     weight = int(chosen.get("weight", weight)) if chosen.get("source") == "local-render" else weight
     match_italic = "italic" in str(chosen.get("style") or "").lower()
@@ -1377,9 +1517,9 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
             rep_item = prepared[representative]
             if rep_item["ink_confidence"] < min_ink:
                 continue
-            candidates = _match_fonts(
+            candidates = _resolve_font_candidates(
                 rep_item["line"].get("text", ""), rep_item["mask"],
-                rep_item["geo"]["font_size"], font_options,
+                rep_item["geo"], font_options,
             )
             if candidates:
                 for i in idxs:
@@ -1399,8 +1539,12 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
 
         font_confidence = None
         candidates = line["style"].get("fontCandidates") or []
-        if candidates and candidates[0].get("source") == "local-render":
-            font_confidence = candidates[0].get("score")
+        render_candidates = [
+            item for item in candidates
+            if isinstance(item, dict) and item.get("source") in {"local-render", "google-cache"}
+        ]
+        if render_candidates:
+            font_confidence = max(float(item.get("score", 0.0) or 0.0) for item in render_candidates)
         fidelity_confidence = item["ink_confidence"] if font_confidence is None else min(
             item["ink_confidence"], font_confidence
         )
@@ -1455,4 +1599,4 @@ def run_text_analysis(img_path: str, ocr_result: dict, cfg: Optional[dict] = Non
     return analyze_text(img_path, ocr_result, cfg)
 
 
-__all__ = ["analyze_text", "run_text_analysis"]
+__all__ = ["analyze_text", "run_text_analysis", "needs_vlm_font_judge", "local_score_threshold"]

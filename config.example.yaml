@@ -39,6 +39,8 @@ vlm:
     passes: 2                         # both passes must agree on winner/score
     padding: 4
     max_styles: 12
+    # Also runs automatically when text_analysis.font_matching.local_score_threshold
+    # is not met and vlm.enabled is true — even if font_judge.enabled is false.
   scene_text:                      # optional VLM text-placement classifier after text_analysis
     enabled: false
     context_padding: 24            # crop padding so the model sees surrounding layout
@@ -46,6 +48,11 @@ vlm:
     max_lines: 32
   element_propose:                   # optional VLM coarse boxes before SAM box-refine
     enabled: false
+    lightweight_grid: false            # harness rerun-detection can enable a cheap grid pass
+    lightweight_grid_below_sam_count: 3  # when set, auto-enables lightweight grid if prior sam count is below
+    lightweight_grid_size: 2
+    lightweight_max_tiles: 8
+    lightweight_overlap: 0.15
     grid: 4                           # NxN overlapping tiles (and gap sampling)
     overlap: 0.25                     # tile overlap fraction
     tile_mode: both                   # grid | gaps | both (gaps = low residual coverage)
@@ -95,6 +102,9 @@ text_analysis:
     max_fonts: 64
     max_lines: 16
     top_k: 5
+    local_score_threshold: 0.55       # auto VLM font judge when top render score is below this
+    google_fonts_cache: ~/.cache/google-fonts
+    fallback_families: [Inter, Arial, Helvetica, Roboto]
     font_dirs: []                     # add brand/font-library folders here
 
 sam3:
@@ -103,6 +113,7 @@ sam3:
   # bpe_path: C:/src/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
   load_from_hf: false                 # local-only by default; no surprise downloads
   confidence: 0.45
+  box_refine_confidence: 0.32         # lower bar for geometric refine when residuals exist
   resolution: 1008
   compile: false
   # Every residual proposal is also box-refined; prompts find missed semantic elements.
@@ -110,11 +121,20 @@ sam3:
     - {prompt: person, role: person, kind: photo-fragment}
     - {prompt: product, role: product, kind: photo-fragment}
     - {prompt: product package, role: product, kind: photo-fragment}
+    - {prompt: product shot, role: product, kind: photo-fragment}
     - {prompt: logo, role: logo, kind: icon}
+    - {prompt: brand logo, role: logo, kind: icon}
     - {prompt: icon, role: icon, kind: icon}
+    - {prompt: app icon, role: icon, kind: icon}
     - {prompt: arrow, role: arrow, kind: icon}
     - {prompt: badge, role: badge, kind: icon}
+    - {prompt: price badge, role: badge, kind: icon}
+    - {prompt: sale badge, role: badge, kind: icon}
     - {prompt: button, role: button, kind: shape}
+    - {prompt: cta button, role: button, kind: shape}
+    - {prompt: call to action, role: button, kind: shape}
+    - {prompt: card, role: card, kind: shape}
+    - {prompt: offer card, role: card, kind: shape}
     - {prompt: illustration, role: illustration, kind: photo-fragment}
 
 element_fusion:
@@ -134,6 +154,39 @@ backend_url: http://127.0.0.1:8188    # ComfyUI, only used when qwen.mode=comfyu
 vectorize:
   color_engine: vtracer               # resolved from PATH or .bin/vtracer(.exe)
   binary_engine: potrace
+  contour_fallback: true               # OpenCV approxPolyDP for flat single-color icons
+  contour_epsilon: 0.02
+  preprocess:
+    enabled: true
+    upscale_below: 48                  # upscale crops whose min side is below this
+    upscale_target: 96
+    quantize_colors: true
+    max_colors: 16
+    denoise_fringe: true               # harden alpha to remove anti-alias fringe
+  score_min:                           # role-based fidelity gate (lower = fewer false rejects)
+    default: 0.85
+    icon: 0.82
+    logo: 0.82
+    badge: 0.80
+    arrow: 0.82
+    chip: 0.80
+    mask: 0.78
+    shape: 0.88
+  max_paths:                           # role-based complexity cap
+    default: 40
+    icon: 60
+    logo: 50
+    badge: 35
+    arrow: 30
+    chip: 35
+    mask: 20
+    shape: 45
+  vtracer_presets:                     # tried in order before potrace / contour fallback
+    - {mode: spline, colormode: color, hierarchical: stacked, filter_speckle: 4}
+    - {mode: spline, colormode: color, hierarchical: cutout, filter_speckle: 2}
+    - {mode: polygon, colormode: color, hierarchical: stacked, filter_speckle: 8}
+    - {mode: spline, colormode: binary, hierarchical: stacked, filter_speckle: 2}
+  potrace_thresholds: [8, 16, 32, 64]  # alpha/luminance cutoffs tried in order
 
 reconstruct:
   dedup_iou: 0.86
@@ -147,18 +200,20 @@ reconstruct:
     detect_shadows: true
 
 inpaint:
-  mode: auto                           # Big-LaMa when installed, OpenCV fallback
+  mode: auto                           # Big-LaMa when ComfyUI+package healthy, OpenCV fallback
   allow_fallback: true
   opencv_radius: 5
   opencv_method: auto                  # auto picks the lower-seam Telea/NS fallback
-  # Per-target removal-mask dilation (pixels). Buttons/shapes need more bleed so anti-aliased
-  # shells and re-edits do not leave halos; photos stay tighter to protect surroundings.
+  mask_feather: 1                      # minimal edge soften on the union mask (0 = off)
+  multipass_fraction: 0.12             # coarse→fine when removal area exceeds this fraction
+  # Per-target removal-mask dilation (pixels). Buttons need more bleed so anti-aliased
+  # shells and re-edits do not leave halos; photos stay tight to protect surroundings.
   mask_dilate:
     default: 2
     button: 4
     shape: 3
     text: 2
-    photo: 1
+    photo: 0
     image: 2
     icon: 2
 

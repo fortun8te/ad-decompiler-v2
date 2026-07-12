@@ -203,9 +203,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                                     log_fn=lambda msg: _log(run_dir, msg))
                 ocr_res = vlm_scene_text.classify_scene_text(norm_path, ocr_res, cfg)
             font_judge = ((cfg.get("vlm") or {}).get("font_judge") or {})
-            font_matching = ((cfg.get("text_analysis") or {}).get("font_matching"))
-            fm_on = font_matching if isinstance(font_matching, bool) else bool((font_matching or {}).get("enabled"))
-            if font_judge.get("enabled") and fm_on:
+            if vlm_font_judge.should_judge_fonts(ocr_res, cfg):
                 vram.stage_boundary("text", "vlm-font-judge", cfg, run_dir,
                                     log_fn=lambda msg: _log(run_dir, msg))
                 ocr_res = vlm_font_judge.judge_fonts(norm_path, ocr_res, cfg)
@@ -232,11 +230,28 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         residual = load(A("residual.json"))
 
         ep_cfg = ((cfg.get("vlm") or {}).get("element_propose") or {})
-        if ep_cfg.get("enabled") and (stage("sam") or not exists("sam3.json")):
+        sam_element_count = None
+        if exists("sam3.json"):
+            prev_sam = load(A("sam3.json")) or {}
+            sam_element_count = len(prev_sam.get("elements") or [])
+        lightweight_due_to_sam = (
+            sam_element_count is not None
+            and ep_cfg.get("lightweight_grid_below_sam_count") is not None
+            and sam_element_count < int(ep_cfg.get("lightweight_grid_below_sam_count"))
+        )
+        should_enrich = ep_cfg.get("enabled") and (
+            stage("sam")
+            or not exists("sam3.json")
+            or ep_cfg.get("lightweight_grid")
+            or lightweight_due_to_sam
+        )
+        if should_enrich:
             vram.stage_boundary("residual", "vlm-element-propose", cfg, run_dir,
                                 log_fn=lambda msg: _log(run_dir, msg))
             before = len(residual)
-            residual = vlm_element_propose.enrich_residual(norm_path, residual, cfg)
+            residual = vlm_element_propose.enrich_residual(
+                norm_path, residual, cfg, sam_element_count=sam_element_count
+            )
             added = len(residual) - before
             if added:
                 dump(residual, A("residual.json"))
@@ -292,11 +307,23 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                  f"background={reconstruction['stats']['inpaint']['backend']}")
         reconstruction = load(A("reconstruction.json"))
         inpaint_backend = str((reconstruction.get("stats") or {}).get("inpaint", {}).get("backend") or "")
+        inpaint_diag = (reconstruction.get("stats") or {}).get("inpaint", {}).get("diagnostics") or {}
+        comfy_note = ""
+        if inpaint_diag.get("comfyui_healthy") is True:
+            comfy_note = "; comfyui=ok"
+        elif inpaint_diag.get("comfyui_healthy") is False:
+            comfy_note = "; comfyui=down"
         if inpaint_backend and inpaint_backend != "big-lama":
-            report.stage("inpaint", "fallback", detail=f"backend={inpaint_backend}")
-            report.degraded("inpaint", f"Big-LaMa unavailable; used {inpaint_backend} fallback for background plate")
+            report.stage("inpaint", "fallback", detail=f"backend={inpaint_backend}{comfy_note}")
+            skip = inpaint_diag.get("auto_skip_reason")
+            reason = f"Big-LaMa unavailable; used {inpaint_backend} fallback for background plate"
+            if skip:
+                reason = f"{reason} ({skip})"
+            report.degraded("inpaint", reason)
         elif inpaint_backend:
-            report.stage("inpaint", "ok", detail=f"backend={inpaint_backend}")
+            passes = inpaint_diag.get("inpaint_passes")
+            pass_note = f"; passes={passes}" if passes else ""
+            report.stage("inpaint", "ok", detail=f"backend={inpaint_backend}{comfy_note}{pass_note}")
 
         if stage("layout") or not exists("layout.json"):
             tree = layout.infer(reconstruction.get("candidates", []), canvas, cfg)

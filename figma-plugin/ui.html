@@ -1067,7 +1067,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.0.0","build":23,"commit":"d4a0fbd","dirty":true,"built_at":"2026-07-12T01:49:09Z","label":"v2.0.0+b23.d4a0fbd-dirty","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.0.0","build":24,"commit":"80d12b5","dirty":true,"built_at":"2026-07-12T09:14:18Z","label":"v2.0.0+b24.80d12b5-dirty","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -1084,13 +1084,22 @@
       pluginBuild: PLUGIN_BUILD,
     };
 
+    let DEBUG_SESSION = null;
+
+    function applyDebugSession(source) {
+      if (!source) return;
+      const sid = source.debug_session;
+      if (sid) DEBUG_SESSION = String(sid);
+    }
+
     function agentDebugLog(location, message, data, hypothesisId) {
+      if (!DEBUG_SESSION) return;
       // #region agent log
       fetch("http://127.0.0.1:7523/ingest/27bfebeb-9c6b-44a2-b935-8f158eb825f5", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "0bad44" },
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": DEBUG_SESSION },
         body: JSON.stringify({
-          sessionId: "0bad44",
+          sessionId: DEBUG_SESSION,
           location: location,
           message: message,
           data: data || {},
@@ -1354,6 +1363,7 @@
       if (health.supports_process === false) {
         throw new Error("This bridge is too old for uploads — update ad-decompiler and restart the bridge.");
       }
+      applyDebugSession(health);
       return health;
     }
 
@@ -1768,6 +1778,7 @@
         setTimeout(function () { pollProcessJob(base, jobId, filename, startedAt); }, 2500);
         return;
       }
+      applyDebugSession(status);
       if (status.status === "cancelled") {
         state.uploading = false;
         setUploadBusy(false);

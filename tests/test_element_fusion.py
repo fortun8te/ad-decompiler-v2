@@ -222,3 +222,39 @@ def test_overlapping_but_semantically_distinct_masks_survive():
     }
     fused = element_fusion.fuse(sam3, [], [], CANVAS)
     assert {e["role"] for e in fused} == {"photo", "badge"}
+
+
+def test_residual_stream_unions_with_sam_residual_fallback(tmp_path):
+    mask = _mask(12, 12, 20, 20)
+    residual = [
+        {
+            "id": "R0",
+            "box": _box(12, 12, 20, 20),
+            "kind": "icon",
+            "_mask": mask,
+        }
+    ]
+    sam3 = {
+        "status": "fallback",
+        "elements": [
+            {
+                "id": "S0",
+                "box": _box(12, 12, 20, 20),
+                "role": "icon",
+                "kind": "icon",
+                "score": 0.35,
+                "_mask": mask,
+                "source": "residual-fallback",
+                "provenance": {
+                    "mode": "residual-fallback",
+                    "residual_id": "R0",
+                    "reason": "checkpoint missing",
+                },
+            }
+        ],
+    }
+    fused = element_fusion.fuse(sam3, residual, [], CANVAS, run_dir=str(tmp_path))
+    assert len(fused) == 1
+    sources = fused[0]["provenance"]["sources"]
+    assert "sam3:residual-fallback" in sources
+    assert "residual" in sources

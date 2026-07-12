@@ -775,7 +775,16 @@ def test_process_triggers_auto_repair_on_failed_qa(tmp_path, monkeypatch):
                 json.dump(qa, fh)
         return {"stopped": "qa_ok", "qa_ok": True, "iterations": 1, "attempts": []}
 
-    monkeypatch.setattr("src.harness.execute_repairs", fake_execute_repairs)
+    monkeypatch.setattr("src.harness_loop.execute_repairs", fake_execute_repairs)
+    monkeypatch.setattr(
+        "src.harness_loop._run_critic_pass",
+        lambda rd, cfg: {"prioritized_issues": [], "suggested_fix_ids": [],
+                         "blockers": [], "filtered_repairs": []},
+    )
+    monkeypatch.setattr(
+        "src.harness_loop._run_fixer_pass",
+        lambda rd, cfg, c: {"cfg": cfg, "fixes": []},
+    )
 
     def run_one(image_path, run_dir, cfg, start_from="normalize"):
         os.makedirs(run_dir, exist_ok=True)
@@ -811,10 +820,11 @@ def test_process_triggers_auto_repair_on_failed_qa(tmp_path, monkeypatch):
         assert status["result"].get("repair", {}).get("qa_ok") is True
         assert status["result"].get("qa_ok") is True
         assert status.get("harness_rounds") == 1
-        assert status.get("harness_stopped") == "qa_ok"
+        assert status.get("harness_stopped") == "qa_ok_after_repairs"
         assert status.get("final_qa_ok") is True
         assert status.get("staged") is True
         assert status.get("doc_id") == "repair-test"
+        assert (tmp_path / "inbox" / "uploads" / queued["job_id"] / "run" / "harness_loop.json").exists()
     finally:
         server.shutdown()
         server.server_close()
@@ -829,7 +839,16 @@ def test_process_triggers_auto_repair_when_staging_fails(tmp_path, monkeypatch):
         repair_calls.append(run_dir)
         return {"stopped": "already_ok", "qa_ok": True, "iterations": 0, "attempts": []}
 
-    monkeypatch.setattr("src.harness.execute_repairs", fake_execute_repairs)
+    monkeypatch.setattr("src.harness_loop.execute_repairs", fake_execute_repairs)
+    monkeypatch.setattr(
+        "src.harness_loop._run_critic_pass",
+        lambda rd, cfg: {"prioritized_issues": [], "suggested_fix_ids": [],
+                         "blockers": [], "filtered_repairs": []},
+    )
+    monkeypatch.setattr(
+        "src.harness_loop._run_fixer_pass",
+        lambda rd, cfg, c: {"cfg": cfg, "fixes": []},
+    )
 
     stage_calls = {"n": 0}
     original_stage = __import__("src.figma_bridge", fromlist=["_stage_job_output"])._stage_job_output
@@ -869,10 +888,71 @@ def test_process_triggers_auto_repair_when_staging_fails(tmp_path, monkeypatch):
         assert status["status"] == "done", status
         assert len(repair_calls) == 1
         assert stage_calls["n"] >= 2
-        assert status.get("harness_rounds") == 0
-        assert status.get("harness_stopped") == "already_ok"
+        assert status.get("harness_rounds") == 1
+        assert status.get("harness_stopped") == "qa_ok_after_repairs"
         assert status.get("final_qa_ok") is True
         assert status.get("staged") is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_process_skips_harness_when_run_one_already_healed(tmp_path, monkeypatch):
+    """Bridge must not double-run harness when run_one already fixed QA."""
+    _allow_machine_ready(monkeypatch)
+    repair_calls = []
+
+    def fake_execute_repairs(run_dir, cfg, max_iterations=2, run_one=None):
+        repair_calls.append(run_dir)
+        return {"stopped": "qa_ok", "qa_ok": True, "iterations": 1, "attempts": []}
+
+    monkeypatch.setattr("src.harness_loop.execute_repairs", fake_execute_repairs)
+
+    def run_one(image_path, run_dir, cfg, start_from="normalize"):
+        os.makedirs(run_dir, exist_ok=True)
+        design = {"id": "pre-healed", "canvas": {"w": 10, "h": 10}, "layers": []}
+        with open(os.path.join(run_dir, "design.json"), "w", encoding="utf-8") as fh:
+            json.dump(design, fh)
+        with open(os.path.join(run_dir, "qa.json"), "w", encoding="utf-8") as fh:
+            json.dump({"ok": True}, fh)
+        harness_summary = {
+            "rounds_completed": 2,
+            "stopped": "qa_ok_after_repairs",
+            "qa_ok": True,
+            "rounds": [],
+        }
+        with open(os.path.join(run_dir, "harness_loop.json"), "w", encoding="utf-8") as fh:
+            json.dump(harness_summary, fh)
+        return {
+            "ok": True,
+            "run_dir": run_dir,
+            "runtime_ok": True,
+            "duration_s": 0.01,
+            "qa_ok": True,
+            "repair": harness_summary,
+            "harness_rounds": 2,
+            "harness_stopped": "qa_ok_after_repairs",
+        }
+
+    fake = types.ModuleType("run_pipeline")
+    fake.run_one = run_one
+    monkeypatch.setitem(sys.modules, "run_pipeline", fake)
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        request = Request(base + "/process?filename=healed.png", data=b"x", method="POST")
+        queued = json.loads(urlopen(request, timeout=2).read())
+        status = _poll_job(base, queued["job_id"])
+        assert status["status"] == "done", status
+        assert len(repair_calls) == 0
+        assert status.get("harness_rounds") == 2
+        assert status.get("harness_stopped") == "qa_ok_after_repairs"
+        assert status.get("final_qa_ok") is True
     finally:
         server.shutdown()
         server.server_close()

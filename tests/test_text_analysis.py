@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import json
 import math
 import os
 import sys
@@ -467,3 +468,114 @@ def test_style_cluster_propagates_font_match_beyond_max_lines_budget(tmp_path):
     # every line via propagation from a single representative match.
     assert sources.count("local-render") == n_lines
     assert result["text_analysis"]["font_matches_attempted"] <= 3
+
+
+def test_meta_alignment_prefers_matching_weight():
+    profile = text_analysis._typography_profile({"weight": 700, "shear_angle": None, "font_size": 24})
+    bold_meta = {"family": "Inter", "style": "Bold", "weight": 700}
+    light_meta = {"family": "Inter", "style": "Light", "weight": 300}
+    assert text_analysis._meta_alignment_adjustment(bold_meta, profile) > \
+        text_analysis._meta_alignment_adjustment(light_meta, profile)
+
+
+def test_fallback_chain_uses_weight_and_italic(tmp_path):
+    path = tmp_path / "plain.png"
+    Image.new("RGB", (200, 80), "white").save(path)
+    ocr = {
+        "source": {"w": 200, "h": 80},
+        "lines": [_line("L0", "SALE", (20, 20, 120, 50))],
+    }
+    result = text_analysis.analyze_text(
+        str(path), ocr,
+        {"text_analysis": {"font_matching": {"enabled": False}}},
+    )
+    style = result["lines"][0]["style"]
+    assert style["fontWeight"] in {300, 400, 500, 600, 700}
+    assert style["fontCandidates"][0]["weight"] == style["fontWeight"]
+    assert "Italic" not in style["fontCandidates"][0]["style"]
+
+
+def test_google_fonts_cache_candidates_merge_into_chain(tmp_path):
+    font_path = _font_path()
+    if not font_path:
+        pytest.skip("Pillow did not expose a test TrueType font path")
+    cache_dir = tmp_path / "google-fonts"
+    cache_dir.mkdir()
+    cached_font = cache_dir / "Inter-Regular.ttf"
+    cached_font.write_bytes(open(font_path, "rb").read())
+
+    image = Image.new("RGB", (520, 180), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype(font_path, 38)
+    ocr_box = _draw_text(draw, (35, 45), "Cache", font, (0, 0, 0))
+    path = tmp_path / "font.png"
+    image.save(path)
+    ocr = {
+        "engine": "synthetic",
+        "source": {"path": str(path), "w": 520, "h": 180},
+        "lines": [_line("L0", "Cache", ocr_box)],
+    }
+    cfg = {
+        "text_analysis": {
+            "font_matching": {
+                "enabled": True,
+                "font_files": [],
+                "font_dirs": [],
+                "google_fonts_cache": str(cache_dir),
+                "max_fonts": 1,
+                "max_lines": 1,
+                "top_k": 3,
+            }
+        }
+    }
+
+    result = text_analysis.analyze_text(str(path), ocr, cfg)
+    sources = {item.get("source") for item in result["lines"][0]["style"]["fontCandidates"]}
+    assert "google-cache" in sources
+    assert "fallback" in sources
+
+
+def test_needs_vlm_font_judge_when_local_score_is_weak():
+    ocr = {
+        "lines": [{
+            "style": {
+                "fontCandidates": [
+                    {"family": "Inter", "source": "local-render", "score": 0.31, "path": "/tmp/a.ttf"},
+                    {"family": "Arial", "source": "fallback", "score": 0.55},
+                ]
+            }
+        }]
+    }
+    cfg = {"text_analysis": {"font_matching": {"enabled": True, "local_score_threshold": 0.55}}}
+    assert text_analysis.needs_vlm_font_judge(ocr, cfg) is True
+
+
+def test_design_json_preserves_font_candidates(tmp_path):
+    from src.build_design_json import build
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    candidates = [{
+        "id": "T0",
+        "target": "text",
+        "text": "SALE",
+        "box": {"x": 10, "y": 10, "w": 120, "h": 40},
+        "visible_box": {"x": 10, "y": 10, "w": 120, "h": 40},
+        "style": {
+            "fontFamily": "Inter",
+            "fontSize": 28,
+            "fontWeight": 700,
+            "fontStyle": "Bold",
+            "color": "#111111",
+            "fontCandidates": [
+                {"family": "Inter", "style": "Bold", "weight": 700, "score": 0.82, "source": "local-render"},
+                {"family": "Arial", "style": "Bold", "weight": 700, "score": 0.71, "source": "fallback"},
+            ],
+            "fontSizeCandidates": [{"value": 28, "score": 0.75}],
+        },
+    }]
+    build(candidates, {"w": 200, "h": 120}, str(run_dir))
+    design = json.loads((run_dir / "design.json").read_text(encoding="utf-8"))
+    style = design["layers"][0]["style"]
+    assert style["fontCandidates"][0]["family"] == "Inter"
+    assert style["fontSizeCandidates"][0]["value"] == 28

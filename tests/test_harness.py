@@ -35,6 +35,18 @@ def test_resume_stage_aliases_text_analysis_and_inpaint():
     }) == "merge"
 
 
+def test_resolve_fonts_patch_enables_aggressive_rematch():
+    patches = harness.config_patches_for({
+        "stage": "text-analysis", "action": "resolve-fonts",
+    })
+    fm = patches["text_analysis"]["font_matching"]
+    assert fm["enabled"] is True
+    assert fm["repair_pass"] is True
+    assert fm["max_fonts"] == 96
+    assert fm["max_lines"] == 24
+    assert patches["vlm"]["font_judge"]["enabled"] is True
+
+
 def test_merge_dedup_patch_raises_iou_thresholds():
     patches = harness.config_patches_for({
         "stage": "merge", "action": "dedup", "params": {"raise_dedup_iou": True},

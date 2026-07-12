@@ -22,6 +22,10 @@ _DEFAULT_IOU = 0.55
 _DEFAULT_GAP_COVERAGE = 0.35
 _DEFAULT_MAX_TILES = 20
 _DEFAULT_MAX_PROPOSALS = 32
+_DEFAULT_LIGHTWEIGHT_GRID = 2
+_DEFAULT_LIGHTWEIGHT_MAX_TILES = 8
+_DEFAULT_LIGHTWEIGHT_OVERLAP = 0.15
+_DEFAULT_LIGHTWEIGHT_BELOW_SAM = 3
 
 _LABELS = frozenset({"product", "icon", "button", "badge", "person"})
 _LABEL_TO_KIND = {
@@ -255,13 +259,41 @@ def _build_element(proposal: dict, canvas_w: int, canvas_h: int, tile_idx: int) 
     }
 
 
-def enrich_residual(image_path: str, residual: list[dict], cfg: dict) -> list[dict]:
+def _should_use_lightweight_grid(ep: dict, sam_element_count: int | None) -> bool:
+    if ep.get("lightweight_grid"):
+        return True
+    threshold = ep.get("lightweight_grid_below_sam_count")
+    if threshold is None or sam_element_count is None:
+        return False
+    return int(sam_element_count) < int(threshold)
+
+
+def _effective_ep_cfg(ep: dict, sam_element_count: int | None) -> dict:
+    if not _should_use_lightweight_grid(ep, sam_element_count):
+        return ep
+    lightweight = {
+        "grid": int(ep.get("lightweight_grid_size", _DEFAULT_LIGHTWEIGHT_GRID)),
+        "max_tiles": int(ep.get("lightweight_max_tiles", _DEFAULT_LIGHTWEIGHT_MAX_TILES)),
+        "overlap": float(ep.get("lightweight_overlap", _DEFAULT_LIGHTWEIGHT_OVERLAP)),
+        "tile_mode": "grid",
+    }
+    return {**ep, **lightweight}
+
+
+def enrich_residual(
+    image_path: str,
+    residual: list[dict],
+    cfg: dict,
+    sam_element_count: int | None = None,
+) -> list[dict]:
     """Return residual proposals augmented with optional VLM box hints. Never raises."""
     ep = ((cfg or {}).get("vlm") or {}).get("element_propose") or {}
     if not ep.get("enabled", False):
         return residual
+    ep = _effective_ep_cfg(ep, sam_element_count)
 
     vcfg = _vlm_cfg(cfg)
+    vcfg.update({k: v for k, v in ep.items() if k != "enabled"})
     base_url = str(vcfg.get("base_url") or vlm_client._DEFAULT_BASE_URL)
     model = str(vcfg.get("model") or vlm_client._DEFAULT_MODEL)
     timeout_s = float(vcfg.get("timeout_s") or vlm_client._DEFAULT_TIMEOUT_S)

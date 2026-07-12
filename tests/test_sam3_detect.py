@@ -161,3 +161,53 @@ def test_clip_box_off_canvas_origin_does_not_inflate_size():
     # Fully on-canvas box is unaffected.
     inside = sam3_detect._clip_box({"x": 5, "y": 5, "w": 10, "h": 10}, 100, 100)
     assert inside == {"x": 5, "y": 5, "w": 10, "h": 10}
+
+
+def test_default_prompts_include_ui_ad_roles():
+    roles = {spec["role"] for spec in sam3_detect._prompt_specs(None)}
+    assert {"badge", "button", "card", "logo", "product", "icon"} <= roles
+
+
+def test_box_refine_accepts_lower_score_when_residuals_exist(tmp_path):
+    class LowScoreBoxBackend(FakeSam3):
+        def predict_box(self, box):
+            self.box_calls.append(dict(box))
+            mask = np.zeros((100, 120), dtype=bool)
+            x, y, w, h = (int(box[k]) for k in ("x", "y", "w", "h"))
+            mask[y : y + h, x : x + w] = True
+            return [{"mask": mask, "box": [x, y, x + w, y + h], "score": 0.34}]
+
+    backend = LowScoreBoxBackend()
+    residual = [{"id": "R0", "kind": "shape", "box": {"x": 10, "y": 30, "w": 30, "h": 20}}]
+    result = sam3_detect.detect(
+        _image(tmp_path),
+        residual,
+        {"sam3": {"prompts": [], "confidence": 0.45}},
+        run_dir=str(tmp_path),
+        backend=backend,
+    )
+    refined = next(e for e in result["elements"] if e["provenance"].get("residual_id") == "R0")
+    assert refined["provenance"]["mode"] == "box-refine"
+    assert result["thresholds"]["box_refine_min_score"] == 0.32
+
+
+def test_union_residual_guarantees_missing_box_refine(tmp_path):
+    class SkipBoxBackend(FakeSam3):
+        def predict_box(self, box):
+            return []
+
+    backend = SkipBoxBackend()
+    residual = [
+        {"id": "R0", "kind": "shape", "box": {"x": 10, "y": 30, "w": 30, "h": 20}},
+        {"id": "R1", "kind": "icon", "box": {"x": 70, "y": 55, "w": 18, "h": 18}},
+    ]
+    result = sam3_detect.detect(
+        _image(tmp_path),
+        residual,
+        {"sam3": {"prompts": []}},
+        run_dir=str(tmp_path),
+        backend=backend,
+    )
+    covered = {e["provenance"].get("residual_id") for e in result["elements"]}
+    assert covered == {"R0", "R1"}
+    assert all(e["provenance"].get("residual_id") for e in result["elements"])

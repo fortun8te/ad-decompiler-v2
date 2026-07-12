@@ -152,6 +152,49 @@ def test_below_threshold_tries_next_candidate(tmp_path, monkeypatch):
     assert out["vlm_font_judge"]["notes"][0]["attempts"] == 2
 
 
+def test_should_judge_fonts_when_weak_local_score_without_explicit_enable():
+    ocr = {
+        "lines": [_ocr_line("L0", "SALE", {"x": 0, "y": 0, "w": 10, "h": 10}, [
+            {"family": "Arial", "style": "Regular", "weight": 400, "score": 0.31,
+             "source": "local-render", "path": "/tmp/a.ttf"},
+        ])],
+    }
+    cfg = {
+        "vlm": {"enabled": True, "font_judge": {"enabled": False}},
+        "text_analysis": {"font_matching": {"enabled": True, "local_score_threshold": 0.55}},
+    }
+    assert vlm_font_judge.should_judge_fonts(ocr, cfg) is True
+
+
+def test_should_judge_fonts_false_when_scores_are_strong():
+    ocr = {
+        "lines": [_ocr_line("L0", "SALE", {"x": 0, "y": 0, "w": 10, "h": 10}, [
+            {"family": "Arial", "style": "Regular", "weight": 400, "score": 0.91,
+             "source": "local-render", "path": "/tmp/a.ttf"},
+        ])],
+    }
+    cfg = {
+        "vlm": {"enabled": True, "font_judge": {"enabled": False}},
+        "text_analysis": {"font_matching": {"enabled": True, "local_score_threshold": 0.55}},
+    }
+    assert vlm_font_judge.should_judge_fonts(ocr, cfg) is False
+
+
+def test_auto_judge_runs_when_local_score_weak(tmp_path, monkeypatch):
+    _mock_vlm(monkeypatch, [json.dumps({"score": 8, "reject": False})])
+    img, box = _image_with_text(tmp_path)
+    cands = _candidates()
+    cands[0]["score"] = 0.31
+    ocr = {"lines": [_ocr_line("L0", "SALE", box, cands[:1])]}
+    cfg = {
+        "vlm": {"enabled": True, "font_judge": {"enabled": False, "score_threshold": 7}},
+        "text_analysis": {"font_matching": {"enabled": True, "local_score_threshold": 0.55}},
+    }
+    out = vlm_font_judge.judge_fonts(img, ocr, cfg)
+    assert out["lines"][0]["vlm_font_judged"] is True
+    assert out["vlm_font_judge"]["enabled"] is True
+
+
 def test_disagreement_leaves_ranking_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(vlm_client, "multi_pass_answer", lambda *a, **k: (None, "vlm_disagreement"))
     img, box = _image_with_text(tmp_path)

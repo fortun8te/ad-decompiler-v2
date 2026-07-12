@@ -52,6 +52,8 @@ def test_fix_inpaint_forces_big_lama_and_widens_button_mask():
     assert "force-lama-inpaint" in applied
     assert cfg["inpaint"]["mode"] == "big-lama"
     assert cfg["inpaint"]["mask_dilate"]["button"] >= 6
+    assert cfg["inpaint"]["mask_dilate"]["text"] >= 3
+    assert cfg["inpaint"]["multipass_fraction"] == 0.08
 
 
 def test_fix_layout_tightens_container_inference():

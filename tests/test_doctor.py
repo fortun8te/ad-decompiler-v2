@@ -75,6 +75,26 @@ def test_doctor_leaves_big_lama_optional_without_require_active_models(tmp_path,
     assert not any(item["name"] == "Big-LaMa" for item in report["blockers"])
 
 
+def test_doctor_reports_inpaint_stack_when_auto_mode_and_comfyui_down(tmp_path, monkeypatch):
+    workflow = tmp_path / "workflow.json"
+    workflow.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("doctor._module", lambda name: name == "simple_lama_inpainting")
+    monkeypatch.setattr("doctor._torch", lambda device: {"name": "torch", "ok": True, "required": False, "detail": "cpu"})
+    monkeypatch.setattr("doctor._http", lambda url: False)
+
+    report = inspect({
+        "device": "cpu",
+        "ocr": {"primary": "doctr"},
+        "qwen": {"enabled": True, "mode": "comfyui", "workflow": str(workflow)},
+        "inpaint": {"mode": "auto"},
+        "runtime": {"require_active_models": True},
+    }, Path(tmp_path))
+
+    stack = next(item for item in report["checks"] if item["name"] == "inpaint stack (ComfyUI+Big-LaMa)")
+    assert stack["ok"] is False
+    assert any(item["name"] == "inpaint stack (ComfyUI+Big-LaMa)" for item in report["blockers"])
+
+
 def test_ocr_ready_summary_flags_primary_blockers(tmp_path, monkeypatch):
     monkeypatch.setattr("doctor._module", lambda name: name != "paddleocr")
     monkeypatch.setattr("doctor._torch", lambda device: {"name": "cuda", "ok": True, "required": True, "detail": "fake"})

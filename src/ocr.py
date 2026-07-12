@@ -532,7 +532,7 @@ def _paddle_engine(cfg: dict, *, device_override: Optional[str] = None):
         from paddleocr import PaddleOCR
     except ImportError as error:  # pragma: no cover - exercised on GPU host
         # #region agent log
-        _agent_log("ocr.py:_paddle_engine", "paddleocr import failed", data={"error": str(error)}, hypothesis_id="H1")
+        _agent_log("ocr.py:_paddle_engine", "paddleocr import failed", data={"error": str(error)}, hypothesis_id="H1", cfg=cfg)
         # #endregion
         raise ImportError(
             "PP-OCRv6 requires paddleocr>=3 and a matching paddlepaddle build.\n"
@@ -583,7 +583,7 @@ def _is_paddle_gpu_failure(error: Exception) -> bool:
 def _paddle(img_path, cfg, *, device_override: Optional[str] = None):
     device = device_override or str(cfg.get("device", "cpu"))
     # #region agent log
-    _agent_log("ocr.py:_paddle", "paddle backend start", data={"device": device, "path": os.path.basename(img_path)}, hypothesis_id="H1")
+    _agent_log("ocr.py:_paddle", "paddle backend start", data={"device": device, "path": os.path.basename(img_path)}, hypothesis_id="H1", cfg=cfg)
     # #endregion
     try:
         engine, api = _paddle_engine(cfg, device_override=device_override)
@@ -593,12 +593,12 @@ def _paddle(img_path, cfg, *, device_override: Optional[str] = None):
             result = engine.ocr(img_path, cls=True)
         lines = _parse_paddle_result(result)
         # #region agent log
-        _agent_log("ocr.py:_paddle", "paddle backend ok", data={"api": api, "lines": len(lines), "device": device}, hypothesis_id="H1")
+        _agent_log("ocr.py:_paddle", "paddle backend ok", data={"api": api, "lines": len(lines), "device": device}, hypothesis_id="H1", cfg=cfg)
         # #endregion
         return lines, "ppocr-v6"
     except Exception as error:
         # #region agent log
-        _agent_log("ocr.py:_paddle", "paddle backend failed", data={"device": device, "error": str(error), "error_type": type(error).__name__}, hypothesis_id="H1")
+        _agent_log("ocr.py:_paddle", "paddle backend failed", data={"device": device, "error": str(error), "error_type": type(error).__name__}, hypothesis_id="H1", cfg=cfg)
         # #endregion
         configured = str(cfg.get("device", "cpu"))
         if (
@@ -612,6 +612,7 @@ def _paddle(img_path, cfg, *, device_override: Optional[str] = None):
                 "ocr.py:_paddle", "paddle gpu failed; retrying cpu",
                 data={"error": str(error), "error_type": type(error).__name__},
                 hypothesis_id="H1",
+                cfg=cfg,
             )
             # #endregion
             try:
@@ -685,14 +686,14 @@ def _parse_surya_predictions(predictions: Any) -> list:
 
 def _surya(img_path, cfg):
     # #region agent log
-    _agent_log("ocr.py:_surya", "surya backend start", data={"device": str(cfg.get("device", "cpu"))}, hypothesis_id="H2")
+    _agent_log("ocr.py:_surya", "surya backend start", data={"device": str(cfg.get("device", "cpu"))}, hypothesis_id="H2", cfg=cfg)
     # #endregion
     try:
         from PIL import Image
         image = Image.open(img_path).convert("RGB")
     except ImportError as error:  # pragma: no cover
         # #region agent log
-        _agent_log("ocr.py:_surya", "surya import failed", data={"error": str(error)}, hypothesis_id="H2")
+        _agent_log("ocr.py:_surya", "surya import failed", data={"error": str(error)}, hypothesis_id="H2", cfg=cfg)
         # #endregion
         raise ImportError("Surya requires Pillow and surya-ocr.") from error
 
@@ -727,12 +728,12 @@ def _surya(img_path, cfg):
             predictions = predictor([image], [[language]], detector)
         lines = _parse_surya_predictions(predictions)
         # #region agent log
-        _agent_log("ocr.py:_surya", "surya backend ok", data={"api": api, "lines": len(lines)}, hypothesis_id="H2")
+        _agent_log("ocr.py:_surya", "surya backend ok", data={"api": api, "lines": len(lines)}, hypothesis_id="H2", cfg=cfg)
         # #endregion
         return lines, "surya"
     except Exception as error:
         # #region agent log
-        _agent_log("ocr.py:_surya", "surya backend failed", data={"error": str(error), "error_type": type(error).__name__}, hypothesis_id="H2")
+        _agent_log("ocr.py:_surya", "surya backend failed", data={"error": str(error), "error_type": type(error).__name__}, hypothesis_id="H2", cfg=cfg)
         # #endregion
         raise
 
@@ -1516,7 +1517,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
     _agent_log(
         "ocr.py:run_ocr", "ocr run start",
         data={"primary": primary_name, "challengers": challenger_names, "device": str(cfg.get("device", "cpu"))},
-        hypothesis_id="H3", run_dir=run_dir,
+        hypothesis_id="H3", run_dir=run_dir, cfg=cfg,
     )
     # #endregion
 
@@ -1539,7 +1540,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         _agent_log(
             "ocr.py:run_ocr", "primary backend failed",
             data={"engine": primary_name, "error": str(error), "error_type": type(error).__name__},
-            hypothesis_id="H1", run_dir=run_dir,
+            hypothesis_id="H1", run_dir=run_dir, cfg=cfg,
         )
         # #endregion
         print(f"[ocr] primary '{primary_name}' unavailable: {error}")
@@ -1557,7 +1558,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
             _agent_log(
                 "ocr.py:run_ocr", "challenger backend failed",
                 data={"engine": name, "error": str(error), "error_type": type(error).__name__},
-                hypothesis_id="H2", run_dir=run_dir,
+                hypothesis_id="H2", run_dir=run_dir, cfg=cfg,
             )
             # #endregion
             continue
@@ -1578,7 +1579,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
                 _agent_log(
                     "ocr.py:run_ocr", "fallback backend failed",
                     data={"engine": name, "error": str(error), "error_type": type(error).__name__},
-                    hypothesis_id="H3", run_dir=run_dir,
+                    hypothesis_id="H3", run_dir=run_dir, cfg=cfg,
                 )
                 # #endregion
                 continue
@@ -1597,7 +1598,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
             _agent_log(
                 "ocr.py:run_ocr", "fallback backend recovered ocr",
                 data={"engine": primary_engine, "lines": len(primary_lines)},
-                hypothesis_id="H3", run_dir=run_dir,
+                hypothesis_id="H3", run_dir=run_dir, cfg=cfg,
             )
             # #endregion
             break
@@ -1608,7 +1609,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         _agent_log(
             "ocr.py:run_ocr", "all ocr backends failed",
             data={"errors": errors, "engines_used": engines_used},
-            hypothesis_id="H3", run_dir=run_dir,
+            hypothesis_id="H3", run_dir=run_dir, cfg=cfg,
         )
         # #endregion
         raise RuntimeError(message)

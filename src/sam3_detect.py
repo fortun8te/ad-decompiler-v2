@@ -40,17 +40,26 @@ DEFAULT_PROMPTS = [
     {"prompt": "hand", "role": "person", "kind": "photo-fragment"},
     {"prompt": "product", "role": "product", "kind": "photo-fragment"},
     {"prompt": "product package", "role": "product", "kind": "photo-fragment"},
+    {"prompt": "product shot", "role": "product", "kind": "photo-fragment"},
     {"prompt": "bottle", "role": "product", "kind": "photo-fragment"},
     {"prompt": "jar", "role": "product", "kind": "photo-fragment"},
     {"prompt": "tube", "role": "product", "kind": "photo-fragment"},
     {"prompt": "box", "role": "product", "kind": "photo-fragment"},
     {"prompt": "phone", "role": "product", "kind": "photo-fragment"},
     {"prompt": "logo", "role": "logo", "kind": "icon"},
+    {"prompt": "brand logo", "role": "logo", "kind": "icon"},
     {"prompt": "icon", "role": "icon", "kind": "icon"},
+    {"prompt": "app icon", "role": "icon", "kind": "icon"},
     {"prompt": "arrow", "role": "arrow", "kind": "icon"},
     {"prompt": "badge", "role": "badge", "kind": "icon"},
+    {"prompt": "price badge", "role": "badge", "kind": "icon"},
+    {"prompt": "sale badge", "role": "badge", "kind": "icon"},
     {"prompt": "sticker", "role": "sticker", "kind": "shape"},
     {"prompt": "button", "role": "button", "kind": "shape"},
+    {"prompt": "cta button", "role": "button", "kind": "shape"},
+    {"prompt": "call to action", "role": "button", "kind": "shape"},
+    {"prompt": "card", "role": "card", "kind": "shape"},
+    {"prompt": "offer card", "role": "card", "kind": "shape"},
     {"prompt": "illustration", "role": "illustration", "kind": "photo-fragment"},
 ]
 
@@ -490,6 +499,72 @@ def _make_element(
     }
 
 
+def _text_min_score(scfg: dict) -> float:
+    return float(scfg.get("min_score", scfg.get("confidence", 0.45)))
+
+
+def _box_refine_min_score(scfg: dict, residual: list) -> float:
+    """Box-refine keeps a lower acceptance bar when deterministic residuals exist."""
+    if scfg.get("box_refine_confidence") is not None:
+        return float(scfg["box_refine_confidence"])
+    if residual:
+        return 0.32
+    return float(scfg.get("confidence", 0.45))
+
+
+def _residual_ids_in_elements(elements: list) -> set[str]:
+    covered = set()
+    for element in elements or []:
+        prov = element.get("provenance") or {}
+        residual_id = prov.get("residual_id")
+        if residual_id is not None:
+            covered.add(str(residual_id))
+    return covered
+
+
+def _union_residual_guarantees(
+    elements: list,
+    residual: list,
+    width: int,
+    height: int,
+    run_dir: Optional[str],
+    note: str,
+) -> list[dict]:
+    """Append residual-backed observations for any proposal SAM did not emit."""
+    out = list(elements or [])
+    covered = _residual_ids_in_elements(out)
+    for item in residual:
+        residual_id = str(item.get("id")) if item.get("id") is not None else None
+        if residual_id is not None and residual_id in covered:
+            continue
+        if not _valid_box(item.get("box")):
+            continue
+        role = _role_from_residual(item)
+        mask = _load_residual_mask(item, width, height, run_dir)
+        el = _make_element(
+            len(out),
+            mask,
+            role,
+            item.get("kind") or _kind_for_role(role),
+            float(item.get("score", item.get("confidence", 0.35)) or 0.35),
+            width,
+            height,
+            run_dir,
+            {
+                "model": "sam3",
+                "mode": "residual-fallback",
+                "residual_id": item.get("id"),
+                "reason": note,
+            },
+            source="residual-fallback",
+        )
+        if el:
+            out.append(el)
+            if residual_id is not None:
+                covered.add(residual_id)
+    return out
+
+
 def _fallback_elements(
     residual: list,
     width: int,
@@ -583,7 +658,8 @@ def detect(
         return result
 
     elements = []
-    min_score = float(scfg.get("min_score", scfg.get("confidence", 0.45)))
+    min_score = _text_min_score(scfg)
+    box_min_score = _box_refine_min_score(scfg, residual)
 
     # Open-vocabulary sweep. Duplicates are intentionally retained as observations and
     # resolved once, mask-aware, by element_fusion.fuse().
@@ -630,6 +706,8 @@ def detect(
         try:
             preds = _prediction_dicts(backend.predict_box(box), width, height)
             for pred in preds:
+                if float(pred.get("score", 0)) < box_min_score:
+                    continue
                 mask = pred.get("mask")
                 if mask is None:
                     mask = _rect_mask(pred.get("box") or box, width, height)
@@ -671,6 +749,15 @@ def detect(
         if el:
             elements.append(el)
 
+    elements = _union_residual_guarantees(
+        elements,
+        residual,
+        width,
+        height,
+        run_dir,
+        "residual proposal missing from SAM observations",
+    )
+
     result = {
         "engine": getattr(backend, "name", "sam3"),
         "status": "ok" if not errors else "partial",
@@ -678,6 +765,10 @@ def detect(
         "source": {"path": img_path, "w": width, "h": height},
         "prompts": [p["prompt"] for p in prompts],
         "elements": elements,
+        "thresholds": {
+            "text_min_score": min_score,
+            "box_refine_min_score": box_min_score,
+        },
     }
     _write_manifest(result, run_dir)
     return result

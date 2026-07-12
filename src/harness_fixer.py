@@ -155,7 +155,7 @@ def fix_vlm_stack(cfg: dict | None = None, issue: dict | None = None) -> tuple[d
 
 
 def fix_inpaint(cfg: dict | None = None) -> tuple[dict, list[str]]:
-    """Force Big-LaMa and widen button removal masks."""
+    """Force Big-LaMa and widen removal masks when QA reports background leakage."""
     cfg = copy.deepcopy(cfg or {})
     applied: list[str] = []
     inpaint = cfg.setdefault("inpaint", {})
@@ -166,12 +166,26 @@ def fix_inpaint(cfg: dict | None = None) -> tuple[dict, list[str]]:
         inpaint["allow_fallback"] = False
         applied.append("inpaint.big-lama")
 
+    if float(inpaint.get("multipass_fraction", 0.12)) > 0.08:
+        inpaint["multipass_fraction"] = 0.08
+        applied.append("inpaint.multipass")
+
     mask_dilate = inpaint.setdefault("mask_dilate", {})
     button = int(mask_dilate.get("button", 4))
-    target = max(6, button + 2)
-    if button < target:
-        mask_dilate["button"] = target
+    target_button = max(6, button + 2)
+    if button < target_button:
+        mask_dilate["button"] = target_button
         applied.append("inpaint.button_mask_dilate")
+
+    text = int(mask_dilate.get("text", 2))
+    if text < 3:
+        mask_dilate["text"] = 3
+        applied.append("inpaint.text_mask_dilate")
+
+    shape = int(mask_dilate.get("shape", 3))
+    if shape < target_button:
+        mask_dilate["shape"] = target_button
+        applied.append("inpaint.shape_mask_dilate")
 
     if applied:
         applied.insert(0, "force-lama-inpaint")

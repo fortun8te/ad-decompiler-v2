@@ -460,6 +460,9 @@ def fuse(
             if obs:
                 observations.append(obs)
 
+    # Residual-fallback SAM observations must never replace the deterministic residual stream.
+    # If SAM emitted nothing for a residual id, the residual observation still survives above.
+
     # Identity dedup happens before geometric clustering. If the same observation was supplied
     # twice, only its strongest copy can enter a canonical element.
     unique = {}

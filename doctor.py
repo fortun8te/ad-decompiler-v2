@@ -239,18 +239,54 @@ def inspect(cfg, root: Path) -> dict:
         base = str(vlm.get("base_url", "http://127.0.0.1:1234/v1")).rstrip("/")
         checks.append(_check("VLM server", _http(f"{base}/models"), base, required=False))
 
-    for binary in ("vtracer", "potrace"):
-        checks.append(_check(binary, bool(shutil.which(binary)), "on PATH"))
+    try:
+        from src.vectorize import check_binaries as _vectorize_binaries
+    except Exception:
+        _vectorize_binaries = None
+    if _vectorize_binaries:
+        vz = _vectorize_binaries(cfg)
+        for name in ("vtracer", "potrace", "cairosvg"):
+            info = vz.get(name) or {}
+            detail = info.get("path", "unknown")
+            if name == "cairosvg":
+                checks.append(_check(
+                    "cairosvg (vectorize gate)", info.get("ok"), detail, required=False,
+                ))
+            else:
+                checks.append(_check(f"vectorize:{name}", info.get("ok"), detail, required=False))
+    else:
+        for binary in ("vtracer", "potrace"):
+            checks.append(_check(f"vectorize:{binary}", bool(shutil.which(binary)), "on PATH"))
     # Big-LaMa quality directly determines the clean background plate. Under
     # require_active_models it must be a real acceptance condition like SAM/OCR,
     # not silently optional — an OpenCV fallback degrades plate quality (see
     # src/run_report.py::_required, run_pipeline.py inpaint stage).
-    inpaint_required = bool(runtime.get("require_active_models", False) and
-                             str((cfg.get("inpaint") or {}).get("mode", "auto")).lower() != "opencv")
-    checks.append(_check("Big-LaMa", _module("simple_lama_inpainting"),
+    inpaint_cfg = cfg.get("inpaint") or {}
+    inpaint_mode = str(inpaint_cfg.get("mode", "auto")).lower()
+    inpaint_required = bool(runtime.get("require_active_models", False) and inpaint_mode != "opencv")
+    lama_ok = _module("simple_lama_inpainting")
+    comfy_ok = True
+    comfy_detail = "not required (qwen disabled or non-comfyui mode)"
+    qwen_enabled = bool((cfg.get("qwen") or {}).get("enabled", True))
+    if qwen_enabled and str((cfg.get("qwen") or {}).get("mode", "comfyui")).lower() == "comfyui":
+        base = str(cfg.get("backend_url", "http://127.0.0.1:8188")).rstrip("/")
+        comfy_ok = _http(f"{base}/system_stats")
+        comfy_detail = base if comfy_ok else f"{base} unreachable"
+    checks.append(_check("Big-LaMa", lama_ok,
                           "optional; OpenCV fallback exists" if not inpaint_required
                           else "required by runtime.require_active_models; OpenCV fallback degrades background plate",
                           required=inpaint_required))
+    if inpaint_mode in ("auto", "big-lama", "lama", "simple-lama"):
+        stack_ok = lama_ok and (comfy_ok or not qwen_enabled)
+        stack_detail = (
+            f"ComfyUI={comfy_detail}; Big-LaMa={'installed' if lama_ok else 'missing'}"
+        )
+        checks.append(_check(
+            "inpaint stack (ComfyUI+Big-LaMa)",
+            stack_ok,
+            stack_detail,
+            required=inpaint_required and inpaint_mode == "auto",
+        ))
     checks.append(_check("Figma bridge", _module("requests"), "required only for plugin staging"))
 
     blockers = [item for item in checks if item["required"] and not item["ok"]]

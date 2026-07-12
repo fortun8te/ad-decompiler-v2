@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src import harness_critic
+from src import agent_debug, harness_critic
 
 
 def _write_run(run_dir, *, qa, repairs=None, runtime=None, log_lines=None, debug_lines=None):
@@ -18,7 +18,8 @@ def _write_run(run_dir, *, qa, repairs=None, runtime=None, log_lines=None, debug
     if log_lines is not None:
         (run_dir / "pipeline.log").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
     if debug_lines is not None:
-        path = run_dir / "debug-0bad44.jsonl"
+        sid = agent_debug.session_id() or "test-session"
+        path = run_dir / f"debug-{sid}.jsonl"
         with open(path, "w", encoding="utf-8") as handle:
             for entry in debug_lines:
                 handle.write(json.dumps(entry) + "\n")

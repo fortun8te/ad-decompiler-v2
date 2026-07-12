@@ -86,3 +86,36 @@ def test_fraction_to_pixel_helpers():
     frac = {"x": 0.25, "y": 0.5, "w": 0.5, "h": 0.25}
     box = vlm_element_propose._fraction_to_pixel(frac, tile, 400, 300)
     assert box == {"x": 150, "y": 100, "w": 100, "h": 25}
+
+
+def test_lightweight_grid_when_sam_count_below_threshold(tmp_path, monkeypatch):
+    payload = json.dumps([{
+        "label": "icon",
+        "approx_box_fraction": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+    }])
+    seen = {"grid": None, "max_tiles": None, "tile_mode": None}
+
+    def fake_ask(*args, **kwargs):
+        return payload
+
+    def fake_grid(width, height, grid, overlap):
+        seen["grid"] = grid
+        seen["tile_mode"] = "grid"
+        return [{"x": 0, "y": 0, "w": width, "h": height}]
+
+    monkeypatch.setattr(vlm_element_propose.vlm_client, "ask_vlm", fake_ask)
+    monkeypatch.setattr(vlm_element_propose, "_grid_tiles", fake_grid)
+    cfg = {
+        "vlm": {
+            "element_propose": {
+                "enabled": True,
+                "grid": 4,
+                "max_tiles": 20,
+                "lightweight_grid_below_sam_count": 3,
+            }
+        }
+    }
+    out = vlm_element_propose.enrich_residual(_image(tmp_path), [], cfg, sam_element_count=1)
+    assert len(out) == 1
+    assert seen["grid"] == 2
+    assert seen["tile_mode"] == "grid"

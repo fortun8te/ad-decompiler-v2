@@ -22,7 +22,9 @@ def test_opencv_auto_chooses_lower_seam_candidate_and_preserves_unmasked_pixels(
     )
 
     assert backend == "opencv-ns"
-    assert diagnostics == {"telea_seam": 8.0, "ns_seam": 2.0}
+    assert diagnostics["telea_seam"] == 8.0
+    assert diagnostics["ns_seam"] == 2.0
+    assert diagnostics["backend_choice"] == "opencv-ns"
     assert np.all(output[mask == 0] == source[mask == 0])
     assert np.all(output[mask > 0] == 220)
 
@@ -73,14 +75,103 @@ def test_build_union_mask_excludes_is_background_flagged_entities():
 
 def test_resolve_mask_dilate_maps_buttons_photos_and_text():
     cfg = {"inpaint": {"mask_dilate": {
-        "default": 2, "button": 5, "shape": 4, "text": 2, "photo": 1, "image": 2,
+        "default": 2, "button": 5, "shape": 4, "text": 2, "photo": 0, "image": 2,
     }}}
     assert inpaint.resolve_mask_dilate({"target": "shape", "meta": {"role": "button"}}, cfg) == 5
     assert inpaint.resolve_mask_dilate({"target": "shape", "meta": {"role": "card"}}, cfg) == 5
     assert inpaint.resolve_mask_dilate({"target": "shape", "meta": {"role": "sticker"}}, cfg) == 4
     assert inpaint.resolve_mask_dilate({"target": "text"}, cfg) == 2
-    assert inpaint.resolve_mask_dilate({"target": "image", "meta": {"role": "product"}}, cfg) == 1
+    assert inpaint.resolve_mask_dilate({"target": "image", "meta": {"role": "product"}}, cfg) == 0
     assert inpaint.resolve_mask_dilate({"target": "image", "meta": {"role": "logo"}}, cfg) == 2
+
+
+def test_build_union_mask_solidifies_soft_alpha_before_dilate():
+    canvas = (20, 20)
+    soft = np.zeros((20, 20), dtype=np.uint8)
+    soft[5:15, 5:15] = 40
+    observations = [{"box": {"x": 5, "y": 5, "w": 10, "h": 10}, "mask_array": soft, "dilate": 0}]
+
+    union = inpaint.build_union_mask(canvas, observations, default_dilate=0)
+
+    assert np.count_nonzero(union) == 100
+    assert set(np.unique(union)).issubset({0, 255})
+
+
+def test_build_union_mask_applies_minimal_feather_from_cfg():
+    canvas = (16, 16)
+    mask = np.zeros((16, 16), dtype=np.uint8)
+    mask[4:12, 4:12] = 255
+    observations = [{"box": {"x": 4, "y": 4, "w": 8, "h": 8}, "mask_array": mask, "dilate": 0}]
+    cfg = {"inpaint": {"mask_feather": 1}}
+
+    union = inpaint.build_union_mask(canvas, observations, default_dilate=0, cfg=cfg)
+
+    assert union[8, 8] == 255
+    rim = union[3, 8]
+    assert 0 < rim < 255
+
+
+def test_auto_prefers_big_lama_when_comfyui_healthy(monkeypatch):
+    source = np.full((8, 8, 3), 90, dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+    hallucination = np.zeros_like(source)
+    monkeypatch.setattr(inpaint, "comfyui_healthy", lambda cfg, probe=None: True)
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: True)
+    monkeypatch.setattr(inpaint, "_simple_lama", lambda rgb, inner_mask: hallucination)
+
+    output, backend, diagnostics = inpaint.inpaint_array(
+        source, mask, {"inpaint": {"mode": "auto"}}, return_diagnostics=True,
+    )
+
+    assert backend == "big-lama"
+    assert diagnostics["comfyui_healthy"] is True
+    assert diagnostics["backend_choice"] == "big-lama"
+    assert np.all(output[mask == 0] == source[mask == 0])
+
+
+def test_auto_skips_big_lama_when_comfyui_down(monkeypatch):
+    source = np.full((8, 8, 3), 90, dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+    telea = np.full_like(source, 11)
+
+    monkeypatch.setattr(inpaint, "comfyui_healthy", lambda cfg, probe=None: False)
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: True)
+    monkeypatch.setattr(inpaint, "_opencv_inpaint", lambda rgb, inner_mask, radius, method: telea)
+
+    output, backend, diagnostics = inpaint.inpaint_array(
+        source, mask, {"inpaint": {"mode": "auto", "opencv_method": "telea"}},
+        return_diagnostics=True,
+    )
+
+    assert backend == "opencv-telea"
+    assert diagnostics["auto_skip_reason"] == "comfyui_down"
+    assert diagnostics["comfyui_healthy"] is False
+
+
+def test_multipass_inpaint_runs_coarse_then_fine(monkeypatch):
+    source = np.full((40, 40, 3), 100, dtype=np.uint8)
+    mask = np.zeros((40, 40), dtype=np.uint8)
+    mask[:, :] = 255
+    calls = []
+
+    def fake_single(rgb, inner_mask, cfg=None):
+        calls.append(rgb.shape[:2])
+        return np.full_like(rgb, len(calls) * 10), f"pass-{len(calls)}", {}
+
+    monkeypatch.setattr(inpaint, "_inpaint_single_pass", fake_single)
+
+    _, backend, diagnostics = inpaint.inpaint_array(
+        source, mask,
+        {"inpaint": {"mode": "opencv", "multipass_fraction": 0.10}},
+        return_diagnostics=True,
+    )
+
+    assert diagnostics["inpaint_passes"] == 2
+    assert calls[0] == (20, 20)
+    assert calls[1] == (40, 40)
+    assert backend == "pass-2"
 
 
 def test_big_lama_compositing_only_replaces_masked_pixels(monkeypatch):

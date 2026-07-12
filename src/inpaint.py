@@ -129,6 +129,58 @@ def solidify_mask(mask, threshold: int = 16):
     return np.where(np.asarray(mask) > threshold, 255, 0).astype(np.uint8)
 
 
+def feather_mask_edges(mask, radius: int = 1):
+    """Soften only the outer rim of a binary mask — helps LaMa blend without widening the hole."""
+    cv2, np, _ = _deps()
+    radius = max(0, int(radius))
+    binary = solidify_mask(mask)
+    if radius <= 0 or not np.any(binary):
+        return binary
+    kernel = np.ones((3, 3), np.uint8)
+    core = cv2.erode(binary, kernel, iterations=radius)
+    boundary = cv2.subtract(binary, core)
+    k = 2 * radius + 1
+    soft_rim = cv2.GaussianBlur(boundary, (k, k), 0)
+    return np.clip(np.maximum(core, soft_rim), 0, 255).astype(np.uint8)
+
+
+def comfyui_healthy(cfg: Optional[dict] = None, probe=None) -> bool:
+    """True when the configured ComfyUI backend answers /system_stats.
+
+  On the RTX workstation ComfyUI liveness is a practical proxy for "GPU box is up".
+  Mac/unit-test runs pass ``probe`` to avoid real HTTP.
+    """
+    cfg = cfg or {}
+    qwen = cfg.get("qwen") or {}
+    if not qwen.get("enabled", True):
+        return True
+    if str(qwen.get("mode", "comfyui")).lower() != "comfyui":
+        return True
+    base = str(cfg.get("backend_url", "http://127.0.0.1:8188")).rstrip("/")
+    if probe is not None:
+        return bool(probe(f"{base}/system_stats"))
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{base}/system_stats", timeout=0.5) as response:
+            return 200 <= response.status < 500
+    except Exception:
+        return False
+
+
+def _big_lama_available() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("simple_lama_inpainting") is not None
+    except Exception:
+        return False
+
+
+def _mask_fraction(mask) -> float:
+    _, np, _ = _deps()
+    arr = np.asarray(mask)
+    return float(np.count_nonzero(arr)) / max(1, arr.size)
+
+
 def resolve_mask_dilate(candidate: dict, cfg: Optional[dict] = None) -> int:
     """Per-target inpaint dilation radius in pixels.
 
@@ -185,9 +237,12 @@ def default_mask_dilate(cfg: Optional[dict] = None) -> int:
 
 
 def build_union_mask(canvas: tuple[int, int], observations: Iterable[dict],
-                     run_dir: Optional[str] = None, default_dilate: int = 2):
+                     run_dir: Optional[str] = None, default_dilate: int = 2,
+                     cfg: Optional[dict] = None):
     """Return one uint8 union mask from canonical (already deduplicated) entities."""
     cv2, np, _ = _deps()
+    icfg = (cfg or {}).get("inpaint") or {}
+    feather = int(icfg.get("mask_feather", 0))
     width, height = canvas
     union = np.zeros((height, width), dtype=np.uint8)
     for item in observations:
@@ -200,11 +255,14 @@ def build_union_mask(canvas: tuple[int, int], observations: Iterable[dict],
         mask = item.get("mask_array")
         if mask is None:
             mask = mask_on_canvas(path, box, canvas, run_dir)
+        mask = solidify_mask(mask)
         radius = int(item.get("dilate", default_dilate))
         if radius > 0:
             k = 2 * radius + 1
             mask = cv2.dilate(mask, np.ones((k, k), np.uint8), iterations=1)
         union = cv2.bitwise_or(union, mask.astype(np.uint8))
+    if feather > 0 and np.any(union):
+        union = feather_mask_edges(union, feather)
     return union
 
 
@@ -267,40 +325,104 @@ def _simple_lama(rgb, mask):
     return np.asarray(result.convert("RGB"), dtype=np.uint8)
 
 
-def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: bool = False):
-    """Inpaint RGB pixels and guarantee that pixels outside ``mask`` stay byte-identical."""
+def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
+    """Run one inpaint backend selection without multi-pass orchestration."""
     _, np, _ = _deps()
     cfg = cfg or {}
     icfg = cfg.get("inpaint") or {}
     mode = str(icfg.get("mode", "auto")).lower()
-    mask = (np.asarray(mask) > 0).astype(np.uint8) * 255
-    if not np.any(mask):
-        result = (np.asarray(rgb, dtype=np.uint8).copy(), "none", {})
-        return result if return_diagnostics else result[:2]
+    comfy_ok = comfyui_healthy(cfg, probe=icfg.get("_comfyui_probe"))
+    lama_ok = _big_lama_available()
+    diagnostics: dict = {
+        "comfyui_healthy": comfy_ok,
+        "big_lama_installed": lama_ok,
+    }
 
     generated = None
     used = mode
-    diagnostics = {}
-    if mode in ("auto", "lama", "big-lama", "simple-lama"):
+    try_lama = mode in ("lama", "big-lama", "simple-lama")
+    if mode == "auto":
+        # Prefer Big-LaMa on the GPU workstation; skip it on a laptop where ComfyUI is down.
+        try_lama = comfy_ok and lama_ok
+        if not comfy_ok:
+            diagnostics["auto_skip_reason"] = "comfyui_down"
+        elif not lama_ok:
+            diagnostics["auto_skip_reason"] = "big_lama_missing"
+
+    if try_lama:
         try:
             generated = _simple_lama(np.asarray(rgb, dtype=np.uint8), mask)
             used = "big-lama"
+            diagnostics["backend_choice"] = "big-lama"
         except Exception as exc:
+            diagnostics["big_lama_error"] = str(exc)
             if mode != "auto" and not icfg.get("allow_fallback", True):
                 raise
             print(f"[inpaint] Big-LaMa unavailable ({exc}); using OpenCV fallback")
+
     if generated is None:
         radius = int(icfg.get("opencv_radius", 5))
         fallback_method = str(icfg.get("opencv_method", "auto" if mode == "auto" else "telea")).lower()
         if fallback_method in ("auto", "best"):
-            generated, used, diagnostics = _opencv_auto(np.asarray(rgb, dtype=np.uint8), mask, radius)
+            generated, used, auto_diag = _opencv_auto(np.asarray(rgb, dtype=np.uint8), mask, radius)
+            diagnostics.update(auto_diag)
         else:
             generated = _opencv_inpaint(np.asarray(rgb, dtype=np.uint8), mask, radius, fallback_method)
             used = "opencv-ns" if fallback_method in ("ns", "navier-stokes", "navier_stokes") else "opencv-telea"
+        diagnostics["backend_choice"] = used
+
+    return generated, used, diagnostics
+
+
+def _multipass_inpaint(rgb, mask, cfg: Optional[dict] = None):
+    """Coarse-to-fine inpaint for large removal regions."""
+    cv2, np, _ = _deps()
+    icfg = (cfg or {}).get("inpaint") or {}
+    threshold = float(icfg.get("multipass_fraction", 0.12))
+    fraction = _mask_fraction(mask)
+    if fraction < threshold:
+        generated, used, diagnostics = _inpaint_single_pass(rgb, mask, cfg)
+        diagnostics["inpaint_passes"] = 1
+        diagnostics["masked_fraction"] = round(fraction, 6)
+        return generated, used, diagnostics
+
+    h, w = rgb.shape[:2]
+    half = (max(1, w // 2), max(1, h // 2))
+    small_rgb = cv2.resize(np.asarray(rgb, dtype=np.uint8), half, interpolation=cv2.INTER_AREA)
+    small_mask = cv2.resize(np.asarray(mask, dtype=np.uint8), half, interpolation=cv2.INTER_NEAREST)
+    coarse, coarse_backend, coarse_diag = _inpaint_single_pass(small_rgb, small_mask, cfg)
+    coarse_up = cv2.resize(coarse, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    working = np.asarray(rgb, dtype=np.uint8).copy()
+    selected = np.asarray(mask) > 0
+    working[selected] = coarse_up[selected]
+    generated, used, diagnostics = _inpaint_single_pass(working, mask, cfg)
+    diagnostics.update({
+        "inpaint_passes": 2,
+        "masked_fraction": round(fraction, 6),
+        "coarse_backend": coarse_backend,
+        "coarse_fraction": threshold,
+    })
+    diagnostics.update({f"coarse_{key}": value for key, value in coarse_diag.items()})
+    return generated, used, diagnostics
+
+
+def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: bool = False):
+    """Inpaint RGB pixels and guarantee that pixels outside ``mask`` stay byte-identical."""
+    _, np, _ = _deps()
+    cfg = cfg or {}
+    composite_mask = solidify_mask(mask)
+    if not np.any(composite_mask):
+        result = (np.asarray(rgb, dtype=np.uint8).copy(), "none", {})
+        return result if return_diagnostics else result[:2]
+
+    generated, used, diagnostics = _multipass_inpaint(
+        np.asarray(rgb, dtype=np.uint8), composite_mask, cfg,
+    )
 
     original = np.asarray(rgb, dtype=np.uint8)
     out = original.copy()
-    selected = mask > 0
+    selected = composite_mask > 0
     out[selected] = np.asarray(generated, dtype=np.uint8)[selected]
     result = (out, used, diagnostics)
     return result if return_diagnostics else result[:2]

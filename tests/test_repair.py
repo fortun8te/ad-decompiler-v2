@@ -24,7 +24,10 @@ def test_repair_suggests_rerun_detection_for_low_element_recall():
     assert choice is not None
     assert choice["resume"] == "sam"
     assert choice["patches"]["sam3"]["enabled"] is True
+    assert choice["patches"]["sam3"]["confidence"] == 0.38
+    assert choice["patches"]["sam3"]["box_refine_confidence"] == 0.30
     assert choice["patches"]["vlm"]["element_propose"]["enabled"] is True
+    assert choice["patches"]["vlm"]["element_propose"]["lightweight_grid"] is True
 
 
 def test_repair_computes_element_recall_from_artifacts(tmp_path):

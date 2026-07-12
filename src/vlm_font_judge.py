@@ -14,7 +14,7 @@ import json
 import re
 
 from src import vlm_client
-from src.text_analysis import _style_cluster_key
+from src.text_analysis import _style_cluster_key, needs_vlm_font_judge
 
 _DEFAULT_PASSES = 2
 _DEFAULT_MAX_TOKENS = 120
@@ -63,6 +63,19 @@ def _font_matching_enabled(cfg: dict) -> bool:
     if isinstance(fm, dict):
         return bool(fm.get("enabled"))
     return False
+
+
+def should_judge_fonts(ocr_result: dict, cfg: dict) -> bool:
+    """Run when explicitly enabled, or when local/google render scores are weak."""
+    judge = ((cfg or {}).get("vlm") or {}).get("font_judge") or {}
+    if not _font_matching_enabled(cfg):
+        return False
+    if judge.get("enabled"):
+        return True
+    vlm_root = (cfg or {}).get("vlm") or {}
+    if not vlm_root.get("enabled"):
+        return False
+    return needs_vlm_font_judge(ocr_result, cfg)
 
 
 def _extract_json(text: str) -> dict | None:
@@ -176,12 +189,12 @@ def _render_candidate(text: str, candidate: dict, size: float, colour: tuple[int
         return None
 
 
-def _local_candidates(candidates: list[dict], max_n: int) -> list[dict]:
+def _judgeable_candidates(candidates: list[dict], max_n: int) -> list[dict]:
     out = []
     for item in candidates or []:
         if not isinstance(item, dict):
             continue
-        if item.get("source") != "local-render" or not item.get("path"):
+        if item.get("source") not in {"local-render", "google-cache"} or not item.get("path"):
             continue
         out.append(item)
         if len(out) >= max_n:
@@ -310,9 +323,10 @@ def _judge_cluster(rep: dict, candidates: list[dict], source_crop: bytes, option
 
 def judge_fonts(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     """Re-rank font candidates per style cluster using optional VLM judging. Never raises."""
-    judge = ((cfg or {}).get("vlm") or {}).get("font_judge") or {}
-    if not judge.get("enabled", False) or not _font_matching_enabled(cfg):
+    if not should_judge_fonts(ocr_result, cfg):
         return ocr_result
+
+    judge = ((cfg or {}).get("vlm") or {}).get("font_judge") or {}
 
     lines = list(ocr_result.get("lines") or [])
     if not lines:
@@ -324,11 +338,11 @@ def judge_fonts(image_path: str, ocr_result: dict, cfg: dict) -> dict:
         "model": str(vcfg.get("model") or vlm_client._DEFAULT_MODEL),
         "timeout_s": float(vcfg.get("timeout_s") or vlm_client._DEFAULT_TIMEOUT_S),
         "max_tokens": int(vcfg.get("max_tokens") or _DEFAULT_MAX_TOKENS),
-        "padding": int(vcfg.get("padding", _DEFAULT_PADDING)),
-        "passes": int(vcfg.get("passes", _DEFAULT_PASSES)),
-        "max_candidates": int(vcfg.get("max_candidates", vcfg.get("top_candidates", _DEFAULT_MAX_CANDIDATES))),
-        "score_threshold": float(vcfg.get("score_threshold", vcfg.get("min_score", _DEFAULT_SCORE_THRESHOLD))),
-        "max_styles": int(vcfg.get("max_styles", _DEFAULT_MAX_STYLES)),
+        "padding": int(vcfg.get("padding") if vcfg.get("padding") is not None else _DEFAULT_PADDING),
+        "passes": int(vcfg.get("passes") if vcfg.get("passes") is not None else _DEFAULT_PASSES),
+        "max_candidates": int(vcfg.get("max_candidates") or vcfg.get("top_candidates") or _DEFAULT_MAX_CANDIDATES),
+        "score_threshold": float(vcfg.get("score_threshold") or vcfg.get("min_score") or _DEFAULT_SCORE_THRESHOLD),
+        "max_styles": int(vcfg.get("max_styles") if vcfg.get("max_styles") is not None else _DEFAULT_MAX_STYLES),
     }
 
     try:
@@ -341,7 +355,7 @@ def judge_fonts(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     clusters: dict[str, list[dict]] = {}
     for line in lines:
         style = line.get("style") or {}
-        if not _local_candidates(style.get("fontCandidates") or [], 1):
+        if not _judgeable_candidates(style.get("fontCandidates") or [], 1):
             continue
         clusters.setdefault(_cluster_key(line), []).append(line)
 
@@ -358,7 +372,7 @@ def judge_fonts(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     for cluster_key, cluster_lines in list(clusters.items())[: options["max_styles"]]:
         rep = max(cluster_lines, key=lambda ln: float(ln.get("ink_confidence", ln.get("conf", 0))))
         style = rep.get("style") or {}
-        candidates = _local_candidates(style.get("fontCandidates") or [], options["max_candidates"])
+        candidates = _judgeable_candidates(style.get("fontCandidates") or [], options["max_candidates"])
         if not candidates:
             continue
         box = rep.get("painted_box") or rep.get("box")
@@ -399,7 +413,7 @@ def judge_fonts(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     result = copy.deepcopy(ocr_result)
     result["lines"] = lines
     result["vlm_font_judge"] = {
-        "enabled": True,
+        "enabled": bool(judge.get("enabled")) or needs_vlm_font_judge(ocr_result, cfg),
         "model": options["model"],
         "score_threshold": options["score_threshold"],
         "clusters_judged": judged,
@@ -412,4 +426,4 @@ def judge_fonts(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     return result
 
 
-__all__ = ["judge_fonts"]
+__all__ = ["judge_fonts", "should_judge_fonts"]

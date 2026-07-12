@@ -90,8 +90,16 @@ def config_patches_for(repair: dict) -> dict:
             patches["reconstruct"] = {"dedup_iou": 0.90}
 
     elif stage == "text-analysis" and action == "resolve-fonts":
-        patches["text_analysis"] = {"font_matching": {"enabled": True}}
-        if params.get("enable_vlm_font_judge"):
+        patches["text_analysis"] = {
+            "font_matching": {
+                "enabled": True,
+                "repair_pass": True,
+                "max_fonts": int(params.get("max_fonts", 96)),
+                "max_lines": int(params.get("max_lines", 24)),
+                "top_k": int(params.get("top_k", 5)),
+            }
+        }
+        if params.get("enable_vlm_font_judge") is not False:
             patches["vlm"] = {"font_judge": {"enabled": True}}
 
     elif stage == "inpaint" and action == "rebuild-clean-plate":
@@ -143,9 +151,15 @@ def config_patches_for(repair: dict) -> dict:
         sam3_patch: dict[str, Any] = {"enabled": True}
         if params.get("lower_confidence"):
             sam3_patch["confidence"] = float(params.get("confidence", 0.38))
+            sam3_patch["box_refine_confidence"] = float(
+                params.get("box_refine_confidence", 0.30)
+            )
         patches["sam3"] = sam3_patch
         if params.get("enable_element_propose"):
-            patches.setdefault("vlm", {})["element_propose"] = {"enabled": True}
+            patches.setdefault("vlm", {})["element_propose"] = {
+                "enabled": True,
+                "lightweight_grid": bool(params.get("lightweight_grid", True)),
+            }
         if params.get("disable_segment_filter"):
             patches.setdefault("vlm", {})["segment_filter"] = {"enabled": False}
 

@@ -18,6 +18,13 @@ from .wordmark import is_wordmark_candidate
 ICON_MAX_AREA_FRAC = 0.06
 EMOJI_RE_HINT = ("emoji", "pictograph")
 
+# Roles that should attempt vector tracing when small enough.
+VECTORIZE_ROLES = (
+    "icon", "badge", "logo", "arrow", "symbol", "pictogram", "chip", "divider", "chrome",
+)
+# Flat UI chrome shapes that are often simple enough to trace instead of primitive-fit.
+VECTORIZE_SHAPE_ROLES = ("badge", "chip", "button", "divider")
+
 # Below this combined ink/font-match confidence, a text candidate cannot be faithfully
 # reproduced as editable text (glyph too hard to isolate, or the closest font/effect
 # match is a poor fit) — it is routed to a masked-pixel fallback layer instead of
@@ -108,7 +115,7 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
         return c
 
     # 4. Icons / badges / simple graphics → vectorize (small only) ------------------
-    if kind == "icon" or meta.get("role") in ("icon", "badge", "logo", "arrow"):
+    if kind == "icon" or meta.get("role") in VECTORIZE_ROLES:
         if _area_frac(c.get("box", {}), canvas) <= ICON_MAX_AREA_FRAC:
             c["target"] = "icon"
         else:
@@ -118,8 +125,17 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
 
     # 5. Shapes / cards / buttons → primitive when fill is solid/gradient -----------
     if kind == "shape":
+        role = meta.get("role")
+        small = _area_frac(c.get("box", {}), canvas) <= ICON_MAX_AREA_FRAC
+        if small and (
+            meta.get("flat_fill")
+            or meta.get("simple_graphic")
+            or role in VECTORIZE_SHAPE_ROLES
+        ):
+            c["target"] = "icon"
+            return c
         c["target"] = "shape"
-        if meta.get("role") in ("button", "badge", "chip", "card"):
+        if role in ("button", "badge", "chip", "card"):
             radius = c.get("radius")
             if radius is None:
                 radius = (c.get("style") or {}).get("radius")
