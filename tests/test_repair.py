@@ -116,6 +116,13 @@ def test_near_zero_text_recall_has_vlm_alternative_after_ocr():
     assert ("vlm", "boost-stack") in _actions(repairs)
 
 
+def test_offline_qwen_is_never_enabled_by_visual_repair():
+    repairs = repair.assess({}, {"ssim": 0.48, "hard_fails": []}, {"lines": []},
+                            {"qwen": {"enabled": False}})
+    assert ("qwen", "retry") not in _actions(repairs)
+    assert ("reconstruct", "inspect-worst-regions") in _actions(repairs)
+
+
 def test_repair_per_layer_element_recall_targets_sam3(tmp_path):
     repairs = repair.assess(
         {},

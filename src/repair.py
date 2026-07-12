@@ -149,6 +149,11 @@ def _unclean_background_signal(structural):
 
 def assess(design, qa, ocr, cfg: Optional[dict] = None):
     cfg = cfg or {}
+    # Qwen is an optional, separately hosted layer proposal service.  A failed visual
+    # score must never turn it on just because it happens to be mentioned in an old
+    # repair recipe: that produces a predictable offline request and wastes a repair
+    # iteration.  Explicitly enabled installations still retain Qwen retries.
+    qwen_enabled = bool((cfg.get("qwen") or {}).get("enabled", False))
     pass_ssim = visual_pass_ssim(cfg)
     t = dict(DEFAULTS)
     t["ssim_min"] = pass_ssim
@@ -546,6 +551,16 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
     out.sort(key=lambda r: _sev(r.get("severity")), reverse=True)
 
     run_dir = cfg.get("run_dir")
+    if not qwen_enabled:
+        # Keep the repair actionable when Qwen is unavailable.  Reconstruction is the
+        # native SAM/residual route and has no external ComfyUI dependency.
+        for item in out:
+            if item.get("stage") == "qwen" and item.get("action") == "retry":
+                item["stage"] = "reconstruct"
+                item["action"] = "inspect-worst-regions"
+                item["reason"] = f"Qwen disabled; {item.get('reason', 'inspect visual layer mismatch')}"
+                item["params"] = {"qwen_disabled": True}
+
     if run_dir:
         try:
             schema = importlib.import_module("src.schema")

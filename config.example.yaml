@@ -149,7 +149,7 @@ element_fusion:
   nested_max_area_ratio: 0.62
 
 qwen:
-  enabled: true                        # advisory z/alpha observation; SAM owns element recall
+  enabled: false                       # opt in only after the separate local ComfyUI service is online
   required: false                      # set true only for an experiment that depends on its alpha layers
   mode: comfyui                       # comfyui | direct-diffusers
   workflow: workflows/qwen_layered_8_api.json
