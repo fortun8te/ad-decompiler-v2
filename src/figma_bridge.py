@@ -282,6 +282,63 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _run_repo_update(remote: str = "newrepo", branch: str = "main") -> dict:
+    """git pull on the bridge host so Mac can sync the RTX box over Tailscale."""
+    import subprocess
+
+    root = _repo_root()
+    git_dir = os.path.join(root, ".git")
+    if not os.path.isdir(git_dir):
+        return {"ok": False, "error": "not a git checkout", "root": root}
+
+    def run(*args: str, timeout: int = 180) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            list(args),
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    try:
+        fetch = run("git", "fetch", remote, branch)
+        if fetch.returncode != 0:
+            return {
+                "ok": False,
+                "error": (fetch.stderr or fetch.stdout or "git fetch failed").strip(),
+                "root": root,
+            }
+        pull = run("git", "pull", remote, branch)
+        if pull.returncode != 0:
+            return {
+                "ok": False,
+                "error": (pull.stderr or pull.stdout or "git pull failed").strip(),
+                "root": root,
+            }
+        head = run("git", "rev-parse", "--short", "HEAD")
+        commit = head.stdout.strip() if head.returncode == 0 else None
+        python = sys.executable
+        stamp_note = None
+        stamp_script = os.path.join(root, "scripts", "stamp_plugin_build.py")
+        if os.path.isfile(stamp_script):
+            stamp = run(python, stamp_script, "--quiet", timeout=60)
+            if stamp.returncode != 0:
+                stamp_note = (stamp.stderr or stamp.stdout or "stamp failed").strip()
+        return {
+            "ok": True,
+            "root": root,
+            "remote": remote,
+            "branch": branch,
+            "commit": commit,
+            "pull_output": (pull.stdout or "").strip(),
+            "stamp_note": stamp_note,
+            "restart_required": True,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "git command timed out", "root": root}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "root": root}
+
 def _resolve_config_path(path: str) -> str:
     if not path:
         return os.path.join(_repo_root(), "config.yaml")
@@ -921,6 +978,13 @@ def make_handler(inbox, config_path=None):
 
         def do_POST(self):
             route = urlparse(self.path).path
+            if route == "/repo/update":
+                query = parse_qs(urlparse(self.path).query)
+                remote = (query.get("remote") or ["newrepo"])[0] or "newrepo"
+                branch = (query.get("branch") or ["main"])[0] or "main"
+                result = _run_repo_update(remote=remote, branch=branch)
+                status = 200 if result.get("ok") else 500
+                return self._send(status, json.dumps(result).encode(), "application/json")
             if route == "/export":
                 n = self._content_length(max_bytes=32 * 1024 * 1024)
                 if n is None:

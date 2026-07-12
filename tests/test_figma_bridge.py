@@ -963,3 +963,67 @@ def test_estimate_eta_returns_none_without_history(tmp_path):
     inbox.mkdir()
     eta, sample_size, progress_pct = _estimate_eta(str(inbox), 12.0, "ocr")
     assert eta is None and sample_size == 0 and progress_pct is None
+
+
+def test_repo_update_runs_git_pull(tmp_path, monkeypatch):
+    import subprocess
+
+    from src import figma_bridge
+
+    calls = []
+
+    class FakeResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if list(args[:2]) == ["git", "fetch"]:
+            return FakeResult()
+        if list(args[:2]) == ["git", "pull"]:
+            return FakeResult(stdout="Already up to date.\n")
+        if list(args[:2]) == ["git", "rev-parse"]:
+            return FakeResult(stdout="cd807f2\n")
+        return FakeResult()
+
+    monkeypatch.setattr(figma_bridge, "_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "stamp_plugin_build.py").write_text("print('ok')", encoding="utf-8")
+
+    result = figma_bridge._run_repo_update()
+    assert result["ok"] is True
+    assert result["commit"] == "cd807f2"
+    assert any(call[:3] == ["git", "pull", "newrepo"] for call in calls)
+
+
+def test_repo_update_http_endpoint(tmp_path, monkeypatch):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    _allow_machine_ready(monkeypatch)
+
+    from src import figma_bridge
+
+    monkeypatch.setattr(
+        figma_bridge, "_run_repo_update",
+        lambda remote="newrepo", branch="main": {"ok": True, "commit": "abc1234", "restart_required": True},
+    )
+
+    handler = make_handler(str(inbox), config)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = Request(f"http://127.0.0.1:{port}/repo/update", data=b"", method="POST")
+        with urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert payload["ok"] is True
+        assert payload["commit"] == "abc1234"
+    finally:
+        server.shutdown()
+        server.server_close()

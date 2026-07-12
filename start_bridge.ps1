@@ -38,6 +38,23 @@ function Test-BridgeHealth([int]$TargetPort) {
 }
 
 Ensure-Venv
+
+# Sync repo before starting so the bridge always runs the latest code.
+if (Test-Path (Join-Path $Root ".git")) {
+  try {
+    Write-Host "Syncing repo (git pull newrepo main)..."
+    & git -C $Root fetch newrepo main 2>$null
+    & git -C $Root pull newrepo main
+    if (Test-Path $Python) {
+      & $Python "$Root\scripts\stamp_plugin_build.py" --quiet
+    }
+    $head = (& git -C $Root rev-parse --short HEAD).Trim()
+    Write-Host "Repo at $head"
+  } catch {
+    Write-Host "WARNING: git pull failed — continuing with current checkout: $_"
+  }
+}
+
 & $Python "$Root\scripts\stamp_plugin_build.py" --quiet
 & $Python -m src.bridge_bootstrap --config config.yaml --inbox $Inbox
 
@@ -48,8 +65,8 @@ if (Test-BridgeHealth $Port) {
   Write-Host "  http://localhost:$Port"
   Write-Host "================================================"
   Write-Host ""
-  Write-Host "Open Figma Desktop and run the Ad Decompiler plugin."
-  Write-Host "You can close this window — the bridge keeps running."
+  Write-Host "Code was synced above. Restart this script (or kill python.exe)"
+  Write-Host "so the bridge loads the new checkout."
   Write-Host ""
   Read-Host "Press Enter to close"
   exit 0
