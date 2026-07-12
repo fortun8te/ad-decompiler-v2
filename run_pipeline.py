@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from src.console_io import configure_stdio, safe_print
 from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  element_fusion, qwen_worker, merge_layers, reconstruct, layout,
-                 build_design_json, figma_import, pixel_diff, repair, render_preview)
+                 build_design_json, figma_import, pixel_diff, repair, render_preview,
+                 vlm_proofread)
 from src.run_report import RunReport, qwen_degradation
 from src.schema import dump, load
 
@@ -165,8 +166,11 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         if stage("ocr") or not exists("ocr_raw.json"):
             current_stage = "ocr"
             raw_ocr = ocr.run_ocr(norm_path, cfg, run_dir=run_dir)
+            raw_ocr = vlm_proofread.proofread_lines(norm_path, raw_ocr, cfg)
             dump(raw_ocr, A("ocr_raw.json"))
-            _log(run_dir, f"ocr[{raw_ocr.get('engine')}] → {len(raw_ocr.get('lines', []))} lines")
+            vp = raw_ocr.get("vlm_proofread")
+            vp_note = f", vlm-corrected {vp['lines_corrected']}/{vp['lines_checked']}" if vp else ""
+            _log(run_dir, f"ocr[{raw_ocr.get('engine')}] → {len(raw_ocr.get('lines', []))} lines{vp_note}")
         raw_ocr = load(A("ocr_raw.json")) if exists("ocr_raw.json") else load(A("ocr.json"))
         if stage("text") or not exists("ocr.json"):
             current_stage = "text"

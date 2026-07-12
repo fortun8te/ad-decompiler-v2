@@ -1,6 +1,16 @@
 # ad-decompiler config — copy to config.yaml and adjust for your Windows/RTX 5080 box.
 device: cuda                          # cuda | cpu
 
+# Optional: proofread low-confidence OCR lines against a local vision model. Catches outright
+# misreads (stylized ad type, small/dense labels) that OCR confidence alone can't flag as
+# *wrong*, only uncertain. Off by default -- requires a local OpenAI-vision-compatible server
+# (e.g. LM Studio) running the given model; any failure there just leaves OCR text as-is.
+vlm:
+  enabled: false
+  base_url: http://127.0.0.1:1234/v1
+  model: google/gemma-4-e4b            # any vision-capable local model works
+  confidence_threshold: 0.85           # only lines below this OCR confidence get checked
+
 # An RTX acceptance run must show which model actually ran. Disabled models remain valid for
 # CPU development, but enabled OCR/SAM fallbacks become QA failures instead of quiet boxes.
 runtime:

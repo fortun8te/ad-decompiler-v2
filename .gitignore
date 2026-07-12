@@ -4,6 +4,9 @@
 **/.cache/
 figma-inbox/
 
+# local benchmark images (real third-party ad creatives -- not for the repo)
+/benchmark_set/
+
 # models & binaries (download on the target box)
 *.onnx
 *.pth
