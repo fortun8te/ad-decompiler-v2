@@ -117,6 +117,17 @@ def _run_comfyui(img_path, run_dir, cfg, schema):
     wf_path = qcfg.get("workflow", "workflows/qwen_layered_8_api.json")
     layers_n = int(qcfg.get("layers", 8))
 
+    # Fail fast when the separately hosted ComfyUI service is not running. The old
+    # upload-first path could waste thirty seconds on every harness round.
+    try:
+        probe = requests.get(f"{base}/system_stats", timeout=float(qcfg.get("probe_timeout_s", 2)))
+        probe.raise_for_status()
+    except Exception as e:
+        note = f"qwen(comfyui): backend offline ({e})"
+        print("[qwen]", note)
+        _write_manifest(schema, [], run_dir, note)
+        return []
+
     if not os.path.exists(wf_path):
         note = f"qwen(comfyui): workflow not found: {wf_path}"
         print("[qwen]", note)

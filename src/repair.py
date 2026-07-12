@@ -154,6 +154,14 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
     # repair recipe: that produces a predictable offline request and wastes a repair
     # iteration.  Explicitly enabled installations still retain Qwen retries.
     qwen_enabled = bool((cfg.get("qwen") or {}).get("enabled", False))
+    run_dir = cfg.get("run_dir")
+    if qwen_enabled and run_dir:
+        try:
+            note = open(os.path.join(run_dir, "qwen.note.txt"), encoding="utf-8").read().lower()
+            if any(marker in note for marker in ("backend offline", "backend likely down", "connection refused")):
+                qwen_enabled = False
+        except OSError:
+            pass
     pass_ssim = visual_pass_ssim(cfg)
     t = dict(DEFAULTS)
     t["ssim_min"] = pass_ssim
@@ -550,7 +558,6 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
     out = unique
     out.sort(key=lambda r: _sev(r.get("severity")), reverse=True)
 
-    run_dir = cfg.get("run_dir")
     if not qwen_enabled:
         # Keep the repair actionable when Qwen is unavailable.  Reconstruction is the
         # native SAM/residual route and has no external ComfyUI dependency.
