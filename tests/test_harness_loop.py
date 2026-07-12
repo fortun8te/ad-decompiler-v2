@@ -222,3 +222,110 @@ def test_malformed_critic_falls_back_with_visible_error(tmp_path, monkeypatch):
 
     assert output["critic_error"] == "critic returned malformed output"
     assert isinstance(output["filtered_repairs"], list)
+
+
+# ── convergence guarantees (best-kept / rollback / no-repeat / plateau) ─────────────────
+
+def _seed_scored_run(tmp_path, *, ssim, design_marker="BASE"):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    (run_dir / "runtime_report.json").write_text(
+        json.dumps({"input": str(input_path)}), encoding="utf-8")
+    (run_dir / "design.json").write_text(
+        json.dumps({"marker": design_marker, "layers": []}), encoding="utf-8")
+    (run_dir / "qa.json").write_text(
+        json.dumps({"ok": False, "ssim": ssim, "hard_fails": [], "repairs": [
+            {"stage": "ocr", "action": "rerun", "severity": "high"}]}), encoding="utf-8")
+    (run_dir / "repairs.json").write_text(json.dumps([
+        {"stage": "ocr", "action": "rerun", "severity": "high"},
+    ]), encoding="utf-8")
+    return str(input_path), str(run_dir)
+
+
+def _write_state(run_dir, *, ssim, marker):
+    with open(os.path.join(run_dir, "design.json"), "w", encoding="utf-8") as fh:
+        json.dump({"marker": marker, "layers": []}, fh)
+    with open(os.path.join(run_dir, "qa.json"), "w", encoding="utf-8") as fh:
+        json.dump({"ok": False, "ssim": ssim, "marker": marker, "hard_fails": [],
+                   "repairs": [{"stage": "ocr", "action": "rerun", "severity": "high"}]}, fh)
+
+
+def _read_marker(run_dir):
+    with open(os.path.join(run_dir, "design.json"), encoding="utf-8") as fh:
+        return json.load(fh)["marker"]
+
+
+def test_regressing_round_rolls_back_and_best_design_is_returned(tmp_path, monkeypatch):
+    input_path, run_dir = _seed_scored_run(tmp_path, ssim=0.70, design_marker="BEST")
+    state = {"n": 0}
+
+    def run_one(path, rd, cfg, start_from="normalize"):
+        state["n"] += 1
+        _write_state(rd, ssim=0.30 + 0.02 * state["n"], marker=f"BAD{state['n']}")
+        return {"ok": True}
+
+    def exec_repairs(rd, cfg, max_iterations=2, run_one=None, blocked_repairs=None):
+        return {"stopped": "max_iterations", "qa_ok": False, "iterations": 1, "attempts": [
+            {"repair": {"stage": "ocr", "action": "rerun", "target_id": None},
+             "qa_improved": False, "pipeline_ok": True}]}
+
+    monkeypatch.setattr(harness_loop, "_run_critic_pass",
+                        lambda rd, cfg: {"prioritized_issues": [], "suggested_fix_ids": [],
+                                         "blockers": [], "filtered_repairs": []})
+    monkeypatch.setattr(harness_loop, "_run_fixer_pass",
+                        lambda rd, cfg, c: {"cfg": cfg, "fixes": ["keep-going"]})
+
+    summary = harness_loop.run_until_acceptable(
+        input_path, run_dir, {}, max_rounds=2,
+        run_one=run_one, execute_repairs_fn=exec_repairs)
+
+    # (c) best-kept: every round regressed, so the original BEST design is emitted.
+    assert _read_marker(run_dir) == "BEST"
+    # (a) at least one regressing round was rolled back.
+    trail = summary["convergence"]["trail"]
+    assert any(entry["rolled_back"] for entry in trail)
+    assert summary["convergence"]["best_round"] == 0
+    assert summary["convergence"]["rolled_back_rounds"] >= 1
+
+
+def test_no_op_repair_is_not_retried_and_plateau_stops(tmp_path, monkeypatch):
+    input_path, run_dir = _seed_scored_run(tmp_path, ssim=0.50)
+    received_blocked = []
+
+    def run_one(path, rd, cfg, start_from="normalize"):
+        # Fresh qa each round but identical quality — a genuine no-op / plateau.
+        _write_state(rd, ssim=0.50, marker=f"round-{len(received_blocked)}")
+        return {"ok": True}
+
+    def exec_repairs(rd, cfg, max_iterations=2, run_one=None, blocked_repairs=None):
+        received_blocked.append(set(blocked_repairs or ()))
+        return {"stopped": "max_iterations", "qa_ok": False, "iterations": 1, "attempts": [
+            {"repair": {"stage": "ocr", "action": "rerun", "target_id": None},
+             "qa_improved": False, "pipeline_ok": True}]}
+
+    monkeypatch.setattr(harness_loop, "_run_critic_pass",
+                        lambda rd, cfg: {"prioritized_issues": [], "suggested_fix_ids": [],
+                                         "blockers": [], "filtered_repairs": []})
+    monkeypatch.setattr(harness_loop, "_run_fixer_pass",
+                        lambda rd, cfg, c: {"cfg": cfg, "fixes": ["keep-going"]})
+
+    summary = harness_loop.run_until_acceptable(
+        input_path, run_dir, {}, max_rounds=5,
+        run_one=run_one, execute_repairs_fn=exec_repairs)
+
+    # (b) the no-op ocr:rerun applied in round 1 is blocked for every later round.
+    assert len(received_blocked) >= 2
+    assert ("ocr", "rerun", None) in received_blocked[1]
+    # PLATEAU stop: identical scores for plateau_rounds rounds ends the loop early.
+    assert summary["stopped"] == "plateau"
+    assert summary["rounds_completed"] < 5
+
+
+def test_convergence_config_keys_are_reportable():
+    cfg = {"runtime": {"harness": {"epsilon": 0.02, "plateau_rounds": 3}}}
+    assert harness_loop.convergence_epsilon(cfg) == 0.02
+    assert harness_loop.plateau_round_limit(cfg) == 3
+    assert harness_loop.convergence_epsilon({}) == harness_loop._DEFAULT_EPSILON
+    assert harness_loop.plateau_round_limit({}) == harness_loop._DEFAULT_PLATEAU_ROUNDS

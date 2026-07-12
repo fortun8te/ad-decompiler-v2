@@ -222,25 +222,83 @@ def _shape_tile(layer, size, run_dir=None):
     return tile
 
 
-def _text_tile(layer, size):
-    from PIL import Image, ImageDraw, ImageFont
-    style = layer.get("style", {}) or {}
-    width, height = size
-    tile = Image.new("RGBA", size, (0, 0, 0, 0))
-    font_size = max(1, int(round(_number(style.get("fontSize", max(12, height)), max(12, height)))))
+def _normalize_align(value, default="left"):
+    token = str(value or default).strip().lower()
+    if token in ("center", "centre", "middle"):
+        return "center"
+    if token in ("right", "end"):
+        return "right"
+    if token in ("left", "start", "justify", "justified"):
+        return "left"
+    return default
+
+
+def _text_font(style, font_size):
+    from PIL import ImageFont
     candidates = style.get("fontCandidates") or []
-    font_path = next((candidate.get("path") for candidate in candidates
-                      if isinstance(candidate, dict) and candidate.get("path") and os.path.exists(candidate["path"])), None)
-    try:
-        font = ImageFont.truetype(font_path or "arial.ttf", font_size)
-    except Exception:
+    paths = [candidate.get("path") for candidate in candidates
+             if isinstance(candidate, dict) and candidate.get("path") and os.path.exists(candidate["path"])]
+    paths += ["arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
+    for path in paths:
         try:
-            font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", font_size)
+            return ImageFont.truetype(path, font_size)
         except Exception:
-            font = ImageFont.load_default()
+            continue
+    try:
+        return ImageFont.load_default(font_size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _line_advance(font, line, tracking):
+    """Rendered width of one line, honoring per-glyph tracking (letterSpacing).
+
+    Measured exactly the way :func:`_draw_tracked_line` advances the pen, so a tile
+    sized to this width can never clip the glyphs it is about to draw.  PIL's own
+    ``multiline_text`` ignores letter spacing entirely, which is why authored text
+    with negative tracking used to overrun its box and clip on the right.
+    """
+    if not line:
+        return 0.0
+    width = 0.0
+    for char in line:
+        width += font.getlength(char)
+    return width + tracking * max(0, len(line) - 1)
+
+
+def _draw_tracked_line(draw, origin, line, font, fill, tracking, ascent):
+    x, baseline = origin
+    for char in line:
+        try:
+            draw.text((x, baseline), char, font=font, fill=fill, anchor="ls")
+        except (ValueError, TypeError):
+            draw.text((x, baseline - ascent), char, font=font, fill=fill)
+        x += font.getlength(char) + tracking
+
+
+def _text_tile(layer, size):
+    """Rasterize a text layer without ever clipping its glyphs.
+
+    The tile is sized to the *measured* rendered text (with letterSpacing applied),
+    not to ``box.w``/``box.h``.  The returned offset places that block so its
+    alignment anchor (left/center/right, top/middle/bottom) coincides with the box,
+    letting text spill outside a too-small box instead of being cut off.
+    """
+    from PIL import Image, ImageDraw
+    style = layer.get("style", {}) or {}
+    box_w, box_h = size
+    text = str(layer.get("text", ""))
+    font_size = max(1, int(round(_number(style.get("fontSize", max(12, box_h)), max(12, box_h)))))
+    font = _text_font(style, font_size)
+    try:
+        ascent, descent = font.getmetrics()
+    except Exception:
+        ascent, descent = int(font_size * 0.8), int(font_size * 0.2)
     line_height = _number(style.get("lineHeight", font_size * 1.2), font_size * 1.2)
-    spacing = max(0, round(line_height - font_size))
-    align = str(style.get("align", "left")).lower()
+    if line_height <= 0:
+        line_height = font_size * 1.2
+    tracking = _number(style.get("letterSpacing", 0), 0)
+    align = _normalize_align(style.get("align", "left"))
     vertical = str(style.get("verticalAlign", style.get("vertical_align", "top"))).lower()
     fill = style.get("color")
     if fill is None:
@@ -249,18 +307,46 @@ def _text_tile(layer, size):
             fill = fill_spec
         elif isinstance(fill_spec, dict):
             fill = fill_spec.get("color", "#111111")
+    colour = _color(fill or "#111111")
+
+    lines = text.split("\n")
+    widths = [_line_advance(font, line, tracking) for line in lines]
+    content_w = max(widths + [0.0])
+    line_count = max(1, len(lines))
+    content_h = (line_count - 1) * line_height + ascent + descent
+
+    # A small margin guards side bearings, negative-tracking overshoot and descenders
+    # so measured content never touches the tile edge (which would clip a glyph).
+    pad = max(2, int(math.ceil(font_size * 0.12)))
+    tile_w = max(1, int(math.ceil(content_w)) + 2 * pad)
+    tile_h = max(1, int(math.ceil(content_h)) + 2 * pad)
+    tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(tile)
-    text = str(layer.get("text", ""))
-    align = align if align in ("left", "center", "right") else "left"
-    bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing, align=align)
-    painted_w, painted_h = max(0, bbox[2] - bbox[0]), max(0, bbox[3] - bbox[1])
-    x = 0 if align == "left" else (width - painted_w) / 2 if align == "center" else width - painted_w
-    y = 0 if vertical == "top" else (height - painted_h) / 2 if vertical in ("center", "middle") else height - painted_h
-    draw.multiline_text(
-        (x - bbox[0], y - bbox[1]), text, fill=_color(fill or "#111111"),
-        font=font, spacing=spacing, align=align,
-    )
-    return tile
+
+    y = float(pad)
+    for line, width in zip(lines, widths):
+        if align == "center":
+            x = pad + (content_w - width) / 2.0
+        elif align == "right":
+            x = pad + (content_w - width)
+        else:
+            x = float(pad)
+        _draw_tracked_line(draw, (x, y + ascent), line, font, colour, tracking, ascent)
+        y += line_height
+
+    if align == "center":
+        anchor_x = (box_w - content_w) / 2.0
+    elif align == "right":
+        anchor_x = box_w - content_w
+    else:
+        anchor_x = 0.0
+    if vertical in ("center", "middle"):
+        anchor_y = (box_h - content_h) / 2.0
+    elif vertical in ("bottom", "end"):
+        anchor_y = box_h - content_h
+    else:
+        anchor_y = 0.0
+    return tile, (anchor_x - pad, anchor_y - pad)
 
 
 def _image_tile(layer, size, run_dir):
@@ -334,6 +420,7 @@ def _render_tile(layer, run_dir):
     box = layer.get("box", {}) or {}
     size = max(1, round(_number(box.get("w", 1), 1))), max(1, round(_number(box.get("h", 1), 1)))
     kind = layer.get("type")
+    text_offset = (0.0, 0.0)
     if kind == "group":
         tile = Image.new("RGBA", size, (0, 0, 0, 0))
         if layer.get("fill"):
@@ -344,10 +431,11 @@ def _render_tile(layer, run_dir):
     elif kind == "image":
         tile = _image_tile(layer, size, run_dir)
     elif kind == "text":
-        tile = _text_tile(layer, size)
+        tile, text_offset = _text_tile(layer, size)
     else:
         tile = _shape_tile(layer, size, run_dir)
-    return _with_effects(tile, layer.get("effects") or [])
+    padded, effect_offset = _with_effects(tile, layer.get("effects") or [])
+    return padded, (effect_offset[0] + text_offset[0], effect_offset[1] + text_offset[1])
 
 
 def _blend(canvas, tile, point, mode):

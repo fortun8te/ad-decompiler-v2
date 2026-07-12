@@ -61,6 +61,12 @@ def _fix_for(check: dict) -> str | None:
         return "Start ComfyUI on port 8188, or set qwen.required: false."
     if name == "qwen workflow":
         return "Put the Qwen workflow JSON at the config path, or set qwen.required: false."
+    if name == "flux comfyui":
+        return "Start ComfyUI on port 8188 (or set inpaint.comfy.base_url), or set inpaint.comfy.required: false."
+    if name == "flux inpaint workflow":
+        return "Ensure workflows/flux_fill_inpaint_api.json exists (path from inpaint.comfy.workflow)."
+    if name == "flux inpaint models":
+        return "Run scripts/setup_flux_inpaint.ps1 -ComfyDir <ComfyUI> to fetch the Flux Fill GGUF + LoRA + encoders + VAE."
     if name.startswith("big-lama") or name.startswith("inpaint stack"):
         return "Run: .venv\\Scripts\\python.exe -m pip install simple-lama-inpainting"
     if name == "vectorize:vtracer":
@@ -310,6 +316,61 @@ def inspect(cfg, root: Path) -> dict:
         else:
             checks.append(_check("Qwen layered pipeline", _module("diffusers"), "git diffusers build",
                                  required=_required_qwen(cfg)))
+
+    # Flux Fill inpaint backend (ComfyUI GGUF). Advisory unless inpaint.comfy.required.
+    # Reports ComfyUI reachability, the workflow file, and (when comfy_dir is known) the
+    # presence of the GGUF/CLIP/VAE/LoRA model files.
+    inpaint_cfg_flux = cfg.get("inpaint") or {}
+    comfy_inpaint = inpaint_cfg_flux.get("comfy") or {}
+    inpaint_mode_flux = str(inpaint_cfg_flux.get("mode", "auto")).lower()
+    flux_enabled = bool(comfy_inpaint.get("enabled")) or inpaint_mode_flux in ("flux_comfy", "flux-comfy", "flux")
+    if flux_enabled:
+        flux_required = bool(comfy_inpaint.get("required"))
+        flux_wf = Path(str(comfy_inpaint.get("workflow", "workflows/flux_fill_inpaint_api.json")))
+        if not flux_wf.is_absolute():
+            flux_wf = root / flux_wf
+        checks.append(_check("flux inpaint workflow", flux_wf.is_file(), str(flux_wf), required=flux_required))
+        flux_base = str(comfy_inpaint.get("base_url") or cfg.get("backend_url", "http://127.0.0.1:8188")).rstrip("/")
+        checks.append(_check("flux ComfyUI", _comfy_probe(flux_base), flux_base, required=flux_required))
+        comfy_dir = comfy_inpaint.get("comfy_dir")
+        model_names = comfy_inpaint.get("models") or {}
+        flux_defaults = {
+            "unet_gguf": "flux1-fill-dev-Q4_K_M.gguf",
+            "t5xxl": "t5xxl_fp8_e4m3fn.safetensors",
+            "clip_l": "clip_l.safetensors",
+            "vae": "ae.safetensors",
+            "lora": "flux1-turbo-alpha.safetensors",
+        }
+        flux_subdirs = {
+            "unet_gguf": ["unet", "diffusion_models"],
+            "t5xxl": ["clip", "text_encoders"],
+            "clip_l": ["clip", "text_encoders"],
+            "vae": ["vae"],
+            "lora": ["loras"],
+        }
+        if comfy_dir:
+            comfy_dir = os.path.expandvars(os.path.expanduser(str(comfy_dir)))
+            missing = []
+            for key, default_name in flux_defaults.items():
+                fname = str(model_names.get(key, default_name))
+                found = any(
+                    os.path.isfile(os.path.join(comfy_dir, "models", sub, fname))
+                    for sub in flux_subdirs[key]
+                )
+                if not found:
+                    missing.append(f"{fname} (models/{'|'.join(flux_subdirs[key])})")
+            checks.append(_check(
+                "flux inpaint models",
+                not missing,
+                "all Flux Fill model files present" if not missing else "missing: " + "; ".join(missing),
+                required=flux_required,
+            ))
+        else:
+            checks.append(_check(
+                "flux inpaint models", True,
+                "set inpaint.comfy.comfy_dir to verify the GGUF/CLIP/VAE/LoRA files",
+                required=False,
+            ))
 
     vlm = cfg.get("vlm") or {}
     if _vlm_feature_enabled(cfg):

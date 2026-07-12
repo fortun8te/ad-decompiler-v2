@@ -310,6 +310,107 @@ def test_big_lama_size_mismatch_is_resized_not_crashed(monkeypatch):
     assert np.array_equal(out[0, 0], source[0, 0])
 
 
+# ── flux_comfy backend selection ──────────────────────────────────────────────────────
+def _flux_scene():
+    source = np.full((8, 8, 3), 90, dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+    return source, mask
+
+
+def test_flux_comfy_backend_used_when_available(monkeypatch):
+    source, mask = _flux_scene()
+    filled = np.full_like(source, 7)
+    monkeypatch.setattr(inpaint, "_flux_comfy_inpaint", lambda rgb, m, cfg: filled)
+
+    out, backend, diagnostics = inpaint.inpaint_array(
+        source, mask, {"inpaint": {"mode": "flux_comfy", "multipass_fraction": 1.0}},
+        return_diagnostics=True,
+    )
+
+    assert backend == "flux-comfy"
+    assert diagnostics["backend_choice"] == "flux-comfy"
+    assert np.all(out[mask == 0] == source[mask == 0])  # unmasked pixels untouched
+    assert np.all(out[mask > 0] == 7)
+
+
+def test_flux_comfy_used_in_auto_only_when_opted_in(monkeypatch):
+    source, mask = _flux_scene()
+    filled = np.full_like(source, 9)
+    monkeypatch.setattr(inpaint, "_flux_comfy_inpaint", lambda rgb, m, cfg: filled)
+
+    out, backend, _ = inpaint.inpaint_array(
+        source, mask,
+        {"inpaint": {"mode": "auto", "comfy": {"enabled": True}, "multipass_fraction": 1.0}},
+        return_diagnostics=True,
+    )
+    assert backend == "flux-comfy"
+
+
+def test_flux_comfy_not_attempted_in_plain_auto(monkeypatch):
+    source, mask = _flux_scene()
+    called = []
+
+    def spy(*args, **kwargs):
+        called.append(1)
+        return None
+
+    monkeypatch.setattr(inpaint, "_flux_comfy_inpaint", spy)
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: False)
+    monkeypatch.setattr(inpaint, "_opencv_inpaint", lambda rgb, m, r, method: np.full_like(source, 5))
+
+    inpaint.inpaint_array(
+        source, mask, {"inpaint": {"mode": "auto", "opencv_method": "telea",
+                                   "multipass_fraction": 1.0}},
+    )
+    assert called == []  # flux is opt-in; plain auto must not touch ComfyUI
+
+
+def test_flux_comfy_falls_back_to_big_lama_when_comfy_down(monkeypatch):
+    source, mask = _flux_scene()
+    lama = np.full_like(source, 42)
+    monkeypatch.setattr(inpaint, "_flux_comfy_inpaint", lambda *a, **k: None)
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: True)
+    monkeypatch.setattr(inpaint, "_simple_lama", lambda rgb, m: lama)
+
+    out, backend, diagnostics = inpaint.inpaint_array(
+        source, mask, {"inpaint": {"mode": "flux_comfy", "multipass_fraction": 1.0}},
+        return_diagnostics=True,
+    )
+
+    assert backend == "big-lama"
+    assert diagnostics["flux_comfy"] == "unavailable"
+    assert np.all(out[mask > 0] == 42)
+
+
+def test_flux_comfy_falls_back_to_opencv_when_comfy_and_lama_down(monkeypatch):
+    source, mask = _flux_scene()
+    telea = np.full_like(source, 3)
+    monkeypatch.setattr(inpaint, "_flux_comfy_inpaint", lambda *a, **k: None)
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: False)
+    monkeypatch.setattr(inpaint, "_opencv_inpaint", lambda rgb, m, r, method: telea)
+
+    out, backend, _ = inpaint.inpaint_array(
+        source, mask,
+        {"inpaint": {"mode": "flux_comfy", "opencv_method": "telea", "multipass_fraction": 1.0}},
+        return_diagnostics=True,
+    )
+    assert backend == "opencv-telea"
+    assert np.all(out[mask > 0] == 3)
+
+
+def test_flux_comfy_required_without_fallback_raises(monkeypatch):
+    source, mask = _flux_scene()
+    monkeypatch.setattr(inpaint, "_flux_comfy_inpaint", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError, match="flux_comfy"):
+        inpaint.inpaint_array(
+            source, mask,
+            {"inpaint": {"mode": "flux_comfy", "allow_fallback": False,
+                         "comfy": {"required": True}, "multipass_fraction": 1.0}},
+        )
+
+
 def test_role_aware_overlap_is_owned_by_large_object_pass(tmp_path, monkeypatch):
     from PIL import Image
     source = np.full((20, 30, 3), 100, dtype=np.uint8)

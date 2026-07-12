@@ -234,6 +234,206 @@ def _run_comfyui(img_path, run_dir, cfg, schema):
     return layers
 
 
+# ── Flux Fill inpaint backend (ComfyUI) ──────────────────────────────────────────────
+def _requests():
+    """Indirection so tests can inject a fake HTTP client without a live ComfyUI."""
+    import requests
+    return requests
+
+
+_FLUX_DEFAULTS = {
+    "base_url": "http://127.0.0.1:8188",
+    "workflow": "workflows/flux_fill_inpaint_api.json",
+    "steps": 8,
+    "cfg": 1.0,
+    "guidance": 30.0,
+    "denoise": 1.0,
+    "seed": 0,
+    "prompt": "",
+    "negative_prompt": "",
+    "probe_timeout_s": 2.0,
+    "timeout_s": 300,
+}
+
+
+def _resolve_workflow_path(wf_path: str) -> Optional[str]:
+    """Find the workflow JSON relative to cwd or the repo root (parent of src/)."""
+    if os.path.isabs(wf_path):
+        return wf_path if os.path.exists(wf_path) else None
+    if os.path.exists(wf_path):
+        return wf_path
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    alt = os.path.join(repo_root, wf_path)
+    return alt if os.path.exists(alt) else None
+
+
+def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
+    """Inpaint a background plate with FLUX.1 Fill dev on ComfyUI.
+
+    ``rgb`` is an HxWx3 uint8 array, ``mask`` an HxW array where non-zero pixels are the
+    region to regenerate.  Returns an HxWx3 uint8 array on success, or ``None`` when
+    ComfyUI is unreachable / the workflow is missing / anything fails.  This NEVER raises
+    for backend problems: src/inpaint.py degrades to Big-LaMa/OpenCV so a downed GPU box
+    can never crash the pipeline.
+
+    Config is read from ``cfg['inpaint']['comfy']`` (see workflows/flux_fill_inpaint_api.json
+    _note for the keys).  ``base_url`` falls back to the top-level ``backend_url``.
+    """
+    import io
+    import tempfile
+
+    import numpy as np
+    from PIL import Image
+
+    try:
+        requests = _requests()
+    except ImportError:
+        return None
+
+    cfg = cfg or {}
+    icfg = cfg.get("inpaint") or {}
+    comfy = icfg.get("comfy") or {}
+    params = dict(_FLUX_DEFAULTS)
+    params.update({k: v for k, v in comfy.items() if k in _FLUX_DEFAULTS})
+    base = str(comfy.get("base_url") or cfg.get("backend_url") or _FLUX_DEFAULTS["base_url"]).rstrip("/")
+
+    try:
+        # Fail fast when the separately hosted ComfyUI service is not running.
+        try:
+            probe = requests.get(f"{base}/system_stats", timeout=float(params["probe_timeout_s"]))
+            probe.raise_for_status()
+        except Exception as exc:
+            print(f"[flux-inpaint] ComfyUI offline at {base} ({exc}); caller will fall back")
+            return None
+
+        wf_path = _resolve_workflow_path(str(params["workflow"]))
+        if not wf_path:
+            print(f"[flux-inpaint] workflow not found: {params['workflow']}; caller will fall back")
+            return None
+        with open(wf_path, encoding="utf-8") as fh:
+            workflow = json.load(fh)
+        workflow.pop("_note", None)
+
+        # Stage the source + mask as PNGs and upload them so LoadImage can find them.
+        tmp = tempfile.mkdtemp(prefix="flux_inpaint_")
+        src_png = os.path.join(tmp, "flux_source.png")
+        mask_png = os.path.join(tmp, "flux_mask.png")
+        Image.fromarray(np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)), "RGB").save(src_png)
+        binary_mask = np.where(np.asarray(mask) > 0, 255, 0).astype(np.uint8)
+        Image.fromarray(np.ascontiguousarray(binary_mask), "L").save(mask_png)
+
+        def _upload(path):
+            with open(path, "rb") as handle:
+                resp = requests.post(
+                    f"{base}/upload/image",
+                    files={"image": (os.path.basename(path), handle, "image/png")},
+                    data={"overwrite": "true"},
+                    timeout=30,
+                )
+            resp.raise_for_status()
+            return resp.json().get("name", os.path.basename(path))
+
+        try:
+            src_name = _upload(src_png)
+            mask_name = _upload(mask_png)
+        except Exception as exc:
+            print(f"[flux-inpaint] image/mask upload failed ({exc}); caller will fall back")
+            return None
+
+        # Patch the graph. Match by _meta.title first (robust to node-id changes), then by
+        # class_type. Optional model filename overrides keep the graph easy to re-point.
+        models = comfy.get("models") or {}
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            ct = node.get("class_type")
+            title = str((node.get("_meta") or {}).get("title", ""))
+            ins = node.setdefault("inputs", {})
+            if ct == "LoadImage":
+                is_mask = title == "mask_image" or "mask" in str(ins.get("image", "")).lower()
+                ins["image"] = mask_name if is_mask else src_name
+            elif ct == "CLIPTextEncode":
+                if title == "negative_prompt":
+                    ins["text"] = str(params["negative_prompt"])
+                elif title == "positive_prompt":
+                    ins["text"] = str(params["prompt"])
+            elif ct == "FluxGuidance":
+                ins["guidance"] = float(params["guidance"])
+            elif ct == "KSampler":
+                ins["steps"] = int(params["steps"])
+                ins["cfg"] = float(params["cfg"])
+                ins["denoise"] = float(params["denoise"])
+                ins["seed"] = int(params["seed"])
+            elif ct in ("UnetLoaderGGUF", "UnetLoaderGGUFAdvanced") and models.get("unet_gguf"):
+                ins["unet_name"] = str(models["unet_gguf"])
+            elif ct == "DualCLIPLoader":
+                if models.get("t5xxl"):
+                    ins["clip_name1"] = str(models["t5xxl"])
+                if models.get("clip_l"):
+                    ins["clip_name2"] = str(models["clip_l"])
+            elif ct == "VAELoader" and models.get("vae"):
+                ins["vae_name"] = str(models["vae"])
+            elif ct in ("LoraLoaderModelOnly", "LoraLoader") and models.get("lora"):
+                ins["lora_name"] = str(models["lora"])
+
+        client_id = str(uuid.uuid4())
+        try:
+            resp = requests.post(
+                f"{base}/prompt",
+                json={"prompt": workflow, "client_id": client_id},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            prompt_id = resp.json()["prompt_id"]
+        except Exception as exc:
+            print(f"[flux-inpaint] /prompt failed ({exc}); caller will fall back")
+            return None
+
+        deadline = time.time() + int(params["timeout_s"])
+        history = None
+        while time.time() < deadline:
+            try:
+                h = requests.get(f"{base}/history/{prompt_id}", timeout=15).json()
+            except Exception:
+                time.sleep(1.5)
+                continue
+            if prompt_id in h:
+                history = h[prompt_id]
+                break
+            time.sleep(1.5)
+        if history is None:
+            print(f"[flux-inpaint] timed out waiting for {prompt_id}; caller will fall back")
+            return None
+
+        outputs = history.get("outputs", {})
+        for node_id in sorted(outputs.keys(), key=lambda k: str(k)):
+            for img in outputs[node_id].get("images", []):
+                if img.get("type") == "temp":
+                    continue
+                try:
+                    view = requests.get(
+                        f"{base}/view",
+                        params={
+                            "filename": img["filename"],
+                            "subfolder": img.get("subfolder", ""),
+                            "type": img.get("type", "output"),
+                        },
+                        timeout=60,
+                    )
+                    view.raise_for_status()
+                    arr = np.asarray(Image.open(io.BytesIO(view.content)).convert("RGB"), dtype=np.uint8)
+                except Exception as exc:
+                    print(f"[flux-inpaint] output download/decode failed ({exc})")
+                    continue
+                print(f"[flux-inpaint] produced {arr.shape[1]}x{arr.shape[0]} plate")
+                return arr
+        print("[flux-inpaint] run completed but produced no images; caller will fall back")
+        return None
+    except Exception as exc:  # pragma: no cover - last-ditch guard, must never crash the run
+        print(f"[flux-inpaint] unexpected error ({exc}); caller will fall back")
+        return None
+
+
 # ── direct diffusers backend ─────────────────────────────────────────────────────────
 def _run_diffusers(img_path, run_dir, cfg, schema):
     try:

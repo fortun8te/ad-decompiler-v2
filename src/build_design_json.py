@@ -6,6 +6,18 @@ import shutil
 from typing import Optional
 
 from .schema import DesignDoc, Layer, SCHEMA_VERSION, dump, validate_design
+from .text_analysis import fit_text_box
+
+# Candidate keys that ``_compile`` already routes to a concrete Layer field.  Anything
+# else on a reconstruct entity (e.g. an image ``ref`` or a future mask spec another
+# stage attaches) is unknown to the dataclass, so it is preserved under
+# ``meta['passthrough']`` rather than silently dropped on the way to design.json.
+_CONSUMED_CANDIDATE_KEYS = frozenset({
+    "id", "target", "box", "meta", "z_index", "z", "visible_box", "ink_box",
+    "rotation", "opacity", "blend_mode", "effects", "constraints", "component",
+    "layout", "children", "text", "style", "text_runs", "fill", "stroke",
+    "shape_kind", "path", "svg", "src", "radius", "paths", "mask", "name", "role",
+})
 
 
 def _truncate(value, length=28):
@@ -146,6 +158,10 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         "component": dict(candidate.get("component") or {}),
         "layout": dict(candidate.get("layout") or {}),
     }
+    passthrough = {key: value for key, value in candidate.items()
+                   if key not in _CONSUMED_CANDIDATE_KEYS}
+    if passthrough:
+        common["meta"]["passthrough"] = passthrough
 
     if target == "group":
         children = []
@@ -172,9 +188,16 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         style = dict(candidate.get("style") or {})
         fill = candidate.get("fill") or style.pop("fill", None)
         stroke = candidate.get("stroke") or style.pop("stroke", None)
+        text_value = str(candidate.get("text") or "")
+        # Grow/shrink the box so the rendered glyph run cannot clip, and record the
+        # matching Figma auto-resize intent (WIDTH label / HEIGHT paragraph / NONE).
+        fitted_box, auto_resize, style_patch = fit_text_box(text_value, style, common["box"])
+        common["box"] = fitted_box
+        style.update(style_patch)
+        style.setdefault("autoResize", auto_resize)
         return Layer(
             type="text",
-            text=str(candidate.get("text") or ""),
+            text=text_value,
             style=style,
             text_runs=list(candidate.get("text_runs") or []),
             fill=fill,

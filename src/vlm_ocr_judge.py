@@ -11,6 +11,7 @@ the canvas exceeds ``max_image_pixels``. Disabled by default and never raises.
 from __future__ import annotations
 
 import copy
+import re
 from difflib import SequenceMatcher
 
 from src import vlm_client
@@ -41,6 +42,15 @@ _OCR_READ_PROMPT = (
     "If there is no legible text, output an empty string."
 )
 
+_PROOFREAD_PROMPT = (
+    "This crop contains exactly ONE short line of text from an ad (often a brand name, "
+    "a headline word, or a price). Transcribe it character for character, preserving "
+    "capitalization, currency symbols (e.g. €), punctuation, and arrows (e.g. →) exactly "
+    "as shown. Read the letters that are actually there — do not substitute a more common "
+    "word if the letters differ. Output only the transcribed line, nothing else, no "
+    "explanation, no newlines. If no legible text is visible, output an empty string."
+)
+
 
 def _ocr_judge_cfg(cfg: dict) -> dict:
     root = (cfg or {}).get("vlm") or {}
@@ -52,7 +62,8 @@ def _ocr_judge_cfg(cfg: dict) -> dict:
         "max_tokens": root.get("max_tokens"),
         "passes": root.get("passes"),
     }
-    merged.update({k: v for k, v in judge.items() if k not in {"enabled", "ocr_read"}})
+    merged.update({k: v for k, v in judge.items()
+                   if k not in {"enabled", "ocr_read", "proofread"}})
     return merged
 
 
@@ -62,6 +73,34 @@ def _ocr_read_cfg(cfg: dict) -> dict:
     if isinstance(read, bool):
         return {"enabled": read}
     return dict(read)
+
+
+def _proofread_cfg(cfg: dict) -> dict:
+    judge = ((cfg or {}).get("vlm") or {}).get("ocr_judge") or {}
+    proof = judge.get("proofread") or {}
+    if isinstance(proof, bool):
+        return {"enabled": proof}
+    return dict(proof)
+
+
+def _looks_like_brand_token(text: str) -> bool:
+    """Whether a line is a wordmark/brand-style token worth VLM proofing.
+
+    Brand names and headline wordmarks are the tokens where a single-character OCR slip
+    (P/H, O/0, I/l) is both most likely and most damaging, and — unlike body copy — they
+    carry no dictionary context for the engine to self-correct.  They are short, (almost)
+    all uppercase, and mostly letters.
+    """
+    stripped = str(text or "").strip()
+    if not stripped or len(stripped.split()) > 2:
+        return False
+    letters = [char for char in stripped if char.isalpha()]
+    if len(letters) < 4:
+        return False
+    if len(letters) / len(re.sub(r"\s", "", stripped)) < 0.6:
+        return False
+    uppercase = sum(1 for char in letters if char.isupper())
+    return uppercase / len(letters) >= 0.8
 
 
 def _engine_readings(line: dict) -> list[str]:
@@ -148,6 +187,7 @@ def _grid_boxes(width: int, height: int, cols: int, rows: int) -> list[dict]:
 def _resolve_options(cfg: dict) -> dict:
     merged = _ocr_judge_cfg(cfg)
     read = _ocr_read_cfg(cfg)
+    proof = _proofread_cfg(cfg)
     passes = int(merged.get("passes") or _DEFAULT_PASSES)
     return {
         "base_url": str(merged.get("base_url") or vlm_client._DEFAULT_BASE_URL),
@@ -165,6 +205,12 @@ def _resolve_options(cfg: dict) -> dict:
         "ocr_read_max_pixels": int(read.get("max_image_pixels") or _DEFAULT_MAX_IMAGE_PIXELS),
         "ocr_read_max_regions": int(read.get("max_regions") or _DEFAULT_MAX_OCR_READ_REGIONS),
         "ocr_read_passes": int(read.get("passes") or passes),
+        "proofread_enabled": bool(proof.get("enabled", False)),
+        "proofread_max_conf": float(proof.get("max_conf", 0.80)),
+        "proofread_brand_tokens": bool(proof.get("brand_tokens", True)),
+        "proofread_max_regions": int(proof.get("max_regions") or 8),
+        "proofread_passes": int(proof.get("passes") or passes),
+        "proofread_min_similarity": float(proof.get("min_similarity", 0.6)),
     }
 
 
@@ -234,6 +280,90 @@ def _judge_disagreements(
                                          "reading_similarity": round(similarity, 4)}
             line["meta"] = meta
     return checked, corrected, disagreements, errors, notes
+
+
+def _judge_uncertain(
+    image,
+    lines: list[dict],
+    options: dict,
+) -> tuple[int, int, int, list[dict]]:
+    """Proofread low-confidence and brand-token lines that no engine disputed.
+
+    A single-engine primary (docTR) produces no ``meta.disagreement`` to trigger the
+    arbitration path, so a confident single-character misread on a wordmark (PINDAKAAS →
+    HINDAKAAS) slips through.  This routes those lines through the same VLM, but — since
+    there is only one reading to defend — accepts the answer only when it stays close to
+    the OCR text (a character-level fix), never a wholesale rewrite."""
+    if not options["proofread_enabled"]:
+        return 0, 0, 0, []
+
+    max_conf = options["proofread_max_conf"]
+    want_brand = options["proofread_brand_tokens"]
+    candidates: list[tuple[dict, bool]] = []
+    for line in lines:
+        if not line.get("box") or line.get("vlm_ocr_judged") or _has_disagreement(line):
+            continue
+        text = str(line.get("text", ""))
+        low_conf = float(line.get("conf", 1.0) or 0.0) <= max_conf
+        brandish = want_brand and _looks_like_brand_token(text)
+        if low_conf or brandish:
+            candidates.append((line, brandish))
+    # Spend the bounded budget on brand/wordmark tokens first (the target of this pass),
+    # then the least-confident remaining lines.
+    candidates.sort(key=lambda pair: (0 if pair[1] else 1, float(pair[0].get("conf", 1.0) or 0.0)))
+    candidates = candidates[: options["proofread_max_regions"]]
+
+    checked = corrected = errors = 0
+    notes: list[dict] = []
+    for line, brandish in candidates:
+        crop = vlm_client.crop_box_bytes(image, line["box"], options["padding"])
+        if crop is None:
+            continue
+        wider_crop = vlm_client.crop_box_bytes(image, line["box"], options["padding"] + 2)
+        crop_variants = [crop] + ([wider_crop] if wider_crop and wider_crop != crop else [])
+        checked += 1
+        answer, note = vlm_client.multi_pass_answer(
+            crop,
+            _PROOFREAD_PROMPT,
+            base_url=options["base_url"],
+            model=options["model"],
+            timeout_s=options["timeout_s"],
+            max_tokens=options["max_tokens"],
+            passes=options["proofread_passes"],
+            crop_variants=crop_variants,
+        )
+        original = str(line.get("text", ""))
+        if note == "vlm_error":
+            errors += 1
+            notes.append({"line_id": line.get("id"), "note": "vlm_error", "ocr_text": original})
+            continue
+        if note:
+            notes.append({"line_id": line.get("id"), "note": note, "ocr_text": original})
+            continue
+        if answer is None or not _looks_plausible(original, answer):
+            continue
+        similarity = SequenceMatcher(
+            None, answer.casefold().strip(), original.casefold().strip()
+        ).ratio()
+        if similarity < options["proofread_min_similarity"]:
+            notes.append({"line_id": line.get("id"), "note": "vlm_low_similarity",
+                          "answer": answer, "ocr_text": original,
+                          "similarity": round(similarity, 4)})
+            continue
+        if answer != original:
+            line["ocr_text"] = original
+            line["text"] = answer
+            corrected += 1
+        line["vlm_ocr_judged"] = True
+        meta = copy.deepcopy(line.get("meta") or {})
+        meta["vlm_ocr_proofread"] = {
+            "answer": answer,
+            "passes": options["proofread_passes"],
+            "reason": "brand-token" if brandish else "low-confidence",
+            "similarity": round(similarity, 4),
+        }
+        line["meta"] = meta
+    return checked, corrected, errors, notes
 
 
 def _ocr_read_missed(
@@ -307,6 +437,13 @@ def judge_ocr_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     options = _resolve_options(cfg)
     checked, corrected, disagreements, errors, notes = _judge_disagreements(image, lines, options)
 
+    proofread_checked = proofread_corrected = proofread_errors = 0
+    if options["proofread_enabled"]:
+        proofread_checked, proofread_corrected, proofread_errors, proofread_notes = _judge_uncertain(
+            image, lines, options,
+        )
+        notes = notes + proofread_notes
+
     ocr_read_checked = ocr_read_added = ocr_read_errors = 0
     new_lines: list[dict] = []
     if options["ocr_read_enabled"]:
@@ -324,6 +461,10 @@ def judge_ocr_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
         "lines_corrected": corrected,
         "lines_disagreed": disagreements,
         "lines_errored": errors,
+        "proofread_enabled": options["proofread_enabled"],
+        "proofread_checked": proofread_checked,
+        "proofread_corrected": proofread_corrected,
+        "proofread_errored": proofread_errors,
         "ocr_read_enabled": options["ocr_read_enabled"],
         "ocr_read_checked": ocr_read_checked,
         "ocr_read_added": ocr_read_added,

@@ -38,6 +38,67 @@ def _sev(x):
     return {"high": 3, "medium": 2, "low": 1}.get(x, 0)
 
 
+def repairs_from_anomalies(anomalies, design=None):
+    """Translate VLM anomaly records (see src.vlm_anomaly) into actionable repairs.
+
+    duplicate/ghosted/overlapping text -> merge dedup (drop the redundant layer);
+    clipped/cut-off text               -> text-analysis refit-text-box (widen/shrink-to-fit);
+    clearly wrong glyphs               -> text-analysis resolve-fonts (font substitution).
+
+    Pure and deterministic. Layer ids, when the anomaly carries them, become the repair
+    target so the resumed stage acts on the offending layer instead of the whole design.
+    """
+    out = []
+    for anomaly in anomalies or []:
+        if not isinstance(anomaly, dict):
+            continue
+        kind = str(anomaly.get("type") or "").strip().lower()
+        text = str(anomaly.get("text") or "").strip()
+        detail = str(anomaly.get("detail") or "").strip()
+        layer_ids = [str(i) for i in (anomaly.get("layer_ids") or []) if i]
+        label = text or detail or kind
+        if kind == "duplicate_text":
+            reason = f"duplicate/ghosted text {label!r}" + (
+                f" across layers {', '.join(layer_ids[:4])}" if layer_ids else "")
+            item = {
+                "stage": "merge",
+                "action": "dedup",
+                "reason": reason,
+                "params": {"raise_dedup_iou": True, "duplicate_text": [text] if text else [],
+                           "layer_ids": layer_ids},
+                "severity": "high",
+            }
+            if layer_ids:
+                item["target_id"] = layer_ids[0]
+            out.append(item)
+        elif kind == "clipped_text":
+            reason = f"clipped/cut-off text {label!r}"
+            item = {
+                "stage": "text-analysis",
+                "action": "refit-text-box",
+                "reason": reason,
+                "params": {"widen": True, "shrink_to_fit": True,
+                           "clipped_text": [text] if text else [],
+                           "layer_ids": layer_ids},
+                "severity": "high",
+            }
+            if layer_ids:
+                item["target_id"] = layer_ids[0]
+            out.append(item)
+        elif kind == "wrong_glyphs":
+            item = {
+                "stage": "text-analysis",
+                "action": "resolve-fonts",
+                "reason": f"wrong glyphs {label!r} (likely font substitution)",
+                "params": {"wrong_glyphs": [text] if text else [], "layer_ids": layer_ids},
+                "severity": "medium",
+            }
+            if layer_ids:
+                item["target_id"] = layer_ids[0]
+            out.append(item)
+    return out
+
+
 def _load_json(path: str, fallback):
     if not path or not os.path.exists(path):
         return fallback
@@ -545,6 +606,19 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
                 "severity": "low",
             }
         )
+
+    # ── rendered-output anomalies (VLM pass) ──────────────────────────────────────────
+    # The metric QA never reads the compiled ad, so duplicate/ghosted text, clipped text,
+    # and mojibake glyphs only surface via src.vlm_anomaly. Its findings (from qa.anomalies
+    # or anomalies.json) become merge-dedup / text-refit / resolve-fonts repairs here so the
+    # harness resumes the right stage.
+    anomalies = qa.get("anomalies") if isinstance(qa, dict) else None
+    if not anomalies and run_dir:
+        anomalies = _load_json(os.path.join(run_dir, "anomalies.json"), None)
+        if isinstance(anomalies, dict):
+            anomalies = anomalies.get("anomalies")
+    if isinstance(anomalies, list) and anomalies:
+        out.extend(repairs_from_anomalies(anomalies, design))
 
     # One underlying failure can arrive both as a scalar and a hard-fail record. Remove exact
     # duplicate repair actions while retaining distinct evidence/reasons.

@@ -28,6 +28,7 @@ ACTIONABLE = {
     ("text-analysis", "restore-editable-text"),
     ("text-analysis", "refit-colors-effects"),
     ("text-analysis", "resolve-fonts"),
+    ("text-analysis", "refit-text-box"),
     ("qwen", "retry"),
     ("vlm", "boost-stack"),
     ("inpaint", "rebuild-clean-plate"),
@@ -123,8 +124,17 @@ def config_patches_for(repair: dict) -> dict:
         patches["qwen"] = qwen_patch
 
     elif stage == "merge" and action == "dedup":
-        if params.get("raise_dedup_iou"):
-            patches["merge"] = {"dedup_iou": 0.72}
+        if params.get("raise_dedup_iou") or params.get("duplicate_text") or params.get("layer_ids"):
+            merge_patch: dict[str, Any] = {"dedup_iou": 0.72}
+            # Duplicate/ghosted text (from the anomaly pass): tell merge to dedupe text
+            # layers and which offending text/layers to collapse to a single owner.
+            if params.get("duplicate_text"):
+                merge_patch["dedup_text"] = True
+                merge_patch["duplicate_text"] = list(params["duplicate_text"])
+            if params.get("layer_ids"):
+                merge_patch["dedup_text"] = True
+                merge_patch["layer_ids"] = list(params["layer_ids"])
+            patches["merge"] = merge_patch
             patches["reconstruct"] = {"dedup_iou": 0.90}
 
     elif stage == "text-analysis" and action == "resolve-fonts":
@@ -139,6 +149,22 @@ def config_patches_for(repair: dict) -> dict:
         }
         if params.get("enable_vlm_font_judge") is not False:
             patches["vlm"] = {"font_judge": {"enabled": True}}
+
+    elif stage == "text-analysis" and action == "refit-text-box":
+        # Clipped/cut-off text: let the text stage widen the box and/or shrink-to-fit so
+        # the glyphs stop being cropped at a container or image edge.
+        fit_patch: dict[str, Any] = {"refit": True}
+        if params.get("widen", True):
+            fit_patch["widen_clipped"] = True
+        if params.get("shrink_to_fit", True):
+            fit_patch["shrink_to_fit"] = True
+        clipped = params.get("clipped_text") or params.get("clipped")
+        if clipped:
+            fit_patch["clipped_text"] = list(clipped)
+        layer_ids = params.get("layer_ids")
+        if layer_ids:
+            fit_patch["layer_ids"] = list(layer_ids)
+        patches["text_analysis"] = {"fit": fit_patch}
 
     elif stage == "inpaint" and action == "rebuild-clean-plate":
         patches["inpaint"] = {
@@ -531,8 +557,14 @@ def execute_repairs(
     max_iterations: Optional[int] = None,
     *,
     run_one: Optional[Callable[..., dict]] = None,
+    blocked_repairs: Optional[set] = None,
 ) -> dict:
-    """Apply actionable repairs by resuming the pipeline from mapped stages."""
+    """Apply actionable repairs by resuming the pipeline from mapped stages.
+
+    ``blocked_repairs`` seeds the exhausted set with repair signatures (stage, action,
+    target_id) the caller already knows produced no improvement — the harness loop passes
+    these across rounds so a non-improving repair is never re-applied (no oscillation).
+    """
     run_dir = os.path.abspath(run_dir)
     cfg = copy.deepcopy(cfg or {})
     if max_iterations is None:
@@ -563,7 +595,7 @@ def execute_repairs(
         })
 
     attempts = []
-    exhausted: set[tuple] = set()
+    exhausted: set[tuple] = set(blocked_repairs or ())
     working_cfg = copy.deepcopy(cfg)
     working_cfg.setdefault("runtime", {})["auto_repair"] = False
 

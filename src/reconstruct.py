@@ -22,6 +22,12 @@ def _deps():
     return cv2, np, Image
 
 
+# A "shape" region whose interior colour dispersion (max per-channel std) exceeds this is
+# photographic (a real photo/avatar), not a flat/gradient design fill, so it must stay a
+# swappable IMAGE clipped by its detected primitive instead of being flattened to a colour.
+PHOTO_SHAPE_MIN_STD = 28.0
+
+
 def _iou(a, b):
     ix = max(0.0, min(a.get("x", 0) + a.get("w", 0), b.get("x", 0) + b.get("w", 0))
              - max(a.get("x", 0), b.get("x", 0)))
@@ -512,6 +518,126 @@ def _infer_shape(mask, box):
     return "rect", round(radius, 2)
 
 
+def _local_alpha(mask, box):
+    """Binary (bool) crop of the canvas-space alpha for a candidate's box."""
+    _, np, _ = _deps()
+    x0, y0 = max(0, int(round(box.get("x", 0)))), max(0, int(round(box.get("y", 0))))
+    x1 = min(mask.shape[1], int(round(box.get("x", 0) + box.get("w", 0))))
+    y1 = min(mask.shape[0], int(round(box.get("y", 0) + box.get("h", 0))))
+    if x1 <= x0 or y1 <= y0:
+        return np.zeros((0, 0), dtype=bool)
+    return mask[y0:y1, x0:x1] > 16
+
+
+def _alpha_silhouette_path(mask, box):
+    """Trace a single clean alpha silhouette as an SVG ``d`` string in local box pixels.
+
+    Used for logo/brand cutouts: the mask becomes the logo's own outline so the raster fill
+    can be swapped while the shape holds.  Only a single dominant contour qualifies as a
+    "clean silhouette"; multi-blob artwork (e.g. multi-word lettering) returns ``None`` so
+    the caller falls back to the image's own alpha rather than emitting messy geometry.
+    """
+    cv2, np, _ = _deps()
+    local = _local_alpha(mask, box)
+    if local.size == 0 or not local.any():
+        return None
+    contours, _ = cv2.findContours(local.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    areas = [float(cv2.contourArea(c)) for c in contours]
+    total = sum(areas)
+    if total <= 0:
+        return None
+    largest = max(range(len(contours)), key=lambda i: areas[i])
+    if areas[largest] < 0.90 * total:
+        return None
+    contour = contours[largest]
+    approx = cv2.approxPolyDP(contour, 0.01 * cv2.arcLength(contour, True), True).reshape(-1, 2)
+    if len(approx) < 3 or len(approx) > 200:
+        return None
+    return "M " + " L ".join("%.1f %.1f" % (float(x), float(y)) for x, y in approx) + " Z"
+
+
+def _image_mask_spec(candidate, mask, box):
+    """Finalize the swappable mask spec for an image cutout.
+
+    Honors a routing/role hint (ellipse/rrect/path) and completes its geometry from the
+    alpha; when no shape was requested, infers a primitive from the alpha coverage so a
+    near-square round cutout (a circular avatar) becomes an ellipse and a genuinely rounded
+    cutout becomes a rounded rect.  Icons keep their own alpha silhouette.
+    """
+    meta = candidate.get("meta") or {}
+    role = str(meta.get("role") or "").lower()
+    existing = candidate.get("mask") if isinstance(candidate.get("mask"), dict) else {}
+    kind = str(existing.get("kind") or "").lower()
+
+    # An icon's shape IS its art; keep the raster's own alpha rather than a primitive clip.
+    if meta.get("vector_fallback") or role == "icon":
+        return {"kind": "alpha"}
+
+    if kind in ("ellipse", "circle"):
+        return {"kind": "ellipse"}
+    if kind in ("rrect", "rounded_rect"):
+        radius = existing.get("radius")
+        if radius is None:
+            _, radius = _infer_shape(mask, box)
+        return {"kind": "rrect", "radius": round(float(radius or 0), 2)}
+    if kind == "path":
+        path = existing.get("path") or _alpha_silhouette_path(mask, box)
+        return {"kind": "path", "path": path} if path else {"kind": "alpha"}
+
+    # No shape requested: infer a swappable primitive from the actual alpha coverage.
+    local = _local_alpha(mask, box)
+    if local.size and min(local.shape) >= 8:
+        if _simple_shape_geometry(local) == "ellipse":
+            return {"kind": "ellipse"}
+        radius = _corner_radius(local)
+        if isinstance(radius, (int, float)) and radius >= 2:
+            return {"kind": "rrect", "radius": round(float(radius), 2)}
+    return {"kind": "alpha"}
+
+
+def _photo_shape_override(rgb, mask, box, extracted, candidate):
+    """Return a mask spec when a ``shape`` region is really a photo that must stay a swappable
+    image, or ``None`` to keep it a flat native primitive.
+
+    A flat button, gradient panel or bordered card is faithfully a primitive and must NOT be
+    rasterized.  Only a genuinely photographic interior — high colour dispersion that no
+    flat/gradient paint explains — is reclassified, e.g. the circular Twitter avatar on ad9
+    that would otherwise flatten to a solid ``#fcfcfc`` ellipse.
+    """
+    _, np, _ = _deps()
+    meta = candidate.get("meta") or {}
+    role = str(meta.get("role") or "").lower()
+    # Interactive / line chrome is always a primitive, regardless of any texture.
+    if role in ("button", "cta", "chip", "divider", "bar"):
+        return None
+    local_rgb, local_mask = _local_shape_pixels(rgb, mask, box)
+    if local_mask.size == 0 or min(local_mask.shape) < 8:
+        return None
+    geometry = (extracted or {}).get("shape_kind") or _simple_shape_geometry(local_mask)
+    if geometry not in ("ellipse", "rect"):
+        return None
+    # A clean gradient/solid surface is a design fill, not a photo.
+    if extracted and (extracted.get("fill") or {}).get("kind") in ("linear", "radial"):
+        return None
+    pixels = local_rgb[local_mask]
+    if pixels.shape[0] < 60:
+        return None
+    dispersion = float(np.max(np.std(pixels.astype(np.float32), axis=0)))
+    if dispersion < PHOTO_SHAPE_MIN_STD:
+        return None
+    if geometry == "ellipse":
+        return {"kind": "ellipse"}
+    radius = (extracted or {}).get("radius")
+    if not isinstance(radius, (int, float)) or radius <= 0:
+        radius = _corner_radius(local_mask)
+    spec = {"kind": "rrect", "radius": 0.0}
+    if isinstance(radius, (int, float)) and radius > 0:
+        spec["radius"] = round(float(radius), 2)
+    return spec
+
+
 def _paths_to_svg(paths, width, height):
     body = []
     for path in paths:
@@ -613,25 +739,38 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             # Do not overwrite upstream paint facts.  This fills only the gaps left by
             # segmentation/Qwen and tags every inference for later QA/debugging.
             extracted = _extract_shape_style(rgb, mask, c.get("box", {}), cfg)
+            photo_mask = _photo_shape_override(rgb, mask, c.get("box", {}), extracted, c)
+            if photo_mask is None:
+                if extracted:
+                    c["shape_kind"] = c.get("shape_kind") or extracted["shape_kind"]
+                    c["fill"] = c.get("fill") or extracted["fill"]
+                    c["stroke"] = c.get("stroke") or extracted["stroke"]
+                    if not c.get("effects") and extracted["effects"]:
+                        c["effects"] = extracted["effects"]
+                    if c.get("radius") is None and extracted["radius"] not in (None, 0):
+                        c["radius"] = extracted["radius"]
+                    c["meta"]["style_extraction"] = extracted["meta"]
+                else:
+                    kind, radius = _infer_shape(mask, c.get("box", {}))
+                    c["shape_kind"] = c.get("shape_kind") or kind
+                    c["fill"] = c.get("fill") or {
+                        "kind": "flat", "color": _dominant_fill(rgb, mask, c.get("box", {}))
+                    }
+                    if radius and kind == "rect" and c.get("radius") is None:
+                        c["radius"] = radius
+                updated.append(c)
+                continue
+            # Photographic region (e.g. the ad9 circular avatar): deliver the real pixels as
+            # a swappable IMAGE clipped by the detected primitive, not a flattened solid fill.
+            if extracted and extracted.get("effects") and not c.get("effects"):
+                c["effects"] = extracted["effects"]
             if extracted:
-                c["shape_kind"] = c.get("shape_kind") or extracted["shape_kind"]
-                c["fill"] = c.get("fill") or extracted["fill"]
-                c["stroke"] = c.get("stroke") or extracted["stroke"]
-                if not c.get("effects") and extracted["effects"]:
-                    c["effects"] = extracted["effects"]
-                if c.get("radius") is None and extracted["radius"] not in (None, 0):
-                    c["radius"] = extracted["radius"]
                 c["meta"]["style_extraction"] = extracted["meta"]
-            else:
-                kind, radius = _infer_shape(mask, c.get("box", {}))
-                c["shape_kind"] = c.get("shape_kind") or kind
-                c["fill"] = c.get("fill") or {
-                    "kind": "flat", "color": _dominant_fill(rgb, mask, c.get("box", {}))
-                }
-                if radius and kind == "rect" and c.get("radius") is None:
-                    c["radius"] = radius
-            updated.append(c)
-            continue
+            c["meta"]["reclassified"] = "shape->image"
+            c["meta"]["photo_shape"] = True
+            c["mask"] = photo_mask
+            target = c["target"] = "image"
+            # fall through to the image materialization below
 
         image = _source_rgba(c, rgb, mask, run_dir)
         owned = (ownership == owner_number.get(cid, 0)).astype(np.uint8) * 255
@@ -676,7 +815,9 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             vector_fallback += 1
 
         c["src"] = raster_src
-        c["mask"] = {"kind": "alpha"}
+        # Swappable mask shape: ellipse for round avatars, rounded-rect for cards, path for
+        # a clean logo silhouette; irregular cutouts keep their own alpha.
+        c["mask"] = _image_mask_spec(c, mask, c.get("box", {}))
         updated.append(c)
 
     removal = []

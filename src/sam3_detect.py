@@ -48,10 +48,16 @@ DEFAULT_PROMPTS = [
     {"prompt": "phone", "role": "product", "kind": "photo-fragment"},
     {"prompt": "logo", "role": "logo", "kind": "icon"},
     {"prompt": "brand logo", "role": "logo", "kind": "icon"},
+    {"prompt": "circular logo", "role": "logo", "kind": "icon"},
     {"prompt": "icon", "role": "icon", "kind": "icon"},
     {"prompt": "app icon", "role": "icon", "kind": "icon"},
+    {"prompt": "profile picture", "role": "avatar", "kind": "icon"},
+    {"prompt": "profile photo", "role": "avatar", "kind": "icon"},
+    {"prompt": "avatar", "role": "avatar", "kind": "icon"},
     {"prompt": "arrow", "role": "arrow", "kind": "icon"},
     {"prompt": "badge", "role": "badge", "kind": "icon"},
+    {"prompt": "verified badge", "role": "verified", "kind": "icon"},
+    {"prompt": "verified checkmark", "role": "verified", "kind": "icon"},
     {"prompt": "price badge", "role": "badge", "kind": "icon"},
     {"prompt": "sale badge", "role": "badge", "kind": "icon"},
     {"prompt": "sticker", "role": "sticker", "kind": "shape"},
@@ -105,7 +111,9 @@ def _prompt_specs(raw) -> list[dict]:
 
 def _kind_for_role(role: str) -> str:
     role = str(role or "").lower()
-    if role in {"logo", "icon", "arrow", "badge", "symbol", "pictogram"}:
+    if role in {"logo", "icon", "arrow", "badge", "symbol", "pictogram",
+                "avatar", "profile", "profile-picture", "verified",
+                "verified-badge", "checkmark"}:
         return "icon"
     if role in {"shape", "button", "card", "container", "sticker", "background"}:
         return "shape"
@@ -513,6 +521,51 @@ def _text_min_score(scfg: dict) -> float:
     return float(scfg.get("min_score", scfg.get("confidence", 0.45)))
 
 
+# Small circular logos, avatars, and verified badges routinely land just below the
+# generic text-prompt bar (the ad9 verified badge scored 0.539).  For roughly-square,
+# small (sub-canvas) predictions coming from an icon/logo/badge/avatar prompt we accept
+# a lower score.  Large regions keep the full bar, so this cannot rescue a prompt that
+# snapped to a whole photograph.
+_SMALL_ICON_ROLES = {
+    "avatar", "profile", "profile-picture", "logo", "badge", "icon",
+    "verified", "verified-badge", "checkmark", "symbol",
+}
+
+
+def _small_icon_cfg(scfg: dict) -> dict:
+    raw = scfg.get("small_icon")
+    if raw is None:
+        return {"enabled": True}
+    if isinstance(raw, bool):
+        return {"enabled": raw}
+    if isinstance(raw, dict):
+        out = dict(raw)
+        out.setdefault("enabled", True)
+        return out
+    return {"enabled": False}
+
+
+def _text_pred_threshold(scfg: dict, role: str, mask, width: int, height: int,
+                         base: float) -> float:
+    cfg = _small_icon_cfg(scfg)
+    if not cfg.get("enabled", True):
+        return base
+    roles = cfg.get("roles")
+    roles = set(roles) if roles else _SMALL_ICON_ROLES
+    if str(role) not in roles:
+        return base
+    box = _mask_box(mask)
+    if box["w"] <= 0 or box["h"] <= 0:
+        return base
+    coverage = (box["w"] * box["h"]) / max(1, width * height)
+    if coverage > float(cfg.get("max_coverage", 0.05)):
+        return base
+    aspect = box["w"] / max(1, box["h"])
+    if not (float(cfg.get("min_aspect", 0.6)) <= aspect <= float(cfg.get("max_aspect", 1.7))):
+        return base
+    return min(base, float(cfg.get("min_score", 0.30)))
+
+
 def _box_refine_min_score(scfg: dict, residual: list) -> float:
     """Box-refine keeps a lower acceptance bar when deterministic residuals exist."""
     if scfg.get("box_refine_confidence") is not None:
@@ -704,12 +757,15 @@ def detect(
             errors.append(f"text:{spec['prompt']}: {exc}")
             continue
         for pred in preds:
-            if float(pred.get("score", 0)) < min_score:
-                continue
             # A SAM score/box without a segmentation mask is not ownership evidence.
             # Do not promote the model box into a fabricated rectangular owner.
             mask = pred.get("mask")
             if mask is None:
+                continue
+            # Small square avatars/badges/logos get a lower acceptance bar; every other
+            # prediction keeps the generic min_score.
+            threshold = _text_pred_threshold(scfg, spec["role"], mask, width, height, min_score)
+            if float(pred.get("score", 0)) < threshold:
                 continue
             el = _make_element(
                 len(elements),

@@ -1167,11 +1167,21 @@ def _targeted_retry(img_path: str, lines: list, engine: str, cfg: dict,
         return copy.deepcopy(lines)
 
     runner = runner or _run_backend
+    width, height = source.size
     scale = max(1.1, min(4.0, _float(options.get("scale"), 2.0)))
     small_height = max(4.0, _float(options.get("small_height"), 26.0))
     low_confidence = max(0.0, min(1.0, _float(options.get("low_confidence"), 0.72)))
     max_regions = max(0, min(32, int(options.get("max_regions", 6))))
     min_gain = max(0.0, _float(options.get("min_confidence_gain"), 0.025))
+    # Text that runs to the image edge is frequently clipped: the detector box stops a
+    # few px short of the last visible glyph.  Re-scan those lines on a crop that reaches
+    # toward the margin so trailing/leading characters can be recovered.
+    edge_recover = bool(options.get("edge_recover", True))
+    edge_margin = _float(options.get("edge_margin"), 0.0)
+    if edge_margin <= 0:
+        edge_margin = max(4.0, width * 0.01)
+    edge_extend_factor = max(1.0, _float(options.get("edge_extend_factor"), 4.0))
+    edge_conf_tolerance = max(0.0, _float(options.get("edge_conf_tolerance"), 0.08))
 
     eligible = []
     for index, line in enumerate(lines):
@@ -1180,6 +1190,12 @@ def _targeted_retry(img_path: str, lines: list, engine: str, cfg: dict,
             reasons.append("low-confidence")
         if _float(line.get("box", {}).get("h")) <= small_height:
             reasons.append("small-text")
+        box = _clean_box(line.get("box") or {})
+        if edge_recover and box["w"] > 0 and box["h"] > 0:
+            if (width - (box["x"] + box["w"])) <= edge_margin:
+                reasons.append("edge-right")
+            if box["x"] <= edge_margin:
+                reasons.append("edge-left")
         if reasons:
             priority = (_float(line.get("conf")), _float(line.get("box", {}).get("h")))
             eligible.append((priority, index, reasons))
@@ -1189,7 +1205,6 @@ def _targeted_retry(img_path: str, lines: list, engine: str, cfg: dict,
         return copy.deepcopy(lines)
 
     output = copy.deepcopy(lines)
-    width, height = source.size
     with tempfile.TemporaryDirectory(prefix="ocr_retry_") as directory:
         for retry_index, (_, index, reasons) in enumerate(eligible):
             original = output[index]
@@ -1199,6 +1214,12 @@ def _targeted_retry(img_path: str, lines: list, engine: str, cfg: dict,
             y0 = max(0, int(math.floor(box["y"] - padding)))
             x1 = min(width, int(math.ceil(box["x"] + box["w"] + padding)))
             y1 = min(height, int(math.ceil(box["y"] + box["h"] + padding)))
+            # Reach further toward a touched margin so a clipped glyph enters the crop.
+            edge_extend = int(round(box["h"] * edge_extend_factor))
+            if "edge-right" in reasons:
+                x1 = min(width, int(math.ceil(box["x"] + box["w"] + padding + edge_extend)))
+            if "edge-left" in reasons:
+                x0 = max(0, int(math.floor(box["x"] - padding - edge_extend)))
             if x1 <= x0 or y1 <= y0:
                 continue
             crop = source.crop((x0, y0, x1, y1))
@@ -1229,10 +1250,26 @@ def _targeted_retry(img_path: str, lines: list, engine: str, cfg: dict,
             agreement = _text_similarity(original.get("text"), candidate.get("text"))
             retry_conf = _float(candidate.get("conf"))
             original_conf = _float(original.get("conf"))
+            # An edge crop that reads a strict extension of the clipped line (the original
+            # text as a prefix/suffix, now longer) is accepted even without a confidence
+            # gain — it only ever adds the recovered glyphs, never rewrites the reading.
+            original_key = _text_key(original.get("text"))
+            candidate_key = _text_key(candidate.get("text"))
+            recovered = (
+                ("edge-right" in reasons or "edge-left" in reasons)
+                and bool(original_key)
+                and candidate_key != original_key
+                and len(candidate_key) > len(original_key)
+                and (candidate_key.startswith(original_key)
+                     or candidate_key.endswith(original_key)
+                     or original_key in candidate_key)
+                and retry_conf >= original_conf - edge_conf_tolerance
+            )
             selected = (
                 (agreement >= 0.96 and retry_conf >= original_conf)
                 or retry_conf >= original_conf + min_gain
                 or (not str(original.get("text") or "").strip() and retry_conf > 0)
+                or recovered
             )
             retry_meta = {
                 "attempted": True,
@@ -1243,13 +1280,20 @@ def _targeted_retry(img_path: str, lines: list, engine: str, cfg: dict,
                 "candidate_confidence": round(retry_conf, 4),
                 "text_agreement": round(agreement, 4),
                 "candidate_box": copy.deepcopy(candidate["box"]),
+                "recovered_truncation": recovered,
             }
             if selected:
                 # Full-image detection owns line placement.  The retry owns the
-                # transcription/confidence and its useful word-level geometry.
+                # transcription/confidence and its useful word-level geometry.  A recovered
+                # truncation additionally extends the box to cover the new glyphs.
                 replacement = copy.deepcopy(candidate)
-                replacement["box"] = copy.deepcopy(original["box"])
-                replacement["quad"] = copy.deepcopy(original.get("quad") or _rect_quad(original["box"]))
+                if recovered:
+                    union = _union_boxes([original["box"], candidate["box"]])
+                    replacement["box"] = union
+                    replacement["quad"] = _rect_quad(union)
+                else:
+                    replacement["box"] = copy.deepcopy(original["box"])
+                    replacement["quad"] = copy.deepcopy(original.get("quad") or _rect_quad(original["box"]))
                 replacement.setdefault("meta", {}).update(copy.deepcopy(original.get("meta") or {}))
                 replacement["meta"]["engine"] = engine
                 replacement["meta"]["retry_2x"] = retry_meta

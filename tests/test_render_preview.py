@@ -112,6 +112,33 @@ def test_preview_honors_text_horizontal_and_vertical_alignment(tmp_path):
     assert second_ink[:, 0].mean() > first_ink[:, 0].mean() + 10
 
 
+def test_preview_never_clips_text_wider_than_its_box(tmp_path):
+    # The box is deliberately far too narrow for the run; the renderer must grow the
+    # drawn region instead of cutting the last words off at the right edge (ad9 defect).
+    preview = np.asarray(_render(tmp_path, [{
+        "id": "copy", "type": "text", "box": {"x": 5, "y": 15, "w": 30, "h": 22},
+        "text": "waarbij je 20%", "style": {"fontSize": 20, "align": "left"},
+    }], size=(400, 60)))
+    ink_cols = np.where(np.any(preview < 200, axis=(0, 2)))[0]
+    assert ink_cols.size, "text should have been drawn"
+    # Ink must extend well past the 35px box right edge — nothing is clipped away.
+    assert ink_cols.max() > 120
+    assert ink_cols.min() <= 12
+
+
+def test_preview_applies_letter_spacing_tracking(tmp_path):
+    def right_edge(tracking):
+        preview = np.asarray(_render(tmp_path / f"t{tracking}", [{
+            "id": "copy", "type": "text", "box": {"x": 5, "y": 15, "w": 380, "h": 22},
+            "text": "MMMMMM", "style": {"fontSize": 20, "align": "left", "letterSpacing": tracking},
+        }], size=(400, 60)))
+        cols = np.where(np.any(preview < 200, axis=(0, 2)))[0]
+        return int(cols.max())
+    # Positive tracking spreads the glyphs, so the same string reaches further right;
+    # a renderer that ignored letterSpacing (as PIL's multiline_text does) would tie.
+    assert right_edge(12) > right_edge(0) + 30
+
+
 def test_preview_does_not_draw_fake_gray_for_missing_image(tmp_path):
     preview = _render(tmp_path, [{
         "id": "missing", "type": "image", "box": {"x": 10, "y": 10, "w": 20, "h": 20},

@@ -31,15 +31,129 @@ from src.harness import (
     _flag,
     _qa_progress,
     _qa_accepts,
+    _repair_id,
     execute_repairs,
     harness_enabled,
     harness_max_rounds,
+    is_actionable,
     load_repairs,
     recommended_resume,
     _load_json,
     _write_json,
 )
 from src.qa_config import visual_pass_ssim
+
+# Artifacts that together define "the design produced this round". Snapshotting these lets
+# the loop keep the best-scoring design and roll back a regressing round.
+_SNAPSHOT_FILES = ("design.json", "qa.json", "preview.png", "layout.json", "figma_export.png")
+
+# Metrics folded into the harness-local round score. This is a read-only aggregation of QA
+# fields already written by pixel_diff — the loop never computes a new visual metric here.
+_SCORE_KEYS = (
+    "ssim", "visual_score", "text_recall", "editable_text_recall",
+    "edge_f1", "color_similarity",
+)
+
+_DEFAULT_EPSILON = 0.005
+_DEFAULT_PLATEAU_ROUNDS = 2
+
+
+def convergence_epsilon(cfg: Optional[dict] = None, default: float = _DEFAULT_EPSILON) -> float:
+    harness = ((cfg or {}).get("runtime") or {}).get("harness") or {}
+    try:
+        return float(harness.get("epsilon", default))
+    except (TypeError, ValueError):
+        return default
+
+
+def plateau_round_limit(cfg: Optional[dict] = None, default: int = _DEFAULT_PLATEAU_ROUNDS) -> int:
+    harness = ((cfg or {}).get("runtime") or {}).get("harness") or {}
+    try:
+        return max(1, int(harness.get("plateau_rounds", default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _qa_score(qa: Optional[dict]) -> Optional[float]:
+    """Scalar round quality from existing QA fields. Higher is better; None if unknown."""
+    qa = qa or {}
+    if _qa_accepts(qa, allow_summary=True):
+        return 1.0
+    values = [float(qa[key]) for key in _SCORE_KEYS if isinstance(qa.get(key), (int, float))]
+    if not values:
+        return None
+    base = sum(values) / len(values)
+    hard_fails = qa.get("hard_fails")
+    penalty = 0.05 * len(hard_fails) if isinstance(hard_fails, list) else 0.0
+    return round(max(0.0, base - penalty), 6)
+
+
+def _snapshot_artifacts(run_dir: str) -> dict[str, bytes]:
+    snapshot: dict[str, bytes] = {}
+    for name in _SNAPSHOT_FILES:
+        path = os.path.join(run_dir, name)
+        try:
+            with open(path, "rb") as handle:
+                snapshot[name] = handle.read()
+        except OSError:
+            continue
+    return snapshot
+
+
+def _restore_artifacts(run_dir: str, snapshot: dict[str, bytes]) -> None:
+    for name, blob in (snapshot or {}).items():
+        path = os.path.join(run_dir, name)
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            temporary = path + ".tmp"
+            with open(temporary, "wb") as handle:
+                handle.write(blob)
+            os.replace(temporary, path)
+        except OSError:
+            continue
+
+
+def _invoke_execute_repairs(fn, run_dir, cfg, *, max_iterations, run_one, blocked_repairs):
+    """Pass ``blocked_repairs`` only to runners that accept it (test fakes may not)."""
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_blocked = "blocked_repairs" in parameters or any(
+        item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+    )
+    if accepts_blocked:
+        return fn(run_dir, cfg, max_iterations=max_iterations, run_one=run_one,
+                  blocked_repairs=set(blocked_repairs or ()))
+    return fn(run_dir, cfg, max_iterations=max_iterations, run_one=run_one)
+
+
+def _round_repair_signatures(repair_summary: dict) -> tuple[list, set]:
+    """From a repair summary's attempts, return (applied, non_improving) signatures."""
+    applied: list = []
+    non_improving: set = set()
+    for attempt in (repair_summary or {}).get("attempts") or []:
+        repair = attempt.get("repair") or {}
+        signature = (repair.get("stage"), repair.get("action"), repair.get("target_id"))
+        if signature == (None, None, None):
+            continue
+        applied.append(signature)
+        if not attempt.get("qa_improved") or not attempt.get("pipeline_ok", True):
+            non_improving.add(signature)
+    return applied, non_improving
+
+
+def _actionable_signatures(run_dir: str, cfg: dict, blocked: set) -> list:
+    """Signatures of currently actionable repairs not already blocked."""
+    out: list = []
+    for repair in load_repairs(run_dir, cfg) or []:
+        if not is_actionable(repair):
+            continue
+        signature = _repair_id(repair)
+        if signature in blocked or signature in out:
+            continue
+        out.append(signature)
+    return out
 
 
 def max_harness_rounds(cfg: Optional[dict] = None, default: int = 3) -> int:
@@ -187,6 +301,7 @@ def _run_round(
     run_one: Callable[..., dict],
     execute_repairs_fn: Callable[..., dict],
     repair_iters: int,
+    blocked_repairs: Optional[set] = None,
 ) -> tuple[dict, dict, bool]:
     """Execute one harness round. Returns (round_record, updated_cfg, should_stop)."""
     round_record: dict[str, Any] = {"round": round_num}
@@ -233,8 +348,10 @@ def _run_round(
     qa_before_repairs = _load_json(os.path.join(run_dir, "qa.json"), {})
     repair_cfg = _cfg_for_pipeline(working_cfg)
     try:
-        repair_summary = execute_repairs_fn(
-            run_dir, repair_cfg, max_iterations=repair_iters, run_one=run_one,
+        repair_summary = _invoke_execute_repairs(
+            execute_repairs_fn, run_dir, repair_cfg,
+            max_iterations=repair_iters, run_one=run_one,
+            blocked_repairs=blocked_repairs,
         )
         if not isinstance(repair_summary, dict):
             raise TypeError("repair executor returned malformed output")
@@ -313,10 +430,22 @@ def run_until_acceptable(
     cfg = copy.deepcopy(cfg or {})
     max_rounds = max(1, int(max_rounds or max_harness_rounds(cfg)))
     repair_iters = repair_iterations(cfg)
+    epsilon = convergence_epsilon(cfg)
+    plateau_limit = plateau_round_limit(cfg)
     threshold_snapshot = _threshold_snapshot(cfg)
     working_cfg = copy.deepcopy(cfg)
     rounds: list[dict] = []
     stopped = "max_rounds"
+
+    # Convergence state — the direct fix for the observed oscillation.
+    blocked: set = set()                       # repairs proven non-improving (no-repeat)
+    convergence: list[dict] = []               # per-round (repair, before, after, kept/rolled)
+    before_score = _qa_score(_load_json(os.path.join(run_dir, "qa.json"), {}))
+    best_score = before_score if before_score is not None else float("-inf")
+    best_round = 0
+    best_snapshot = _snapshot_artifacts(run_dir) if before_score is not None else {}
+    plateau = 0
+    rolled_back_rounds = 0
 
     next_resume = start_from
     for round_num in range(1, max_rounds + 1):
@@ -334,14 +463,96 @@ def run_until_acceptable(
             run_one=run_one,
             execute_repairs_fn=execute_repairs_fn,
             repair_iters=repair_iters,
+            blocked_repairs=blocked,
         )
         next_resume = round_record.get("next_resume") or next_resume
+        round_stopped = round_record.get("stopped")
+
+        # ── convergence bookkeeping ────────────────────────────────────────────────
+        after_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+        after_score = _qa_score(after_qa)
+        applied, non_improving = _round_repair_signatures(round_record.get("repairs") or {})
+        blocked |= non_improving
+        record: dict[str, Any] = {
+            "round": round_num,
+            "repair": [list(sig) for sig in applied],
+            "before_score": before_score,
+            "after_score": after_score,
+            "delta": None,
+            "kept": False,
+            "rolled_back": False,
+            "blocked": [list(sig) for sig in sorted(non_improving)],
+        }
+
+        if after_score is not None:
+            delta = after_score - (before_score if before_score is not None else after_score)
+            record["delta"] = round(delta, 6)
+            if after_score > best_score:
+                best_score, best_round = after_score, round_num
+                best_snapshot = _snapshot_artifacts(run_dir)
+                record["kept"] = True
+            elif after_score < best_score - epsilon and best_snapshot and not should_stop:
+                # Regression: restore the best design and force a different repair next round.
+                _restore_artifacts(run_dir, best_snapshot)
+                rolled_back_rounds += 1
+                record["rolled_back"] = True
+                blocked |= set(applied)
+                after_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+                after_score = best_score
+                steer = recommended_resume(
+                    [r for r in load_repairs(run_dir, working_cfg)
+                     if is_actionable(r) and _repair_id(r) not in blocked]
+                )
+                if steer:
+                    next_resume = steer["resume"]
+            elif applied and abs(delta) <= epsilon:
+                # No-op repair — never retry it.
+                blocked |= set(applied)
+            plateau = plateau + 1 if abs(delta) < epsilon else 0
+            before_score = after_score
+        convergence.append(record)
         rounds.append(round_record)
+
         if should_stop:
-            stopped = round_record.get("stopped", stopped)
+            stopped = round_stopped or stopped
+            # A "no_progress" stop is premature when the current design still has untried,
+            # non-blocked repairs and the round did not exhaust the repair space. Steer to a
+            # different operator and keep going rather than oscillating on the same one.
+            repair_stopped = (round_record.get("repairs") or {}).get("stopped")
+            exhausted_space = repair_stopped in {
+                "no_actionable_repairs", "all_repairs_failed", "missing_input",
+            }
+            alternatives = _actionable_signatures(run_dir, working_cfg, blocked)
+            if (
+                stopped == "no_progress"
+                and not exhausted_space
+                and alternatives
+                and plateau < plateau_limit
+                and round_num < max_rounds
+            ):
+                choice = recommended_resume(
+                    [r for r in load_repairs(run_dir, working_cfg)
+                     if is_actionable(r) and _repair_id(r) not in blocked]
+                )
+                if choice:
+                    next_resume = choice["resume"]
+                    stopped = "max_rounds"  # not actually stopping — keep converging
+                    continue
             break
 
+        if plateau >= plateau_limit:
+            stopped = "plateau"
+            break
+
+    # Emit the BEST design seen, not merely the last one.
     final_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+    live_score = _qa_score(final_qa)
+    if best_snapshot and best_score != float("-inf") and (
+        live_score is None or live_score < best_score
+    ):
+        _restore_artifacts(run_dir, best_snapshot)
+        final_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+
     success_stop = stopped in {"qa_ok", "qa_ok_after_repairs"}
     summary = {
         "run_dir": run_dir,
@@ -351,9 +562,42 @@ def run_until_acceptable(
         "qa_ok": success_stop and _qa_accepts(final_qa, allow_summary=True),
         "stopped": stopped,
         "thresholds": threshold_snapshot,
+        "convergence": {
+            "epsilon": epsilon,
+            "plateau_rounds": plateau_limit,
+            "best_round": best_round,
+            "best_score": None if best_score == float("-inf") else round(best_score, 6),
+            "rolled_back_rounds": rolled_back_rounds,
+            "trail": convergence,
+        },
     }
     _write_json(os.path.join(run_dir, "harness_loop.json"), summary)
+    _patch_runtime_report(run_dir, summary["convergence"], stopped, summary["qa_ok"])
     return summary
+
+
+def _patch_runtime_report(run_dir: str, convergence: dict, stopped: str, qa_ok: bool) -> None:
+    """Surface convergence behaviour in runtime_report.json when it exists (visible/testable)."""
+    path = os.path.join(run_dir, "runtime_report.json")
+    if not os.path.exists(path):
+        return
+    report = _load_json(path, None)
+    if not isinstance(report, dict):
+        return
+    report["harness_convergence"] = {
+        "stopped": stopped,
+        "qa_ok": bool(qa_ok),
+        "best_round": convergence.get("best_round"),
+        "best_score": convergence.get("best_score"),
+        "rolled_back_rounds": convergence.get("rolled_back_rounds"),
+        "epsilon": convergence.get("epsilon"),
+        "plateau_rounds": convergence.get("plateau_rounds"),
+        "trail": convergence.get("trail"),
+    }
+    try:
+        _write_json(path, report)
+    except OSError:
+        pass
 
 
 def run_harness_after_pipeline(

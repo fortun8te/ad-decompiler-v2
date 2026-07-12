@@ -663,6 +663,129 @@ def _estimate_tracking(text: str, painted_box: dict, font_size: float) -> float:
     return round(max(-font_size * 0.08, min(font_size * 0.20, tracking)), 3)
 
 
+# ---------------------------------------------------------------------------
+# Text-box fitting for the Figma compiler
+#
+# A design.json text layer is rendered into a fixed box.  When the box is narrower
+# than the rendered glyph run the text clips on the right (the ad9 defect).
+# ``fit_text_box`` returns a box that fully contains the text plus a Figma
+# ``autoResize`` hint: single-line labels grow width from their alignment anchor;
+# fixed-width wrapped paragraphs keep their width and shrink fontSize/letterSpacing
+# until every line fits, growing height instead.
+
+
+def _fit_font(style: dict, font_size: float):
+    try:
+        from PIL import ImageFont
+    except Exception:
+        return None
+    candidates = style.get("fontCandidates") or []
+    paths = [c.get("path") for c in candidates
+             if isinstance(c, dict) and c.get("path") and os.path.exists(c["path"])]
+    paths += ["arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
+    size = max(1, int(round(font_size)))
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except Exception:
+        try:
+            return ImageFont.load_default()
+        except Exception:
+            return None
+
+
+def _line_advance(font, line: str, tracking: float) -> float:
+    """Rendered width of one line honoring per-glyph tracking (letterSpacing)."""
+    if not line:
+        return 0.0
+    try:
+        width = sum(font.getlength(ch) for ch in line)
+    except Exception:
+        width = len(line) * 0.5 * float(getattr(font, "size", 12) or 12)
+    return width + tracking * max(0, len(line) - 1)
+
+
+def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
+    """Return ``(box, auto_resize, style_patch)`` sized so ``text`` cannot clip.
+
+    ``auto_resize`` is a Figma hint: ``"WIDTH"`` for a single-line label (the box
+    grows horizontally from its alignment anchor), ``"HEIGHT"`` for a fixed-width
+    paragraph (fontSize/letterSpacing shrink to the width, height grows), or
+    ``"NONE"`` when measurement is unavailable.  ``style_patch`` carries any reduced
+    ``fontSize``/``letterSpacing`` for the paragraph case; it is empty otherwise.
+    """
+    fitted = dict(box or {})
+    text = str(text or "")
+    lines = text.split("\n")
+    font_size = _num(style.get("fontSize"), max(1.0, _num(fitted.get("h"), 12.0)))
+    if font_size <= 0:
+        font_size = max(1.0, _num(fitted.get("h"), 12.0))
+    tracking = _num(style.get("letterSpacing"), 0.0)
+    line_height = _num(style.get("lineHeight"), font_size * 1.2) or font_size * 1.2
+    align = str(style.get("align", "LEFT")).upper()
+    font = _fit_font(style, font_size)
+    if font is None:
+        return fitted, "NONE", {}
+    try:
+        ascent, descent = font.getmetrics()
+    except Exception:
+        ascent, descent = font_size * 0.8, font_size * 0.2
+    pad = max(2.0, font_size * 0.12)
+
+    widths = [_line_advance(font, line, tracking) for line in lines]
+    content_w = max(widths + [0.0])
+    line_count = max(1, len(lines))
+
+    if line_count <= 1:
+        # Auto-width label: grow the box from its alignment anchor to fit the run.
+        needed = content_w + 2.0 * pad
+        current_w = _num(fitted.get("w"))
+        if needed > current_w:
+            extra = needed - current_w
+            if align == "RIGHT":
+                fitted["x"] = round(_num(fitted.get("x")) - extra, 2)
+            elif align == "CENTER":
+                fitted["x"] = round(_num(fitted.get("x")) - extra / 2.0, 2)
+            fitted["w"] = round(needed, 2)
+        min_h = ascent + descent + 2.0 * pad
+        if min_h > _num(fitted.get("h")):
+            fitted["h"] = round(min_h, 2)
+        return fitted, "WIDTH", {}
+
+    # Fixed-width paragraph: shrink glyphs to the available width, then grow height.
+    patch: dict = {}
+    avail = max(1.0, _num(fitted.get("w")) - 2.0 * pad)
+    if content_w > avail:
+        # Glyph width is very close to linear in point size, so scale directly and
+        # tighten letter spacing only for the small residual — keeps the paragraph
+        # readable rather than crushing it with tracking alone.
+        target_scale = max(0.5, avail / content_w)
+        new_size = max(1.0, font_size * target_scale)
+        fit_font = _fit_font(style, new_size) or font
+        current = max((_line_advance(fit_font, line, tracking) for line in lines), default=0.0)
+        fit_tracking = tracking
+        if current > avail:
+            longest = max((len(line) for line in lines), default=1)
+            fit_tracking = tracking - (current - avail) / max(1, longest - 1)
+        if new_size < font_size - 0.01:
+            patch["fontSize"] = round(new_size, 2)
+        if fit_tracking < tracking - 0.01:
+            patch["letterSpacing"] = round(fit_tracking, 3)
+        try:
+            ascent, descent = fit_font.getmetrics()
+        except Exception:
+            pass
+
+    content_h = (line_count - 1) * line_height + ascent + descent + 2.0 * pad
+    if content_h > _num(fitted.get("h")):
+        fitted["h"] = round(content_h, 2)
+    return fitted, "HEIGHT", patch
+
+
 def _fallback_font_candidates(weight: int, options: dict, top_k: int, italic: bool = False) -> list[dict]:
     families = options.get("fallback_families") or options.get("families") or _DEFAULT_FAMILIES
     if isinstance(families, str):
@@ -1652,4 +1775,5 @@ def run_text_analysis(img_path: str, ocr_result: dict, cfg: Optional[dict] = Non
     return analyze_text(img_path, ocr_result, cfg)
 
 
-__all__ = ["analyze_text", "run_text_analysis", "needs_vlm_font_judge", "local_score_threshold"]
+__all__ = ["analyze_text", "run_text_analysis", "needs_vlm_font_judge", "local_score_threshold",
+           "fit_text_box"]

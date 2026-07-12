@@ -59,3 +59,96 @@ def test_finalize_rejects_fully_transparent_fake_layers(tmp_path):
 
     assert layers == []
     assert not (tmp_path / "qwen_layers" / "Q0.png").exists()
+
+
+# ── Flux Fill inpaint backend ─────────────────────────────────────────────────────────
+def _mask_pair():
+    rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+    return rgb, mask
+
+
+def test_flux_inpaint_returns_none_when_comfyui_offline(monkeypatch):
+    class _Dead:
+        def get(self, *args, **kwargs):
+            raise OSError("connection refused")
+
+        def post(self, *args, **kwargs):
+            raise OSError("connection refused")
+
+    monkeypatch.setattr(qwen_worker, "_requests", lambda: _Dead())
+    rgb, mask = _mask_pair()
+    # A downed ComfyUI must degrade gracefully to None, never raise.
+    assert qwen_worker.flux_inpaint(rgb, mask, {"inpaint": {"comfy": {}}}) is None
+
+
+def test_flux_inpaint_returns_none_when_workflow_missing(monkeypatch):
+    class _R:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {}
+
+    class _OkProbe:
+        def get(self, *args, **kwargs):
+            return _R()
+
+        def post(self, *args, **kwargs):
+            return _R()
+
+    monkeypatch.setattr(qwen_worker, "_requests", lambda: _OkProbe())
+    rgb, mask = _mask_pair()
+    cfg = {"inpaint": {"comfy": {"workflow": "workflows/__does_not_exist__.json"}}}
+    assert qwen_worker.flux_inpaint(rgb, mask, cfg) is None
+
+
+def test_flux_inpaint_full_cycle_returns_decoded_plate(monkeypatch):
+    import io
+
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), (11, 22, 33)).save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    class _Resp:
+        def __init__(self, json_data=None, content=b""):
+            self._json = json_data
+            self.content = content
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._json
+
+    class _Fake:
+        def get(self, url, **kwargs):
+            if url.endswith("/system_stats"):
+                return _Resp(json_data={"ok": 1})
+            if "/history/" in url:
+                return _Resp(json_data={"pid123": {"outputs": {
+                    "14": {"images": [{"filename": "flux_inpaint_00001_.png",
+                                       "subfolder": "", "type": "output"}]}
+                }}})
+            if "/view" in url:
+                return _Resp(content=png_bytes)
+            return _Resp(json_data={})
+
+        def post(self, url, **kwargs):
+            if url.endswith("/upload/image"):
+                return _Resp(json_data={"name": "flux_uploaded.png"})
+            if url.endswith("/prompt"):
+                return _Resp(json_data={"prompt_id": "pid123"})
+            return _Resp(json_data={})
+
+    monkeypatch.setattr(qwen_worker, "_requests", lambda: _Fake())
+    rgb, mask = _mask_pair()
+    cfg = {"inpaint": {"comfy": {
+        "workflow": "workflows/flux_fill_inpaint_api.json", "timeout_s": 5,
+    }}}
+    out = qwen_worker.flux_inpaint(rgb, mask, cfg)
+    assert out is not None
+    assert out.shape == (8, 8, 3)

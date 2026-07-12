@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.0.0","build":24,"commit":"80d12b5","dirty":true,"built_at":"2026-07-12T09:14:18Z","label":"v2.0.0+b24.80d12b5-dirty","source":"git"};
+const PLUGIN_BUILD = {"version":"2.0.0","build":35,"commit":"65dfd32","dirty":true,"built_at":"2026-07-12T21:14:28Z","label":"v2.0.0+b35.65dfd32-dirty","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,
@@ -1235,7 +1235,13 @@ async function createImageLayer(layer, parent, context) {
   const directMaskGeometry = (maskKind === "ELLIPSE" || maskKind === "CIRCLE" || maskKind === "RRECT" || maskKind === "ROUNDED_RECT") &&
     (pick(mask, "box", "bounds") || ["x", "y", "w", "h", "width", "height", "left", "top"].some(function (key) { return mask[key] !== undefined; }));
   setGeometry(node, directMaskGeometry ? maskLayerFor(mask, layer) : layer, context, false);
-  node.fills = [imagePaint(image, layer)];
+  const shapeClipped = maskKind === "ELLIPSE" || maskKind === "CIRCLE" || maskKind === "RRECT" || maskKind === "ROUNDED_RECT";
+  const paint = imagePaint(image, layer);
+  // A shape-masked cutout is meant to be swapped in Figma: force FILL so any replacement
+  // image always covers the ellipse/rounded-rect with no transparent gaps (unless an
+  // explicit CROP transform was supplied).
+  if (shapeClipped && !paint.imageTransform) paint.scaleMode = "FILL";
+  node.fills = [paint];
   if (maskKind === "RRECT" || maskKind === "ROUNDED_RECT") node.cornerRadius = Math.max(0, finite(pick(mask, "radius", "corner_radius", "cornerRadius"), finite(pick(layer, "radius"), 16)));
   applyStrokes(node, layer, context);
   applyEffects(node, layer, context);

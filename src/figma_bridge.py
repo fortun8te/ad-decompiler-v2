@@ -706,7 +706,14 @@ def make_handler(inbox, config_path=None):
                 if result.get("ok"):
                     staging = _stage_job_output(inbox, run_dir, cfg)
                     qa_path = os.path.join(run_dir, "qa.json")
-                    qa = load_qa(run_dir) if os.path.exists(qa_path) else None
+                    # A bridge-only runner may intentionally return a compact
+                    # result without producing qa.json.  Keep that summary
+                    # explicit and scoped to this bridge decision; real
+                    # qa.json artifacts continue through the strict gate.
+                    qa = load_qa(run_dir) if os.path.exists(qa_path) else {
+                        "ok": result.get("qa_ok", result.get("ok")),
+                        "_bridge_summary": True,
+                    }
                     should_repair, repair_reason = harness_should_repair(
                         result, qa=qa, staging=staging,
                     )

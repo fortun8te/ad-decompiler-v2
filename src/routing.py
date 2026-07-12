@@ -31,6 +31,50 @@ PRIMITIVE_SHAPE_ROLES = ("badge", "chip", "button", "divider", "card")
 # emitting a guessed rendering. Overridable via cfg["routing"]["min_text_fidelity"].
 MIN_TEXT_FIDELITY = 0.30
 
+# Roles whose rasterized cutout should be delivered as an IMAGE clipped by a swappable
+# shape mask (see _image_mask). The raster is the swappable fill; the mask is the shape.
+AVATAR_ROLES = ("avatar", "profile", "profile_picture", "profile_photo", "pfp",
+                "headshot", "user_photo")
+CARD_ROLES = ("card", "badge", "thumbnail", "tile")
+LOGO_ROLES = ("logo", "wordmark", "brand", "logotype")
+
+
+def _image_mask(candidate: dict, canvas: dict) -> dict:
+    """Choose the swappable mask SHAPE for a rasterized image element.
+
+    The raster cutout stays the (swappable) fill; the mask spec defines the clip so a
+    logo/photo/avatar can be replaced in Figma without re-flattening it into the plate:
+      avatar/profile  -> {"kind": "ellipse"}          (circular profile picture)
+      card/badge      -> {"kind": "rrect", radius?}   (rounded card/thumbnail)
+      logo/wordmark   -> {"kind": "path"}             (silhouette, traced in reconstruct)
+      everything else -> {"kind": "alpha"}            (irregular cutout, own transparency)
+
+    Only the coarse, role-driven hint is set here. Geometry that needs pixel evidence
+    (round alpha coverage, corner radius, silhouette path) is finalized in reconstruct.py.
+    Any pre-existing mask keys (notably ``src``, used by reconstruct to load the matte)
+    are preserved.
+    """
+    meta = candidate.get("meta") or {}
+    role = str(meta.get("role") or "").lower()
+    mask = dict(candidate.get("mask")) if isinstance(candidate.get("mask"), dict) else {}
+    # A shape already decided upstream (or by an earlier pass) is authoritative.
+    if mask.get("kind") and str(mask.get("kind")).lower() != "alpha":
+        return mask
+    if role in AVATAR_ROLES or meta.get("avatar") or meta.get("circular"):
+        mask["kind"] = "ellipse"
+    elif role in LOGO_ROLES or meta.get("wordmark"):
+        mask["kind"] = "path"
+    elif role in CARD_ROLES:
+        mask["kind"] = "rrect"
+        radius = candidate.get("radius")
+        if radius is None:
+            radius = (candidate.get("style") or {}).get("radius")
+        if radius is not None:
+            mask.setdefault("radius", radius)
+    else:
+        mask["kind"] = "alpha"
+    return mask
+
 
 def _area_frac(box, canvas):
     W = max(1, canvas.get("w", 1)); H = max(1, canvas.get("h", 1))
@@ -93,11 +137,15 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
             c["target"] = "image" if cfg and cfg.get("wordmark_as_raster", True) else "icon"
             meta["wordmark"] = True
             meta["role"] = meta.get("role") or "logo"
+            if c["target"] == "image":
+                c["mask"] = _image_mask(c, canvas)
             return c
         if is_wordmark_candidate({"text": c.get("text"), "box": c.get("box"), "id": c.get("id")}, canvas):
             c["target"] = "image" if cfg and cfg.get("wordmark_as_raster", True) else "icon"
             meta["wordmark"] = True
             meta["role"] = meta.get("role") or "logo"
+            if c["target"] == "image":
+                c["mask"] = _image_mask(c, canvas)
             return c
         # confidence/fidelity gate: a font/effect we cannot faithfully reproduce as
         # editable text falls back to the original painted pixels instead of a guess.
@@ -116,7 +164,9 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
     # 3. Photos / products / people → raster + mask ---------------------------------
     if kind == "photo-fragment" or meta.get("role") in ("product", "person", "photo"):
         c["target"] = "image"
-        c.setdefault("mask", {"kind": "alpha"})   # alpha from qwen layer or matte
+        # Swappable raster-in-shape (alpha for irregular cutouts; an avatar/card/logo role
+        # upgrades to ellipse/rrect/path). reconstruct refines the geometry from pixels.
+        c["mask"] = _image_mask(c, canvas)
         return c
 
     # 4. Icons / badges / simple graphics → vectorize (small only) ------------------
@@ -154,6 +204,7 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
     # 6. Fallback: unknown residual → raster crop (never a placeholder, never a trace)
     c["target"] = "image"
     meta["fallback"] = True
+    c["mask"] = _image_mask(c, canvas)
     return c
 
 

@@ -173,6 +173,64 @@ def test_judge_rejects_unrelated_third_reading(tmp_path, monkeypatch):
     assert out["vlm_ocr_judge"]["notes"][0]["note"] == "vlm_novel_reading"
 
 
+def _cfg_proofread(max_conf=0.80, brand_tokens=True, min_similarity=0.6):
+    return {"vlm": {"ocr_judge": {
+        "enabled": True, "passes": 2,
+        "proofread": {"enabled": True, "max_conf": max_conf,
+                      "brand_tokens": brand_tokens, "min_similarity": min_similarity},
+    }}}
+
+
+def test_brand_token_single_char_misread_is_proofread(tmp_path, monkeypatch):
+    # High-confidence, single-engine (no disagreement) brand-token misread: P->H.
+    _mock_multi(monkeypatch, ["PINDAKAAS"])
+    ocr_result = {"lines": [_line("HINDAKAAS", conf=0.95)]}
+    out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), ocr_result, _cfg_proofread())
+    line = out["lines"][0]
+    assert line["text"] == "PINDAKAAS"
+    assert line["ocr_text"] == "HINDAKAAS"
+    assert line["vlm_ocr_judged"] is True
+    assert line["meta"]["vlm_ocr_proofread"]["reason"] == "brand-token"
+    assert out["vlm_ocr_judge"]["proofread_corrected"] == 1
+
+
+def test_proofread_rejects_wholesale_rewrite(tmp_path, monkeypatch):
+    # A dissimilar answer (hallucinated real word) must not replace the OCR reading.
+    _mock_multi(monkeypatch, ["CHOCOLADE"])
+    ocr_result = {"lines": [_line("HINDAKAAS", conf=0.95)]}
+    out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), ocr_result, _cfg_proofread())
+    assert out["lines"][0]["text"] == "HINDAKAAS"
+    assert out["vlm_ocr_judge"]["proofread_corrected"] == 0
+    assert out["vlm_ocr_judge"]["notes"][0]["note"] == "vlm_low_similarity"
+
+
+def test_proofread_routes_low_confidence_line(tmp_path, monkeypatch):
+    _mock_multi(monkeypatch, ["energie"])
+    ocr_result = {"lines": [_line("energi", conf=0.55)]}
+    out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), ocr_result, _cfg_proofread())
+    line = out["lines"][0]
+    assert line["text"] == "energie"
+    assert line["meta"]["vlm_ocr_proofread"]["reason"] == "low-confidence"
+
+
+def test_proofread_disabled_by_default(tmp_path, monkeypatch):
+    called = []
+    monkeypatch.setattr(vlm_client, "multi_pass_answer",
+                        lambda *a, **k: called.append(1) or ("PINDAKAAS", None))
+    ocr_result = {"lines": [_line("HINDAKAAS", conf=0.95)]}
+    out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), ocr_result, _cfg())
+    assert called == []  # no disagreement + proofread off => no VLM call
+    assert out["lines"][0]["text"] == "HINDAKAAS"
+
+
+def test_brand_token_heuristic():
+    assert vlm_ocr_judge._looks_like_brand_token("PINDAKAAS")
+    assert vlm_ocr_judge._looks_like_brand_token("UPFRONT")
+    assert not vlm_ocr_judge._looks_like_brand_token("save today")  # lowercase body copy
+    assert not vlm_ocr_judge._looks_like_brand_token("De Vakantiegeldsale komt eraan")
+    assert not vlm_ocr_judge._looks_like_brand_token("AB")  # too short
+
+
 def test_ocr_read_adds_missed_line(tmp_path, monkeypatch):
     monkeypatch.setattr(
         vlm_client, "multi_pass_answer",

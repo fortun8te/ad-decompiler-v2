@@ -62,3 +62,57 @@ def test_explicit_small_nonprimitive_graphic_is_vectorized():
         CANVAS,
     )
     assert out["target"] == "icon"
+
+
+def test_avatar_photo_routes_to_image_with_ellipse_mask():
+    out = routing.route(
+        {"id": "AV", "kind": "photo-fragment", "box": {"x": 24, "y": 132, "w": 122, "h": 123},
+         "meta": {"role": "avatar"}},
+        CANVAS,
+    )
+    assert out["target"] == "image"
+    assert out["mask"]["kind"] == "ellipse"
+
+
+def test_photo_role_keeps_alpha_mask_and_preserves_src():
+    out = routing.route(
+        {"id": "P0", "kind": "photo-fragment", "box": {"x": 0, "y": 0, "w": 400, "h": 200},
+         "mask": {"src": "fused_elements/E0.png"}, "meta": {"role": "photo"}},
+        CANVAS,
+    )
+    assert out["target"] == "image"
+    assert out["mask"]["kind"] == "alpha"
+    # The matte path reconstruct needs to load the mask must survive routing.
+    assert out["mask"]["src"] == "fused_elements/E0.png"
+
+
+def test_card_role_routes_to_rounded_rect_mask_with_radius():
+    out = routing.route(
+        {"id": "C0", "kind": "photo-fragment", "box": {"x": 10, "y": 10, "w": 200, "h": 120},
+         "radius": 18, "meta": {"role": "card"}},
+        CANVAS,
+    )
+    assert out["target"] == "image"
+    assert out["mask"]["kind"] == "rrect"
+    assert out["mask"]["radius"] == 18
+
+
+def test_wordmark_logo_routes_to_image_with_path_mask():
+    out = routing.route(
+        {"id": "W0", "text": "UpfrontFood", "kind": "text",
+         "box": {"x": 185, "y": 198, "w": 226, "h": 30},
+         "meta": {"scene_text_role": "wordmark"}},
+        CANVAS, {"wordmark_as_raster": True},
+    )
+    assert out["target"] == "image"
+    assert out["meta"]["wordmark"] is True
+    assert out["mask"]["kind"] == "path"
+
+
+def test_explicit_upstream_mask_shape_is_not_downgraded():
+    out = routing.route(
+        {"id": "M0", "kind": "photo-fragment", "box": {"x": 0, "y": 0, "w": 80, "h": 80},
+         "mask": {"kind": "ellipse"}, "meta": {"role": "photo"}},
+        CANVAS,
+    )
+    assert out["mask"]["kind"] == "ellipse"

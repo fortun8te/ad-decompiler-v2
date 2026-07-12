@@ -52,6 +52,16 @@ RULE_TO_CATEGORY = {
     "local-ssim": "layout",
     "edge-fidelity": "layout",
     "color-fidelity": "text",
+    "duplicate-text": "staging",
+    "clipped-text": "text",
+    "wrong-glyphs": "text",
+}
+
+# Rendered-output anomaly types (src.vlm_anomaly) → failure category + score weight.
+ANOMALY_CATEGORY = {
+    "duplicate_text": ("staging", 0.5),
+    "clipped_text": ("text", 0.5),
+    "wrong_glyphs": ("text", 0.45),
 }
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0}
@@ -429,6 +439,36 @@ def _suggested_fix_ids(repairs: list[dict], scores: dict[str, dict[str, Any]]) -
     return out
 
 
+def _detect_anomalies(run_dir: str, qa: dict, cfg: Optional[dict]) -> list[dict]:
+    """Run the optional VLM anomaly pass (safe, capped). Reuse qa.anomalies if present."""
+    existing = qa.get("anomalies") if isinstance(qa, dict) else None
+    if isinstance(existing, list) and existing:
+        return [a for a in existing if isinstance(a, dict)]
+    try:
+        from src import vlm_anomaly
+        if not vlm_anomaly.enabled(cfg):
+            return []
+        return vlm_anomaly.detect_anomalies(run_dir, cfg)
+    except Exception:
+        return []
+
+
+def _score_anomalies(scores: dict[str, dict[str, Any]], anomalies: list[dict]) -> None:
+    for anomaly in anomalies or []:
+        if not isinstance(anomaly, dict):
+            continue
+        kind = str(anomaly.get("type") or "").strip().lower()
+        mapping = ANOMALY_CATEGORY.get(kind)
+        if not mapping:
+            continue
+        category, weight = mapping
+        label = str(anomaly.get("text") or anomaly.get("detail") or kind)[:120]
+        _bump(scores[category], weight, f"anomaly {kind}: {label}")
+    for bucket in scores.values():
+        bucket["score"] = round(min(1.0, bucket["score"]), 3)
+        bucket["severity"] = _severity_from_score(bucket["score"])
+
+
 def analyze(run_dir: str, *, write: bool = True, cfg: Optional[dict] = None) -> dict:
     """Analyze a run directory after QA failure and optionally write critic.json."""
     run_dir = os.path.abspath(run_dir)
@@ -441,6 +481,9 @@ def analyze(run_dir: str, *, write: bool = True, cfg: Optional[dict] = None) -> 
     agent_debug = agent_debug_tail(run_dir, cfg=cfg)
 
     scores = _score_categories(qa, runtime, log_tail, agent_debug)
+    anomalies = _detect_anomalies(run_dir, qa, cfg)
+    if anomalies:
+        _score_anomalies(scores, anomalies)
     blockers = _collect_blockers(qa, runtime, repairs, log_tail, agent_debug)
     issues = _prioritized_issues(scores)
     suggested = _suggested_fix_ids(repairs, scores)
@@ -452,12 +495,14 @@ def analyze(run_dir: str, *, write: bool = True, cfg: Optional[dict] = None) -> 
         "prioritized_issues": issues,
         "suggested_fix_ids": suggested,
         "blockers": blockers,
+        "anomalies": anomalies,
         "sources": {
             "qa": os.path.exists(os.path.join(run_dir, "qa.json")),
             "repairs": os.path.exists(os.path.join(run_dir, "repairs.json")),
             "runtime_report": os.path.exists(os.path.join(run_dir, "runtime_report.json")),
             "pipeline_log": os.path.exists(os.path.join(run_dir, "pipeline.log")),
             "agent_debug": bool(agent_debug),
+            "anomalies": bool(anomalies),
         },
     }
     if write:

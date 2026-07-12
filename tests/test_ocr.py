@@ -212,6 +212,53 @@ def test_targeted_retry_is_bounded_and_skips_large_confident_lines(tmp_path):
     assert "retry_2x" not in result[0]["meta"]
 
 
+def test_targeted_retry_recovers_truncated_line_at_right_edge(tmp_path):
+    # A confident line whose box reaches the image right edge is re-scanned on an extended
+    # crop; a strict prefix-extension of the clipped reading is accepted and the box grows.
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (400, 120), "white").save(image_path)
+    original = _line("bestelling", 0.90, _box(60, 40, 338, 40), "ppocr-v6")  # right edge = 398/400
+
+    def runner(engine, crop_path, cfg, use_cache=False):
+        return {"engine": engine, "lines": [
+            _line("bestellingen", 0.89, _box(6, 6, 360, 40), engine),
+        ]}
+
+    result = ocr._targeted_retry(
+        str(image_path), [original], "ppocr-v6",
+        {"ocr": {"retry_2x": {"enabled": True, "scale": 2, "max_regions": 1}}},
+        runner=runner,
+    )
+
+    assert result[0]["text"] == "bestellingen"
+    assert result[0]["meta"]["retry_2x"]["recovered_truncation"] is True
+    assert "edge-right" in result[0]["meta"]["retry_2x"]["reasons"]
+    # Recovered truncation extends the box to cover the newly read glyphs.
+    assert result[0]["box"]["w"] >= original["box"]["w"]
+
+
+def test_targeted_retry_edge_pass_rejects_a_rewrite_not_an_extension(tmp_path):
+    # An edge line whose re-read is a *different* word (not a prefix/suffix extension) and
+    # brings no confidence gain must be left untouched.
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (400, 120), "white").save(image_path)
+    original = _line("bestelling", 0.90, _box(60, 40, 338, 40), "ppocr-v6")
+
+    def runner(engine, crop_path, cfg, use_cache=False):
+        return {"engine": engine, "lines": [
+            _line("aanbieding", 0.88, _box(6, 6, 300, 40), engine),
+        ]}
+
+    result = ocr._targeted_retry(
+        str(image_path), [original], "ppocr-v6",
+        {"ocr": {"retry_2x": {"enabled": True, "scale": 2, "max_regions": 1}}},
+        runner=runner,
+    )
+
+    assert result[0]["text"] == "bestelling"
+    assert result[0]["meta"]["retry_2x"]["selected"] is False
+
+
 def test_ordering_keeps_words_inside_parent_line():
     word = {"text": "inside", "conf": 0.9, "box": _box(30, 20, 45, 12),
             "quad": _quad(30, 20, 45, 12), "meta": {"engine": "fixture"}}

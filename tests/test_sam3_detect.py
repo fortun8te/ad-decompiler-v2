@@ -211,7 +211,52 @@ def test_clip_box_off_canvas_origin_does_not_inflate_size():
 
 def test_default_prompts_include_ui_ad_roles():
     roles = {spec["role"] for spec in sam3_detect._prompt_specs(None)}
-    assert {"badge", "button", "card", "logo", "product", "icon"} <= roles
+    assert {"badge", "button", "card", "logo", "product", "icon",
+            "avatar", "verified"} <= roles
+
+
+def test_small_square_icon_accepted_below_generic_min_score(tmp_path):
+    """A small, roughly-square avatar/badge/logo prediction is accepted below the generic
+    text-prompt bar; a large one at the same score is not."""
+
+    class SmallSquareBackend(FakeSam3):
+        def predict_text(self, prompt):
+            self.text_calls.append(prompt)
+            if prompt == "verified badge":
+                mask = np.zeros((100, 120), dtype=bool)
+                mask[10:30, 40:60] = True  # 20x20 square, ~0.3% of canvas
+                return [{"mask": mask, "box": [40, 10, 60, 30], "score": 0.34}]
+            if prompt == "person":
+                mask = np.zeros((100, 120), dtype=bool)
+                mask[0:90, 0:110] = True  # large region at the same low score
+                return [{"mask": mask, "box": [0, 0, 110, 90], "score": 0.34}]
+            return []
+
+    backend = SmallSquareBackend()
+    cfg = {"sam3": {"prompts": [
+        {"prompt": "verified badge", "role": "verified", "kind": "icon"},
+        {"prompt": "person", "role": "person", "kind": "photo-fragment"},
+    ], "confidence": 0.45}}
+    result = sam3_detect.detect(_image(tmp_path), [], cfg, run_dir=str(tmp_path), backend=backend)
+    roles = {e["role"] for e in result["elements"] if e["provenance"]["mode"] == "text-prompt"}
+    assert "verified" in roles          # small square badge rescued at 0.34
+    assert "person" not in roles        # large low-score region still rejected
+
+
+def test_small_icon_pass_can_be_disabled(tmp_path):
+    class SmallSquareBackend(FakeSam3):
+        def predict_text(self, prompt):
+            if prompt == "badge":
+                mask = np.zeros((100, 120), dtype=bool)
+                mask[10:30, 40:60] = True
+                return [{"mask": mask, "box": [40, 10, 60, 30], "score": 0.34}]
+            return []
+
+    cfg = {"sam3": {"prompts": [{"prompt": "badge", "role": "badge", "kind": "icon"}],
+                    "confidence": 0.45, "small_icon": {"enabled": False}}}
+    result = sam3_detect.detect(_image(tmp_path), [], cfg, run_dir=str(tmp_path),
+                                backend=SmallSquareBackend())
+    assert [e for e in result["elements"] if e["provenance"]["mode"] == "text-prompt"] == []
 
 
 def test_box_refine_accepts_lower_score_when_residuals_exist(tmp_path):

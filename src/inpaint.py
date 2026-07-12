@@ -27,6 +27,30 @@ def _deps():
     return cv2, np, Image
 
 
+def _load_qwen_worker():
+    """Import the ComfyUI client module regardless of whether we're imported as
+    ``src.inpaint`` or a bare ``inpaint``.  Returns ``None`` if it cannot be found."""
+    import importlib
+    for name in ("src.qwen_worker", "qwen_worker"):
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    return None
+
+
+def _flux_comfy_inpaint(rgb, mask, cfg: Optional[dict] = None):
+    """Run the Flux Fill ComfyUI backend, returning an HxWx3 uint8 plate or ``None``.
+
+    Thin seam over ``qwen_worker.flux_inpaint`` so tests can monkeypatch the whole GPU
+    backend and so an offline/absent ComfyUI degrades to Big-LaMa/OpenCV.
+    """
+    worker = _load_qwen_worker()
+    if worker is None or not hasattr(worker, "flux_inpaint"):
+        return None
+    return worker.flux_inpaint(rgb, mask, cfg)
+
+
 def resolve_path(path: Optional[str], run_dir: Optional[str] = None) -> Optional[str]:
     if not path:
         return None
@@ -429,6 +453,37 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
 
     generated = None
     used = mode
+
+    # Flux Fill via ComfyUI (real GPU inpaint, quantized GGUF + ~8-step turbo LoRA).
+    # Attempted first when explicitly selected (inpaint.mode: flux_comfy) or opted into
+    # under auto mode (inpaint.comfy.enabled: true). When the GPU box is offline the seam
+    # returns None and we degrade to Big-LaMa/OpenCV below, so the pipeline never crashes
+    # merely because ComfyUI is down.
+    comfy_inpaint = icfg.get("comfy") or {}
+    flux_modes = ("flux_comfy", "flux-comfy", "flux")
+    flux_requested = mode in flux_modes or (mode == "auto" and bool(comfy_inpaint.get("enabled")))
+    if flux_requested:
+        flux_out = None
+        try:
+            flux_out = _flux_comfy_inpaint(np.asarray(rgb, dtype=np.uint8), mask, cfg)
+        except Exception as exc:  # defensive: a client bug must not crash the run
+            diagnostics["flux_comfy_error"] = str(exc)
+        if flux_out is not None:
+            generated = np.asarray(flux_out, dtype=np.uint8)
+            used = "flux-comfy"
+            diagnostics["backend_choice"] = "flux-comfy"
+            diagnostics["flux_comfy"] = "ok"
+        else:
+            diagnostics["flux_comfy"] = "unavailable"
+            flux_required = bool(comfy_inpaint.get("required"))
+            require_active = bool((cfg.get("runtime") or {}).get("require_active_models"))
+            if (mode in flux_modes and (flux_required or require_active)
+                    and not icfg.get("allow_fallback", True)):
+                diagnostics["active_model_required"] = True
+                raise RuntimeError(
+                    "flux_comfy inpaint required but ComfyUI/Flux Fill is unavailable"
+                )
+
     try_lama = mode in ("lama", "big-lama", "simple-lama")
     if mode == "auto":
         # Big-LaMa is a local pip package; whether it can run has nothing to do with
@@ -439,8 +494,11 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
         try_lama = lama_ok
         if not lama_ok:
             diagnostics["auto_skip_reason"] = "big_lama_missing"
+    # A downed Flux ComfyUI degrades to Big-LaMa (higher quality than OpenCV) before OpenCV.
+    if generated is None and mode in flux_modes and lama_ok:
+        try_lama = True
 
-    if try_lama:
+    if generated is None and try_lama:
         try:
             generated = _simple_lama(np.asarray(rgb, dtype=np.uint8), mask)
             used = "big-lama"
@@ -455,7 +513,8 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
 
     if generated is None:
         radius = int(icfg.get("opencv_radius", 5))
-        fallback_method = str(icfg.get("opencv_method", "auto" if mode == "auto" else "telea")).lower()
+        auto_default = "auto" if mode in ("auto", *flux_modes) else "telea"
+        fallback_method = str(icfg.get("opencv_method", auto_default)).lower()
         if fallback_method in ("auto", "best"):
             generated, used, auto_diag = _opencv_auto(np.asarray(rgb, dtype=np.uint8), mask, radius)
             diagnostics.update(auto_diag)
