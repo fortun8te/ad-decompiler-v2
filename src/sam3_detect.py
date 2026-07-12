@@ -672,9 +672,11 @@ def detect(
         for pred in preds:
             if float(pred.get("score", 0)) < min_score:
                 continue
+            # A SAM score/box without a segmentation mask is not ownership evidence.
+            # Do not promote the model box into a fabricated rectangular owner.
             mask = pred.get("mask")
             if mask is None:
-                mask = _rect_mask(pred.get("box") or {}, width, height)
+                continue
             el = _make_element(
                 len(elements),
                 mask,
@@ -708,9 +710,12 @@ def detect(
             for pred in preds:
                 if float(pred.get("score", 0)) < box_min_score:
                     continue
+                # Box refinement is accepted only when SAM actually returned a mask;
+                # a box-only response must fall through to the deterministic residual
+                # observation below.
                 mask = pred.get("mask")
                 if mask is None:
-                    mask = _rect_mask(pred.get("box") or box, width, height)
+                    continue
                 quality = 0.7 * float(pred.get("score", 0)) + 0.3 * _mask_iou_box(mask, box)
                 if best is None or quality > best[0]:
                     best = (quality, pred, mask)

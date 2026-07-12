@@ -1,6 +1,25 @@
 import numpy as np
+import pytest
 
 from src import inpaint
+
+
+def test_check_backends_reports_opencv_fallback(monkeypatch):
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: False)
+    status = inpaint.check_backends({"inpaint": {"mode": "auto"}})
+    assert status["big_lama"]["ok"] is False
+    assert status["fallback_ready"] is True
+    assert status["ready"] is False
+
+
+def test_active_model_requirement_does_not_silently_fall_back(monkeypatch):
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: True)
+    monkeypatch.setattr(inpaint, "_simple_lama", lambda *_args: (_ for _ in ()).throw(RuntimeError("model failed")))
+    source = np.zeros((8, 8, 3), dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+    with pytest.raises(RuntimeError, match="model failed"):
+        inpaint.inpaint_array(source, mask, {"runtime": {"require_active_models": True}})
 
 
 def test_opencv_auto_chooses_lower_seam_candidate_and_preserves_unmasked_pixels(monkeypatch):
@@ -35,6 +54,39 @@ def test_inpaint_array_keeps_legacy_two_value_return_by_default():
 
     assert backend == "none"
     assert np.array_equal(output, source)
+
+
+def test_text_ink_mask_does_not_fallback_to_a_solid_body_text_rectangle():
+    """High-coverage contrast on a textured plate must stay pixel-shaped."""
+    rgb = np.zeros((24, 48, 3), dtype=np.uint8)
+    for x in range(48):
+        rgb[:, x] = (150 + x * 2, 150 + x * 2, 150 + x * 2)
+    rgb[8:16, 18:30] = 20
+
+    mask = inpaint.text_ink_mask(rgb, {"x": 8, "y": 4, "w": 32, "h": 16})
+
+    local = mask[4:20, 8:40]
+    assert np.count_nonzero(local) > 0
+    assert np.count_nonzero(local) < local.size
+
+
+def test_overlay_text_mask_fails_closed_without_a_glyph_signal():
+    rgb = np.full((20, 40, 3), 128, dtype=np.uint8)
+    mask = inpaint.text_ink_mask(
+        rgb, {"x": 5, "y": 4, "w": 30, "h": 12}, allow_box_fallback=False,
+    )
+    assert np.count_nonzero(mask) == 0
+
+
+def test_overlay_text_mask_is_constrained_to_quad_not_rectangle():
+    rgb = np.full((30, 50, 3), 220, dtype=np.uint8)
+    rgb[10:16, 15:35] = 20
+    quad = [[15, 10], [35, 10], [35, 16], [15, 16]]
+    mask = inpaint.text_ink_mask(
+        rgb, {"x": 5, "y": 5, "w": 40, "h": 16}, quad, allow_box_fallback=False,
+    )
+    assert np.count_nonzero(mask[5:10, 5:45]) == 0
+    assert np.count_nonzero(mask[10:16, 15:35]) > 0
 
 
 def test_build_union_mask_excludes_kept_regions_so_they_are_never_erased_or_regenerated():
@@ -83,6 +135,28 @@ def test_resolve_mask_dilate_maps_buttons_photos_and_text():
     assert inpaint.resolve_mask_dilate({"target": "text"}, cfg) == 2
     assert inpaint.resolve_mask_dilate({"target": "image", "meta": {"role": "product"}}, cfg) == 0
     assert inpaint.resolve_mask_dilate({"target": "image", "meta": {"role": "logo"}}, cfg) == 2
+
+
+def test_resolve_mask_dilate_has_separate_overlay_text_halo():
+    cfg = {"inpaint": {"mask_dilate": {"default": 1, "text": 2, "overlay_text": 4}}}
+    assert inpaint.resolve_mask_dilate(
+        {"target": "text", "meta": {"overlay_text": True}}, cfg
+    ) == 4
+
+
+def test_resolve_mask_dilate_defaults_are_role_aware_for_overlay_text():
+    assert inpaint.resolve_mask_dilate(
+        {"target": "text", "meta": {"overlay_text": True, "role": "headline"}},
+        {"reconstruct": {"mask_dilate": 2}},
+    ) == 5
+    assert inpaint.resolve_mask_dilate(
+        {"target": "text", "meta": {"overlay_text": True, "role": "body"}},
+        {"reconstruct": {"mask_dilate": 2}},
+    ) == 4
+    assert inpaint.resolve_mask_dilate(
+        {"target": "text", "meta": {"role": "body"}},
+        {"reconstruct": {"mask_dilate": 2}},
+    ) == 2
 
 
 def test_build_union_mask_solidifies_soft_alpha_before_dilate():

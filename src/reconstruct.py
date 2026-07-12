@@ -60,8 +60,20 @@ def _is_background_plate(candidate, width, height):
         box.get("x", 0) + box.get("w", 0) >= width - tolerance_x,
         box.get("y", 0) + box.get("h", 0) >= height - tolerance_y,
     ))
+    # A large edge-touching product/photo is the scene's hero photograph, not a small
+    # editable cutout.  Removing it from the plate asks the inpainter to hallucinate
+    # detailed packaging across a broad region; the same raster would then be painted
+    # back on top, producing the characteristic smeared/ghosted preview.  Keep this
+    # lower bound deliberately scoped to edge-touching photographic candidates so a
+    # genuinely isolated photo remains editable.
     return (role == "background" or area_frac > .92 or
-            (role in ("photo", "illustration", "image") and area_frac > .58 and touches >= 3))
+            # A package/product can legitimately be a large, edge-touching
+            # foreground cutout (016 is exactly this case).  Treating it as a
+            # plate makes it target=drop, skips removal, and leaves the final
+            # reconstruction with only the broad photo observation.  Keep the
+            # heuristic for scene photographs, but never for semantic product
+            # candidates.
+            (role in ("photo", "illustration", "image") and area_frac > .40 and touches >= 3))
 
 
 def deduplicate(candidates: list, threshold: float = 0.86):
@@ -111,19 +123,13 @@ def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None):
     h, w = rgb.shape[:2]
     meta = candidate.get("meta") or {}
     if candidate.get("target") == "text" or (candidate.get("text") and meta.get("wordmark")):
-        members = [ocr_lines[line_id] for line_id in meta.get("line_ids", [])
-                   if ocr_lines and line_id in ocr_lines]
-        if members:
-            combined = np.zeros(rgb.shape[:2], dtype=np.uint8)
-            for line in members:
-                combined = np.maximum(combined, inpaint.text_ink_mask(
-                    rgb, line.get("painted_box") or line.get("box", {}), line.get("quad")
-                ))
-            return combined
+        # line_ids are provenance only: merge/reordering can leave them stale or point
+        # at an unrelated OCR line. The merged candidate geometry is canonical.
         return inpaint.text_ink_mask(
             rgb,
             candidate.get("visible_box") or candidate.get("ink_box") or candidate.get("box", {}),
             candidate.get("quad") or meta.get("quad"),
+            allow_box_fallback=not bool(meta.get("overlay_text")),
         )
     mask = inpaint.mask_on_canvas(_mask_path(candidate), candidate.get("box", {}), (w, h), run_dir)
     if candidate.get("target") in ("shape", "icon", "image"):
@@ -542,12 +548,26 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     # A background plate becomes no foreground layer at all.  Excluding it *before*
     # ownership matters: otherwise a large Qwen/background observation can claim every pixel
     # and leave the real product/icon cutout with an empty alpha channel.
+    def _ownership_priority(candidate):
+        target = candidate.get("target")
+        role = str((candidate.get("meta") or {}).get("role") or "").lower()
+        # Semantic foreground cutouts must claim their pixels before a broad
+        # scene/photo region.  z is often unavailable for SAM/residual-only
+        # runs, so relying on z alone silently reverses ownership.
+        if target == "text":
+            return 4
+        if target == "icon":
+            return 3
+        if target in ("shape", "image") and role in ("product", "person", "foreground", "cutout"):
+            return 2
+        return 1
+
     front = sorted(
         (c for c in canonical if c.get("target") != "drop" and not (
             c.get("target") == "image" and _is_background_plate(c, w, h)
         )),
         key=lambda c: (
-            3 if c.get("target") == "text" else 2 if c.get("target") == "icon" else 1,
+            _ownership_priority(c),
             float(c.get("z", 0)),
             -c.get("box", {}).get("w", 0) * c.get("box", {}).get("h", 0),
         ), reverse=True,
@@ -610,6 +630,10 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         image = _source_rgba(c, rgb, mask, run_dir)
         owned = (ownership == owner_number.get(cid, 0)).astype(np.uint8) * 255
         image = _apply_owned_alpha(image, owned, c.get("box", {}))
+        # Keep the exact reconstructed crop even when the editable vector passes
+        # the fidelity gate.  It is the deterministic preview fallback for SVGs
+        # that CairoSVG cannot paint (or paints fully transparent).
+        raster_src = _write_asset(image, assets_dir, cid)
         if target == "icon":
             role = (c.get("meta") or {}).get("role")
             traced = vectorize.vectorize_crop(np.asarray(image), cfg, role=role)
@@ -619,39 +643,69 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             if traced.get("ok"):
                 c["paths"] = traced["paths"]
                 c["svg"] = traced.get("svg") or _paths_to_svg(traced["paths"], image.width, image.height)
+                c["src"] = raster_src
                 c["fill"] = {"kind": "flat", "color": traced["paths"][0].get("fill", "#000000")}
                 vector_ok += 1
                 updated.append(c)
                 continue
+            # Active Big-LaMa/inpainting is independent from the optional icon
+            # vector fidelity gate.  A complex icon may legitimately fail the
+            # path-count/colour gate; retain it as an explicit raster fallback
+            # so the batch can finish and QA can report the degradation.
+            if bool(((cfg.get("vectorize") or {}).get("require_active", False))):
+                raise RuntimeError(
+                    f"vectorization required for icon {cid}, but no gated trace was available: "
+                    f"{traced.get('note', 'unknown vectorization failure')}"
+                )
             c["target"] = "image"
             c["meta"]["vector_fallback"] = True
             vector_fallback += 1
 
-        c["src"] = _write_asset(image, assets_dir, cid)
+        c["src"] = raster_src
         c["mask"] = {"kind": "alpha"}
         updated.append(c)
 
     removal = []
+    text_removal = []
+    large_removal = []
     for c in updated:
-        if c.get("target") == "drop":
+        if c.get("target") == "drop" and not (c.get("meta") or {}).get("removal_required"):
             continue
         box = c.get("box", {})
         area_frac = box.get("w", 0) * box.get("h", 0) / max(1, w * h)
         # A full-canvas raster is the plate itself. Everything else is removed from the plate.
         is_background = bool(c.get("meta", {}).get("role") == "background" or area_frac > 0.92)
-        removal.append({
+        observation = {
             "box": box,
             "mask_array": masks.get(c.get("id")),
             "is_background": is_background,
             "dilate": inpaint.resolve_mask_dilate(c, cfg),
-        })
+        }
+        removal.append(observation)
+        if c.get("target") == "text" or (c.get("target") == "drop" and (c.get("meta") or {}).get("removal_required")):
+            text_removal.append(observation)
+        else:
+            large_removal.append(observation)
     union = inpaint.build_union_mask(
         (w, h), removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg), cfg=cfg,
     )
     mask_path = os.path.join(run_dir, "removal_mask.png")
     Image.fromarray(union).save(mask_path)
     background_path = os.path.join(run_dir, "background_clean.png")
-    inpaint_result = inpaint.inpaint_once(image_path, union, background_path, cfg)
+    text_union = inpaint.build_union_mask(
+        (w, h), text_removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg), cfg=cfg,
+    )
+    large_union = inpaint.build_union_mask(
+        (w, h), large_removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg), cfg=cfg,
+    )
+    if np.any(text_union) and np.any(large_union):
+        large_union = cv2.bitwise_and(large_union, cv2.bitwise_not(text_union))
+    if text_removal and large_removal:
+        inpaint_result = inpaint.inpaint_role_aware(
+            image_path, {"text": text_union, "large": large_union}, background_path, cfg,
+        )
+    else:
+        inpaint_result = inpaint.inpaint_once(image_path, union, background_path, cfg)
 
     # Visual ownership map plus a machine-readable legend.
     ownership_path = os.path.join(run_dir, "ownership.png")

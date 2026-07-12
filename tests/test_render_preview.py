@@ -67,3 +67,31 @@ def test_preview_uses_non_normal_blend_mode(tmp_path):
          "fill": {"color": "#808080"}, "blend_mode": "MULTIPLY"},
     ])
     assert preview.getpixel((20, 20))[0] < 100
+
+
+def test_preview_does_not_replace_failed_vector_path_with_rectangle(tmp_path, monkeypatch):
+    monkeypatch.setattr(render_preview, "_svg_or_path_mask", lambda layer, size: None)
+    preview = _render(tmp_path, [{
+        "id": "arrow", "type": "shape", "box": {"x": 10, "y": 10, "w": 20, "h": 30},
+        "shape_kind": "path", "path": "malformed", "fill": {"color": "#203010"},
+    }])
+    assert preview.getpixel((20, 20)) == (255, 255, 255)
+
+
+def test_preview_uses_raster_fallback_when_vector_is_empty(tmp_path, monkeypatch):
+    fallback = tmp_path / "icon.png"
+    Image.new("RGBA", (10, 10), (12, 180, 40, 255)).save(fallback)
+    monkeypatch.setattr(render_preview, "_svg_or_path_mask", lambda layer, size: None)
+    preview = _render(tmp_path, [{
+        "id": "icon", "type": "shape", "box": {"x": 10, "y": 10, "w": 20, "h": 20},
+        "shape_kind": "path", "svg": "<svg></svg>", "src": "icon.png",
+    }])
+    assert preview.getpixel((20, 20)) == (12, 180, 40)
+
+
+def test_preview_text_uses_layer_fill_when_style_color_is_absent(tmp_path):
+    preview = _render(tmp_path, [{
+        "id": "copy", "type": "text", "box": {"x": 5, "y": 5, "w": 60, "h": 20},
+        "text": "A", "style": {"fontSize": 18}, "fill": {"color": "#ff0000"},
+    }])
+    assert any(pixel[0] > pixel[1] * 2 for pixel in preview.getdata())

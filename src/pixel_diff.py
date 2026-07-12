@@ -398,7 +398,15 @@ def _duplicate_ownership(layers):
         lid = str(layer.get("id") or layer.get("name") or "unnamed")
         meta = layer.get("meta") or {}
         provenance = meta.get("provenance") or {}
-        observations = provenance.get("observations") or meta.get("observations") or []
+        # Older fusion records stored provenance directly as a list; repair
+        # rounds can reintroduce that shape. Normalize both forms so QA never
+        # crashes while checking duplicate ownership.
+        if isinstance(provenance, list):
+            observations = provenance
+        elif isinstance(provenance, dict):
+            observations = provenance.get("observations") or meta.get("observations") or []
+        else:
+            observations = meta.get("observations") or []
         for observation in observations:
             key = _observation_key(observation)
             if not key:

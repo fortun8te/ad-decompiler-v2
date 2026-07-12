@@ -122,10 +122,28 @@ def _horizontal_overlap(a: dict, b: dict) -> float:
 
 
 def _quad_rotation(quad: Any) -> float:
+    """Return the text baseline angle from an OCR quadrilateral.
+
+    OCR providers do not agree on quad winding.  In particular, some emit the
+    short side first, which made ordinary horizontal lines look vertical.  The
+    text direction is the longer of the two pairs of opposite edges.
+    """
     try:
-        p0, p1 = quad[0], quad[1]
-        angle = math.degrees(math.atan2(float(p1[1]) - float(p0[1]),
-                                        float(p1[0]) - float(p0[0])))
+        points = [(float(point[0]), float(point[1])) for point in quad[:4]]
+        edges = []
+        for index in range(4):
+            x0, y0 = points[index]
+            x1, y1 = points[(index + 1) % 4]
+            dx, dy = x1 - x0, y1 - y0
+            edges.append((math.hypot(dx, dy), dx, dy))
+        # Opposite edges describe the same text direction.  Use their longer
+        # pair and average their directed vectors after making them agree.
+        pair = (edges[0], edges[2]) if edges[0][0] + edges[2][0] >= edges[1][0] + edges[3][0] else (edges[1], edges[3])
+        _, dx, dy = pair[0]
+        _, odx, ody = pair[1]
+        if dx * odx + dy * ody < 0:
+            odx, ody = -odx, -ody
+        angle = math.degrees(math.atan2(dy + ody, dx + odx))
     except (TypeError, ValueError, IndexError):
         return 0.0
     while angle > 90.0:
@@ -499,7 +517,13 @@ def _measure_shear_angle(mask) -> Optional[float]:
     if best_score is None or best_score <= 0 or best_shift == 0:
         return None
     dy = max(1.0, h / 2.0)
-    return round(math.degrees(math.atan(best_shift / dy)), 2)
+    angle = math.degrees(math.atan(best_shift / dy))
+    # The signal is intended to identify italic shear, not compensate for a
+    # rotated text box.  Large values are overwhelmingly cross-correlation
+    # artefacts (or box rotation) and would incorrectly force an italic font.
+    if abs(angle) > 20.0:
+        return None
+    return round(angle, 2)
 
 
 def _painted_geometry(image, line: dict) -> tuple[dict, dict, str, float, Any, dict]:
@@ -1281,6 +1305,13 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
             line["style"]["align"] = alignment
             line["style"]["lineHeight"] = round(line_height, 2)
             line["hierarchy"]["parent_id"] = block_id
+        rotations = [float(line.get("rotation_deg", 0.0) or 0.0) for line in group]
+        rotation = _median(rotations)
+        # A block is normally a stack of horizontal lines.  Do not let one
+        # malformed OCR quad rotate the whole paragraph; preserve a strong
+        # angle for a genuine single-line rotated element.
+        if len(group) > 1 and abs(rotation) > 20.0:
+            rotation = 0.0
         # Propagate the fidelity gate onto the block. A block is only as trustworthy as its
         # worst line: if any member line was flagged low_fidelity, the block must carry that
         # flag (and that line's fallback crop/reason) so downstream routing sees it — blocks,
@@ -1309,6 +1340,8 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
             "painted_box": _union_boxes(line["painted_box"] for line in group),
             "alignment": alignment,
             "line_height": round(line_height, 2),
+            "rotation": round(rotation, 3),
+            "rotation_deg": round(rotation, 3),
             "role": role,
             "hierarchy": {"level": level, "parent_id": None},
             "style_id": None,
@@ -1584,6 +1617,26 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
         "type": "text-root",
         "children": [section["id"] for section in sections],
     }
+    # Preserve a machine-checkable audit trail for optional VLM proofreading.  A
+    # correction without the original OCR text is not evidence and is therefore
+    # reported as invalid instead of being silently trusted downstream.
+    vlm = result.get("vlm_proofread")
+    if isinstance(vlm, dict):
+        corrected = [line for line in enriched if line.get("vlm_corrected")]
+        invalid = [line.get("id") for line in corrected if not line.get("ocr_text")]
+        result["text_analysis_vlm_evidence"] = {
+            "present": True,
+            "lines_checked": int(vlm.get("lines_checked", 0) or 0),
+            "lines_corrected": int(vlm.get("lines_corrected", 0) or 0),
+            "ensemble_disagreement_checked": int(vlm.get("ensemble_disagreement_checked", 0) or 0),
+            "invalid_corrections": invalid,
+            "valid": not invalid and int(vlm.get("lines_corrected", 0) or 0) == len(corrected),
+            "fail_closed": bool(invalid),
+        }
+    else:
+        result["text_analysis_vlm_evidence"] = {
+            "present": False, "valid": True, "fail_closed": False,
+        }
     result["text_analysis"] = {
         "version": 1,
         "ms": round((time.perf_counter() - started) * 1000.0, 2),

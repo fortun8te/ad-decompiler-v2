@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +44,80 @@ def test_check_binaries_reports_paths(monkeypatch):
     assert "path" in status["vtracer"]
 
 
+def test_check_backends_reports_trace_and_gate_health(monkeypatch):
+    monkeypatch.setattr(vectorize, "check_binaries", lambda _cfg: {
+        "vtracer": {"ok": False}, "potrace": {"ok": False},
+        "contour": {"ok": True}, "cairosvg": {"ok": True}, "resvg": {"ok": False},
+    })
+    status = vectorize.check_backends({})
+    assert status["ready"] is True
+    assert status["fallback_ready"] is True
+
+
+def test_check_binaries_reports_resvg(monkeypatch):
+    monkeypatch.setitem(sys.modules, "resvg", types.SimpleNamespace())
+    status = vectorize.check_binaries({})
+    assert status["resvg"] == {"ok": True, "path": "installed"}
+
+
+def test_score_render_falls_back_to_resvg(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    Image.new("RGBA", (10, 10), (255, 0, 0, 255)).save(source)
+    calls = []
+
+    class FakeTree:
+        @staticmethod
+        def from_str(svg, opts):
+            calls.append(("tree", svg, opts))
+            return object()
+
+    def render(tree, transform, bg_size, bg_color):
+        calls.append(("render", transform, bg_size, bg_color))
+        padded = Image.new("RGBA", (12, 12), (255, 0, 0, 255))
+        buf = __import__("io").BytesIO()
+        padded.save(buf, format="PNG")
+        return buf.getvalue()
+
+    fake_resvg = types.SimpleNamespace(
+        usvg=types.SimpleNamespace(
+            Tree=FakeTree,
+            Options=types.SimpleNamespace(default=lambda: object()),
+        ),
+        render=render,
+    )
+    monkeypatch.setitem(sys.modules, "cairosvg", None)
+    monkeypatch.setitem(sys.modules, "resvg", fake_resvg)
+
+    score = vectorize._score_render(
+        '<svg width="10" height="10"><rect width="10" height="10" fill="red"/></svg>',
+        str(source),
+    )
+    assert score == 1.0
+    assert calls[1] == ("render", (1.0, 0.0, 1.0, 0.0, 1.0, 1.0), (12, 12), (0, 0, 0, 0))
+
+
+def test_resolve_binary_finds_repo_bin_windows_executable(tmp_path, monkeypatch):
+    exe = Path(vectorize.__file__).parent.parent / ".bin" / "vtracer.exe"
+    exe.parent.mkdir(exist_ok=True)
+    try:
+        exe.write_bytes(b"stub")
+        monkeypatch.setattr(vectorize.shutil, "which", lambda _name: None)
+        assert vectorize._resolve_binary({}, "color_engine", "vtracer") == str(exe)
+    finally:
+        if exe.exists():
+            exe.unlink()
+        if exe.parent.exists() and not any(exe.parent.iterdir()):
+            exe.parent.rmdir()
+
+
+def test_check_binaries_reports_contour_availability(monkeypatch):
+    monkeypatch.setattr(vectorize.shutil, "which", lambda _name: None)
+    monkeypatch.setitem(__import__("sys").modules, "cv2", None)
+    status = vectorize.check_binaries({})
+    assert status["contour"]["ok"] is False
+    assert "opencv" in status["contour"]["path"]
+
+
 def test_evaluate_trace_applies_role_gate(monkeypatch):
     svg = '<svg><path d="M0 0 L10 0 L10 10 Z" fill="#ff0000"/></svg>'
     monkeypatch.setattr(vectorize, "_score_render", lambda _s, _p: 0.81)
@@ -75,6 +151,35 @@ def test_vtracer_tries_multiple_presets(tmp_path, monkeypatch):
     assert result["ok"] is True
     assert result["engine"] == "vtracer"
     assert len(calls) == 2
+
+
+def test_vtracer_python_api_is_used_when_binary_is_unavailable(tmp_path, monkeypatch):
+    source = tmp_path / "icon.png"
+    Image.new("RGBA", (12, 12), (20, 40, 60, 255)).save(source)
+    calls = []
+
+    def convert(image_path, out_path, **kwargs):
+        calls.append((image_path, out_path, kwargs))
+        Path(out_path).write_text(
+            '<svg><path d="M0 0L12 0L12 12Z" fill="#14283c"/></svg>',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(vectorize, "_resolve_binary", lambda *args: None)
+    monkeypatch.setitem(sys.modules, "vtracer", types.SimpleNamespace(
+        convert_image_to_svg_py=convert,
+    ))
+
+    svg, error = vectorize._run_vtracer(str(source), {}, {
+        "mode": "polygon", "colormode": "color", "filter_speckle": 3,
+    })
+
+    assert error is None
+    assert "<path" in svg
+    assert calls == [(str(source), calls[0][1], {
+        "mode": "polygon", "colormode": "color", "filter_speckle": 3,
+    })]
+    assert not os.path.exists(calls[0][1])
 
 
 def test_potrace_threshold_chain_for_monochrome(tmp_path, monkeypatch):

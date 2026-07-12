@@ -1,6 +1,6 @@
 import json
 
-from benchmark import _entry, _harness_telemetry, _markdown
+from benchmark import _entry, _harness_telemetry, _markdown, select_images
 from src import harness
 from src.harness import harness_enabled
 
@@ -27,6 +27,12 @@ def _fixture_run(tmp_path, *, qa=None, harness_loop=None, harness_legacy=None, c
         "degraded": [{"component": "qwen", "reason": "offline", "required": False}],
         "violations": [],
     }))
+    for name in (
+        "input_manifest.json", "normalized.png", "ocr_raw.json", "ocr.json",
+        "residual.json", "qwen.json", "sam3.json", "fused_elements.json",
+        "elements.json", "merged.json", "layout.json",
+    ):
+        (run / name).write_text("{}", encoding="utf-8")
     if harness_loop is not None:
         (run / "harness_loop.json").write_text(encoding="utf-8", data=json.dumps(harness_loop))
     if harness_legacy is not None:
@@ -107,3 +113,24 @@ def test_harness_enabled_defaults_from_config():
 def test_harness_max_rounds_defaults_to_three():
     assert harness.harness_max_rounds({}) == 3
     assert harness.harness_max_rounds({"runtime": {"harness": {"max_rounds": 5}}}) == 5
+
+
+def test_benchmark_selection_is_stable_and_supports_five_image_cap(tmp_path):
+    for name in ("03.webp", "01.png", "02.jpg", "05.jpeg", "04.png", "ignored.txt"):
+        (tmp_path / name).write_bytes(b"fixture")
+
+    assert [p.name for p in select_images(tmp_path, 5)] == [
+        "01.png", "02.jpg", "03.webp", "04.png", "05.jpeg"
+    ]
+
+
+def test_benchmark_entry_rejects_partial_run_even_if_result_claims_success(tmp_path):
+    run = _fixture_run(tmp_path)
+    (run / "qa.json").unlink()
+
+    row = _entry(run, {"ok": True, "runtime_ok": True})
+
+    assert row["complete"] is False
+    assert row["qa_ok"] is False
+    assert row["runtime_ok"] is False
+    assert "qa.json" in row["missing_artifacts"]

@@ -139,3 +139,22 @@ def test_card_panel_hoists_inner_background_fill():
     frame = tree[0]
     assert frame["fill"]["color"] == "#eeeeee"
     assert frame["radius"] == 12
+
+
+def test_zero_placeholder_z_keeps_text_above_plate_and_cutout():
+    tree = layout.infer([
+        {"id": "plate", "target": "shape", "box": {"x": 0, "y": 0, "w": 100, "h": 100}, "z": 0},
+        {"id": "cutout", "target": "image", "box": {"x": 10, "y": 10, "w": 50, "h": 50}, "z": 0},
+        {"id": "copy", "target": "text", "box": {"x": 10, "y": 10, "w": 50, "h": 20}, "text": "Hi", "z": 0},
+    ], {"w": 100, "h": 100})
+    assert [node["id"] for node in tree] == ["plate", "cutout", "copy"]
+
+
+def test_paragraph_lines_with_shared_block_id_form_one_editable_group():
+    tree = layout.infer([
+        {"id": "line1", "target": "text", "box": {"x": 20, "y": 20, "w": 100, "h": 12}, "text": "First", "meta": {"role": "body", "block_id": "p1"}},
+        {"id": "line2", "target": "text", "box": {"x": 20, "y": 80, "w": 90, "h": 12}, "text": "Second", "meta": {"role": "body", "block_id": "p1"}},
+    ], {"w": 200, "h": 150})
+    assert len(tree) == 1
+    assert tree[0]["target"] == "group"
+    assert [child["id"] for child in tree[0]["children"]] == ["line1", "line2"]

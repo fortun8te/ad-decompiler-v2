@@ -12,6 +12,23 @@ from src.harness import harness_enabled
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+REQUIRED_ARTIFACTS = (
+    "input_manifest.json", "normalized.png", "ocr_raw.json", "ocr.json",
+    "residual.json", "qwen.json", "sam3.json", "fused_elements.json",
+    "elements.json", "merged.json", "reconstruction.json", "layout.json",
+    "design.json", "runtime_report.json", "qa.json",
+)
+
+
+def select_images(source_dir: Path, max_images: int | None = None) -> list[Path]:
+    """Return a stable benchmark selection, limited after sorting by filename."""
+    images = sorted(path for path in source_dir.iterdir()
+                    if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+    if max_images is not None:
+        if max_images < 1:
+            raise ValueError("max_images must be at least 1")
+        images = images[:max_images]
+    return images
 
 
 def _read(path: Path, fallback):
@@ -91,15 +108,22 @@ def _entry(run_dir: Path, result: dict) -> dict:
     design = _read(run_dir / "design.json", {})
     runtime = _read(run_dir / "runtime_report.json", {})
     structure = qa.get("structural") or {}
+    missing_artifacts = [name for name in REQUIRED_ARTIFACTS
+                         if not (run_dir / name).is_file()]
+    complete = not missing_artifacts
+    runtime_ok = bool(runtime.get("acceptable")) if runtime else False
+    qa_ok = bool(qa.get("ok")) if qa else False
     return {
         "id": run_dir.name,
-        "pipeline_ok": bool(result.get("ok")),
-        "runtime_ok": bool(runtime.get("acceptable", result.get("runtime_ok", False))),
+        "pipeline_ok": bool(result.get("ok")) and complete,
+        "complete": complete,
+        "missing_artifacts": missing_artifacts,
+        "runtime_ok": runtime_ok and complete,
         "runtime_status": runtime.get("status", result.get("runtime_status")),
         "runtime_degraded": runtime.get("degraded") or [],
         "runtime_violations": runtime.get("violations") or [],
         "duration_s": result.get("duration_s"),
-        "qa_ok": bool(qa.get("ok")),
+        "qa_ok": qa_ok and complete,
         "visual_score": qa.get("visual_score"),
         "ssim": qa.get("ssim"),
         "text_recall": qa.get("text_recall"),
@@ -164,6 +188,8 @@ def main():
         default=None,
         help="enable runtime.auto_repair / harness loop (default: on when harness enabled in config)",
     )
+    parser.add_argument("--max-images", type=int, default=None,
+                        help="benchmark only the first N images after stable filename sorting (for example, 5)")
     parser.add_argument("--skip-doctor", action="store_true",
                         help="development only; benchmark normally refuses an unready model machine")
     args = parser.parse_args()
@@ -182,7 +208,10 @@ def main():
         if not preflight.get("ok"):
             print(json.dumps({"benchmark": "blocked", "doctor": preflight.get("blockers")}, indent=2))
             raise SystemExit(2)
-    images = sorted(path for path in source_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS)
+    try:
+        images = select_images(source_dir, args.max_images)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if not images:
         raise SystemExit(f"No images found in {source_dir}")
 
@@ -200,6 +229,7 @@ def main():
         "runs": runs,
         "summary": {
             "images": len(runs),
+            "complete_runs": sum(1 for row in runs if row["complete"]),
             "pipeline_passing": sum(1 for row in runs if row["pipeline_ok"]),
             "qa_passing": sum(1 for row in runs if row["qa_ok"]),
             "runtime_accepted": sum(1 for row in runs if row["runtime_ok"]),
@@ -219,7 +249,9 @@ def main():
     (output / "benchmark.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (output / "benchmark.md").write_text(_markdown(report), encoding="utf-8")
     print(json.dumps(report["summary"], indent=2))
-    passing = (report["summary"]["qa_passing"] == len(runs)
+    passing = (report["summary"]["images"] > 0
+               and report["summary"]["complete_runs"] == len(runs)
+               and report["summary"]["qa_passing"] == len(runs)
                and report["summary"]["runtime_accepted"] == len(runs))
     raise SystemExit(0 if passing else 2)
 

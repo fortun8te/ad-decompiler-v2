@@ -21,7 +21,7 @@ def _ocr():
     return {
         "lines": [
             {"id": "L0", "text": "BIG SALE", "conf": 0.98,
-             "box": {"x": 40, "y": 30, "w": 220, "h": 60}},
+             "box": {"x": 40, "y": 30, "w": 220, "h": 60}, "role": "headline"},
             {"id": "L1", "text": "engraved on the watch", "conf": 0.8,
              "box": {"x": 320, "y": 400, "w": 150, "h": 22}},
         ]
@@ -78,6 +78,8 @@ def test_headline_text_survives_and_is_editable():
     assert m["c_L0"]["text"] == "BIG SALE"
     # text sits above shapes
     assert m["c_L0"]["z"] >= m["c_E0"]["z"]
+    assert m["c_L0"]["meta"]["overlay_text"] is True
+    assert m["c_L0"]["meta"]["removal_required"] is True
 
 
 def test_shape_that_is_pure_text_box_is_deduped():

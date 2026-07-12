@@ -125,6 +125,29 @@ def test_backend_failure_is_a_manifest_not_an_exception(tmp_path):
     assert len(result["elements"]) == 1
 
 
+def test_box_only_model_output_does_not_claim_rectangular_ownership(tmp_path):
+    class BoxOnlyBackend:
+        name = "box-only"
+
+        def set_image(self, image):
+            pass
+
+        def predict_text(self, prompt):
+            return [{"box": [20, 25, 32, 35], "score": 0.99}]
+
+        def predict_box(self, box):
+            return [{"box": [20, 25, 32, 35], "score": 0.99}]
+
+    result = sam3_detect.detect(
+        _image(tmp_path),
+        [],
+        {"sam3": {"prompts": ["icon"]}},
+        run_dir=str(tmp_path),
+        backend=BoxOnlyBackend(),
+    )
+    assert result["elements"] == []
+
+
 def test_official_processor_state_shapes_are_normalized_to_predictions():
     """The real SAM 3 processor returns state with N x 1 x H x W masks."""
     state = {

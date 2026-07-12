@@ -78,6 +78,23 @@ def _surface_fill(candidate):
     return None
 
 
+def _semantic_z(candidate, target):
+    """Return a stable fallback when upstream stages emit the placeholder z=0."""
+    meta = candidate.get("meta") or {}
+    role = str(meta.get("role") or candidate.get("role") or "").lower()
+    if role in {"background", "plate", "clean plate"} or meta.get("source") == "inpaint":
+        return -1_000_000
+    if target == "text":
+        return 40
+    if target == "icon":
+        return 35
+    if target == "image":
+        return 30 if role not in {"background", "photo-fragment"} else 25
+    if target in {"shape", "group"}:
+        return 20
+    return 10
+
+
 def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
     target = candidate.get("target")
     layer_id = str(candidate.get("id") or "layer")
@@ -92,7 +109,9 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         z_raw = meta.get("z")
     else:
         z_raw = default_z.get(target, 10)
-    z_index = float(z_raw or 0)
+    # Fusion/layout currently use zero as an unset placeholder. Treat only that
+    # placeholder as absent; explicit positive/negative ordering remains intact.
+    z_index = float(_semantic_z(candidate, target) if z_raw in (None, 0, "0", "0.0") else z_raw)
     if meta.get("substitution"):
         warnings.append({"code": "text-fidelity-fallback", "layer_id": layer_id, **meta["substitution"]})
     common = {
@@ -144,6 +163,8 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
             shape_kind=candidate.get("shape_kind") or "rect",
             path=candidate.get("path"),
             svg=candidate.get("svg"),
+            src=_stage_asset(candidate.get("src"), layer_id, run_dir, warnings)
+                if candidate.get("src") else None,
             fill=candidate.get("fill"),
             stroke=candidate.get("stroke"),
             radius=candidate.get("radius") or (candidate.get("style") or {}).get("radius"),
@@ -159,6 +180,8 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
             shape_kind="path",
             path=path,
             svg=svg,
+            src=_stage_asset(candidate.get("src"), layer_id, run_dir, warnings)
+                if candidate.get("src") else None,
             fill=candidate.get("fill"),
             stroke=candidate.get("stroke"),
             meta={**common.pop("meta"), "vector_paths": paths},

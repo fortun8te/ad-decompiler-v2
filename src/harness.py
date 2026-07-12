@@ -46,6 +46,42 @@ ACTIONABLE = {
 }
 
 
+def _flag(value: Any, default: bool = False) -> bool:
+    """Interpret persisted boolean flags without treating ``"false"`` as true."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "on", "ready", "ok"}:
+            return True
+        if normalized in {"false", "no", "0", "off", "failed", "not_ready"}:
+            return False
+    if value is None:
+        return default
+    return value is True
+
+
+def _qa_accepts(qa: Any, *, allow_summary: bool = False) -> bool:
+    """Fail closed on missing, malformed, or contradictory QA summaries."""
+    if not isinstance(qa, dict) or not _flag(qa.get("ok")):
+        return False
+    # Lightweight bridge/test summaries intentionally carry only the boolean
+    # result.  They are not artifact QA and must be handled before requiring
+    # artifact fields below; real qa.json still takes the strict path.
+    if allow_summary and "hard_fails" not in qa and "structural" not in qa and not any(
+        key in qa for key in ("ssim", "visual_score", "composite")
+    ):
+        return True
+    hard = qa.get("hard_fails")
+    structural = qa.get("structural") or {}
+    if not isinstance(hard, list) or hard:
+        return False
+    structural_hard = structural.get("hard_fails") if isinstance(structural, dict) else None
+    if structural_hard is not None and (not isinstance(structural_hard, list) or structural_hard):
+        return False
+    if any(key in qa for key in ("ssim", "visual_score", "composite")):
+        return True
+    return False
+
+
 def deep_merge(base: dict, patch: dict) -> dict:
     """Recursively merge *patch* into a copy of *base*."""
     out = copy.deepcopy(base)
@@ -105,7 +141,7 @@ def config_patches_for(repair: dict) -> dict:
     elif stage == "inpaint" and action == "rebuild-clean-plate":
         patches["inpaint"] = {
             "mode": params.get("mode", "auto"),
-            "allow_fallback": bool(params.get("allow_fallback", True)),
+            "allow_fallback": False,
         }
 
     elif stage == "layout" and action == "refit-geometry":
@@ -314,8 +350,8 @@ def harness_enabled(cfg: Optional[dict]) -> bool:
     runtime = (cfg or {}).get("runtime") or {}
     harness = runtime.get("harness") or {}
     if "enabled" in harness:
-        return bool(harness["enabled"])
-    return bool(runtime.get("auto_repair"))
+        return _flag(harness["enabled"])
+    return _flag(runtime.get("auto_repair"))
 
 
 def harness_max_rounds(cfg: Optional[dict]) -> int:
@@ -342,15 +378,23 @@ def harness_should_repair(
     if not result.get("ok"):
         return False, "pipeline_failed"
 
-    if staging is not None and not staging.get("staged"):
+    if staging is not None and not _flag(staging.get("staged")):
         return True, "staging_failed"
 
-    if isinstance(qa, dict) and qa.get("ok") is False:
+    if qa is not None and not _qa_accepts(qa, allow_summary=True):
         return True, "qa_failed"
 
-    if not qa and result.get("runtime_ok") is False:
+    if "runtime_ok" in result and not _flag(result.get("runtime_ok")):
         return True, "runtime_degraded"
 
+    # Bridge/pipeline callers may already have summarized QA and omit qa.json.
+    # Do not report a run as ready when that summary explicitly failed QA.
+    for key in ("final_qa_ok", "qa_ok"):
+        if key in result and not _flag(result.get(key)):
+            return True, "qa_failed"
+
+    if qa is None:
+        return True, "qa_missing"
     return False, "ok"
 
 
@@ -373,7 +417,7 @@ def harness_loop(
     should, reason = harness_should_repair(pipeline_result, qa=qa, staging=staging)
     if not should:
         if qa is not None:
-            pipeline_result.setdefault("qa_ok", bool(qa.get("ok")))
+            pipeline_result.setdefault("qa_ok", _qa_accepts(qa, allow_summary=True))
         return {
             "repaired": False,
             "reason": reason,
@@ -391,11 +435,11 @@ def harness_loop(
         run_one=run_one,
     )
     pipeline_result["repair"] = repair_summary
-    pipeline_result["qa_ok"] = bool(repair_summary.get("qa_ok"))
+    pipeline_result["qa_ok"] = _flag(repair_summary.get("qa_ok"))
 
     final_qa = load_qa(run_dir) if os.path.exists(qa_path) else {}
     if final_qa:
-        pipeline_result["qa_ok"] = bool(final_qa.get("ok"))
+        pipeline_result["qa_ok"] = _qa_accepts(final_qa, allow_summary=True)
 
     return {
         "repaired": True,
@@ -422,7 +466,7 @@ def execute_repairs(
         run_one = run_pipeline.run_one
 
     qa = _load_json(os.path.join(run_dir, "qa.json"), {})
-    if qa.get("ok"):
+    if _qa_accepts(qa, allow_summary=True):
         return {
             "run_dir": run_dir,
             "iterations": 0,
@@ -453,7 +497,7 @@ def execute_repairs(
             return {
                 "run_dir": run_dir,
                 "iterations": iteration - 1,
-                "qa_ok": bool(_load_json(os.path.join(run_dir, "qa.json"), {}).get("ok")),
+                "qa_ok": _qa_accepts(_load_json(os.path.join(run_dir, "qa.json"), {})),
                 "stopped": "no_actionable_repairs",
                 "attempts": attempts,
             }
@@ -464,8 +508,12 @@ def execute_repairs(
         iter_cfg["run_dir"] = run_dir
         iter_cfg.setdefault("runtime", {})["auto_repair"] = False
 
+        qa_path = os.path.join(run_dir, "qa.json")
+        before_qa_ns = os.stat(qa_path).st_mtime_ns if os.path.exists(qa_path) else None
         result = run_one(input_path, run_dir, iter_cfg, resume)
         qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+        after_qa_ns = os.stat(qa_path).st_mtime_ns if os.path.exists(qa_path) else None
+        qa_fresh = after_qa_ns is not None and (before_qa_ns is None or after_qa_ns > before_qa_ns)
         attempt = {
             "iteration": iteration,
             "resume": resume,
@@ -477,12 +525,12 @@ def execute_repairs(
             },
             "patches": patches,
             "pipeline_ok": bool(result.get("ok")),
-            "qa_ok": bool(qa.get("ok")),
+            "qa_ok": qa_fresh and _qa_accepts(qa, allow_summary=True),
         }
         attempts.append(attempt)
         working_cfg = iter_cfg
 
-        if qa.get("ok"):
+        if qa_fresh and _qa_accepts(qa, allow_summary=True):
             summary = {
                 "run_dir": run_dir,
                 "iterations": iteration,
@@ -497,7 +545,7 @@ def execute_repairs(
     summary = {
         "run_dir": run_dir,
         "iterations": len(attempts),
-        "qa_ok": bool(final_qa.get("ok")),
+        "qa_ok": _qa_accepts(final_qa),
         "stopped": "max_iterations",
         "attempts": attempts,
     }

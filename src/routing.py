@@ -80,7 +80,11 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
     # 1. TEXT candidates (from OCR) --------------------------------------------------
     if c.get("text") is not None and kind in (None, "text"):
         # scene text printed on a product/photo → never a layer
-        if meta.get("origin") == "scene" or c.get("kept_in_photo"):
+        if (
+            meta.get("origin") == "scene"
+            or meta.get("scene_text_role") == "printed_on_product"
+            or c.get("kept_in_photo")
+        ):
             c["target"] = "drop"; meta["kept_in_photo"] = True
             return c
         # wordmark / brand lettering → artwork, not editable text, never font-matched

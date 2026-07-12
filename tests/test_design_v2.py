@@ -35,6 +35,18 @@ def test_svg_z_and_nested_frame_survive_design_compile(tmp_path):
     assert doc.layers[1].children[0].z_index == 7
 
 
+def test_vector_layer_keeps_raster_preview_fallback(tmp_path):
+    from PIL import Image
+    asset = tmp_path / "icon.png"
+    Image.new("RGBA", (4, 4), (20, 30, 40, 255)).save(asset)
+    doc = build_design_json.build([{
+        "id": "icon", "target": "icon", "box": {"x": 0, "y": 0, "w": 4, "h": 4},
+        "svg": '<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0L4 0L0 4Z"/></svg>',
+        "src": str(asset),
+    }], {"w": 4, "h": 4}, str(tmp_path))
+    assert doc.layers[0].src.replace("\\", "/") == "assets/icon_icon.png"
+
+
 def test_atomic_figma_staging_contains_manifest_and_assets(tmp_path):
     run = tmp_path / "run"
     run.mkdir()

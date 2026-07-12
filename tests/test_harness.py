@@ -168,6 +168,31 @@ def test_harness_should_repair_on_qa_or_staging_failure():
     assert harness.harness_should_repair({"ok": False}, qa={"ok": False}) == (False, "pipeline_failed")
 
 
+def test_harness_gating_rejects_stale_or_string_false_qa_summaries():
+    """A completed pipeline must not look ready when its QA summary says false."""
+    assert harness.harness_should_repair(
+        {"ok": True, "runtime_ok": True, "qa_ok": False}, qa=None,
+        staging={"staged": True},
+    ) == (True, "qa_failed")
+    assert harness.harness_should_repair(
+        {"ok": True, "runtime_ok": True}, qa={"ok": "false"},
+        staging={"staged": True},
+    ) == (True, "qa_failed")
+
+
+def test_execute_repairs_does_not_treat_string_false_as_already_ok(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "qa.json").write_text(json.dumps({"ok": "false"}), encoding="utf-8")
+    (run_dir / "repairs.json").write_text(json.dumps([]), encoding="utf-8")
+    summary = harness.execute_repairs(str(run_dir), {}, max_iterations=1)
+    # The fixture intentionally has no input image, so execution stops before
+    # loading repair actions; the important invariant is that string "false"
+    # is not treated as an already-OK QA result.
+    assert summary["stopped"] == "missing_input"
+    assert summary["qa_ok"] is False
+
+
 def test_harness_loop_skips_when_qa_ok(tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

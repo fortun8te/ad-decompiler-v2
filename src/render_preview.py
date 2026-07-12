@@ -179,16 +179,27 @@ def _stroke_spec(layer):
     return None, 0
 
 
-def _shape_tile(layer, size):
-    from PIL import ImageDraw
+def _shape_tile(layer, size, run_dir=None):
+    from PIL import Image, ImageDraw
     width, height = size
     svg = layer.get("svg")
-    if svg or (layer.get("shape_kind") == "path" and layer.get("path")):
+    is_vector_path = bool(svg or (layer.get("shape_kind") == "path" and layer.get("path")))
+    if is_vector_path:
         mask = _svg_or_path_mask(layer, size)
-        if mask is not None:
+        if mask is not None and mask.getbbox() is not None:
             tile = _fill_tile(size, layer.get("fill"))
             tile.putalpha(_multiply_alpha(tile, mask).getchannel("A"))
             return tile
+        # SVG is the editable representation, but it is not a reliable preview
+        # representation (malformed paths and transparent SVGs are both common).
+        # Reconstructed vector layers carry the source crop as a lossless fallback.
+        fallback = layer.get("src")
+        if fallback and run_dir:
+            path = fallback if os.path.isabs(fallback) else os.path.join(run_dir, fallback)
+            if os.path.exists(path):
+                return Image.open(path).convert("RGBA").resize(size, Image.Resampling.LANCZOS)
+        # No source pixels exist: omission is safer than inventing an opaque shape.
+        return Image.new("RGBA", size, (0, 0, 0, 0))
     tile = _fill_tile(size, layer.get("fill"))
     kind = str(layer.get("shape_kind", "rect")).lower()
     ellipse = kind in ("ellipse", "circle")
@@ -230,8 +241,15 @@ def _text_tile(layer, size):
     line_height = _number(style.get("lineHeight", font_size * 1.2), font_size * 1.2)
     spacing = max(0, round(line_height - font_size))
     align = str(style.get("align", "left")).lower()
+    fill = style.get("color")
+    if fill is None:
+        fill_spec = layer.get("fill")
+        if isinstance(fill_spec, str):
+            fill = fill_spec
+        elif isinstance(fill_spec, dict):
+            fill = fill_spec.get("color", "#111111")
     ImageDraw.Draw(tile).multiline_text(
-        (0, 0), str(layer.get("text", "")), fill=_color(style.get("color", "#111111")),
+        (0, 0), str(layer.get("text", "")), fill=_color(fill or "#111111"),
         font=font, spacing=spacing, align=align if align in ("left", "center", "right") else "left",
     )
     return tile
@@ -306,7 +324,7 @@ def _render_tile(layer, run_dir):
     if kind == "group":
         tile = Image.new("RGBA", size, (0, 0, 0, 0))
         if layer.get("fill"):
-            base = _shape_tile({**layer, "shape_kind": "rect"}, size)
+            base = _shape_tile({**layer, "shape_kind": "rect"}, size, run_dir)
             tile.alpha_composite(base)
         for child in sorted(layer.get("children") or [], key=lambda entry: _number(entry.get("z_index", entry.get("z", 0)))):
             _draw_layer(tile, child, run_dir)
@@ -315,7 +333,7 @@ def _render_tile(layer, run_dir):
     elif kind == "text":
         tile = _text_tile(layer, size)
     else:
-        tile = _shape_tile(layer, size)
+        tile = _shape_tile(layer, size, run_dir)
     return _with_effects(tile, layer.get("effects") or [])
 
 

@@ -360,8 +360,36 @@ def _potrace_thresholds(cfg):
 
 
 def _resolve_binary(cfg, key, default):
-    binary = _vz_cfg(cfg).get(key, default)
-    return shutil.which(binary) or (binary if os.path.exists(binary) else None)
+    """Resolve a configured tracer executable on all supported host platforms.
+
+    ``shutil.which`` does not search the repository-local ``.bin`` directory and,
+    on Windows, a configured bare name is not necessarily spelled with ``.exe``.
+    The example configuration explicitly promises ``.bin/vtracer(.exe)`` support,
+    so keep that lookup here rather than making every caller know about it.
+    """
+    configured = _vz_cfg(cfg).get(key, default)
+    if configured is None:
+        return None
+    binary = os.fspath(configured)
+    candidates = [binary]
+    if not os.path.splitext(binary)[1]:
+        candidates.extend(binary + ext for ext in (".exe", ".cmd", ".bat"))
+
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            return found
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+
+    # The documented local install location is relative to the repository, not
+    # the process working directory (which is often a benchmark output folder).
+    repo_bin = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".bin"))
+    for name in candidates:
+        local = os.path.join(repo_bin, os.path.basename(name))
+        if os.path.isfile(local):
+            return local
+    return None
 
 
 def check_binaries(cfg=None):
@@ -381,10 +409,34 @@ def check_binaries(cfg=None):
         # unhandled exception here previously crashed readiness reporting entirely instead
         # of just marking this one optional gate unavailable.
         gate = False
+    try:
+        import cv2  # noqa: F401
+        contour = True
+    except Exception:
+        contour = False
+    try:
+        import resvg  # noqa: F401
+        resvg_ok = True
+    except Exception:
+        resvg_ok = False
     return {
         "vtracer": {"ok": bool(vtracer), "path": vtracer or "not on PATH (cargo install vtracer)"},
         "potrace": {"ok": bool(potrace), "path": potrace or "not on PATH (brew/choco install potrace)"},
+        "contour": {"ok": contour, "path": "opencv-python" if contour else "not installed (pip install opencv-python)"},
         "cairosvg": {"ok": gate, "path": "installed" if gate else "pip install cairosvg (quality gate)"},
+        "resvg": {"ok": resvg_ok, "path": "installed" if resvg_ok else "not installed (pip install resvg)"},
+    }
+
+
+def check_backends(cfg=None):
+    """Return JSON-safe vector backend health, including usable fallbacks."""
+    status = check_binaries(cfg)
+    trace_ready = bool(status["vtracer"]["ok"] or status["potrace"]["ok"] or status["contour"]["ok"])
+    gate_ready = bool(status["cairosvg"]["ok"] or status["resvg"]["ok"])
+    return {
+        "trace": status,
+        "ready": trace_ready and gate_ready,
+        "fallback_ready": bool(status["contour"]["ok"] and gate_ready),
     }
 
 
@@ -449,28 +501,44 @@ def _preprocess_crop(png_path, cfg, role=None):
 # ── engines ──────────────────────────────────────────────────────────────────────────
 def _run_vtracer(png_path, cfg, preset=None):
     exe = _resolve_binary(cfg, "color_engine", "vtracer")
-    if not exe:
-        return None, "vtracer binary not found (cargo install vtracer)"
     preset = preset or {}
     out_svg = tempfile.NamedTemporaryFile(suffix=".svg", delete=False).name
-    cmd = [
-        exe, "--input", png_path, "--output", out_svg,
-        "--mode", str(preset.get("mode", "spline")),
-        "--colormode", str(preset.get("colormode", "color")),
-        "--hierarchical", str(preset.get("hierarchical", "stacked")),
-    ]
-    if "filter_speckle" in preset:
-        cmd.extend(["--filter_speckle", str(preset["filter_speckle"])])
-    if "color_precision" in preset:
-        cmd.extend(["--color_precision", str(preset["color_precision"])])
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+        if exe:
+            cmd = [
+                exe, "--input", png_path, "--output", out_svg,
+                "--mode", str(preset.get("mode", "spline")),
+                "--colormode", str(preset.get("colormode", "color")),
+                "--hierarchical", str(preset.get("hierarchical", "stacked")),
+            ]
+            if "filter_speckle" in preset:
+                cmd.extend(["--filter_speckle", str(preset["filter_speckle"])])
+            if "color_precision" in preset:
+                cmd.extend(["--color_precision", str(preset["color_precision"])])
+            subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+        else:
+            try:
+                from vtracer import convert_image_to_svg_py
+            except ImportError as e:
+                raise RuntimeError("Python vtracer package not found") from e
+            kwargs = {
+                key: preset[key]
+                for key in (
+                    "colormode", "hierarchical", "mode", "filter_speckle",
+                    "color_precision", "layer_difference", "corner_threshold",
+                    "length_threshold", "max_iterations", "splice_threshold",
+                    "path_precision",
+                )
+                if key in preset
+            }
+            convert_image_to_svg_py(png_path, out_svg, **kwargs)
     except Exception as e:
         try:
             os.unlink(out_svg)
         except OSError:
             pass
-        return None, f"vtracer failed: {e}"
+        backend = "vtracer" if exe else "Python vtracer"
+        return None, f"{backend} failed: {e}"
     try:
         with open(out_svg, encoding="utf-8") as f:
             text = f.read()
@@ -651,7 +719,23 @@ def _score_render(svg_text, png_path):
         import io
         ras = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
     except Exception:
-        return 0.0  # cairosvg missing -> caller treats as ungated (score 0 -> not ok)
+        try:
+            import resvg
+            tree = resvg.usvg.Tree.from_str(svg_text, resvg.usvg.Options.default())
+            # resvg's Python binding otherwise returns a fully transparent surface
+            # for an SVG without an explicit background.  A transparent background
+            # is still required for the alpha silhouette, so clear it explicitly.
+            png_bytes = resvg.render(
+                # resvg follows affine's flattened order (a, c, e, b, d, f).
+                # A one-pixel translation avoids its origin-edge clipping bug;
+                # crop that padding back off below.
+                tree, (1.0, 0.0, 1.0, 0.0, 1.0, 1.0),
+                bg_size=(w + 2, h + 2), bg_color=(0, 0, 0, 0),
+            )
+            import io
+            ras = Image.open(io.BytesIO(png_bytes)).convert("RGBA").crop((1, 1, w + 1, h + 1))
+        except Exception:
+            return 0.0  # no rasterizer -> caller treats as ungated (score 0 -> not ok)
     ras_arr = np.asarray(ras.resize((w, h))).astype(np.float32)
     ras_a = ras_arr[:, :, 3] > 8
     union = np.logical_or(src_a, ras_a)
@@ -769,7 +853,11 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
         else:
             note = err or note
 
-        return best or _fail("none", note)
+        result = best or _fail("none", note)
+        if not result.get("ok") and bool((cfg.get("runtime") or {}).get("require_active_models")):
+            result["active_model_required"] = True
+            result["note"] = f"active vector backend required: {result.get('note', note)}"
+        return result
     finally:
         for path, do_cleanup in ((pre_path, pre_cleanup), (png_path, cleanup)):
             if do_cleanup and path:

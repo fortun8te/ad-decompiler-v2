@@ -957,6 +957,43 @@ def ensemble_disagreement_lines(lines: Iterable[dict], cfg: Optional[dict] = Non
     return output
 
 
+def _geometry_metrics(lines: Iterable[dict]) -> dict:
+    """Return conservative geometry health metrics for the OCR evidence."""
+    total = invalid = missing_quad = 0
+    for line in lines or []:
+        total += 1
+        box = _clean_box(line.get("box") or {})
+        quad = _normalize_quad(line.get("quad"))
+        if not quad:
+            missing_quad += 1
+        if box["w"] <= 0 or box["h"] <= 0 or len(quad) < 4:
+            invalid += 1
+    return {
+        "lines": total,
+        "valid_lines": max(0, total - invalid),
+        "invalid_lines": invalid,
+        "missing_quad": missing_quad,
+        "valid": invalid == 0,
+    }
+
+
+def _cross_check_metrics(lines: list[dict], configured: list[str], successful: list[str]) -> dict:
+    disagreements = sum(1 for line in lines if (line.get("meta") or {}).get("disagreement"))
+    required = list(dict.fromkeys(str(name) for name in configured))
+    present = list(dict.fromkeys(str(name) for name in successful))
+    missing = [name for name in required if name not in present]
+    return {
+        "required_engines": required,
+        "successful_engines": present,
+        "missing_engines": missing,
+        "required": bool(required),
+        "complete": not required or not missing,
+        "lines_checked": len(lines) if len(present) > 1 else 0,
+        "disagreements": disagreements,
+        "fail_closed": bool(required and bool(missing)),
+    }
+
+
 def _tesseract_available() -> bool:
     if not shutil.which("tesseract"):
         return False
@@ -1523,12 +1560,14 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
 
     errors = []
     fallback_errors: list[dict] = []
+    primary_has_evidence = False
     try:
         primary_payload = _run_backend(primary_name, img_path, cfg)
         primary_engine = primary_payload.get("engine", primary_name)
         primary_lines = _targeted_retry(
             img_path, primary_payload.get("lines", []), primary_name, cfg
         )
+        primary_has_evidence = bool(primary_lines)
     except Exception as error:
         # A configured challenger can still produce a usable observation set.  Do not hide
         # the failed primary: runtime_report.json turns this status into a benchmark failure
@@ -1545,6 +1584,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         # #endregion
         print(f"[ocr] primary '{primary_name}' unavailable: {error}")
     challenger_sets = []
+    successful_challengers = []
     engines_used = [] if errors else [primary_engine]
     for name in challenger_names:
         if name == primary_name:
@@ -1564,6 +1604,8 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
             continue
         challenger_sets.append(payload.get("lines", []))
         engines_used.append(payload.get("engine", name))
+        if payload.get("lines"):
+            successful_challengers.append(name)
 
     if not engines_used:
         configured = {primary_name, *challenger_names}
@@ -1640,13 +1682,27 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
             width, height = image.size
     except Exception:
         pass
+    configured_engines = [primary_name, *challenger_names]
+    successful_engines = ([primary_name] if primary_has_evidence else []) + successful_challengers
+    cross_check = _cross_check_metrics(lines_out, configured_engines, successful_engines)
+    geometry = _geometry_metrics(lines_out)
+    # A configured challenger is evidence, not a best-effort hint.  Empty output
+    # is indistinguishable from a failed cross-check and must remain visible.
+    if cross_check["fail_closed"]:
+        status = "partial"
+    else:
+        status = "ok" if not errors else "partial"
     result = {
         "engine": "+".join(dict.fromkeys(engines_used)),
-        "status": "ok" if not errors else "partial",
+        "status": status,
         "errors": errors,
         "source": {"path": img_path, "w": width, "h": height},
         "ms": round((time.time() - started) * 1000, 1),
         "lines": lines_out,
+        "metrics": {
+            "cross_check": cross_check,
+            "geometry": geometry,
+        },
     }
     if run_dir is None:
         run_dir = cfg.get("run_dir")

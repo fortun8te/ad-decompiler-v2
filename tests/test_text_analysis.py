@@ -147,6 +147,43 @@ def test_rotation_and_missing_image_fallback_are_safe(tmp_path):
     assert result["text_analysis"]["image_available"] is False
 
 
+def test_quad_rotation_uses_long_text_edge_when_ocr_starts_with_short_edge():
+    # This is the winding emitted by the benchmark's horizontal lines: the
+    # first edge is vertical, while the long opposite edge is horizontal.
+    quad = [[10, 40], [10, 10], [210, 10], [210, 40]]
+    assert text_analysis._quad_rotation(quad) == pytest.approx(0.0)
+
+
+def test_paragraph_rotation_aggregates_stacked_horizontal_lines(tmp_path):
+    path = tmp_path / "stack.png"
+    Image.new("RGB", (500, 180), "white").save(path)
+    lines = []
+    for index, y in enumerate((30, 70, 110)):
+        line = _line(f"L{index}", "STACKED LINE", (30, y, 260, y + 20))
+        line["quad"] = [[30, y + 20], [30, y], [260, y], [260, y + 20]]
+        lines.append(line)
+    result = text_analysis.analyze_text(str(path), {"source": {"w": 500, "h": 180}, "lines": lines}, {})
+    block = next(block for block in result["blocks"] if len(block["line_ids"]) == 3)
+    assert block["rotation_deg"] == pytest.approx(0.0)
+    assert all(line["rotation_deg"] == pytest.approx(0.0) for line in result["lines"])
+
+
+def test_single_rotated_quad_keeps_supported_angle():
+    angle = 32.0
+    radians = math.radians(angle)
+    width, height = 180.0, 30.0
+    dx, dy = math.cos(radians) * width, math.sin(radians) * width
+    quad = [[0, height], [0, 0], [dx, dy], [dx, dy + height]]
+    assert text_analysis._quad_rotation(quad) == pytest.approx(angle, abs=0.01)
+
+
+def test_shear_measurement_rejects_implausible_rotation_like_drift():
+    mask = np.zeros((24, 40), dtype=bool)
+    mask[2:10, 4:12] = True
+    mask[14:22, 25:33] = True
+    assert text_analysis._measure_shear_angle(mask) is None
+
+
 def test_optional_local_font_matching_is_bounded(tmp_path):
     font = _font(38)
     font_path = _font_path()

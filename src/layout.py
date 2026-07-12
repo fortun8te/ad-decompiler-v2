@@ -337,7 +337,7 @@ def _wrap_repeated_card_grids(roots):
             "id": f"repeat-grid-{signature}",
             "target": "group",
             "box": box,
-            "z": min(float(member.get("z", 0)) for member in members),
+            "z": min(_node_z(member) for member in members),
             "children": members,
             "layout": layout,
             "meta": {
@@ -353,7 +353,7 @@ def _wrap_repeated_card_grids(roots):
         return roots
     out = [node for node in roots if node.get("id") not in consumed]
     out.extend(wrappers)
-    out.sort(key=lambda node: (float(node.get("z", 0)), node.get("id", "")))
+    out.sort(key=lambda node: (_node_z(node), node.get("id", "")))
     return out
 
 
@@ -449,6 +449,17 @@ def _text_alignment(a, b):
     return left or center or overlap >= 0.72
 
 
+def _node_z(node):
+    raw = node.get("z_index", node.get("z"))
+    if raw not in (None, 0, "0", "0.0"):
+        return float(raw)
+    target = node.get("target")
+    role = str((node.get("meta") or {}).get("role") or node.get("role") or "").lower()
+    if role in {"background", "plate", "clean plate"}:
+        return -1_000_000.0
+    return {"text": 40.0, "icon": 35.0, "image": 25.0}.get(target, 20.0)
+
+
 def _semantic_text_stacks(roots):
     """Group only clearly contiguous text hierarchy into a vertical Figma frame.
 
@@ -469,8 +480,12 @@ def _semantic_text_stacks(roots):
         prior_box = previous.get("box") or {}
         gap = box.get("y", 0) - (prior_box.get("y", 0) + prior_box.get("h", 0))
         median_h = median([max(1.0, item.get("box", {}).get("h", 1)) for item in current + [node]])
-        if (0 <= gap <= max(14.0, median_h * 1.75)
-                and _text_alignment(prior_box, box)):
+        pmeta = previous.get("meta") or {}
+        nmeta = node.get("meta") or {}
+        same_paragraph = any(pmeta.get(key) is not None and pmeta.get(key) == nmeta.get(key)
+                             for key in ("paragraph_id", "block_id", "text_block_id"))
+        if (same_paragraph or (0 <= gap <= max(14.0, median_h * 1.75)
+                               and _text_alignment(prior_box, box))):
             current.append(node)
         else:
             if len(current) >= 2:
@@ -493,7 +508,7 @@ def _semantic_text_stacks(roots):
             "id": group_id,
             "target": "group",
             "box": box,
-            "z": min(float(node.get("z", 0)) for node in group),
+            "z": min(_node_z(node) for node in group),
             "children": group,
             "layout": {
                 "mode": "VERTICAL", "confidence": 0.9,
@@ -617,8 +632,8 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
     roots = _semantic_text_stacks(roots)
     for node in nodes:
         if node.get("children"):
-            node["children"].sort(key=lambda c: (float(c.get("z", 0)), c.get("id", "")))
-    roots.sort(key=lambda c: (float(c.get("z", 0)), c.get("id", "")))
+            node["children"].sort(key=lambda c: (_node_z(c), c.get("id", "")))
+    roots.sort(key=lambda c: (_node_z(c), c.get("id", "")))
 
     # Mark exact repeated groups as safe component candidates. Structural-but-different
     # repeats are still discoverable from the signature in metadata, but not instantiated.

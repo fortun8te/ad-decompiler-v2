@@ -82,7 +82,8 @@ def mask_on_canvas(mask_path: Optional[str], box: dict, canvas: tuple[int, int],
     return out
 
 
-def text_ink_mask(rgb, box: dict, quad: Optional[list] = None):
+def text_ink_mask(rgb, box: dict, quad: Optional[list] = None,
+                  allow_box_fallback: bool = True):
     """Estimate painted glyph pixels, avoiding a destructive whole OCR rectangle.
 
     Border pixels estimate the local plate.  Pixels whose RGB distance from that plate is
@@ -111,8 +112,35 @@ def text_ink_mask(rgb, box: dict, quad: Optional[list] = None):
     local = ((distance >= max(18.0, float(threshold))) * 255).astype(np.uint8)
     local = cv2.morphologyEx(local, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
     coverage = float(np.count_nonzero(local)) / max(1, local.size)
-    if coverage < 0.01 or coverage > 0.72:
-        local[:] = 255
+    if coverage < 0.01:
+        # Overlay text must fail closed.  A box-sized hole is materially worse than
+        # leaving uncertain pixels in the background plate.
+        local[:] = 255 if allow_box_fallback else 0
+    elif coverage > 0.72:
+        # A textured/gradient plate can make the first-pass contrast mask nearly full.
+        # Replacing it with the OCR rectangle is worse: dilation then creates the solid
+        # rectangular holes seen on body copy.  Tighten the contrast instead and retain
+        # the measured geometry; only use the rectangle for the genuinely low-contrast
+        # case where there is no useful ink signal at all.
+        strict = ((distance >= max(32.0, float(threshold) * 1.5)) * 255).astype(np.uint8)
+        strict = cv2.morphologyEx(strict, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        if np.count_nonzero(strict):
+            local = strict
+        elif not allow_box_fallback:
+            local[:] = 0
+
+    if not allow_box_fallback and np.any(local):
+        # Keep only compact ink components from the current candidate crop.  This
+        # prevents a low-frequency plate gradient from becoming one connected block.
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (local > 0).astype(np.uint8), connectivity=8
+        )
+        components = np.zeros_like(local)
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area >= 2:
+                components[labels == label] = 255
+        local = components
     out[y0:y1, x0:x1] = local
 
     if quad and len(quad) >= 4:
@@ -175,6 +203,31 @@ def _big_lama_available() -> bool:
         return False
 
 
+def check_backends(cfg: Optional[dict] = None) -> dict:
+    """Return JSON-safe availability for the inpainting backends.
+
+    This is intentionally a cheap import/API probe; model construction is deferred to
+    the first real inpaint call.  ``ready`` means the configured active backend can run,
+    while ``fallback_ready`` describes the deterministic OpenCV alternative.
+    """
+    cfg = cfg or {}
+    mode = str((cfg.get("inpaint") or {}).get("mode", "auto")).lower()
+    try:
+        import cv2  # noqa: F401
+        opencv_ok, opencv_detail = True, "opencv-python importable"
+    except Exception as exc:
+        opencv_ok, opencv_detail = False, str(exc)
+    lama_ok = _big_lama_available()
+    active = lama_ok if mode in ("auto", "lama", "big-lama", "simple-lama") else opencv_ok
+    return {
+        "mode": mode,
+        "big_lama": {"ok": lama_ok, "detail": "simple-lama-inpainting importable" if lama_ok else "not installed"},
+        "opencv": {"ok": opencv_ok, "detail": opencv_detail},
+        "ready": active,
+        "fallback_ready": opencv_ok,
+    }
+
+
 def _mask_fraction(mask) -> float:
     _, np, _ = _deps()
     arr = np.asarray(mask)
@@ -200,6 +253,10 @@ def resolve_mask_dilate(candidate: dict, cfg: Optional[dict] = None) -> int:
     if isinstance(mcfg, dict):
         default = int(mcfg.get("default", legacy))
         if target == "text":
+            # Overlay copy is re-drawn as editable text.  Give it an explicit
+            # knob so the halo can be covered without widening every OCR mask.
+            if (candidate.get("meta") or {}).get("overlay_text"):
+                return int(mcfg.get("overlay_text", mcfg.get("text", default)))
             return int(mcfg.get("text", default))
         if target == "shape":
             if role in ("button", "badge", "chip", "card"):
@@ -215,7 +272,15 @@ def resolve_mask_dilate(candidate: dict, cfg: Optional[dict] = None) -> int:
 
     base = int(mcfg) if isinstance(mcfg, (int, float)) else legacy
     if target == "text":
-        return max(1, base - 1) if mcfg is None else base
+        if mcfg is not None:
+            return base
+        # OCR boxes contain painted glyphs only approximately.  The editable text
+        # is rendered over the plate, so a one-pixel halo is still a duplicate.  Use
+        # a larger role-aware footprint for overlay text while keeping ordinary OCR
+        # text conservative (it may intentionally remain part of a photo).
+        if (candidate.get("meta") or {}).get("overlay_text"):
+            return {"headline": 5, "offer": 5, "cta": 4}.get(role, 4)
+        return max(2, base - 1)
     if target == "shape":
         return base + 1 if mcfg is None else base
     if target == "image" and role in ("product", "person", "photo") and mcfg is None:
@@ -321,7 +386,14 @@ def _simple_lama(rgb, mask):
     if model is None:
         model = SimpleLama()
         _simple_lama.__dict__["_model"] = model
-    result = model(Image.fromarray(rgb), Image.fromarray(mask).convert("L"))
+    # simple-lama-inpainting expects a binary L-mode mask.  Passing a view with a
+    # soft/odd-shaped dtype can make the package normalize the mask incorrectly,
+    # which leaves the original glyphs in its result even though our union mask is
+    # correct.  Normalize at the backend boundary and keep the source dimensions.
+    image = Image.fromarray(np.ascontiguousarray(rgb, dtype=np.uint8), mode="RGB")
+    binary_mask = np.where(np.asarray(mask) > 0, 255, 0).astype(np.uint8)
+    mask_image = Image.fromarray(np.ascontiguousarray(binary_mask), mode="L")
+    result = model(image, mask_image)
     return np.asarray(result.convert("RGB"), dtype=np.uint8)
 
 
@@ -358,7 +430,9 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
             diagnostics["backend_choice"] = "big-lama"
         except Exception as exc:
             diagnostics["big_lama_error"] = str(exc)
-            if mode != "auto" and not icfg.get("allow_fallback", True):
+            require_active = bool((cfg.get("runtime") or {}).get("require_active_models"))
+            if (mode != "auto" and not icfg.get("allow_fallback", True)) or require_active:
+                diagnostics["active_model_required"] = require_active
                 raise
             print(f"[inpaint] Big-LaMa unavailable ({exc}); using OpenCV fallback")
 
@@ -463,4 +537,40 @@ def inpaint_once(image_path: str, mask, output_path: str, cfg: Optional[dict] = 
         "backend": backend,
         "masked_fraction": round(float(np.count_nonzero(mask_arr)) / mask_arr.size, 6),
         "diagnostics": diagnostics,
+    }
+
+
+def inpaint_role_aware(image_path: str, masks: dict, output_path: str,
+                       cfg: Optional[dict] = None) -> dict:
+    """Inpaint semantic removal masks with role-specific backends.
+
+    ``text`` is deliberately processed with OpenCV on the original pixels; all
+    remaining pixels use the configured backend (normally Big-LaMa).  Masks are
+    made disjoint so the large-region pass cannot overwrite a text repair.
+    """
+    cv2, np, Image = _deps()
+    cfg = cfg or {}
+    source = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+    text_mask = solidify_mask(masks.get("text")) if masks.get("text") is not None else np.zeros(source.shape[:2], dtype=np.uint8)
+    large_mask = solidify_mask(masks.get("large")) if masks.get("large") is not None else np.zeros(source.shape[:2], dtype=np.uint8)
+    large_mask = cv2.bitwise_and(large_mask, cv2.bitwise_not(text_mask))
+    working = source.copy()
+    parts = []
+    if np.any(text_mask):
+        text_cfg = dict(cfg)
+        text_cfg["inpaint"] = dict(cfg.get("inpaint") or {})
+        text_cfg["inpaint"].update({"mode": "opencv", "opencv_method": "telea"})
+        working, backend, diagnostics = inpaint_array(working, text_mask, text_cfg, return_diagnostics=True)
+        parts.append({"role": "text", "backend": backend, "masked_fraction": round(float(np.count_nonzero(text_mask)) / text_mask.size, 6), "diagnostics": diagnostics})
+    if np.any(large_mask):
+        working, backend, diagnostics = inpaint_array(working, large_mask, cfg, return_diagnostics=True)
+        parts.append({"role": "large", "backend": backend, "masked_fraction": round(float(np.count_nonzero(large_mask)) / large_mask.size, 6), "diagnostics": diagnostics})
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    Image.fromarray(working).save(output_path)
+    return {
+        "ok": True,
+        "path": output_path,
+        "backend": "role-aware",
+        "masked_fraction": round(float(np.count_nonzero(text_mask | large_mask)) / text_mask.size, 6),
+        "parts": parts,
     }

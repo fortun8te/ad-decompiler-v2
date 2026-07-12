@@ -279,6 +279,36 @@ def test_primary_failure_uses_challenger_but_exposes_partial_status(tmp_path, mo
     assert result["lines"][0]["text"] == "SALE"
 
 
+def test_empty_configured_challenger_is_fail_closed(tmp_path, monkeypatch):
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (160, 80), "white").save(image_path)
+
+    def fake_backend(name, path, cfg, use_cache=True):
+        if name == "surya":
+            return {"engine": name, "lines": []}
+        return {"engine": name, "lines": [_line("SALE", 0.98, _box(10, 10, 50, 20), name)]}
+
+    monkeypatch.setattr(ocr, "_run_backend", fake_backend)
+    result = ocr.run_ocr(str(image_path), {
+        "ocr": {"primary": "ppocr-v6", "challengers": ["surya"], "retry_2x": False}
+    })
+
+    assert result["status"] == "partial"
+    assert result["metrics"]["cross_check"]["fail_closed"] is True
+    assert result["metrics"]["cross_check"]["missing_engines"] == ["surya"]
+
+
+def test_ocr_metrics_report_geometry_and_cross_check_health():
+    lines = [_line("OK", 0.9, _box(1, 2, 30, 10), "primary")]
+    assert ocr._geometry_metrics(lines) == {
+        "lines": 1, "valid_lines": 1, "invalid_lines": 0,
+        "missing_quad": 0, "valid": True,
+    }
+    metrics = ocr._cross_check_metrics(lines, ["primary", "challenger"], ["primary"])
+    assert metrics["complete"] is False
+    assert metrics["fail_closed"] is True
+
+
 def test_paddle_gpu_failure_retries_cpu_once(monkeypatch):
     calls = []
 

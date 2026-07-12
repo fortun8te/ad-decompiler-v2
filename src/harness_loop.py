@@ -12,6 +12,8 @@ import os
 from typing import Any, Callable, Optional
 
 from src.harness import (
+    _flag,
+    _qa_accepts,
     execute_repairs,
     harness_enabled,
     harness_max_rounds,
@@ -68,7 +70,7 @@ def _cfg_for_pipeline(cfg: dict) -> dict:
 def _qa_summary(qa: dict) -> dict:
     qa = qa or {}
     return {
-        "ok": bool(qa.get("ok")),
+        "ok": _flag(qa.get("ok")),
         "ssim": qa.get("ssim"),
         "text_recall": qa.get("text_recall"),
         "hard_fails": len(qa.get("hard_fails") or []),
@@ -164,7 +166,7 @@ def _run_round(
         }
         qa = _load_json(os.path.join(run_dir, "qa.json"), {})
         round_record["qa"] = _qa_summary(qa)
-        if qa.get("ok"):
+        if _qa_accepts(qa, allow_summary=True):
             round_record["stopped"] = "qa_ok"
             return round_record, working_cfg, True
 
@@ -175,7 +177,7 @@ def _run_round(
     round_record["repairs"] = repair_summary
     qa = _load_json(os.path.join(run_dir, "qa.json"), {})
     round_record["qa_after_repairs"] = _qa_summary(qa)
-    if qa.get("ok"):
+    if _qa_accepts(qa, allow_summary=True):
         round_record["stopped"] = "qa_ok_after_repairs"
         return round_record, working_cfg, True
 
@@ -268,7 +270,7 @@ def run_until_acceptable(
         "rounds": rounds,
         "rounds_completed": len(rounds),
         "max_rounds": max_rounds,
-        "qa_ok": bool(final_qa.get("ok")),
+        "qa_ok": _qa_accepts(final_qa, allow_summary=True),
         "stopped": stopped,
         "thresholds": threshold_snapshot,
     }

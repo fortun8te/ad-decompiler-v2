@@ -260,6 +260,11 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
         if scene_text_role == "overlay_copy":
             continue
         if c["meta"].get("role") in overlay_text_roles:
+            # Overlay copy must be painted back as editable text, so its original
+            # glyphs have to be removed from the Big-LaMa plate first.  Keep this
+            # explicit because a downstream router may conservatively return drop.
+            c["meta"]["overlay_text"] = True
+            c["meta"]["removal_required"] = True
             continue
         for pr in scene_regions:
             if _inside_frac(c["box"], pr) >= photo_inside:

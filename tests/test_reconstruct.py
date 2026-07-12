@@ -2,6 +2,20 @@ import json
 import os
 
 import numpy as np
+
+from src.reconstruct import _is_background_plate
+
+
+def test_large_edge_touching_product_is_foreground_not_plate():
+    # Hero packaging is a foreground product cutout, not a clean plate.  It must remain
+    # available for reconstruction and claim its pixels before the broad photo.
+    product = {"box": {"x": 10, "y": 536, "w": 1057, "h": 544},
+               "meta": {"role": "product"}}
+    isolated = {"box": {"x": 100, "y": 100, "w": 700, "h": 700},
+                "meta": {"role": "product"}}
+
+    assert not _is_background_plate(product, 1080, 1080)
+    assert not _is_background_plate(isolated, 1080, 1080)
 from PIL import Image, ImageDraw, ImageFilter
 
 from src import reconstruct
@@ -34,6 +48,24 @@ def test_text_is_removed_from_background_once(tmp_path):
     assert clean.getpixel((80, 55))[0] > 100  # dark overlay is gone
     assert clean.getpixel((5, 5)) == original.getpixel((5, 5))  # untouched outside mask
     assert result["stats"]["inpaint"]["backend"] == "opencv-telea"
+
+
+def test_text_and_large_removals_use_role_aware_backends(tmp_path, monkeypatch):
+    source = tmp_path / "role-aware.png"
+    _source(source, (180, 120))
+    photo_mask = Image.new("L", (60, 40), 255)
+    photo_mask.save(tmp_path / "photo-mask.png")
+    candidates = [
+        {"id": "text", "target": "text", "text": "SALE", "box": {"x": 45, "y": 48, "w": 90, "h": 18},
+         "visible_box": {"x": 45, "y": 48, "w": 90, "h": 18}, "meta": {"role": "body"}},
+        {"id": "photo", "target": "image", "box": {"x": 110, "y": 70, "w": 60, "h": 40},
+         "mask": {"src": "photo-mask.png"}, "meta": {"role": "photo"}},
+    ]
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates, str(tmp_path),
+                                     {"inpaint": {"mode": "opencv", "opencv_method": "telea"}})
+    assert result["stats"]["inpaint"]["backend"] == "role-aware"
+    assert [part["role"] for part in result["stats"]["inpaint"]["parts"]] == ["text", "large"]
+    assert result["stats"]["inpaint"]["parts"][0]["backend"] == "opencv-telea"
 
 
 def test_duplicate_observations_collapse_before_asset_work(tmp_path):
@@ -144,6 +176,53 @@ def test_dropped_background_plate_cannot_claim_product_ownership(tmp_path):
     assert by_id["plate"]["target"] == "drop"
     product = np.asarray(Image.open(tmp_path / by_id["product"]["src"]).convert("RGBA"))
     assert product[:, :, 3].max() == 255
+
+
+def test_edge_touching_product_is_foreground_not_background_plate(tmp_path):
+    source = tmp_path / "source.png"
+    _source(source, (100, 80))
+    masks = tmp_path / "masks"
+    masks.mkdir()
+    Image.new("L", (90, 40), 255).save(masks / "photo.png")
+    Image.new("L", (100, 40), 255).save(masks / "product.png")
+    candidates = [
+        {"id": "photo", "target": "image", "z": 0,
+         "box": {"x": 5, "y": 40, "w": 90, "h": 40},
+         "mask": {"src": "masks/photo.png"}, "meta": {"role": "photo"}},
+        {"id": "product", "target": "image", "z": 0,
+         "box": {"x": 0, "y": 40, "w": 100, "h": 40},
+         "mask": {"src": "masks/product.png"}, "meta": {"role": "product"}},
+    ]
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates, str(tmp_path),
+                                     {"inpaint": {"mode": "opencv"}})
+    by_id = {item["id"]: item for item in result["candidates"]}
+    assert by_id["product"]["target"] == "image"
+    assert by_id["product"]["meta"].get("keep_in_background") is not True
+    assert by_id["photo"]["meta"].get("keep_in_background") is not True
+
+
+def test_product_owns_overlap_before_broad_photo_without_z(tmp_path):
+    source = tmp_path / "source.png"
+    _source(source, (100, 80))
+    masks = tmp_path / "masks"
+    masks.mkdir()
+    Image.new("L", (80, 40), 255).save(masks / "photo.png")
+    Image.new("L", (40, 40), 255).save(masks / "product.png")
+    candidates = [
+        {"id": "photo", "target": "image", "z": 0,
+         "box": {"x": 10, "y": 20, "w": 80, "h": 40},
+         "mask": {"src": "masks/photo.png"}, "meta": {"role": "photo"}},
+        {"id": "product", "target": "image", "z": 0,
+         "box": {"x": 30, "y": 20, "w": 40, "h": 40},
+         "mask": {"src": "masks/product.png"}, "meta": {"role": "product"}},
+    ]
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates, str(tmp_path),
+                                     {"inpaint": {"mode": "opencv"}})
+    by_id = {item["id"]: item for item in result["candidates"]}
+    photo = np.asarray(Image.open(tmp_path / by_id["photo"]["src"]).convert("RGBA"))
+    product = np.asarray(Image.open(tmp_path / by_id["product"]["src"]).convert("RGBA"))
+    assert photo[20, 40, 3] == 0
+    assert product[20, 10, 3] > 0
 
 
 def _shape_candidate(tmp_path, name, box, mask):
@@ -286,6 +365,58 @@ def test_button_and_text_both_removed_while_text_stays_editable(tmp_path):
         np.linalg.norm(button_px.astype(float) - plate.astype(float)) * 0.55
     )
     assert np.all(clean[removal == 0] == source_rgb[removal == 0])
+
+
+def test_drop_overlay_text_is_removed_before_editable_redraw(tmp_path):
+    source = tmp_path / "overlay.png"
+    image = Image.new("RGB", (80, 40), (220, 220, 220))
+    ImageDraw.Draw(image).rectangle((20, 12, 59, 27), fill=(20, 20, 20))
+    image.save(source)
+    candidate = {"id": "overlay", "target": "drop", "text": "SALE", "z": 2,
+                 "box": {"x": 20, "y": 12, "w": 40, "h": 16},
+                 "meta": {"role": "headline", "overlay_text": True,
+                          "removal_required": True}}
+    result = reconstruct.reconstruct(str(source), {"lines": []}, [candidate], str(tmp_path),
+                                     {"inpaint": {"mode": "opencv", "mask_dilate": 0}})
+    removal = np.asarray(Image.open(tmp_path / result["removal_mask"]).convert("L"))
+    assert removal[20, 40] > 0
+
+
+def test_overlay_text_removal_uses_candidate_box_not_stale_ocr_line(tmp_path):
+    source = tmp_path / "overlay-misaligned.png"
+    image = Image.new("RGB", (100, 60), (220, 220, 220))
+    ImageDraw.Draw(image).text((60, 20), "SALE", fill=(20, 20, 20))
+    image.save(source)
+    candidate = {
+        "id": "overlay", "target": "text", "text": "SALE",
+        "box": {"x": 60, "y": 20, "w": 30, "h": 15},
+        "meta": {"role": "headline", "overlay_text": True,
+                 "removal_required": True, "line_ids": ["stale"]},
+    }
+    result = reconstruct.reconstruct(
+        str(source), {"lines": [{"id": "stale", "box": {"x": 5, "y": 5, "w": 20, "h": 10}}]},
+        [candidate], str(tmp_path), {"inpaint": {"mode": "opencv", "mask_dilate": 0}},
+    )
+    removal = np.asarray(Image.open(tmp_path / result["removal_mask"]).convert("L"))
+    assert removal[20:35, 60:90].any()
+    assert removal[10, 15] == 0
+
+
+def test_body_text_removal_uses_candidate_box_not_stale_ocr_lines(tmp_path):
+    source = tmp_path / "body-stale.png"
+    image = Image.new("RGB", (120, 70), (220, 220, 220))
+    ImageDraw.Draw(image).text((70, 20), "BODY", fill=(20, 20, 20))
+    image.save(source)
+    candidate = {"id": "body", "target": "text", "text": "BODY",
+                 "box": {"x": 68, "y": 18, "w": 45, "h": 18},
+                 "meta": {"role": "body", "line_ids": ["stale"]}}
+    result = reconstruct.reconstruct(
+        str(source), {"lines": [{"id": "stale", "box": {"x": 2, "y": 2, "w": 30, "h": 15}}]},
+        [candidate], str(tmp_path), {"inpaint": {"mode": "opencv", "mask_dilate": 0}},
+    )
+    removal = np.asarray(Image.open(tmp_path / result["removal_mask"]).convert("L"))
+    assert removal[18:36, 68:113].any()
+    assert removal[8, 15] == 0
 
 
 def test_photo_mask_uses_zero_dilate_to_protect_surroundings(tmp_path):
