@@ -210,3 +210,27 @@ def test_big_lama_compositing_only_replaces_masked_pixels(monkeypatch):
     assert backend == "big-lama"
     assert np.all(output[mask == 0] == source[mask == 0])
     assert np.all(output[mask > 0] == 0)
+
+
+def test_big_lama_size_mismatch_is_resized_not_crashed(monkeypatch):
+    # Big-LaMa pads to a multiple of 8 and can return a plate a few px off from the input;
+    # compositing that against the original mask previously raised IndexError and crashed
+    # the run (3/16 real benchmark images). The output must be snapped back to input HxW.
+    source = np.full((338, 344, 3), 100, dtype=np.uint8)
+    mask = np.zeros((338, 344), dtype=np.uint8)
+    mask[100:200, 100:200] = 255
+    oversized = np.full((344, 352, 3), 50, dtype=np.uint8)  # padded to mult of 8
+
+    monkeypatch.setattr(inpaint, "comfyui_healthy", lambda cfg, probe=None: True)
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: True)
+    monkeypatch.setattr(inpaint, "_simple_lama", lambda rgb, m: oversized)
+
+    out, backend, diagnostics = inpaint.inpaint_array(
+        source, mask, {"inpaint": {"mode": "auto"}}, return_diagnostics=True,
+    )
+
+    assert backend == "big-lama"
+    assert out.shape == (338, 344, 3)
+    assert diagnostics.get("resized_from") == "352x344"
+    # pixels outside the mask must stay byte-identical to the source
+    assert np.array_equal(out[0, 0], source[0, 0])

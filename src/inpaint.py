@@ -411,7 +411,7 @@ def _multipass_inpaint(rgb, mask, cfg: Optional[dict] = None):
 
 def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: bool = False):
     """Inpaint RGB pixels and guarantee that pixels outside ``mask`` stay byte-identical."""
-    _, np, _ = _deps()
+    cv2, np, Image = _deps()
     cfg = cfg or {}
     composite_mask = solidify_mask(mask)
     if not np.any(composite_mask):
@@ -423,9 +423,20 @@ def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: boo
     )
 
     original = np.asarray(rgb, dtype=np.uint8)
+    generated = np.asarray(generated, dtype=np.uint8)
+    # Big-LaMa internally pads the image up to a multiple of 8 and returns at that padded
+    # size, so its output can be a few pixels larger/smaller than the input (e.g. 344 vs
+    # 338). Compositing that back against the original's boolean mask then raised
+    # IndexError and crashed the whole run (crashed 3/16 real benchmark images the moment
+    # Big-LaMa actually started running). Snap the generated plate back to the exact input
+    # HxW before compositing so the mask always aligns.
+    if generated.shape[:2] != original.shape[:2]:
+        oh, ow = original.shape[:2]
+        diagnostics["resized_from"] = f"{generated.shape[1]}x{generated.shape[0]}"
+        generated = cv2.resize(generated, (ow, oh), interpolation=cv2.INTER_LINEAR)
     out = original.copy()
     selected = composite_mask > 0
-    out[selected] = np.asarray(generated, dtype=np.uint8)[selected]
+    out[selected] = generated[selected]
     result = (out, used, diagnostics)
     return result if return_diagnostics else result[:2]
 
