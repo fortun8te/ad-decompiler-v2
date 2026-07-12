@@ -33,6 +33,8 @@ import time
 import unicodedata
 from typing import Any, Callable, Iterable, Optional
 
+from src.agent_debug import log as _agent_log
+
 
 _PADDLE_ENGINES: dict[tuple, tuple[Any, str]] = {}
 _SURYA_ENGINES: dict[tuple, tuple[Any, str, Any]] = {}
@@ -525,6 +527,9 @@ def _paddle_engine(cfg: dict):
     try:
         from paddleocr import PaddleOCR
     except ImportError as error:  # pragma: no cover - exercised on GPU host
+        # #region agent log
+        _agent_log("ocr.py:_paddle_engine", "paddleocr import failed", data={"error": str(error)}, hypothesis_id="H1")
+        # #endregion
         raise ImportError(
             "PP-OCRv6 requires paddleocr>=3 and a matching paddlepaddle build.\n"
             "  pip install paddleocr>=3 paddlepaddle-gpu"
@@ -558,12 +563,26 @@ def _paddle_engine(cfg: dict):
 
 
 def _paddle(img_path, cfg):
-    engine, api = _paddle_engine(cfg)
-    if api == "v3" and hasattr(engine, "predict"):
-        result = engine.predict(img_path)
-    else:
-        result = engine.ocr(img_path, cls=True)
-    return _parse_paddle_result(result), "ppocr-v6"
+    device = str(cfg.get("device", "cpu"))
+    # #region agent log
+    _agent_log("ocr.py:_paddle", "paddle backend start", data={"device": device, "path": os.path.basename(img_path)}, hypothesis_id="H1")
+    # #endregion
+    try:
+        engine, api = _paddle_engine(cfg)
+        if api == "v3" and hasattr(engine, "predict"):
+            result = engine.predict(img_path)
+        else:
+            result = engine.ocr(img_path, cls=True)
+        lines = _parse_paddle_result(result)
+        # #region agent log
+        _agent_log("ocr.py:_paddle", "paddle backend ok", data={"api": api, "lines": len(lines)}, hypothesis_id="H1")
+        # #endregion
+        return lines, "ppocr-v6"
+    except Exception as error:
+        # #region agent log
+        _agent_log("ocr.py:_paddle", "paddle backend failed", data={"device": device, "error": str(error), "error_type": type(error).__name__}, hypothesis_id="H1")
+        # #endregion
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -627,41 +646,57 @@ def _parse_surya_predictions(predictions: Any) -> list:
 
 
 def _surya(img_path, cfg):
+    # #region agent log
+    _agent_log("ocr.py:_surya", "surya backend start", data={"device": str(cfg.get("device", "cpu"))}, hypothesis_id="H2")
+    # #endregion
     try:
         from PIL import Image
         image = Image.open(img_path).convert("RGB")
     except ImportError as error:  # pragma: no cover
+        # #region agent log
+        _agent_log("ocr.py:_surya", "surya import failed", data={"error": str(error)}, hypothesis_id="H2")
+        # #endregion
         raise ImportError("Surya requires Pillow and surya-ocr.") from error
 
-    key = (str(cfg.get("device", "cpu")),)
-    if key in _SURYA_ENGINES:
-        predictor, api, detector = _SURYA_ENGINES[key]
-    else:
-        try:
-            from surya.inference import SuryaInferenceManager
-            from surya.recognition import RecognitionPredictor
-
-            manager = SuryaInferenceManager()
-            predictor = RecognitionPredictor(manager)
-            detector = None
-            api = "v2"
-        except (ImportError, TypeError):
+    try:
+        key = (str(cfg.get("device", "cpu")),)
+        if key in _SURYA_ENGINES:
+            predictor, api, detector = _SURYA_ENGINES[key]
+        else:
             try:
+                from surya.inference import SuryaInferenceManager
                 from surya.recognition import RecognitionPredictor
-                from surya.detection import DetectionPredictor
-            except ImportError as error:  # pragma: no cover
-                raise ImportError("Surya backend requires surya-ocr.  pip install surya-ocr") from error
-            predictor = RecognitionPredictor()
-            detector = DetectionPredictor()
-            api = "v1"
-        _SURYA_ENGINES[key] = (predictor, api, detector)
 
-    if api == "v2":
-        predictions = predictor([image])
-    else:
-        language = (cfg.get("ocr") or {}).get("lang", "en")
-        predictions = predictor([image], [[language]], detector)
-    return _parse_surya_predictions(predictions), "surya"
+                manager = SuryaInferenceManager()
+                predictor = RecognitionPredictor(manager)
+                detector = None
+                api = "v2"
+            except (ImportError, TypeError):
+                try:
+                    from surya.recognition import RecognitionPredictor
+                    from surya.detection import DetectionPredictor
+                except ImportError as error:  # pragma: no cover
+                    raise ImportError("Surya backend requires surya-ocr.  pip install surya-ocr") from error
+                predictor = RecognitionPredictor()
+                detector = DetectionPredictor()
+                api = "v1"
+            _SURYA_ENGINES[key] = (predictor, api, detector)
+
+        if api == "v2":
+            predictions = predictor([image])
+        else:
+            language = (cfg.get("ocr") or {}).get("lang", "en")
+            predictions = predictor([image], [[language]], detector)
+        lines = _parse_surya_predictions(predictions)
+        # #region agent log
+        _agent_log("ocr.py:_surya", "surya backend ok", data={"api": api, "lines": len(lines)}, hypothesis_id="H2")
+        # #endregion
+        return lines, "surya"
+    except Exception as error:
+        # #region agent log
+        _agent_log("ocr.py:_surya", "surya backend failed", data={"error": str(error), "error_type": type(error).__name__}, hypothesis_id="H2")
+        # #endregion
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1320,6 +1355,13 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
     primary_name = ocr_cfg.get("primary", "ppocr-v6")
     challenger_names = ocr_cfg.get("challengers") or []
     started = time.time()
+    # #region agent log
+    _agent_log(
+        "ocr.py:run_ocr", "ocr run start",
+        data={"primary": primary_name, "challengers": challenger_names, "device": str(cfg.get("device", "cpu"))},
+        hypothesis_id="H3", run_dir=run_dir,
+    )
+    # #endregion
 
     errors = []
     try:
@@ -1335,6 +1377,13 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         primary_engine = primary_name
         primary_lines = []
         errors.append({"engine": primary_name, "error": str(error), "role": "primary"})
+        # #region agent log
+        _agent_log(
+            "ocr.py:run_ocr", "primary backend failed",
+            data={"engine": primary_name, "error": str(error), "error_type": type(error).__name__},
+            hypothesis_id="H1", run_dir=run_dir,
+        )
+        # #endregion
         print(f"[ocr] primary '{primary_name}' unavailable: {error}")
     challenger_sets = []
     engines_used = [] if errors else [primary_engine]
@@ -1346,12 +1395,26 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         except Exception as error:
             print(f"[ocr] challenger '{name}' unavailable, skipping: {error}")
             errors.append({"engine": name, "error": str(error), "role": "challenger"})
+            # #region agent log
+            _agent_log(
+                "ocr.py:run_ocr", "challenger backend failed",
+                data={"engine": name, "error": str(error), "error_type": type(error).__name__},
+                hypothesis_id="H2", run_dir=run_dir,
+            )
+            # #endregion
             continue
         challenger_sets.append(payload.get("lines", []))
         engines_used.append(payload.get("engine", name))
 
     if not engines_used:
         details = "; ".join(f"{item['engine']}: {item['error']}" for item in errors)
+        # #region agent log
+        _agent_log(
+            "ocr.py:run_ocr", "all ocr backends failed",
+            data={"errors": errors, "engines_used": engines_used},
+            hypothesis_id="H3", run_dir=run_dir,
+        )
+        # #endregion
         raise RuntimeError(f"no configured OCR backend completed ({details})")
 
     merged = _reconcile(primary_lines, challenger_sets, cfg=cfg) if challenger_sets else _reconcile(

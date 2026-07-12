@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from src.console_io import configure_stdio, safe_print
+from src.agent_debug import log as _agent_log, tail as _agent_debug_tail
 
 
 def _safe_name(name, fallback="upload"):
@@ -223,6 +224,24 @@ def make_handler(inbox, config_path=None):
             repo_root = _repo_root()
             if repo_root not in sys.path:
                 sys.path.insert(0, repo_root)
+            # #region agent log
+            try:
+                from doctor import inspect as _doctor_inspect
+                from pathlib import Path
+                doctor = _doctor_inspect(base_cfg or {}, Path(repo_root))
+                ocr_blockers = [b for b in doctor.get("blockers", []) if str(b.get("name", "")).startswith("ocr")]
+                _agent_log(
+                    "figma_bridge.py:run_job", "doctor preflight",
+                    data={"ok": doctor.get("ok"), "ocr_blockers": ocr_blockers, "blockers": doctor.get("blockers")},
+                    hypothesis_id="H4", run_dir=run_dir,
+                )
+            except Exception as doctor_error:
+                _agent_log(
+                    "figma_bridge.py:run_job", "doctor preflight failed",
+                    data={"error": str(doctor_error)},
+                    hypothesis_id="H4", run_dir=run_dir,
+                )
+            # #endregion
             import run_pipeline  # heavy: torch/paddleocr/sam3/... — only imported on first use
             cfg = copy.deepcopy(base_cfg or {})
             cfg["figma"] = {**cfg.get("figma", {}), "enabled": True, "mode": "plugin", "inbox": inbox}
@@ -363,9 +382,11 @@ def make_handler(inbox, config_path=None):
                         job["error_detail"] = "\n".join(lines[-5:])
                     if job.get("run_dir"):
                         job["failed_stage"] = _tail_stage(job["run_dir"])
+                    job["agent_debug"] = _agent_debug_tail(job.get("run_dir"))
                 job.pop("traceback", None)
                 if job.get("status") == "running" and job.get("run_dir"):
                     job["stage"] = _tail_stage(job["run_dir"])
+                    job["agent_debug"] = _agent_debug_tail(job.get("run_dir"))
                 if job.get("started_at") and job.get("status") in ("running", "queued"):
                     elapsed = time.time() - job["started_at"]
                     job["elapsed_s"] = round(elapsed, 1)

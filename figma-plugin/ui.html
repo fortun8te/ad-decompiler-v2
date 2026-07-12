@@ -1065,6 +1065,46 @@
       pluginBuild: PLUGIN_BUILD,
     };
 
+    function agentDebugLog(location, message, data, hypothesisId) {
+      // #region agent log
+      fetch("http://127.0.0.1:7523/ingest/27bfebeb-9c6b-44a2-b935-8f158eb825f5", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "0bad44" },
+        body: JSON.stringify({
+          sessionId: "0bad44",
+          location: location,
+          message: message,
+          data: data || {},
+          hypothesisId: hypothesisId || "",
+          timestamp: Date.now(),
+        }),
+      }).catch(function () {});
+      // #endregion
+    }
+
+    function progressVisibilitySnapshot(context) {
+      const uploadBusy = $("uploadBusy");
+      const progressSection = $("progressSection");
+      const segments = $("processSegments");
+      return {
+        context: context,
+        uploadBusyHidden: uploadBusy ? uploadBusy.classList.contains("hidden") : null,
+        progressSectionHidden: progressSection ? progressSection.classList.contains("hidden") : null,
+        stateBuilding: state.building,
+        stateUploading: state.uploading,
+        segmentCount: segments ? segments.childElementCount : 0,
+        processBarWidth: $("processBar") ? $("processBar").style.width : "",
+        progressBarWidth: $("progressBar") ? $("progressBar").style.width : "",
+      };
+    }
+
+    function forwardAgentDebug(entries) {
+      if (!entries || !entries.length) return;
+      entries.slice(-8).forEach(function (entry) {
+        agentDebugLog(entry.location || "bridge", entry.message || "agent_debug", entry.data || {}, entry.hypothesisId || "H0");
+      });
+    }
+
     function renderBuildBadge(build) {
       const info = build || state.pluginBuild || PLUGIN_BUILD;
       const el = $("buildBadge");
@@ -1398,6 +1438,9 @@
       $("uploadIdle").classList.toggle("hidden", Boolean(busy));
       $("uploadBusy").classList.toggle("hidden", !busy);
       if (busy && status) renderProcessStatus(status);
+      // #region agent log
+      agentDebugLog("ui.html:setUploadBusy", "upload busy state", progressVisibilitySnapshot("setUploadBusy:" + Boolean(busy)), "H6");
+      // #endregion
     }
 
     const PROCESS_STAGE_ORDER = [
@@ -1549,6 +1592,11 @@
       updateProcessSegments(status);
       timingRows(status);
       setFooter(stageLabel + " · " + percent + "%");
+      // #region agent log
+      agentDebugLog("ui.html:renderProcessStatus", "process status rendered", Object.assign(progressVisibilitySnapshot("renderProcessStatus"), {
+        stage: status.stage, status: status.status, percent: percent,
+      }), "H6");
+      // #endregion
     }
 
     function formatElapsed(ms) {
@@ -1655,6 +1703,7 @@
       if (status.status === "failed") {
         state.uploading = false;
         setUploadBusy(false);
+        if (status.agent_debug) forwardAgentDebug(status.agent_debug);
         const err = formatProcessingError(status);
         showIssues([err], "error");
         await flushLogs(true);
@@ -1667,6 +1716,7 @@
         return;
       }
       setUploadBusy(true, status);
+      if (status.agent_debug) forwardAgentDebug(status.agent_debug);
       const stageKey = String(status.status || "") + "|" + String(status.stage || "") + "|" + String(status.phase || "");
       if (pollProcessJob._lastKey !== stageKey) {
         pollProcessJob._lastKey = stageKey;
@@ -1796,6 +1846,9 @@
     function setBuilding(building) {
       state.building = building;
       $("progressSection").classList.toggle("hidden", !building);
+      // #region agent log
+      agentDebugLog("ui.html:setBuilding", "import progress section", progressVisibilitySnapshot("setBuilding:" + Boolean(building)), "H7");
+      // #endregion
       $("importButton").disabled = building || !state.doc;
       $("refreshButton").disabled = building;
       $("loadFiles").disabled = building;
