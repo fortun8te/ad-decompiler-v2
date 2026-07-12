@@ -16,6 +16,7 @@ from src import vlm_client
 _DEFAULT_PADDING = 8
 _DEFAULT_PASSES = 2
 _DEFAULT_MAX_TOKENS = 120
+_DEFAULT_REFINE_MAX_TOKENS = 80
 
 _LABELS = frozenset({
     "product",
@@ -28,6 +29,7 @@ _LABELS = frozenset({
     "junk",
 })
 _DECISIONS = frozenset({"keep", "drop", "review"})
+_REFINE_ROLES = frozenset({"button", "icon", "product"})
 
 _PROMPT = (
     "This crop shows one segmented element from a digital advertisement. "
@@ -38,6 +40,16 @@ _PROMPT = (
     "- keep: real semantic element (product, person, icon, button, badge)\n"
     "- drop: segmentation noise (junk, background bleed, stray text artifact)\n"
     "- review: uncertain or borderline"
+)
+
+_REFINE_PROMPT = (
+    "This crop shows one segmented element from a digital advertisement that was classified "
+    "as worth preserving.\n\n"
+    "Reply with ONLY valid JSON on one line, no markdown, no explanation:\n"
+    '{"role": "button"|"icon"|"product"}\n\n'
+    "- button: clickable CTA shell or pill-shaped control\n"
+    "- icon: small graphic, badge, logo mark, or pictogram\n"
+    "- product: physical product, package, bottle, jar, tube, or device"
 )
 
 
@@ -80,6 +92,29 @@ def _parse_classification(raw: str) -> dict | None:
     return {"decision": decision, "label": label}
 
 
+def _parse_refine_role(raw: str) -> str | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[^{}]+\}", text)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    role = str(data.get("role", "")).strip().lower()
+    return role if role in _REFINE_ROLES else None
+
+
 def _annotate(element: dict, *, decision: str, label: str, note: str | None = None) -> dict:
     out = copy.deepcopy(element)
     meta = dict(out.get("meta") or {})
@@ -92,6 +127,29 @@ def _annotate(element: dict, *, decision: str, label: str, note: str | None = No
     if decision == "drop":
         meta["vlm_rejected"] = True
     return out
+
+
+def _refine_role(
+    crop: bytes,
+    *,
+    base_url: str,
+    model: str,
+    timeout_s: float,
+    max_tokens: int,
+    passes: int,
+) -> tuple[str | None, str | None]:
+    answer, note = vlm_client.multi_pass_answer(
+        crop,
+        _REFINE_PROMPT,
+        base_url=base_url,
+        model=model,
+        timeout_s=timeout_s,
+        max_tokens=max_tokens,
+        passes=passes,
+    )
+    if note:
+        return None, note
+    return _parse_refine_role(answer or ""), None
 
 
 def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[dict]:
@@ -111,6 +169,10 @@ def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[di
     passes = int(vcfg.get("passes", _DEFAULT_PASSES))
     max_elements = vcfg.get("max_elements")
     reject_mode = str(vcfg.get("reject_mode", "remove")).strip().lower()
+    refine_cfg = seg.get("refine_role") or {}
+    refine_enabled = bool(refine_cfg.get("enabled", False))
+    refine_passes = int(refine_cfg.get("passes", passes))
+    refine_max_tokens = int(refine_cfg.get("max_tokens", _DEFAULT_REFINE_MAX_TOKENS))
 
     candidates = [el for el in elements if el.get("box")]
     if max_elements is not None:
@@ -168,6 +230,21 @@ def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[di
             results.append(_annotate(element, decision=decision, label=label))
             continue
 
-        results.append(_annotate(element, decision=decision, label=label))
+        kept = _annotate(element, decision=decision, label=label)
+        if refine_enabled:
+            refined, refine_note = _refine_role(
+                crop,
+                base_url=base_url,
+                model=model,
+                timeout_s=timeout_s,
+                max_tokens=refine_max_tokens,
+                passes=refine_passes,
+            )
+            if refined:
+                kept.setdefault("meta", {})["role"] = refined
+                kept["meta"].setdefault("vlm_segment", {})["refined_role"] = refined
+            elif refine_note == "vlm_disagreement":
+                kept["meta"].setdefault("vlm_segment", {})["refine_note"] = "vlm_disagreement"
+        results.append(kept)
 
     return results

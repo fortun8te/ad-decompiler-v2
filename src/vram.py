@@ -84,7 +84,7 @@ def stage_boundary(
 
     if to_stage == "sam" and opts["unload_ocr_before_sam"]:
         unload_ocr_engines()
-    if to_stage in {"vlm-proofread", "vlm-font-judge"} and opts["unload_ocr_before_vlm"]:
+    if to_stage in {"vlm-ocr-judge", "vlm-proofread", "vlm-font-judge", "vlm-scene-text"} and opts["unload_ocr_before_vlm"]:
         unload_ocr_engines()
     if to_stage in {"reconstruct", "inpaint", "vlm-segment-filter"}:
         unload_sam_backend()

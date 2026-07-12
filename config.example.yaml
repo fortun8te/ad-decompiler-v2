@@ -17,6 +17,21 @@ vlm:
     passes: 2
     max_elements: 24                  # cap VLM calls per run
     reject_mode: remove               # remove | mark (mark keeps element with meta.vlm_rejected)
+    refine_role:                     # second VLM pass after keep → meta.role
+      enabled: false
+      passes: 2
+  ocr_judge:                         # optional VLM arbitration when OCR engines disagree
+    enabled: false
+    passes: 2                         # both passes must agree before text is replaced
+    padding: 3
+    max_lines: null                     # cap disagreement judgements per run
+    ocr_read:                           # optional grid scan for text all engines missed
+      enabled: false
+      grid_cols: 4
+      grid_rows: 4
+      max_image_pixels: 4000000         # skip ocr_read when canvas exceeds this
+      max_regions: 8
+      passes: 2
   font_judge:                        # optional VLM re-rank after local font matching
     enabled: false
     score_threshold: 7                # 0-10; below this tries the next candidate (max 3)
@@ -24,6 +39,21 @@ vlm:
     passes: 2                         # both passes must agree on winner/score
     padding: 4
     max_styles: 12
+  scene_text:                      # optional VLM text-placement classifier after text_analysis
+    enabled: false
+    context_padding: 24            # crop padding so the model sees surrounding layout
+    passes: 2
+    max_lines: 32
+  element_propose:                   # optional VLM coarse boxes before SAM box-refine
+    enabled: false
+    grid: 4                           # NxN overlapping tiles (and gap sampling)
+    overlap: 0.25                     # tile overlap fraction
+    tile_mode: both                   # grid | gaps | both (gaps = low residual coverage)
+    gap_coverage: 0.35                # max residual overlap for a gap tile
+    passes: 2                         # both passes must agree on proposal count + boxes
+    iou_thresh: 0.55                  # dedupe against residual + other VLM proposals
+    max_tiles: 20
+    max_proposals: 32
 
 # An RTX acceptance run must show which model actually ran. Disabled models remain valid for
 # CPU development, but enabled OCR/SAM fallbacks become QA failures instead of quiet boxes.
@@ -41,9 +71,9 @@ ocr:
   # paddlepaddle-gpu 3.0 ships no sm_120 kernels and its cu126 CUDA libs also collide
   # with torch's cu128 DLLs in a shared venv, so ppocr-v6 can't use the GPU here (it
   # only auto-retries on CPU, which is slow). Kept ppocr-v6 + tesseract as fallbacks.
-  primary: doctr                      # ppocr-v6 | surya | doctr | tesseract
-  challengers: []                     # optional in-process surya via pip install surya-ocr
-  fallback_engines: [ppocr-v6, tesseract]  # tried only when primary + challengers all fail
+  primary: doctr                      # ppocr-v6 | surya | doctr | easyocr | tesseract
+  challengers: []                     # optional in-process surya or easyocr (pip install surya-ocr / easyocr)
+  fallback_engines: [ppocr-v6, tesseract]  # tried when primary + challengers fail; easyocr also supported
   auto_fallback_tesseract: true        # also auto-try tesseract when binary is on PATH
   ensemble_disagreement:               # when vlm.enabled, proofread confident-but-disputed lines
     enabled: true

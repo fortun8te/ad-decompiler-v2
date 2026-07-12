@@ -118,6 +118,12 @@ def _vlm_feature_enabled(cfg: dict) -> bool:
         return True
     if (vlm.get("font_judge") or {}).get("enabled"):
         return True
+    if (vlm.get("scene_text") or {}).get("enabled"):
+        return True
+    if (vlm.get("ocr_judge") or {}).get("enabled"):
+        return True
+    if (vlm.get("element_propose") or {}).get("enabled"):
+        return True
     return False
 
 
@@ -127,7 +133,8 @@ def _tesseract_binary() -> str | None:
 
 def _ocr_engine_module(name: str) -> str:
     return {"ppocr-v6": "paddleocr", "ppocr": "paddleocr", "surya": "surya",
-            "doctr": "doctr", "tesseract": "pytesseract"}.get(str(name).lower(), str(name).lower())
+            "doctr": "doctr", "easyocr": "easyocr", "tesseract": "pytesseract"}.get(
+                str(name).lower(), str(name).lower())
 
 
 def _ocr_fallback_ready(engine: str) -> tuple[bool, str]:

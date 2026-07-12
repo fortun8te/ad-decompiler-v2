@@ -17,7 +17,8 @@ from src.console_io import configure_stdio, safe_print
 from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  element_fusion, qwen_worker, merge_layers, reconstruct, layout,
                  build_design_json, figma_import, pixel_diff, repair, render_preview,
-                 vlm_proofread, vlm_font_judge, vlm_segment_filter, vram)
+                 vlm_proofread, vlm_ocr_judge, vlm_font_judge, vlm_scene_text,
+                 vlm_segment_filter, vlm_element_propose, vram)
 from src.run_report import RunReport, qwen_degradation
 from src.schema import dump, load
 from src.harness import execute_repairs, recommended_resume
@@ -168,22 +169,38 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         if stage("ocr") or not exists("ocr_raw.json"):
             current_stage = "ocr"
             raw_ocr = ocr.run_ocr(norm_path, cfg, run_dir=run_dir)
+            ocr_judge = ((cfg.get("vlm") or {}).get("ocr_judge") or {})
+            if ocr_judge.get("enabled"):
+                vram.stage_boundary("ocr", "vlm-ocr-judge", cfg, run_dir,
+                                    log_fn=lambda msg: _log(run_dir, msg))
+                raw_ocr = vlm_ocr_judge.judge_ocr_lines(norm_path, raw_ocr, cfg)
             if (cfg.get("vlm") or {}).get("enabled"):
                 vram.stage_boundary("ocr", "vlm-proofread", cfg, run_dir,
                                     log_fn=lambda msg: _log(run_dir, msg))
             raw_ocr = vlm_proofread.proofread_lines(norm_path, raw_ocr, cfg)
             dump(raw_ocr, A("ocr_raw.json"))
+            oj = raw_ocr.get("vlm_ocr_judge")
+            oj_note = ""
+            if oj:
+                oj_note = f", vlm-judged {oj['lines_corrected']}/{oj['lines_checked']}"
+                if oj.get("ocr_read_added"):
+                    oj_note += f", vlm-read +{oj['ocr_read_added']}"
             vp = raw_ocr.get("vlm_proofread")
             vp_note = ""
             if vp:
                 vp_note = f", vlm-corrected {vp['lines_corrected']}/{vp['lines_checked']}"
                 if vp.get("ensemble_disagreement_checked"):
                     vp_note += f", ensemble-proofread {vp['ensemble_disagreement_checked']}"
-            _log(run_dir, f"ocr[{raw_ocr.get('engine')}] → {len(raw_ocr.get('lines', []))} lines{vp_note}")
+            _log(run_dir, f"ocr[{raw_ocr.get('engine')}] → {len(raw_ocr.get('lines', []))} lines{oj_note}{vp_note}")
         raw_ocr = load(A("ocr_raw.json")) if exists("ocr_raw.json") else load(A("ocr.json"))
         if stage("text") or not exists("ocr.json"):
             current_stage = "text"
             ocr_res = text_analysis.analyze_text(norm_path, raw_ocr, cfg)
+            scene_text = ((cfg.get("vlm") or {}).get("scene_text") or {})
+            if scene_text.get("enabled"):
+                vram.stage_boundary("text", "vlm-scene-text", cfg, run_dir,
+                                    log_fn=lambda msg: _log(run_dir, msg))
+                ocr_res = vlm_scene_text.classify_scene_text(norm_path, ocr_res, cfg)
             font_judge = ((cfg.get("vlm") or {}).get("font_judge") or {})
             font_matching = ((cfg.get("text_analysis") or {}).get("font_matching"))
             fm_on = font_matching if isinstance(font_matching, bool) else bool((font_matching or {}).get("enabled"))
@@ -192,12 +209,17 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                                     log_fn=lambda msg: _log(run_dir, msg))
                 ocr_res = vlm_font_judge.judge_fonts(norm_path, ocr_res, cfg)
             dump(ocr_res, A("ocr.json"))
+            st = ocr_res.get("vlm_scene_text")
+            st_note = ""
+            if st:
+                st_note = (f", vlm-scene-text {st.get('lines_classified', 0)}"
+                           f"/{st.get('lines_checked', 0)}")
             fj = ocr_res.get("vlm_font_judge")
             fj_note = ""
             if fj:
                 fj_note = f", vlm-font-judge promoted {fj.get('styles_promoted', 0)}/{fj.get('styles_checked', 0)}"
             _log(run_dir, f"text analysis → {len(ocr_res.get('blocks', []))} blocks, "
-                 f"{len(ocr_res.get('styles', []))} styles{fj_note}")
+                 f"{len(ocr_res.get('styles', []))} styles{st_note}{fj_note}")
         ocr_res = load(A("ocr.json"))
 
         # 3 deterministic residual proposals. This also writes box-local masks.
@@ -207,6 +229,17 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             dump(residual, A("residual.json"))
             _log(run_dir, f"residual proposals → {len(residual)}")
         residual = load(A("residual.json"))
+
+        ep_cfg = ((cfg.get("vlm") or {}).get("element_propose") or {})
+        if ep_cfg.get("enabled") and (stage("sam") or not exists("sam3.json")):
+            vram.stage_boundary("residual", "vlm-element-propose", cfg, run_dir,
+                                log_fn=lambda msg: _log(run_dir, msg))
+            before = len(residual)
+            residual = vlm_element_propose.enrich_residual(norm_path, residual, cfg)
+            added = len(residual) - before
+            if added:
+                dump(residual, A("residual.json"))
+            _log(run_dir, f"vlm element propose → +{added} proposals ({len(residual)} total)")
 
         # 4 optional Qwen layers are advisory observations/assets, never the scene graph.
         if stage("qwen") or not exists("qwen.json"):

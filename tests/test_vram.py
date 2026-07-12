@@ -124,6 +124,18 @@ def test_stage_boundary_pre_vlm_segment_filter_unloads_sam(monkeypatch):
     assert events == ["sam"]
 
 
+def test_stage_boundary_pre_vlm_scene_text_unloads_ocr(monkeypatch):
+    events = []
+    monkeypatch.setattr(vram, "unload_ocr_engines", lambda: events.append("ocr"))
+    monkeypatch.setattr(vram, "optional_torch_cuda_empty_cache", lambda: events.append("cache"))
+    monkeypatch.setattr(vram, "log_vram", lambda label, log_fn=None: None)
+
+    cfg = {"device": "cuda", "runtime": {"vram": {"empty_cache_between_stages": False}}}
+    vram.stage_boundary("text", "vlm-scene-text", cfg, "/tmp/run")
+
+    assert events == ["ocr"]
+
+
 def test_unload_ocr_before_vlm_can_be_disabled(monkeypatch):
     events = []
     monkeypatch.setattr(vram, "unload_ocr_engines", lambda: events.append("ocr"))

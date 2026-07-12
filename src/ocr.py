@@ -40,12 +40,14 @@ from src.agent_debug import log as _agent_log
 _PADDLE_ENGINES: dict[tuple, tuple[Any, str]] = {}
 _SURYA_ENGINES: dict[tuple, tuple[Any, str, Any]] = {}
 _DOCTR_ENGINES: dict[tuple, Any] = {}
+_EASYOCR_ENGINES: dict[tuple, Any] = {}
 
 _DEFAULT_CALIBRATION = {
     "ppocr-v6": 1.00,
     "ppocr": 0.98,
     "surya": 0.97,
     "doctr": 0.95,
+    "easyocr": 0.88,
     "tesseract": 0.82,
 }
 
@@ -833,15 +835,51 @@ def _doctr(img_path, cfg):
 
 
 # ---------------------------------------------------------------------------
-# Tesseract baseline
+# EasyOCR
+
+
+def _parse_easyocr_results(results: Any) -> list:
+    lines = []
+    for item in results or []:
+        item = _plain(item)
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        quad = _normalize_quad(item[0])
+        if not quad:
+            continue
+        line = _make_line(
+            item[1], item[2], quad=quad, engine="easyocr",
+            meta={"engine": "easyocr", "backend_api": "easyocr-readtext", "source_kind": "line"},
+        )
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _easyocr_engine(cfg: dict):
+    ocr_cfg = cfg.get("ocr") or {}
+    lang = str(ocr_cfg.get("lang", "en"))
+    gpu = str(cfg.get("device", "cpu")).lower().startswith("cuda")
+    key = (lang, gpu)
+    reader = _EASYOCR_ENGINES.get(key)
+    if reader is not None:
+        return reader
+    try:
+        import easyocr
+    except ImportError as error:  # pragma: no cover
+        raise ImportError("EasyOCR backend requires easyocr.  pip install easyocr") from error
+    reader = easyocr.Reader([lang], gpu=gpu)
+    _EASYOCR_ENGINES[key] = reader
+    return reader
 
 
 def _easyocr(img_path, cfg):
-    """Reserved backend — not wired yet. Use doctr, ppocr-v6, surya, or tesseract."""
-    raise ImportError(
-        "EasyOCR backend is not implemented in this repo. "
-        "Use doctr (recommended on RTX), ppocr-v6, surya (in-process via surya-ocr), or tesseract."
-    )
+    reader = _easyocr_engine(cfg)
+    return _parse_easyocr_results(reader.readtext(img_path)), "easyocr"
+
+
+# ---------------------------------------------------------------------------
+# Tesseract baseline
 
 
 def _tesseract(img_path, cfg):
@@ -1622,6 +1660,7 @@ def clear_engine_caches() -> None:
     _PADDLE_ENGINES.clear()
     _DOCTR_ENGINES.clear()
     _SURYA_ENGINES.clear()
+    _EASYOCR_ENGINES.clear()
 
 
 if __name__ == "__main__":

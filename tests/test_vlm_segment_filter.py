@@ -39,3 +39,22 @@ def test_vlm_error_degrades_without_dropping(tmp_path, monkeypatch):
     out = vlm_segment_filter.filter_elements(_image(tmp_path), elements, cfg)
     assert len(out) == 1
     assert out[0]["id"] == "E0"
+
+
+def test_refine_role_sets_meta_role_after_keep(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def fake_multi(crop, prompt, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ('{"decision": "keep", "label": "icon"}', None)
+        return ('{"role": "button"}', None)
+
+    monkeypatch.setattr(vlm_segment_filter.vlm_client, "multi_pass_answer", fake_multi)
+    elements = [{"id": "E0", "box": {"x": 10, "y": 10, "w": 40, "h": 30}, "meta": {"role": "shape"}}]
+    cfg = {"vlm": {"segment_filter": {"enabled": True, "refine_role": {"enabled": True}}}}
+    out = vlm_segment_filter.filter_elements(_image(tmp_path), elements, cfg)
+    assert len(out) == 1
+    assert out[0]["meta"]["role"] == "button"
+    assert out[0]["meta"]["vlm_segment"]["refined_role"] == "button"
+    assert calls["n"] == 2

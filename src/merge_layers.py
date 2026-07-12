@@ -245,8 +245,20 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     candidates = text_cands + elem_cands
 
     # scene text: OCR line inside a photo region -> keep baked in the base.
-    # Flag with top-level kept_in_photo + meta.origin='scene' so routing.route drops it.
+    # VLM scene_text_role overrides geometry when confident; geometry remains fallback.
     for c in text_cands:
+        scene_text_role = c["meta"].get("scene_text_role")
+        if scene_text_role == "printed_on_product":
+            c["kept_in_photo"] = True
+            c["meta"]["origin"] = "scene"
+            c["meta"]["role"] = "scene-text"
+            continue
+        if scene_text_role == "wordmark":
+            c["meta"]["wordmark"] = True
+            c["meta"]["role"] = "logo"
+            continue
+        if scene_text_role == "overlay_copy":
+            continue
         if c["meta"].get("role") in overlay_text_roles:
             continue
         for pr in scene_regions:

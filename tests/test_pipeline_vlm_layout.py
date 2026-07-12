@@ -30,7 +30,7 @@ def _make_ad(tmp_path):
 
 def test_pipeline_order_applies_vlm_stages_when_enabled(monkeypatch, tmp_path):
     source = _make_ad(tmp_path)
-    calls = {"proofread": 0, "font_judge": 0, "segment_filter": 0}
+    calls = {"ocr_judge": 0, "proofread": 0, "scene_text": 0, "font_judge": 0, "segment_filter": 0}
     order = []
 
     def fake_ocr(path, cfg, run_dir=None):
@@ -44,6 +44,11 @@ def test_pipeline_order_applies_vlm_stages_when_enabled(monkeypatch, tmp_path):
                 "quad": [[20, 20], [100, 20], [100, 56], [20, 56]], "words": [],
             }],
         }
+
+    def fake_ocr_judge(path, raw, cfg):
+        calls["ocr_judge"] += 1
+        order.append("vlm-ocr-judge")
+        return raw
 
     def fake_proofread(path, raw, cfg):
         calls["proofread"] += 1
@@ -69,6 +74,13 @@ def test_pipeline_order_applies_vlm_stages_when_enabled(monkeypatch, tmp_path):
         line["painted"] = line["box"]
         return {**raw, "lines": [line], "blocks": [], "styles": []}
 
+    def fake_scene_text(path, ocr_res, cfg):
+        calls["scene_text"] += 1
+        order.append("vlm-scene-text")
+        out = dict(ocr_res)
+        out["vlm_scene_text"] = {"lines_classified": 1, "lines_checked": 1}
+        return out
+
     def fake_font_judge(path, ocr_res, cfg):
         calls["font_judge"] += 1
         order.append("vlm-font-judge")
@@ -90,8 +102,10 @@ def test_pipeline_order_applies_vlm_stages_when_enabled(monkeypatch, tmp_path):
         return [{"id": "T0", "target": "text", "text": "SALE!", "box": ocr_res["lines"][0]["box"]}]
 
     monkeypatch.setattr(run_pipeline.ocr, "run_ocr", fake_ocr)
+    monkeypatch.setattr(run_pipeline.vlm_ocr_judge, "judge_ocr_lines", fake_ocr_judge)
     monkeypatch.setattr(run_pipeline.vlm_proofread, "proofread_lines", fake_proofread)
     monkeypatch.setattr(run_pipeline.text_analysis, "analyze_text", fake_analyze)
+    monkeypatch.setattr(run_pipeline.vlm_scene_text, "classify_scene_text", fake_scene_text)
     monkeypatch.setattr(run_pipeline.vlm_font_judge, "judge_fonts", fake_font_judge)
     monkeypatch.setattr(run_pipeline.element_fusion, "fuse", fake_fuse)
     monkeypatch.setattr(run_pipeline.vlm_segment_filter, "filter_elements", fake_segment_filter)
@@ -105,6 +119,8 @@ def test_pipeline_order_applies_vlm_stages_when_enabled(monkeypatch, tmp_path):
             "device": "cpu",
             "vlm": {
                 "enabled": True,
+                "ocr_judge": {"enabled": True},
+                "scene_text": {"enabled": True},
                 "font_judge": {"enabled": True},
                 "segment_filter": {"enabled": True},
             },
@@ -118,14 +134,16 @@ def test_pipeline_order_applies_vlm_stages_when_enabled(monkeypatch, tmp_path):
     )
 
     assert result["ok"] is True
-    assert calls == {"proofread": 1, "font_judge": 1, "segment_filter": 1}
-    assert order.index("ocr") < order.index("vlm-proofread") < order.index("text")
-    assert order.index("text") < order.index("vlm-font-judge") < order.index("fusion")
+    assert calls == {"ocr_judge": 1, "proofread": 1, "scene_text": 1, "font_judge": 1, "segment_filter": 1}
+    assert order.index("ocr") < order.index("vlm-ocr-judge") < order.index("vlm-proofread") < order.index("text")
+    assert order.index("text") < order.index("vlm-scene-text") < order.index("vlm-font-judge") < order.index("fusion")
     assert order.index("fusion") < order.index("vlm-segment-filter") < order.index("merge")
     assert (run_dir / "fused_elements.json").exists()
     assert (run_dir / "elements.json").exists()
     assert json.loads((run_dir / "elements.json").read_text(encoding="utf-8")) == []
+    assert "vram:ocr->vlm-ocr-judge" in order
     assert "vram:ocr->vlm-proofread" in order
+    assert "vram:text->vlm-scene-text" in order
     assert "vram:text->vlm-font-judge" in order
     assert "vram:fusion->vlm-segment-filter" in order
 

@@ -77,6 +77,11 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
             c["target"] = "drop"; meta["kept_in_photo"] = True
             return c
         # wordmark / brand lettering → artwork, not editable text, never font-matched
+        if meta.get("scene_text_role") == "wordmark" or meta.get("wordmark"):
+            c["target"] = "image" if cfg and cfg.get("wordmark_as_raster", True) else "icon"
+            meta["wordmark"] = True
+            meta["role"] = meta.get("role") or "logo"
+            return c
         if is_wordmark_candidate({"text": c.get("text"), "box": c.get("box"), "id": c.get("id")}, canvas):
             c["target"] = "image" if cfg and cfg.get("wordmark_as_raster", True) else "icon"
             meta["wordmark"] = True

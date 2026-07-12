@@ -425,6 +425,45 @@ def test_ensemble_disagreement_lines_filters_confident_disputes():
     assert [line["text"] for line in picked] == ["SAVE 30%"]
 
 
-def test_easyocr_backend_stub_raises_import_error():
-  with pytest.raises(ImportError, match="not implemented"):
-      ocr._easyocr("fake.png", {})
+def test_parse_easyocr_readtext_results():
+    results = [
+        ([[10, 20], [150, 20], [150, 50], [10, 50]], "SAVE 30%", 0.93),
+        ([[12, 62], [132, 60], [133, 84], [13, 86]], "Today only", 0.81),
+    ]
+
+    lines = ocr._parse_easyocr_results(results)
+
+    assert [line["text"] for line in lines] == ["SAVE 30%", "Today only"]
+    assert lines[0]["box"] == _box(10, 20, 140, 30)
+    assert lines[1]["quad"][1] == [132.0, 60.0]
+    assert lines[0]["meta"]["backend_api"] == "easyocr-readtext"
+    assert lines[0]["words"] == []
+
+
+def test_easyocr_backend_uses_cached_reader(monkeypatch):
+    created = []
+
+    class _Reader:
+        def __init__(self, langs, gpu=False):
+            created.append((langs, gpu))
+
+        def readtext(self, path):
+            return [([[1, 2], [31, 2], [31, 12], [1, 12]], "Hello", 0.9)]
+
+    monkeypatch.setitem(sys.modules, "easyocr", SimpleNamespace(Reader=_Reader))
+    ocr._EASYOCR_ENGINES.clear()
+
+    lines, engine = ocr._easyocr("fake.png", {"device": "cuda", "ocr": {"lang": "en"}})
+
+    assert engine == "easyocr"
+    assert lines[0]["text"] == "Hello"
+    assert created == [(["en"], True)]
+
+    ocr._easyocr("fake2.png", {"device": "cuda", "ocr": {"lang": "en"}})
+    assert len(created) == 1
+
+
+def test_clear_engine_caches_clears_easyocr():
+    ocr._EASYOCR_ENGINES[("en", False)] = object()
+    ocr.clear_engine_caches()
+    assert ocr._EASYOCR_ENGINES == {}
