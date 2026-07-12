@@ -295,7 +295,9 @@ def propose_layers(img_path: str, run_dir: str, cfg: Optional[dict] = None):
     cfg = cfg or {}
     os.makedirs(run_dir, exist_ok=True)
     qcfg = cfg.get("qwen") or {}
-    if qcfg.get("enabled", True) is False:
+    # Layer diffusion is strictly opt-in. It is a separately served optional
+    # capability, so an absent config must never make an offline ComfyUI request.
+    if qcfg.get("enabled", False) is False:
         note = "qwen: disabled (SAM/residual pipeline remains active)"
         _write_manifest(schema, [], run_dir, note)
         return []
