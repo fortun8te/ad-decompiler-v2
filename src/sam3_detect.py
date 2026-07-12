@@ -371,6 +371,11 @@ class _OfficialSam3Backend:
             )
 
 
+def unload_backend() -> None:
+    """Release cached SAM3 backends so CUDA memory can be reclaimed between stages."""
+    _BACKEND_CACHE.clear()
+
+
 def _cached_official_backend(cfg: dict):
     """Reuse the 848M model/processor across images; only the image state is replaced."""
     key = (

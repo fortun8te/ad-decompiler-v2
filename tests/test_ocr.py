@@ -344,3 +344,87 @@ def test_run_ocr_failure_message_includes_cudnn_guidance(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="cuDNN"):
         ocr.run_ocr(str(image_path), {"ocr": {"primary": "ppocr-v6", "challengers": []}})
+
+
+def test_doctr_moves_predictor_to_configured_device(monkeypatch):
+    moved = []
+
+    class _Predictor:
+        def to(self, device):
+            moved.append(str(device))
+            return self
+
+        def __call__(self, document):
+            return SimpleNamespace(pages=[])
+
+    monkeypatch.setitem(sys.modules, "doctr", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "doctr.io", SimpleNamespace(
+        DocumentFile=SimpleNamespace(from_images=lambda path: "doc"),
+    ))
+    monkeypatch.setitem(sys.modules, "doctr.models", SimpleNamespace(
+        ocr_predictor=lambda **kwargs: _Predictor(),
+    ))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True),
+        device=lambda name: name,
+    ))
+
+    ocr._DOCTR_ENGINES.clear()
+    ocr._doctr("fake.png", {"device": "cuda"})
+
+    assert moved == ["cuda"]
+
+
+def test_doctr_falls_back_to_cpu_when_cuda_unavailable(monkeypatch):
+    moved = []
+
+    class _Predictor:
+        def to(self, device):
+            moved.append(str(device))
+            return self
+
+        def __call__(self, document):
+            return SimpleNamespace(pages=[])
+
+    monkeypatch.setitem(sys.modules, "doctr", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "doctr.io", SimpleNamespace(
+        DocumentFile=SimpleNamespace(from_images=lambda path: "doc"),
+    ))
+    monkeypatch.setitem(sys.modules, "doctr.models", SimpleNamespace(
+        ocr_predictor=lambda **kwargs: _Predictor(),
+    ))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: False),
+        device=lambda name: name,
+    ))
+
+    ocr._DOCTR_ENGINES.clear()
+    ocr._doctr("fake.png", {"device": "cuda"})
+
+    assert moved == ["cpu"]
+
+
+def test_ensemble_disagreement_lines_filters_confident_disputes():
+    lines = [
+        {
+            "text": "SAVE 30%", "conf": 0.93, "box": _box(1, 2, 30, 10),
+            "meta": {"disagreement": ["SAVE 30%", "SAVF 30%"]},
+        },
+        {
+            "text": "LOW", "conf": 0.55, "box": _box(1, 20, 30, 10),
+            "meta": {"disagreement": ["LOW", "L0W"]},
+        },
+        {"text": "OK", "conf": 0.99, "box": _box(1, 40, 30, 10), "meta": {}},
+    ]
+
+    picked = ocr.ensemble_disagreement_lines(
+        lines,
+        {"ocr": {"ensemble_disagreement": {"enabled": True, "min_confidence": 0.85}}},
+    )
+
+    assert [line["text"] for line in picked] == ["SAVE 30%"]
+
+
+def test_easyocr_backend_stub_raises_import_error():
+  with pytest.raises(ImportError, match="not implemented"):
+      ocr._easyocr("fake.png", {})

@@ -92,6 +92,8 @@ def main():
     parser.add_argument("--output", default="runs/benchmark", help="benchmark report/run root")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--resume", default="normalize", choices=STAGES)
+    parser.add_argument("--auto-repair", action="store_true",
+                        help="enable runtime.auto_repair for each benchmark image")
     parser.add_argument("--skip-doctor", action="store_true",
                         help="development only; benchmark normally refuses an unready model machine")
     args = parser.parse_args()
@@ -99,6 +101,8 @@ def main():
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     cfg = load_cfg(args.config)
+    if args.auto_repair:
+        cfg.setdefault("runtime", {})["auto_repair"] = True
     if not args.skip_doctor:
         preflight = inspect_machine(cfg, Path(__file__).resolve().parent)
         (output / "doctor.json").write_text(json.dumps(preflight, indent=2), encoding="utf-8")

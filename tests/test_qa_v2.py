@@ -1,4 +1,5 @@
 """CPU-only tests for local visual metrics and structural QA gates."""
+import json
 import os
 import sys
 
@@ -7,6 +8,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src import pixel_diff, repair  # noqa: E402
+from src.qa_config import DEFAULT_VISUAL_PASS_SSIM, pixel_diff_thresholds, visual_pass_ssim  # noqa: E402
 
 
 def _scene(path, size=(128, 96)):
@@ -39,6 +41,7 @@ def test_identical_image_scores_perfect_across_all_metrics(tmp_path):
     assert result["delta_e_mean"] == 0.0
     assert result["visual_score"] == 1.0
     assert result["hard_fails"] == []
+    assert result["per_layer"] == []
     assert os.path.exists(result["diff_png"])
 
 
@@ -217,6 +220,114 @@ def test_figma_import_report_becomes_a_qa_failure_when_compiler_rejects_layers(t
         design={"id": "demo", "layers": [], "meta": {}},
     )
     assert {"missing-assets", "figma-compiler-errors"} <= _rules(result)
+
+
+def test_visual_pass_ssim_unifies_pixel_diff_repair_and_pipeline_gate():
+    """qa.visual_pass_ssim is the single acceptance bar for pixel_diff hard-fails,
+    repair ssim/visual_score suggestions, and run_pipeline qa.ok.
+    """
+    cfg = {"qa": {"visual_pass_ssim": 0.9}}
+    assert visual_pass_ssim(cfg) == 0.9
+    assert visual_pass_ssim({}) == DEFAULT_VISUAL_PASS_SSIM
+    assert pixel_diff_thresholds(cfg)["local_ssim_min"] == 0.9
+    assert pixel_diff.DEFAULT_THRESHOLDS["local_ssim_min"] == DEFAULT_VISUAL_PASS_SSIM
+
+    below = repair.assess({}, {"ssim": 0.88, "visual_score": 0.88}, {}, cfg)
+    assert any("ssim 0.88 < 0.9" in item["reason"] for item in below)
+    assert any("visual score 0.88 < 0.90" in item["reason"] for item in below)
+
+    relaxed = {"qa": {"visual_pass_ssim": 0.85}}
+    assert not any(
+        item.get("action") == "retry" and "ssim" in item.get("reason", "")
+        for item in repair.assess({}, {"ssim": 0.88, "visual_score": 0.88}, {}, relaxed)
+    )
+
+
+def test_per_layer_populated_from_reconstruction_stats_for_text_layers(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (100, 80), "white")
+    image.save(source)
+    image.save(render)
+    (tmp_path / "reconstruction.json").write_text(json.dumps({
+        "stats": {
+            "per_layer": [
+                {"id": "headline", "type": "text", "role": "headline", "ssim": 0.72, "recall": 0.65},
+                {"id": "logo", "type": "icon", "score": 0.71},
+            ],
+        },
+        "candidates": [
+            {"id": "headline", "target": "text", "text": "SALE", "meta": {"role": "headline"}},
+        ],
+    }), encoding="utf-8")
+    design = {
+        "layers": [
+            {"id": "headline", "type": "text", "text": "SALE",
+             "style": {"fontFamily": "Inter"}, "meta": {"role": "headline"}},
+        ],
+        "meta": {"editable_ratio": 1.0},
+    }
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
+
+    assert len(result["per_layer"]) == 1
+    row = result["per_layer"][0]
+    assert row["id"] == "headline"
+    assert row["ssim"] == 0.72
+    assert row["recall"] == 0.65
+    assert row["score"] == 0.65
+
+
+def test_per_layer_reads_candidate_meta_qa_for_design_text_layers(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (100, 80), "white")
+    image.save(source)
+    image.save(render)
+    (tmp_path / "reconstruction.json").write_text(json.dumps({
+        "stats": {"canonical_entities": 1},
+        "candidates": [
+            {
+                "id": "cta",
+                "target": "text",
+                "text": "BUY NOW",
+                "meta": {"role": "cta", "qa": {"ssim": 0.81, "recall": 0.9}},
+            },
+        ],
+    }), encoding="utf-8")
+    design = {
+        "layers": [
+            {"id": "cta", "type": "text", "text": "BUY NOW",
+             "style": {"fontFamily": "Inter"}, "meta": {"role": "cta", "source_id": "cta"}},
+        ],
+        "meta": {"editable_ratio": 1.0},
+    }
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
+
+    assert result["per_layer"] == [{
+        "id": "cta",
+        "type": "text",
+        "role": "cta",
+        "ssim": 0.81,
+        "recall": 0.9,
+        "score": 0.81,
+    }]
+
+
+def test_repair_consumes_per_layer_text_scores():
+    repairs = repair.assess(
+        {},
+        {"per_layer": [{"id": "headline", "type": "text", "role": "headline", "score": 0.55}]},
+        {"lines": []},
+        {},
+    )
+    assert any(
+        item["stage"] == "build"
+        and item["action"] == "review"
+        and item["target_id"] == "headline"
+        for item in repairs
+    )
 
 
 def test_repair_consumes_nested_structural_failures_and_new_metrics():

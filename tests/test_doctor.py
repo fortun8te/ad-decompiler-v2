@@ -111,3 +111,40 @@ def test_doctor_reports_tesseract_fallback_when_binary_present(tmp_path, monkeyp
     }, Path(tmp_path))
     if not report["blockers"]:
         assert summary["ok"] is True
+
+
+def test_doctor_reports_doctr_gpu_check_when_primary_is_doctr_on_cuda(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: name == "doctr")
+    monkeypatch.setattr("doctor._torch", lambda device: {"name": "cuda", "ok": True, "required": True, "detail": "fake"})
+    monkeypatch.setattr("doctor._cudnn", lambda device: {"name": "cudnn", "ok": True, "required": False, "detail": "ok"})
+    monkeypatch.setattr("doctor._doctr_gpu", lambda device, primary: {
+        "name": "doctr gpu", "ok": True, "required": True, "detail": "doctr will run on RTX 5080",
+    })
+
+    report = inspect({
+        "device": "cuda",
+        "ocr": {"primary": "doctr"},
+        "qwen": {"enabled": False},
+    }, Path(tmp_path))
+
+    doctr_gpu = next(item for item in report["checks"] if item["name"] == "doctr gpu")
+    assert doctr_gpu["ok"] is True
+    assert doctr_gpu["required"] is True
+
+
+def test_doctor_blocks_when_doctr_primary_but_cuda_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: name == "doctr")
+    monkeypatch.setattr("doctor._torch", lambda device: {"name": "cuda", "ok": False, "required": True, "detail": "missing"})
+    monkeypatch.setattr("doctor._cudnn", lambda device: {"name": "cudnn", "ok": True, "required": False, "detail": "ok"})
+    monkeypatch.setattr("doctor._doctr_gpu", lambda device, primary: {
+        "name": "doctr gpu", "ok": False, "required": True,
+        "detail": "torch cannot see a CUDA device for doctr primary",
+    })
+
+    report = inspect({
+        "device": "cuda",
+        "ocr": {"primary": "doctr"},
+        "qwen": {"enabled": False},
+    }, Path(tmp_path))
+
+    assert any(item["name"] == "doctr gpu" and not item["ok"] for item in report["blockers"])

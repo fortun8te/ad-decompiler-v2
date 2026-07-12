@@ -16,12 +16,12 @@ import importlib
 import os
 from typing import Optional
 
+from src.qa_config import visual_pass_ssim
+
 # thresholds (overridable via cfg.repair)
 DEFAULTS = {
     "text_recall_min": 0.85,
     "editable_text_recall_min": 0.80,
-    "ssim_min": 0.80,
-    "visual_score_min": 0.80,
     "edge_f1_min": 0.68,
     "color_similarity_min": 0.82,
     "editable_ratio_min": 0.15,
@@ -38,7 +38,10 @@ def _sev(x):
 
 def assess(design, qa, ocr, cfg: Optional[dict] = None):
     cfg = cfg or {}
+    pass_ssim = visual_pass_ssim(cfg)
     t = dict(DEFAULTS)
+    t["ssim_min"] = pass_ssim
+    t["visual_score_min"] = pass_ssim
     t.update(cfg.get("repair") or {})
     out = []
 

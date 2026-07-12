@@ -33,6 +33,21 @@ MARKER_HTML = re.compile(
     r"^    const PLUGIN_BUILD = \{.*?\};$",
     re.MULTILINE | re.DOTALL,
 )
+EMBED_JS = re.compile(
+    r"^const PLUGIN_BUILD = (\{.*?\});$",
+    re.MULTILINE | re.DOTALL,
+)
+EMBED_HTML = re.compile(
+    r"^    const PLUGIN_BUILD = (\{.*?\});$",
+    re.MULTILINE | re.DOTALL,
+)
+# Stamp-managed paths must not affect the dirty flag — after git pull the stamp
+# itself updates these files, which would otherwise keep dirty=true forever.
+STAMP_MANAGED = (
+    "figma-plugin/build-info.json",
+    "figma-plugin/code.js",
+    "figma-plugin/ui.html",
+)
 
 
 def _read_version() -> str:
@@ -57,11 +72,7 @@ def _git_info() -> dict:
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
-        dirty = subprocess.call(
-            ["git", "diff", "--quiet", "HEAD", "--"],
-            cwd=ROOT,
-            stderr=subprocess.DEVNULL,
-        ) != 0
+        dirty = _repo_dirty_excluding_stamp()
         return {
             "build": int(count),
             "commit": commit,
@@ -70,6 +81,28 @@ def _git_info() -> dict:
         }
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         return {}
+
+
+def _repo_dirty_excluding_stamp() -> bool:
+    try:
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=ROOT,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return True
+    excluded = set(STAMP_MANAGED)
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path not in excluded:
+            return True
+    return False
 
 
 def _fallback_build() -> int:
@@ -133,6 +166,25 @@ def _stable_key(info: dict) -> tuple:
     return (info.get("version"), info.get("build"), info.get("commit"), info.get("dirty"))
 
 
+def _embedded_build_info(text: str, pattern: re.Pattern[str]) -> dict | None:
+    match = pattern.search(text)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _embedded_matches_info(info: dict) -> bool:
+    code_embed = _embedded_build_info(CODE_JS.read_text(encoding="utf-8"), EMBED_JS)
+    html_embed = _embedded_build_info(UI_HTML.read_text(encoding="utf-8"), EMBED_HTML)
+    if code_embed is None or html_embed is None:
+        return False
+    return _stable_key(code_embed) == _stable_key(info) and _stable_key(html_embed) == _stable_key(info)
+
+
 def stamp_files(info: dict | None = None, *, force: bool = False) -> dict:
     info = info or compute_build_info()
     existing = None
@@ -141,7 +193,12 @@ def stamp_files(info: dict | None = None, *, force: bool = False) -> dict:
             existing = json.loads(BUILD_INFO.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             existing = None
-    if not force and isinstance(existing, dict) and _stable_key(existing) == _stable_key(info):
+    if (
+        not force
+        and isinstance(existing, dict)
+        and _stable_key(existing) == _stable_key(info)
+        and _embedded_matches_info(info)
+    ):
         info["built_at"] = existing.get("built_at", info["built_at"])
         info["label"] = existing.get("label", info["label"])
         return info

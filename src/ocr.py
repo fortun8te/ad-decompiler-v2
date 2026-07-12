@@ -798,13 +798,24 @@ def _parse_doctr_document(document: Any) -> list:
     return lines
 
 
+def _torch_device_name(cfg: dict) -> str:
+    """Map config device string to a torch device name."""
+    device_key = str(cfg.get("device", "cpu")).lower()
+    return "cuda" if device_key.startswith("cuda") else "cpu"
+
+
 def _doctr(img_path, cfg):
     try:
         from doctr.io import DocumentFile
         from doctr.models import ocr_predictor
+        import torch
     except ImportError as error:  # pragma: no cover
         raise ImportError("docTR backend requires python-doctr.  pip install python-doctr[torch]") from error
-    key = (str(cfg.get("device", "cpu")),)
+    device = _torch_device_name(cfg)
+    if device == "cuda" and not torch.cuda.is_available():
+        print("[ocr] doctr CUDA requested but torch cannot see a GPU; using CPU")
+        device = "cpu"
+    key = (device,)
     predictor = _DOCTR_ENGINES.get(key)
     if predictor is None:
         try:
@@ -814,6 +825,8 @@ def _doctr(img_path, cfg):
             )
         except TypeError:
             predictor = ocr_predictor(pretrained=True)
+        if hasattr(predictor, "to"):
+            predictor = predictor.to(torch.device(device))
         _DOCTR_ENGINES[key] = predictor
     document = DocumentFile.from_images(img_path)
     return _parse_doctr_document(predictor(document)), "doctr"
@@ -821,6 +834,14 @@ def _doctr(img_path, cfg):
 
 # ---------------------------------------------------------------------------
 # Tesseract baseline
+
+
+def _easyocr(img_path, cfg):
+    """Reserved backend — not wired yet. Use doctr, ppocr-v6, surya, or tesseract."""
+    raise ImportError(
+        "EasyOCR backend is not implemented in this repo. "
+        "Use doctr (recommended on RTX), ppocr-v6, surya (in-process via surya-ocr), or tesseract."
+    )
 
 
 def _tesseract(img_path, cfg):
@@ -871,8 +892,30 @@ _BACKENDS = {
     "ppocr": _paddle,
     "surya": _surya,
     "doctr": _doctr,
+    "easyocr": _easyocr,
     "tesseract": _tesseract,
 }
+
+
+def ensemble_disagreement_lines(lines: Iterable[dict], cfg: Optional[dict] = None) -> list[dict]:
+    """Return fused OCR lines where challengers disagreed and the winner looks confident."""
+    ocr_cfg = (cfg or {}).get("ocr") or {}
+    setting = ocr_cfg.get("ensemble_disagreement")
+    if not setting:
+        return []
+    min_confidence = 0.85
+    if isinstance(setting, dict):
+        if not setting.get("enabled", True):
+            return []
+        min_confidence = _float(setting.get("min_confidence"), min_confidence)
+    output = []
+    for line in lines or []:
+        meta = line.get("meta") or {}
+        if not meta.get("disagreement"):
+            continue
+        if _float(line.get("conf")) >= min_confidence and line.get("box"):
+            output.append(line)
+    return output
 
 
 def _tesseract_available() -> bool:
@@ -1572,6 +1615,13 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         os.makedirs(run_dir, exist_ok=True)
         schema.dump(result, os.path.join(run_dir, "ocr.json"))
     return result
+
+
+def clear_engine_caches() -> None:
+    """Release cached OCR backends so CUDA memory can be reclaimed between stages."""
+    _PADDLE_ENGINES.clear()
+    _DOCTR_ENGINES.clear()
+    _SURYA_ENGINES.clear()
 
 
 if __name__ == "__main__":

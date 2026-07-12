@@ -1,7 +1,18 @@
 import json
 import os
 
-from src.error_messages import classify_processing_error, detect_failed_stage
+from src.error_messages import classify_processing_error, detect_failed_stage, tail_running_stage
+
+
+def test_tail_running_stage_reads_last_pipeline_marker(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "pipeline.log").write_text(
+        "[12:00:00] normalize → 1080x1080\n"
+        "[12:00:05] ocr[doctr] → 2 lines\n",
+        encoding="utf-8",
+    )
+    assert tail_running_stage(str(run_dir)) == "ocr"
 
 
 def test_detect_failed_stage_ocr_after_normalize_without_ocr_success(tmp_path):

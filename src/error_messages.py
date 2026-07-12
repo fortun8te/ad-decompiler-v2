@@ -41,7 +41,8 @@ _STAGE_MARKERS = [
     ("qa", "qa →"),
 ]
 
-_STAGE_ORDER = [name for name, _ in _STAGE_MARKERS]
+STAGE_ORDER = [name for name, _ in _STAGE_MARKERS]
+_STAGE_ORDER = STAGE_ORDER
 
 _OCR_BLOB = re.compile(
     r"ocr|paddle|ppocr|paddleocr|tesseract|surya|doctr|no configured OCR backend",
@@ -122,6 +123,18 @@ def _failed_stage_from_agent_debug(agent_debug: list[dict[str, Any]] | None) -> 
             if needle in location:
                 return stage
     return None
+
+
+def tail_running_stage(run_dir: str | None) -> str | None:
+    """Last pipeline stage seen in pipeline.log — for live progress, not failure inference."""
+    if not run_dir:
+        return None
+    try:
+        with open(os.path.join(run_dir, "pipeline.log"), encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    return _tail_stage_from_log(lines)
 
 
 def detect_failed_stage(

@@ -149,3 +149,21 @@ def test_max_lines_caps_vlm_calls(tmp_path, monkeypatch):
     cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "max_lines": 2, "passes": 2}}
     vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
     assert len(calls) == 4
+
+
+def test_ensemble_disagreement_proofreads_high_confidence_disputed_line(tmp_path, monkeypatch):
+    monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: "SAVE 30%")
+    ocr_result = {
+        "lines": [{
+            "id": "L0", "text": "SAVF 30%", "conf": 0.93,
+            "box": {"x": 10, "y": 10, "w": 80, "h": 20},
+            "meta": {"disagreement": ["SAVE 30%", "SAVF 30%"]},
+        }],
+    }
+    cfg = {
+        "vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2},
+        "ocr": {"ensemble_disagreement": {"enabled": True, "min_confidence": 0.85}},
+    }
+    out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
+    assert out["lines"][0]["text"] == "SAVE 30%"
+    assert out["vlm_proofread"]["ensemble_disagreement_checked"] == 1

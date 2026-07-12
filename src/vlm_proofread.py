@@ -136,8 +136,24 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     padding = int(vcfg.get("padding", _DEFAULT_PADDING))
     max_lines = vcfg.get("max_lines")
     passes = int(vcfg.get("passes", _DEFAULT_PASSES))
+    ocr_cfg = (cfg or {}).get("ocr") or {}
+    ensemble_cfg = ocr_cfg.get("ensemble_disagreement")
+    ensemble_enabled = bool(ensemble_cfg)
+    ensemble_min_conf = 0.85
+    if isinstance(ensemble_cfg, dict):
+        ensemble_enabled = bool(ensemble_cfg.get("enabled", True))
+        ensemble_min_conf = float(ensemble_cfg.get("min_confidence", ensemble_min_conf))
 
-    candidates = [ln for ln in lines if float(ln.get("conf", 1.0)) < threshold and ln.get("box")]
+    def _proofread_candidate(line: dict) -> bool:
+        if not line.get("box"):
+            return False
+        if float(line.get("conf", 1.0)) < threshold:
+            return True
+        if ensemble_enabled and (line.get("meta") or {}).get("disagreement"):
+            return float(line.get("conf", 0.0)) >= ensemble_min_conf
+        return False
+
+    candidates = [ln for ln in lines if _proofread_candidate(ln)]
     if max_lines is not None:
         candidates = candidates[: int(max_lines)]
     if not candidates:
@@ -153,12 +169,20 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     corrected = 0
     disagreements = 0
     errors = 0
+    ensemble_checked = 0
     notes: list[dict] = []
     for line in candidates:
+        is_ensemble = (
+            ensemble_enabled
+            and float(line.get("conf", 0.0)) >= threshold
+            and bool((line.get("meta") or {}).get("disagreement"))
+        )
         crop = _crop_bytes(image, line["box"], padding)
         if crop is None:
             continue
         checked += 1
+        if is_ensemble:
+            ensemble_checked += 1
         answer, note = _multi_pass_answer(
             crop,
             base_url=base_url,
@@ -190,6 +214,7 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
         "lines_corrected": corrected,
         "lines_disagreed": disagreements,
         "lines_errored": errors,
+        "ensemble_disagreement_checked": ensemble_checked,
         "notes": notes,
     }
     return result

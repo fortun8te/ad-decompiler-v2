@@ -489,6 +489,44 @@ const sceneV2 = {
         { id: "stack-front", type: "shape", name: "Front", box: { x: 0, y: 0, w: 60, h: 60 }, fill: "#eeeeee", z_index: 1 },
       ],
     },
+    {
+      id: "card-panel",
+      type: "group",
+      name: "Card panel",
+      box: { x: 40, y: 840, w: 180, h: 100 },
+      fill: { kind: "flat", color: "#f2f2f2" },
+      radius: 12,
+      z_index: 12,
+      children: [
+        { id: "card-copy", type: "text", name: "Card copy", box: { x: 16, y: 36, w: 148, h: 28 }, text: "Panel", style: { fontFamily: "Inter", fontSize: 16, color: "#111111" } },
+      ],
+    },
+    {
+      id: "stretch-stack",
+      type: "frame",
+      name: "Stretch stack",
+      box: { x: 260, y: 840, w: 220, h: 120 },
+      layout: { mode: "vertical", gap: 8, padding: 12 },
+      z_index: 13,
+      children: [
+        {
+          id: "stretch-line",
+          type: "text",
+          name: "Stretch line",
+          box: { x: 12, y: 12, w: 196, h: 28 },
+          text: "Full width",
+          layout: { layoutGrow: 1, layoutSizingHorizontal: "FILL" },
+          style: {
+            fontFamily: "Inter",
+            fontStyle: "Regular",
+            fontWeight: 700,
+            fontSize: 18,
+            color: "#111111",
+            fontWeightCandidates: [{ value: 700, score: 0.92 }, { value: 400, score: 0.4 }],
+          },
+        },
+      ],
+    },
   ],
 };
 
@@ -576,6 +614,21 @@ assert.deepEqual(
   stackFrame.children.map((child) => child.getPluginData("adDecompilerLayerId")),
   ["stack-back", "stack-front"],
   "z-order follows the design JSON's declared layer stack, not incidental x/y geometry"
+);
+
+const cardPanel = nodeForLayer(firstRoot, "card-panel");
+assert.equal(cardPanel.type, "FRAME", "card panels with background fills promote groups to frames");
+assert.equal(cardPanel.fills[0].type, "SOLID");
+assert.equal(cardPanel.cornerRadius, 12);
+
+const stretchLine = nodeForLayer(firstRoot, "stretch-line");
+assert.equal(stretchLine.fontName.style, "Bold", "fontWeightCandidates steer installed style selection");
+assert.equal(stretchLine.layoutGrow, 1);
+assert.equal(stretchLine.layoutSizingHorizontal, "FILL");
+assert.equal(
+  first.fonts.selections.find((selection) => selection.label === "Stretch line").rank,
+  1,
+  "weight candidates resolve the bold installed style for the primary family"
 );
 
 function approxEqual(actual, expected, label) {
@@ -712,6 +765,16 @@ const buildInfo = JSON.parse(fs.readFileSync("figma-plugin/build-info.json", "ut
 assert.ok(typeof buildInfo.build === "number", "build-info.json carries build number");
 assert.ok(code.includes("const PLUGIN_BUILD = "), "code.js embeds PLUGIN_BUILD");
 assert.ok(html.includes("const PLUGIN_BUILD = "), "ui.html embeds PLUGIN_BUILD");
+const codeBuild = JSON.parse(code.match(/const PLUGIN_BUILD = (\{.*?\});/s)?.[1] ?? "null");
+const htmlBuild = JSON.parse(html.match(/const PLUGIN_BUILD = (\{.*?\});/s)?.[1] ?? "null");
+for (const [name, embedded] of [["code.js", codeBuild], ["ui.html", htmlBuild]]) {
+  assert.ok(embedded, `${name} PLUGIN_BUILD parses as JSON`);
+  assert.equal(embedded.version, buildInfo.version, `${name} version matches build-info.json`);
+  assert.equal(embedded.build, buildInfo.build, `${name} build matches build-info.json`);
+  assert.equal(embedded.commit, buildInfo.commit, `${name} commit matches build-info.json`);
+  assert.equal(embedded.dirty, buildInfo.dirty, `${name} dirty matches build-info.json`);
+  assert.equal(embedded.label, buildInfo.label, `${name} label matches build-info.json`);
+}
 assert.ok(html.includes('id="buildBadge"'), "ui.html shows build badge");
 assert.ok(!("version" in manifest) && !("build" in manifest), "manifest.json has no custom version/build keys");
 

@@ -17,6 +17,7 @@ Endpoints:
                                    re-stages /inbox.json + /design.json when done. Returns
                                    {job_id, status:"queued"} immediately — poll with:
     GET  /process?job_id=x     -> {status:"running"|"done"|"failed", ...}
+    GET  /run-summary?job_id=x -> manifest + staging fields for a finished job (no inbox race)
                                    Requires the pipeline's own deps (torch, paddleocr, sam3,
                                    ...) to be importable in this interpreter; the /process
                                    routes lazy-import run_pipeline so the bridge itself still
@@ -30,7 +31,12 @@ from urllib.parse import urlparse, parse_qs
 
 from src.console_io import configure_stdio, safe_print
 from src.agent_debug import log as _agent_log, tail as _agent_debug_tail
-from src.error_messages import classify_processing_error, detect_failed_stage
+from src.error_messages import (
+    STAGE_ORDER,
+    classify_processing_error,
+    detect_failed_stage,
+    tail_running_stage,
+)
 
 
 def _safe_name(name, fallback="upload"):
@@ -54,29 +60,170 @@ def _load_cfg(path):
             return json.load(fh)
 
 
-def _tail_stage(run_dir):
-    """Best-effort read of pipeline.log's last matched stage — purely informational, never
-    raises (a half-written line or a run_dir that doesn't exist yet just means 'no stage yet')."""
-    return detect_failed_stage(run_dir)
-
-
 def _history_path(inbox):
     return os.path.join(inbox, ".process_history.json")
+
+
+def _tail_stage(run_dir):
+    """Best-effort read of pipeline.log's last matched stage — purely informational."""
+    return tail_running_stage(run_dir)
+
+
+_HISTORY_MAX = 10
+_STAGE_PROGRESS_IN_STAGE = 0.35  # assume ~35% through the active stage for ETA/progress
+
+
+def _empty_history():
+    return {"durations_s": [], "runs": []}
 
 
 def _read_history(inbox):
     try:
         with open(_history_path(inbox), encoding="utf-8") as fh:
             data = json.load(fh)
-        return [float(d) for d in data.get("durations_s") or [] if isinstance(d, (int, float))]
     except (OSError, ValueError, TypeError):
-        return []
+        return _empty_history()
+    runs = data.get("runs") or []
+    durations = [
+        float(d) for d in (data.get("durations_s") or [])
+        if isinstance(d, (int, float))
+    ]
+    if not runs and durations:
+        runs = [{"duration_s": d} for d in durations]
+    cleaned = []
+    for entry in runs:
+        if not isinstance(entry, dict):
+            continue
+        duration = entry.get("duration_s")
+        if not isinstance(duration, (int, float)):
+            continue
+        row = {"duration_s": float(duration)}
+        fracs = entry.get("stage_fractions")
+        if isinstance(fracs, dict):
+            row["stage_fractions"] = {
+                str(k): float(v) for k, v in fracs.items()
+                if k in STAGE_ORDER and isinstance(v, (int, float)) and v >= 0
+            }
+        cleaned.append(row)
+    cleaned = cleaned[-_HISTORY_MAX:]
+    return {
+        "durations_s": [row["duration_s"] for row in cleaned],
+        "runs": cleaned,
+    }
 
 
-def _record_history(inbox, duration_s):
-    durations = (_read_history(inbox) + [duration_s])[-10:]  # a short rolling window adapts to a changed machine/config
+def _parse_stage_fractions(run_dir, total_s):
+    """Derive per-stage time fractions from pipeline.log timestamps."""
+    if not run_dir or not total_s or total_s <= 0:
+        return None
+    log_path = os.path.join(run_dir, "pipeline.log")
     try:
-        _atomic_write(_history_path(inbox), json.dumps({"durations_s": durations}).encode())
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    stamps = []
+    for line in lines:
+        m = re.search(r"\[(\d{2}):(\d{2}):(\d{2})\]", line)
+        if not m:
+            continue
+        secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        stage = None
+        for name, marker in (
+            ("normalize", "normalize →"),
+            ("ocr", "ocr["),
+            ("text", "text analysis →"),
+            ("residual", "residual proposals →"),
+            ("qwen", "qwen →"),
+            ("sam", "sam3["),
+            ("elements", "element fusion →"),
+            ("merge", "merge →"),
+            ("reconstruct", "reconstruct →"),
+            ("layout", "layout →"),
+            ("design", "design.json →"),
+            ("preview", "preview →"),
+            ("figma", "figma import:"),
+            ("export", "export:"),
+            ("qa", "qa →"),
+        ):
+            if marker in line:
+                stage = name
+                break
+        if stage:
+            stamps.append((secs, stage))
+    if len(stamps) < 2:
+        return None
+    durations = {}
+    for i in range(len(stamps) - 1):
+        delta = stamps[i + 1][0] - stamps[i][0]
+        if delta < 0:
+            delta += 24 * 3600
+        if delta > 0:
+            durations[stamps[i][1]] = durations.get(stamps[i][1], 0.0) + delta
+    tail = stamps[-1][1]
+    tail_delta = max(0.0, float(total_s) - sum(durations.values()))
+    if tail_delta > 0:
+        durations[tail] = durations.get(tail, 0.0) + tail_delta
+    accounted = sum(durations.values()) or float(total_s)
+    return {stage: round(max(0.0, secs) / accounted, 4) for stage, secs in durations.items()}
+
+
+def _median_stage_weights(history):
+    runs = [row for row in history.get("runs") or [] if row.get("stage_fractions")]
+    if not runs:
+        return None
+    weights = {stage: 0.0 for stage in STAGE_ORDER}
+    for row in runs:
+        fracs = row.get("stage_fractions") or {}
+        for stage in STAGE_ORDER:
+            weights[stage] += float(fracs.get(stage, 0.0))
+    n = len(runs)
+    return {stage: weights[stage] / n for stage in STAGE_ORDER}
+
+
+def _stage_progress_fraction(stage, weights=None):
+    weights = weights or {s: 1.0 / max(1, len(STAGE_ORDER)) for s in STAGE_ORDER}
+    if stage not in STAGE_ORDER:
+        return 0.0
+    idx = STAGE_ORDER.index(stage)
+    completed = sum(weights.get(STAGE_ORDER[i], 0.0) for i in range(idx))
+    current = weights.get(stage, 0.0) * _STAGE_PROGRESS_IN_STAGE
+    return min(0.98, max(0.0, completed + current))
+
+
+def _estimate_eta(inbox, elapsed_s, stage=None):
+    history = _read_history(inbox)
+    durations = history.get("durations_s") or []
+    if not durations:
+        return None, 0, None
+    median_total = statistics.median(durations)
+    weights = _median_stage_weights(history)
+    if stage and stage in STAGE_ORDER:
+        progress = _stage_progress_fraction(stage, weights)
+    else:
+        progress = min(0.95, max(0.05, elapsed_s / median_total)) if median_total > 0 else 0.05
+    progress = max(0.05, min(0.98, progress))
+    remaining = max(0.0, median_total * (1.0 - progress) - elapsed_s)
+    cap = max(30.0, median_total * 1.25)
+    eta_s = min(remaining, cap)
+    progress_pct = round(progress * 100)
+    return round(eta_s, 1), len(durations), progress_pct
+
+
+def _record_history(inbox, duration_s, run_dir=None):
+    history = _read_history(inbox)
+    entry = {"duration_s": float(duration_s)}
+    fracs = _parse_stage_fractions(run_dir, duration_s)
+    if fracs:
+        entry["stage_fractions"] = fracs
+    runs = (history.get("runs") or []) + [entry]
+    runs = runs[-_HISTORY_MAX:]
+    payload = {
+        "durations_s": [row["duration_s"] for row in runs],
+        "runs": runs,
+    }
+    try:
+        _atomic_write(_history_path(inbox), json.dumps(payload).encode())
     except OSError:
         pass
 
@@ -104,6 +251,30 @@ def _atomic_write(path, data: bytes):
                 os.unlink(temp_path)
             except OSError:
                 pass
+            raise
+
+
+_plugin_log_lock = threading.Lock()
+
+
+def _atomic_append_text(path, text: str):
+    """Append UTF-8 text via read-modify-write atomic replace with retry."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    block = text.encode("utf-8")
+    for attempt in range(2):
+        try:
+            existing = b""
+            try:
+                with open(path, "rb") as fh:
+                    existing = fh.read()
+            except OSError:
+                pass
+            _atomic_write(path, existing + block)
+            return
+        except PermissionError:
+            if attempt == 0:
+                time.sleep(0.05)
+                continue
             raise
 
 
@@ -149,25 +320,25 @@ def _append_plugin_logs(inbox, events, manifest=None):
         if detail:
             line += f" — {detail}"
         lines.append(line + "\n")
-    for path in paths:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.writelines(lines)
-    json_path = os.path.join(inbox, "plugin_events.json")
-    existing = []
-    try:
-        with open(json_path, encoding="utf-8") as fh:
-            existing = json.load(fh)
-        if not isinstance(existing, list):
-            existing = []
-    except (OSError, ValueError, TypeError):
+    text = "".join(lines)
+    with _plugin_log_lock:
+        for path in paths:
+            _atomic_append_text(path, text)
+        json_path = os.path.join(inbox, "plugin_events.json")
         existing = []
-    existing.extend(events)
-    existing = existing[-5000:]
-    payload = json.dumps(existing, ensure_ascii=False, indent=2).encode("utf-8")
-    _atomic_write(json_path, payload)
-    if run_dir:
-        _atomic_write(os.path.join(run_dir, "plugin_events.json"), payload)
+        try:
+            with open(json_path, encoding="utf-8") as fh:
+                existing = json.load(fh)
+            if not isinstance(existing, list):
+                existing = []
+        except (OSError, ValueError, TypeError):
+            existing = []
+        existing.extend(events)
+        existing = existing[-5000:]
+        payload = json.dumps(existing, ensure_ascii=False, indent=2).encode("utf-8")
+        _atomic_write(json_path, payload)
+        if run_dir:
+            _atomic_write(os.path.join(run_dir, "plugin_events.json"), payload)
 
 
 def _read_json_file(path):
@@ -251,6 +422,59 @@ def _save_plugin_client(inbox, build_info):
     )
 
 
+def _bridge_inbox_path(inbox):
+    return os.path.abspath(os.path.expanduser(inbox))
+
+
+def _upload_cfg(base_cfg, inbox):
+    """Force upload jobs to stage into this bridge's inbox, not config.yaml's path."""
+    import copy
+    bridge_inbox = _bridge_inbox_path(inbox)
+    cfg = copy.deepcopy(base_cfg or {})
+    cfg["figma"] = {**cfg.get("figma", {}), "enabled": True, "mode": "plugin", "inbox": bridge_inbox}
+    return cfg
+
+
+def _stage_job_output(inbox, run_dir, cfg):
+    """Always re-stage design.json into the bridge inbox before reporting job done."""
+    design_path = os.path.join(run_dir, "design.json")
+    staging_error = None
+    if not os.path.exists(design_path):
+        return {"staged": False, "doc_id": None, "layer_count": None, "staging_error": None,
+                "design_url": "/design.json"}
+    try:
+        from src import figma_import
+        figma_import.import_design(design_path, run_dir, cfg)
+        # #region agent log
+        _agent_log(
+            "figma_bridge.py:_stage_job_output", "figma_import after pipeline",
+            data={"inbox": _bridge_inbox_path(inbox), "run_dir": run_dir, "design_path": design_path},
+            hypothesis_id="H1", run_dir=run_dir,
+        )
+        # #endregion
+    except Exception as exc:
+        staging_error = str(exc)
+        # #region agent log
+        _agent_log(
+            "figma_bridge.py:_stage_job_output", "figma_import failed",
+            data={"error": staging_error},
+            hypothesis_id="H1", run_dir=run_dir,
+        )
+        # #endregion
+    manifest = _read_json_file(os.path.join(inbox, "inbox.json"))
+    staged = bool(manifest)
+    if not staged and staging_error is None:
+        staging_error = "design.json exists but inbox.json was not written"
+    return {
+        "staged": staged,
+        "doc_id": (manifest or {}).get("doc_id"),
+        "layer_count": ((manifest or {}).get("summary") or {}).get("layers"),
+        "staging_error": staging_error,
+        "design_url": "/design.json",
+        "manifest": manifest,
+    }
+
+
 def make_handler(inbox, config_path=None):
     jobs = {}
     jobs_lock = threading.RLock()
@@ -261,139 +485,139 @@ def make_handler(inbox, config_path=None):
         with jobs_lock:
             return jobs.get(job_id, {}).get("status") == "cancelled"
 
-    def run_job(job_id, image_path, run_dir):
-        started = time.time()
-        manifest = None
-        try:
-            with open(os.path.join(inbox, "inbox.json"), encoding="utf-8") as fh:
-                manifest = json.load(fh)
-        except (OSError, ValueError, TypeError):
-            pass
-        if _job_cancelled(job_id):
-            return
-        _append_plugin_logs(inbox, [{
-            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "level": "info",
-            "title": "Pipeline started",
-            "detail": f"{job_id} — {os.path.basename(image_path)}",
-            "extra": {"job_id": job_id, "run_dir": run_dir},
-        }], manifest)
+    def _finish_job_thread(job_id):
         with jobs_lock:
-            if _job_cancelled(job_id):
-                return
-            jobs[job_id]["status"] = "running"
-            jobs[job_id]["started_at"] = started
-            jobs[job_id]["run_dir"] = run_dir
+            if active_job["id"] == job_id:
+                active_job["id"] = None
+            job = jobs.get(job_id)
+            if job:
+                event = job.get("thread_done")
+                if event is not None:
+                    event.set()
+
+    def run_job(job_id, image_path, run_dir):
         try:
-            import copy
-            repo_root = _repo_root()
-            if repo_root not in sys.path:
-                sys.path.insert(0, repo_root)
-            # #region agent log
+            started = time.time()
+            manifest = None
             try:
-                doctor, ocr_blockers, fallback_ready = _ocr_preflight(base_cfg, repo_root)
-                _agent_log(
-                    "figma_bridge.py:run_job", "doctor preflight",
-                    data={
-                        "ok": doctor.get("ok"),
-                        "ocr_blockers": ocr_blockers,
-                        "blockers": doctor.get("blockers"),
-                        "ocr_fallback_ready": fallback_ready,
-                    },
-                    hypothesis_id="H4", run_dir=run_dir,
-                )
-                blockers = list(doctor.get("blockers") or [])
-                if ocr_blockers and fallback_ready:
-                    ocr_names = {item.get("name") for item in ocr_blockers}
-                    blockers = [item for item in blockers if item.get("name") not in ocr_names]
-                if blockers:
-                    raise RuntimeError(
-                        "Machine not ready — run doctor.py on the bridge host. "
-                        + _format_blockers(blockers)
-                    )
-            except RuntimeError:
-                raise
-            except Exception as doctor_error:
-                _agent_log(
-                    "figma_bridge.py:run_job", "doctor preflight failed",
-                    data={"error": str(doctor_error)},
-                    hypothesis_id="H4", run_dir=run_dir,
-                )
-            # #endregion
-            import run_pipeline  # heavy: torch/paddleocr/sam3/... — only imported on first use
-            cfg = copy.deepcopy(base_cfg or {})
-            cfg["figma"] = {**cfg.get("figma", {}), "enabled": True, "mode": "plugin", "inbox": inbox}
-            result = run_pipeline.run_one(image_path, run_dir, cfg)
-            with jobs_lock:
-                if _job_cancelled(job_id):
-                    return
-                jobs[job_id].update(
-                    status="done" if result.get("ok") else "failed",
-                    result=result, run_dir=run_dir,
-                    error=None if result.get("ok") else (result.get("error") or "pipeline reported failure"),
-                    failed_stage=None if result.get("ok") else result.get("failed_stage"),
-                )
-            if result.get("ok"):
-                _record_history(inbox, time.time() - started)
-                staged = _read_json_file(os.path.join(inbox, "inbox.json"))
-                with jobs_lock:
-                    jobs[job_id]["staged"] = bool(staged)
-                    if staged:
-                        jobs[job_id]["doc_id"] = staged.get("doc_id")
-                        jobs[job_id]["layer_count"] = (staged.get("summary") or {}).get("layers")
-                if not staged:
-                    design_path = os.path.join(run_dir, "design.json")
-                    if os.path.exists(design_path):
-                        try:
-                            from src import figma_import
-                            figma_import.import_design(design_path, run_dir, cfg)
-                            staged = _read_json_file(os.path.join(inbox, "inbox.json"))
-                            with jobs_lock:
-                                jobs[job_id]["staged"] = bool(staged)
-                                if staged:
-                                    jobs[job_id]["doc_id"] = staged.get("doc_id")
-                                    jobs[job_id]["layer_count"] = (staged.get("summary") or {}).get("layers")
-                        except Exception as stage_error:
-                            with jobs_lock:
-                                jobs[job_id]["staging_error"] = str(stage_error)
-                _append_plugin_logs(inbox, [{
-                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "level": "info",
-                    "title": "Pipeline complete",
-                    "detail": job_id,
-                    "extra": {"job_id": job_id, "run_dir": run_dir, "duration_s": round(time.time() - started, 2)},
-                }], manifest)
-            else:
-                _append_plugin_logs(inbox, [{
-                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "level": "error",
-                    "title": "Pipeline failed",
-                    "detail": result.get("error") or "pipeline reported failure",
-                    "extra": {"job_id": job_id, "run_dir": run_dir, "result": result},
-                }], manifest)
-        except Exception as exc:
-            with jobs_lock:
-                if not _job_cancelled(job_id):
-                    jobs[job_id].update(
-                        status="failed",
-                        error=str(exc),
-                        traceback=traceback.format_exc(),
-                        run_dir=run_dir,
-                        failed_stage=getattr(exc, "failed_stage", None),
-                    )
+                with open(os.path.join(inbox, "inbox.json"), encoding="utf-8") as fh:
+                    manifest = json.load(fh)
+            except (OSError, ValueError, TypeError):
+                pass
             if _job_cancelled(job_id):
                 return
             _append_plugin_logs(inbox, [{
                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "level": "error",
-                "title": "Pipeline exception",
-                "detail": str(exc),
-                "extra": {"job_id": job_id, "run_dir": run_dir, "traceback": traceback.format_exc()},
+                "level": "info",
+                "title": "Pipeline started",
+                "detail": f"{job_id} — {os.path.basename(image_path)}",
+                "extra": {"job_id": job_id, "run_dir": run_dir},
             }], manifest)
-        finally:
             with jobs_lock:
-                if active_job["id"] == job_id:
-                    active_job["id"] = None
+                if _job_cancelled(job_id):
+                    return
+                jobs[job_id]["status"] = "running"
+                jobs[job_id]["started_at"] = started
+                jobs[job_id]["run_dir"] = run_dir
+            try:
+                repo_root = _repo_root()
+                if repo_root not in sys.path:
+                    sys.path.insert(0, repo_root)
+                # #region agent log
+                try:
+                    doctor, ocr_blockers, fallback_ready = _ocr_preflight(base_cfg, repo_root)
+                    _agent_log(
+                        "figma_bridge.py:run_job", "doctor preflight",
+                        data={
+                            "ok": doctor.get("ok"),
+                            "ocr_blockers": ocr_blockers,
+                            "blockers": doctor.get("blockers"),
+                            "ocr_fallback_ready": fallback_ready,
+                        },
+                        hypothesis_id="H4", run_dir=run_dir,
+                    )
+                    blockers = list(doctor.get("blockers") or [])
+                    if ocr_blockers and fallback_ready:
+                        ocr_names = {item.get("name") for item in ocr_blockers}
+                        blockers = [item for item in blockers if item.get("name") not in ocr_names]
+                    if blockers:
+                        raise RuntimeError(
+                            "Machine not ready — run doctor.py on the bridge host. "
+                            + _format_blockers(blockers)
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as doctor_error:
+                    _agent_log(
+                        "figma_bridge.py:run_job", "doctor preflight failed",
+                        data={"error": str(doctor_error)},
+                        hypothesis_id="H4", run_dir=run_dir,
+                    )
+                # #endregion
+                import run_pipeline  # heavy: torch/paddleocr/sam3/... — only imported on first use
+                cfg = _upload_cfg(base_cfg, inbox)
+                result = run_pipeline.run_one(image_path, run_dir, cfg)
+                with jobs_lock:
+                    if _job_cancelled(job_id):
+                        return
+                staging = None
+                if result.get("ok"):
+                    staging = _stage_job_output(inbox, run_dir, cfg)
+                with jobs_lock:
+                    if _job_cancelled(job_id):
+                        return
+                    jobs[job_id].update(
+                        status="done" if result.get("ok") else "failed",
+                        result=result, run_dir=run_dir,
+                        error=None if result.get("ok") else (result.get("error") or "pipeline reported failure"),
+                        failed_stage=None if result.get("ok") else result.get("failed_stage"),
+                    )
+                    if staging:
+                        jobs[job_id].update(
+                            staged=staging["staged"],
+                            doc_id=staging.get("doc_id"),
+                            layer_count=staging.get("layer_count"),
+                            staging_error=staging.get("staging_error"),
+                            design_url=staging.get("design_url"),
+                        )
+                if result.get("ok"):
+                    _record_history(inbox, time.time() - started, run_dir)
+                    _append_plugin_logs(inbox, [{
+                        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "level": "info",
+                        "title": "Pipeline complete",
+                        "detail": job_id,
+                        "extra": {"job_id": job_id, "run_dir": run_dir, "duration_s": round(time.time() - started, 2)},
+                    }], manifest)
+                else:
+                    _append_plugin_logs(inbox, [{
+                        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "level": "error",
+                        "title": "Pipeline failed",
+                        "detail": result.get("error") or "pipeline reported failure",
+                        "extra": {"job_id": job_id, "run_dir": run_dir, "result": result},
+                    }], manifest)
+            except Exception as exc:
+                with jobs_lock:
+                    if not _job_cancelled(job_id):
+                        jobs[job_id].update(
+                            status="failed",
+                            error=str(exc),
+                            traceback=traceback.format_exc(),
+                            run_dir=run_dir,
+                            failed_stage=getattr(exc, "failed_stage", None),
+                        )
+                if _job_cancelled(job_id):
+                    return
+                _append_plugin_logs(inbox, [{
+                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "level": "error",
+                    "title": "Pipeline exception",
+                    "detail": str(exc),
+                    "extra": {"job_id": job_id, "run_dir": run_dir, "traceback": traceback.format_exc()},
+                }], manifest)
+        finally:
+            _finish_job_thread(job_id)
 
     class H(BaseHTTPRequestHandler):
         def _send(self, code, body=b"", ctype="application/octet-stream"):
@@ -475,52 +699,86 @@ def make_handler(inbox, config_path=None):
                              ".webp": "image/webp", ".svg": "image/svg+xml"}.get(ext, "application/octet-stream")
                     return self._send(200, open(p, "rb").read(), ctype)
                 return self._send(404)
-            if u.path == "/process":
+            if u.path == "/run-summary":
                 job_id = parse_qs(u.query).get("job_id", [""])[0]
                 with jobs_lock:
                     job = dict(jobs.get(job_id) or {})
                 if not job:
                     return self._send(404, b'{"ok":false,"error":"unknown job_id"}', "application/json")
-                if job.get("status") == "failed":
-                    tb = job.get("traceback") or ""
-                    if tb:
-                        lines = [ln for ln in str(tb).strip().splitlines() if ln.strip()]
-                        job["error_detail"] = "\n".join(lines[-5:])
-                    agent_debug = _agent_debug_tail(job.get("run_dir"))
-                    job["agent_debug"] = agent_debug
-                    if job.get("run_dir"):
-                        job["failed_stage"] = detect_failed_stage(
-                            job["run_dir"],
-                            error_text=str(job.get("error") or ""),
-                            explicit_stage=job.get("failed_stage"),
+                manifest = _read_json_file(os.path.join(inbox, "inbox.json"))
+                run_dir = job.get("run_dir")
+                if manifest and run_dir and manifest.get("run_dir"):
+                    manifest_run = os.path.abspath(str(manifest.get("run_dir")))
+                    if manifest_run != os.path.abspath(str(run_dir)):
+                        manifest = None
+                payload = {
+                    "ok": True,
+                    "job_id": job_id,
+                    "status": job.get("status"),
+                    "staged": job.get("staged") if job.get("staged") is not None else bool(manifest),
+                    "doc_id": job.get("doc_id") or (manifest or {}).get("doc_id"),
+                    "design_url": job.get("design_url") or "/design.json",
+                    "staging_error": job.get("staging_error"),
+                    "run_dir": run_dir,
+                    "manifest": manifest,
+                }
+                return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
+            if u.path == "/process":
+                job_id = parse_qs(u.query).get("job_id", [""])[0]
+                with jobs_lock:
+                    job = jobs.get(job_id)
+                    if not job:
+                        return self._send(404, b'{"ok":false,"error":"unknown job_id"}', "application/json")
+                    snapshot = dict(job)
+                    status = snapshot.get("status")
+                    if status == "running" and snapshot.get("run_dir"):
+                        snapshot["stage"] = tail_running_stage(snapshot["run_dir"])
+                        snapshot["agent_debug"] = _agent_debug_tail(snapshot.get("run_dir"))
+                    if status == "failed":
+                        tb = snapshot.get("traceback") or ""
+                        if tb:
+                            lines = [ln for ln in str(tb).strip().splitlines() if ln.strip()]
+                            snapshot["error_detail"] = "\n".join(lines[-5:])
+                        agent_debug = _agent_debug_tail(snapshot.get("run_dir"))
+                        snapshot["agent_debug"] = agent_debug
+                        if snapshot.get("run_dir"):
+                            snapshot["failed_stage"] = detect_failed_stage(
+                                snapshot["run_dir"],
+                                error_text=str(snapshot.get("error") or ""),
+                                explicit_stage=snapshot.get("failed_stage"),
+                                agent_debug=agent_debug,
+                            )
+                        classified = classify_processing_error(
+                            error=str(snapshot.get("error") or ""),
+                            traceback_text=tb,
+                            failed_stage=snapshot.get("failed_stage"),
                             agent_debug=agent_debug,
                         )
-                    classified = classify_processing_error(
-                        error=str(job.get("error") or ""),
-                        traceback_text=tb,
-                        failed_stage=job.get("failed_stage"),
-                        agent_debug=agent_debug,
-                    )
-                    job["failed_stage"] = classified.get("failed_stage")
-                    job["error_code"] = classified.get("error_code")
-                    job["error_hint"] = classified.get("error_hint")
-                    job["user_title"] = classified.get("user_title")
-                    job["user_detail"] = classified.get("user_detail")
-                job.pop("traceback", None)
-                if job.get("status") == "running" and job.get("run_dir"):
-                    job["stage"] = _tail_stage(job["run_dir"])
-                    job["agent_debug"] = _agent_debug_tail(job.get("run_dir"))
-                if job.get("started_at") and job.get("status") in ("running", "queued"):
-                    elapsed = time.time() - job["started_at"]
-                    job["elapsed_s"] = round(elapsed, 1)
-                    history = _read_history(inbox)
-                    if history:
-                        # Median, not mean: one very slow/cold-start run shouldn't blow out
-                        # every ETA after it, and a short rolling window (see
-                        # _record_history) already adapts if the machine/config changes.
-                        job["eta_s"] = max(0, round(statistics.median(history) - elapsed, 1))
-                        job["eta_sample_size"] = len(history)
-                payload = {"ok": True, "job_id": job_id, **job}
+                        snapshot["failed_stage"] = classified.get("failed_stage")
+                        snapshot["error_code"] = classified.get("error_code")
+                        snapshot["error_hint"] = classified.get("error_hint")
+                        snapshot["user_title"] = classified.get("user_title")
+                        snapshot["user_detail"] = classified.get("user_detail")
+                    snapshot.pop("traceback", None)
+                    if status == "running" and snapshot.get("started_at"):
+                        elapsed = time.time() - snapshot["started_at"]
+                        snapshot["elapsed_s"] = round(elapsed, 1)
+                        eta_s, sample_size, progress_pct = _estimate_eta(
+                            inbox, elapsed, snapshot.get("stage"),
+                        )
+                        if eta_s is not None:
+                            snapshot["eta_s"] = eta_s
+                            snapshot["eta_sample_size"] = sample_size
+                        if progress_pct is not None:
+                            snapshot["progress_pct"] = progress_pct
+                    if status == "done":
+                        snapshot.setdefault("design_url", "/design.json")
+                        if snapshot.get("staged") is None:
+                            manifest = _read_json_file(os.path.join(inbox, "inbox.json"))
+                            snapshot["staged"] = bool(manifest)
+                            if manifest and not snapshot.get("doc_id"):
+                                snapshot["doc_id"] = manifest.get("doc_id")
+                payload = {"ok": True, "job_id": job_id, **snapshot}
                 return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
             return self._send(404)
 
@@ -588,15 +846,19 @@ def make_handler(inbox, config_path=None):
                 return self._send(200, b'{"ok":true}', "application/json")
             if route == "/process/cancel":
                 job_id = parse_qs(urlparse(self.path).query).get("job_id", [""])[0]
+                thread_done = None
                 with jobs_lock:
                     job = jobs.get(job_id)
                     if not job:
                         return self._send(404, b'{"ok":false,"error":"unknown job_id"}', "application/json")
+                    thread_done = job.get("thread_done")
                     if job.get("status") not in ("done", "failed", "cancelled"):
                         job["status"] = "cancelled"
                         job["error"] = "cancelled by user"
                     if active_job["id"] == job_id:
                         active_job["id"] = None
+                if thread_done is not None:
+                    thread_done.wait(timeout=60.0)
                 _append_plugin_logs(inbox, [{
                     "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "level": "info",
@@ -639,7 +901,8 @@ def make_handler(inbox, config_path=None):
                         fh.write(data)
                     jobs[job_id] = {
                         "status": "queued", "filename": filename, "image_path": image_path,
-                        "started_at": queued_at,
+                        "queued_at": queued_at,
+                        "thread_done": threading.Event(),
                     }
                     active_job["id"] = job_id
                 _append_plugin_logs(inbox, [{

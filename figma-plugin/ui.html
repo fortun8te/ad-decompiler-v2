@@ -1067,7 +1067,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.0.0","build":18,"commit":"3eff1f6","dirty":true,"built_at":"2026-07-12T01:30:17Z","label":"v2.0.0+b18.3eff1f6-dirty","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.0.0","build":20,"commit":"4bc116f","dirty":true,"built_at":"2026-07-12T01:35:57Z","label":"v2.0.0+b20.4bc116f-dirty","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -1520,10 +1520,22 @@
       if (status.status === "done") return 100;
       if (status.phase === "upload") return 2;
       if (status.status === "queued") return 5;
+      if (typeof status.progress_pct === "number") {
+        return Math.min(99, Math.max(5, Math.round(status.progress_pct)));
+      }
       const idx = PROCESS_STAGE_ORDER.indexOf(status.stage);
       if (idx >= 0) {
         const stageSpan = 100 / PROCESS_STAGE_ORDER.length;
-        return Math.min(99, Math.round((idx + 0.65) * stageSpan));
+        const stagePct = Math.min(99, Math.round((idx + 0.35) * stageSpan));
+        if (typeof status.elapsed_s === "number" && typeof status.eta_s === "number" && status.eta_s > 0) {
+          const total = status.elapsed_s + status.eta_s;
+          const timePct = Math.round((status.elapsed_s / total) * 100);
+          return Math.min(99, Math.max(stagePct - 4, Math.min(stagePct + 6, timePct)));
+        }
+        if (!status.eta_sample_size) {
+          return Math.min(stagePct, 8 + idx * 5);
+        }
+        return stagePct;
       }
       if (typeof status.elapsed_s === "number" && typeof status.eta_s === "number" && status.eta_s > 0) {
         const total = status.elapsed_s + status.eta_s;
@@ -1566,9 +1578,14 @@
           remainingEl.textContent = "~" + formatElapsed(status.eta_s * 1000);
         }
         remainingEl.classList.remove("hidden");
-        totalEl.textContent = "~" + formatElapsed((status.elapsed_s + status.eta_s) * 1000);
+        const elapsedS = typeof status.elapsed_s === "number" ? status.elapsed_s : 0;
+        totalEl.textContent = "~" + formatElapsed((elapsedS + status.eta_s) * 1000);
         totalEl.className = "timing-total";
         totalEl.classList.remove("hidden");
+      } else if (status.status === "running" && status.stage) {
+        remainingEl.textContent = "Calibrating…";
+        remainingEl.classList.remove("hidden");
+        totalEl.classList.add("hidden");
       } else {
         remainingEl.textContent = "Estimating…";
         remainingEl.classList.remove("hidden");
@@ -1615,6 +1632,7 @@
       // #region agent log
       agentDebugLog("ui.html:renderProcessStatus", "process status rendered", Object.assign(progressVisibilitySnapshot("renderProcessStatus"), {
         stage: status.stage, status: status.status, percent: percent,
+        progress_pct: status.progress_pct, eta_s: status.eta_s, eta_sample_size: status.eta_sample_size,
       }), "H6");
       // #endregion
     }
@@ -1754,15 +1772,35 @@
         state.uploading = false;
         await new Promise(function (resolve) { setTimeout(resolve, 350); });
         setUploadBusy(false);
-        if (status.staged === false) {
+        let summary = null;
+        try {
+          summary = await fetchJson(base + "/run-summary?job_id=" + encodeURIComponent(jobId), 5000);
+        } catch (_) { /* older bridges may not have /run-summary yet */ }
+        const staged = summary ? summary.staged : status.staged;
+        const stagingError = (summary && summary.staging_error) || status.staging_error;
+        const runDir = (summary && summary.run_dir) || status.run_dir;
+        if (staged === false) {
           showIssues([{
             title: "Pipeline finished but nothing staged",
             detail: "The bridge completed processing but design.json was not staged for import."
-              + (status.staging_error ? "\n\n" + status.staging_error : ""),
+              + (stagingError ? "\n\n" + stagingError : "")
+              + (runDir ? "\n\nrun_dir: " + runDir : "")
+              + "\n\njob_id: " + jobId,
             hint: "Check pipeline logs on the bridge machine, then click Refresh in Settings.",
           }], "warning");
         }
         await refreshLatest({ silent: false });
+        if (!state.doc || state.source !== "bridge") {
+          showIssues([{
+            title: "No output from bridge",
+            detail: "Processing finished but the plugin could not load design.json from the bridge."
+              + "\n\njob_id: " + jobId
+              + (runDir ? "\nrun_dir: " + runDir : "")
+              + (stagingError ? "\n\nStaging: " + stagingError : "")
+              + (status.design_url ? "\n\nTry: " + base + status.design_url : ""),
+            hint: "On the bridge host, confirm inbox.json exists and restart the bridge if needed.",
+          }], "error");
+        }
         setFooter("Processed \"" + filename + "\" — " + $("footerStatus").textContent);
         return;
       }

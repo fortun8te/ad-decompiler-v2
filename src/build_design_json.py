@@ -63,6 +63,21 @@ def _stage_asset(src: Optional[str], layer_id: str, run_dir: str, warnings: list
     return os.path.relpath(destination, run_dir)
 
 
+def _surface_fill(candidate):
+    fill = candidate.get("fill")
+    if fill is not None:
+        return fill
+    style = candidate.get("style") or {}
+    fills = style.get("fills")
+    if isinstance(fills, list) and fills:
+        return fills[0]
+    if style.get("fill") is not None:
+        return style.get("fill")
+    if style.get("color"):
+        return {"kind": "flat", "color": style["color"]}
+    return None
+
+
 def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
     target = candidate.get("target")
     layer_id = str(candidate.get("id") or "layer")
@@ -93,6 +108,7 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         "meta": {**meta, "z": z_index, "source_id": layer_id},
         "constraints": dict(candidate.get("constraints") or {}),
         "component": dict(candidate.get("component") or {}),
+        "layout": dict(candidate.get("layout") or {}),
     }
 
     if target == "group":
@@ -101,8 +117,7 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         return Layer(
             type="group",
             children=children,
-            layout=dict(candidate.get("layout") or {}),
-            fill=candidate.get("fill"),
+            fill=_surface_fill(candidate),
             stroke=candidate.get("stroke"),
             radius=candidate.get("radius") or (candidate.get("style") or {}).get("radius"),
             shape_kind="frame",

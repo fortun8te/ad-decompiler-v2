@@ -17,9 +17,11 @@ from src.console_io import configure_stdio, safe_print
 from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  element_fusion, qwen_worker, merge_layers, reconstruct, layout,
                  build_design_json, figma_import, pixel_diff, repair, render_preview,
-                 vlm_proofread)
+                 vlm_proofread, vram)
 from src.run_report import RunReport, qwen_degradation
 from src.schema import dump, load
+from src.harness import execute_repairs, recommended_resume
+from src.qa_config import pixel_diff_thresholds, visual_pass_ssim
 
 configure_stdio()
 
@@ -169,7 +171,11 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             raw_ocr = vlm_proofread.proofread_lines(norm_path, raw_ocr, cfg)
             dump(raw_ocr, A("ocr_raw.json"))
             vp = raw_ocr.get("vlm_proofread")
-            vp_note = f", vlm-corrected {vp['lines_corrected']}/{vp['lines_checked']}" if vp else ""
+            vp_note = ""
+            if vp:
+                vp_note = f", vlm-corrected {vp['lines_corrected']}/{vp['lines_checked']}"
+                if vp.get("ensemble_disagreement_checked"):
+                    vp_note += f", ensemble-proofread {vp['ensemble_disagreement_checked']}"
             _log(run_dir, f"ocr[{raw_ocr.get('engine')}] → {len(raw_ocr.get('lines', []))} lines{vp_note}")
         raw_ocr = load(A("ocr_raw.json")) if exists("ocr_raw.json") else load(A("ocr.json"))
         if stage("text") or not exists("ocr.json"):
@@ -197,6 +203,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         # 5 SAM 3 image prompt sweep + box-refine every residual, then mask-aware fusion.
         if stage("sam") or not exists("sam3.json"):
             current_stage = "sam"
+            vram.stage_boundary("qwen", "sam", cfg, run_dir, log_fn=lambda msg: _log(run_dir, msg))
             sam = _sam_with_safe_retry(norm_path, residual, cfg, run_dir, report)
             _log(run_dir, f"sam3[{sam.get('status')}] → {len(sam.get('elements', []))} observations")
         sam = load(A("sam3.json"))
@@ -222,6 +229,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         merged = load(A("merged.json"))
 
         if stage("reconstruct") or not exists("reconstruction.json"):
+            vram.stage_boundary("merge", "reconstruct", cfg, run_dir, log_fn=lambda msg: _log(run_dir, msg))
             reconstruction = reconstruct.reconstruct(norm_path, ocr_res, merged, run_dir, cfg)
             _log(run_dir, "reconstruct → "
                  f"{reconstruction['stats']['canonical_entities']} entities, "
@@ -271,7 +279,8 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         if (stage("diff") or stage("qa")) and qa_render:
             ren_ocr = ocr.run_ocr(qa_render, cfg, run_dir=run_dir) if cfg.get("qa_ocr", True) else None
             qa_partial = pixel_diff.compare(norm_path, qa_render, run_dir,
-                                            source_ocr=ocr_res, render_ocr=ren_ocr)
+                                            source_ocr=ocr_res, render_ocr=ren_ocr,
+                                            thresholds=pixel_diff_thresholds(cfg))
             design_data = load(A("design.json"))
             structural_fails = []
             warnings = (design_data.get("meta") or {}).get("warnings") or []
@@ -303,8 +312,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 "duplicates_removed", reconstruction.get("stats", {}).get("duplicates_removed", 0)
             )
             qa = {**qa_partial, "repairs": reps,
+                  "recommended_resume": recommended_resume(reps),
                   "structural": structural_report,
-                  "ok": qa_partial.get("ssim", 0) >= 0.9 and not combined_fails}
+                  "ok": qa_partial.get("ssim", 0) >= visual_pass_ssim(cfg) and not combined_fails}
             dump(qa, A("qa.json"))
             report.stage("qa", "ok" if qa.get("ok") else "failed",
                          detail=((qa.get("hard_fails") or [{}])[0].get("detail")),
@@ -320,8 +330,22 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         _log(run_dir, f"done in {elapsed:.1f}s")
         if report.data.get("status") == "running":
             report.finish(qa_ok=None)
-        return {"ok": True, "run_dir": run_dir, "duration_s": elapsed,
-                "runtime_ok": report.acceptable, "runtime_status": report.data.get("status")}
+
+        repair_summary = None
+        runtime_cfg = cfg.get("runtime") or {}
+        if runtime_cfg.get("auto_repair") and os.path.exists(A("qa.json")):
+            qa_state = load(A("qa.json"))
+            if not qa_state.get("ok"):
+                repair_summary = execute_repairs(run_dir, cfg)
+                _log(run_dir, f"auto_repair → {repair_summary.get('stopped')} "
+                     f"after {repair_summary.get('iterations', 0)} iteration(s)")
+
+        result = {"ok": True, "run_dir": run_dir, "duration_s": elapsed,
+                  "runtime_ok": report.acceptable, "runtime_status": report.data.get("status")}
+        if repair_summary is not None:
+            result["repair"] = repair_summary
+            result["qa_ok"] = bool(repair_summary.get("qa_ok"))
+        return result
     except Exception as e:
         _log(run_dir, f"ERROR: {e}\n{traceback.format_exc()}")
         report.stage("pipeline", "failed", detail=str(e))

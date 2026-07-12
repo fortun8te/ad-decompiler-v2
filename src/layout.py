@@ -129,6 +129,173 @@ def infer_auto_layout(container, children):
     return {"mode": "NONE", "confidence": 0.25}
 
 
+def _has_surface(node):
+    if node.get("fill") or node.get("stroke"):
+        return True
+    style = node.get("style") or {}
+    return bool(style.get("fills") or style.get("fill") or style.get("color")
+                or node.get("radius") or style.get("radius"))
+
+
+def _surface_from(node):
+    if node.get("fill"):
+        return node.get("fill")
+    style = node.get("style") or {}
+    fills = style.get("fills")
+    if isinstance(fills, list) and fills:
+        return fills[0]
+    if style.get("fill") is not None:
+        return style.get("fill")
+    if style.get("color"):
+        return {"kind": "flat", "color": style["color"]}
+    return None
+
+
+def _normalize_group_surface(node):
+    """Promote style-only fills onto groups so the Figma compiler can frame-promote cards."""
+    if node.get("target") != "group" or _has_surface(node):
+        return
+    fill = _surface_from(node)
+    if fill is not None:
+        node["fill"] = fill
+    style = node.get("style") or {}
+    if node.get("radius") is None and style.get("radius") is not None:
+        node["radius"] = style.get("radius")
+
+
+def _hoist_background_surface(group):
+    """Card panels often keep the painted background on an inner shape — hoist it to the group."""
+    if group.get("target") != "group" or _has_surface(group):
+        return
+    children = group.get("children") or []
+    parent_box = group.get("box") or {}
+    best = None
+    best_area = 0.0
+    for child in children:
+        if child.get("target") != "shape" or not _has_surface(child):
+            continue
+        child_box = child.get("box") or {}
+        if _inside(child_box, parent_box) < 0.88 or _area(child_box) < _area(parent_box) * 0.72:
+            continue
+        area = _area(child_box)
+        if area > best_area:
+            best_area = area
+            best = child
+    if not best:
+        return
+    group["fill"] = _surface_from(best)
+    if group.get("radius") is None:
+        group["radius"] = best.get("radius") or (best.get("style") or {}).get("radius")
+    if group.get("stroke") is None and best.get("stroke") is not None:
+        group["stroke"] = best.get("stroke")
+
+
+def _annotate_stack_children(parent, children):
+    """Emit child layout hints consumed by the Figma plugin's applyChildLayout()."""
+    layout = parent.get("layout") or {}
+    mode = layout.get("mode")
+    if mode not in ("HORIZONTAL", "VERTICAL") or not children:
+        return
+    parent_box = parent.get("box") or {}
+    boxes = [child.get("box") or {} for child in children]
+    if mode == "VERTICAL":
+        axis_centers = [box.get("x", 0) + box.get("w", 0) / 2 for box in boxes]
+        spread = max(1.0, median([max(1.0, box.get("w", 1)) for box in boxes]))
+    else:
+        axis_centers = [box.get("y", 0) + box.get("h", 0) / 2 for box in boxes]
+        spread = max(1.0, median([max(1.0, box.get("h", 1)) for box in boxes]))
+    axis_center = median(axis_centers)
+
+    for index, child in enumerate(children):
+        child_box = child.get("box") or {}
+        constraints = child.get("constraints") or _constraints(child_box, parent_box)
+        hints = dict(child.get("layout") or {})
+        overlaps = any(
+            index != other and _overlap(child_box, boxes[other]) > 0.12
+            for other in range(len(children))
+        )
+        if mode == "VERTICAL":
+            child_center = child_box.get("x", 0) + child_box.get("w", 0) / 2
+        else:
+            child_center = child_box.get("y", 0) + child_box.get("h", 0) / 2
+        if overlaps or abs(child_center - axis_center) > max(6.0, spread * 0.45):
+            hints["layoutPositioning"] = "ABSOLUTE"
+        elif mode == "VERTICAL":
+            width_frac = child_box.get("w", 0) / max(1.0, parent_box.get("w", 1))
+            if constraints.get("horizontal") == "STRETCH" or width_frac >= 0.92:
+                hints["layoutGrow"] = 1
+                hints["layoutSizingHorizontal"] = "FILL"
+            elif constraints.get("horizontal") == "CENTER":
+                hints["layoutAlign"] = "CENTER"
+        else:
+            height_frac = child_box.get("h", 0) / max(1.0, parent_box.get("h", 1))
+            if constraints.get("vertical") == "STRETCH" or height_frac >= 0.92:
+                hints["layoutGrow"] = 1
+                hints["layoutSizingVertical"] = "FILL"
+            elif constraints.get("vertical") == "CENTER":
+                hints["layoutAlign"] = "CENTER"
+        if hints:
+            child["layout"] = hints
+
+
+def _wrap_repeated_card_grids(roots):
+    """Wrap benchmark-style repeated cards sharing a signature into one auto-layout row/column."""
+    by_signature = {}
+    for node in roots:
+        if node.get("target") != "group":
+            continue
+        signature = (node.get("meta") or {}).get("repeat_signature")
+        if signature:
+            by_signature.setdefault(signature, []).append(node)
+    wrappers = []
+    consumed = set()
+    for signature, members in by_signature.items():
+        if len(members) < 2:
+            continue
+        box = _union([member.get("box") or {} for member in members])
+        layout = infer_auto_layout({"box": box, "meta": {"role": "card-grid"}}, members)
+        if layout.get("mode") not in ("HORIZONTAL", "VERTICAL") or layout.get("confidence", 0) < 0.5:
+            continue
+        if layout["mode"] == "HORIZONTAL":
+            members = sorted(members, key=lambda node: (node.get("box", {}).get("x", 0), node.get("id", "")))
+        else:
+            members = sorted(members, key=lambda node: (node.get("box", {}).get("y", 0), node.get("id", "")))
+        wrapper = {
+            "id": f"repeat-grid-{signature}",
+            "target": "group",
+            "box": box,
+            "z": min(float(member.get("z", 0)) for member in members),
+            "children": members,
+            "layout": layout,
+            "meta": {
+                "role": "card-grid",
+                "repeat_signature": signature,
+                "layout_confidence": layout.get("confidence"),
+            },
+        }
+        _annotate_stack_children(wrapper, members)
+        wrappers.append(wrapper)
+        consumed.update(member.get("id") for member in members)
+    if not wrappers:
+        return roots
+    out = [node for node in roots if node.get("id") not in consumed]
+    out.extend(wrappers)
+    out.sort(key=lambda node: (float(node.get("z", 0)), node.get("id", "")))
+    return out
+
+
+def _finalize_layout(nodes):
+    for node in nodes:
+        children = node.get("children") or []
+        if children:
+            _finalize_layout(children)
+        _normalize_group_surface(node)
+        _hoist_background_surface(node)
+        layout = node.get("layout") or {}
+        if layout.get("mode") in ("HORIZONTAL", "VERTICAL"):
+            _annotate_stack_children(node, children)
+
+
 def _component_signature(node):
     children = node.get("children") or []
     payload = {
@@ -248,7 +415,38 @@ def _semantic_text_stacks(roots):
             "meta": {"role": "text-stack", "semantic_roles": role_names,
                      "layout_confidence": 0.9},
         })
+        _annotate_stack_children(out[-1], group)
     return out
+
+
+def _merge_card_shells(nodes, containers):
+    """Fold a full-bleed painted backdrop into an otherwise empty card shell."""
+    dropped = set()
+    container_set = set(id(node) for node in containers)
+    for host in list(containers):
+        if _has_surface(host):
+            continue
+        role = (host.get("meta") or {}).get("role")
+        if role not in (None, "card", "container"):
+            continue
+        host_box = host.get("box") or {}
+        backdrops = [node for node in nodes if node is not host and node.get("target") == "shape"
+                     and id(node) not in dropped and _has_surface(node)
+                     and _inside(node.get("box", {}), host_box) >= 0.94
+                     and _area(node.get("box", {})) >= _area(host_box) * 0.88]
+        if len(backdrops) != 1:
+            continue
+        backdrop = backdrops[0]
+        host["fill"] = _surface_from(backdrop)
+        if host.get("radius") is None:
+            host["radius"] = backdrop.get("radius") or (backdrop.get("style") or {}).get("radius")
+        if host.get("stroke") is None and backdrop.get("stroke") is not None:
+            host["stroke"] = backdrop.get("stroke")
+        dropped.add(backdrop["id"])
+        if id(backdrop) in container_set:
+            containers.remove(backdrop)
+            container_set.remove(id(backdrop))
+    return dropped
 
 
 def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
@@ -276,9 +474,24 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
                                 (inside[0].get("target") == "text" or role in ("button", "badge", "card", "chip"))):
             containers.append(node)
 
+    # Keep full-bleed painted backdrops as shape children when a larger semantic card owns them.
+    pruned = []
+    for host in containers:
+        if _has_surface(host) and (host.get("meta") or {}).get("role") not in ("button", "badge", "card", "chip"):
+            owned_by = [other for other in containers if other is not host
+                        and _area(other.get("box", {})) >= _area(host.get("box", {})) * 0.98
+                        and _inside(host.get("box", {}), other.get("box", {})) >= 0.94]
+            if owned_by:
+                continue
+        pruned.append(host)
+    containers = pruned
+    dropped = _merge_card_shells(nodes, containers)
+
     # Assign every node to its smallest containing frame. Containers can nest.
     parent = {}
     for node in nodes:
+        if node.get("id") in dropped:
+            continue
         eligible = [host for host in containers if host is not node
                     and _area(host["box"]) > _area(node["box"]) * 1.08
                     and _inside(node["box"], host["box"]) >= .92]
@@ -289,6 +502,8 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
         host["target"] = "group"
         host["children"] = []
     for node in nodes:
+        if node.get("id") in dropped:
+            continue
         pid = parent.get(node["id"])
         if pid and pid in by_id:
             node["constraints"] = _constraints(node["box"], by_id[pid]["box"])
@@ -300,7 +515,7 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
         host.setdefault("meta", {})["layout_confidence"] = host["layout"].get("confidence")
         host["meta"]["role"] = host["meta"].get("role") or "container"
 
-    roots = [n for n in nodes if n.get("id") not in parent]
+    roots = [n for n in nodes if n.get("id") not in parent and n.get("id") not in dropped]
     roots = _semantic_text_stacks(roots)
     for node in nodes:
         if node.get("children"):
@@ -322,6 +537,9 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
                     "key": f"repeat-{sig}", "role": "master" if index == 0 else "instance",
                     "confidence": 1.0,
                 }
+
+    roots = _wrap_repeated_card_grids(roots)
+    _finalize_layout(roots)
 
     for root in roots:
         _relativize(root)

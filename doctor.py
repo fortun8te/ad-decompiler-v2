@@ -53,6 +53,25 @@ def _torch(device):
         return _check("torch", device != "cuda", f"unavailable: {exc}", required=device == "cuda")
 
 
+def _doctr_gpu(device, primary: str):
+    """docTR primary on CUDA needs torch GPU — the working RTX 50-series OCR path."""
+    if device != "cuda" or primary != "doctr":
+        return _check("doctr gpu", True, "not required", required=False)
+    try:
+        import torch
+        if not _module("doctr"):
+            return _check("doctr gpu", False, "python-doctr not installed", required=True)
+        if not torch.cuda.is_available():
+            return _check("doctr gpu", False, "torch cannot see a CUDA device for doctr primary", required=True)
+        return _check(
+            "doctr gpu", True,
+            f"doctr will run on {torch.cuda.get_device_name(0)} via torch {torch.__version__}",
+            required=True,
+        )
+    except Exception as exc:
+        return _check("doctr gpu", False, f"probe failed: {exc}", required=True)
+
+
 def _cudnn(device):
     """Lightweight cuDNN probe — PaddleOCR GPU on Windows often fails without it."""
     if device != "cuda":
@@ -153,6 +172,8 @@ def inspect(cfg, root: Path) -> dict:
     module_for_ocr = _ocr_engine_module(primary)
     checks.append(_check(f"ocr:{primary}", _module(module_for_ocr),
                          f"python module {module_for_ocr}", required=True))
+    if primary == "doctr":
+        checks.append(_doctr_gpu(device, primary))
     if primary == "tesseract":
         checks.append(_check("tesseract binary", bool(_tesseract_binary()),
                              _tesseract_binary() or "not on PATH", required=True))

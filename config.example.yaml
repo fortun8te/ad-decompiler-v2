@@ -16,8 +16,12 @@ vlm:
 # CPU development, but enabled OCR/SAM fallbacks become QA failures instead of quiet boxes.
 runtime:
   require_active_models: true
+  auto_repair: false                  # re-run mapped repair stages after QA failure
   auto_retry:
     sam_disable_compile: true         # one safe retry only when compile=true fails
+  vram:
+    unload_ocr_before_sam: true       # drop OCR model caches before SAM loads
+    empty_cache_between_stages: true  # torch.cuda.empty_cache(); default true when device=cuda
 
 ocr:
   # doctr is the working in-process GPU OCR on RTX 50-series (Blackwell / sm_120):
@@ -25,9 +29,12 @@ ocr:
   # with torch's cu128 DLLs in a shared venv, so ppocr-v6 can't use the GPU here (it
   # only auto-retries on CPU, which is slow). Kept ppocr-v6 + tesseract as fallbacks.
   primary: doctr                      # ppocr-v6 | surya | doctr | tesseract
-  challengers: []                     # surya is Docker-based in this repo; add it back with Docker running
+  challengers: []                     # optional in-process surya via pip install surya-ocr
   fallback_engines: [ppocr-v6, tesseract]  # tried only when primary + challengers all fail
   auto_fallback_tesseract: true        # also auto-try tesseract when binary is on PATH
+  ensemble_disagreement:               # when vlm.enabled, proofread confident-but-disputed lines
+    enabled: true
+    min_confidence: 0.85
   lang: en
   retry_2x:                           # targeted retry for small/low-confidence text
     enabled: true
@@ -113,6 +120,9 @@ figma:
   inbox: ~/figma-inbox                # plugin mode staging folder
   bridge_port: 8790
   # studio_path: C:/…/NEUEGEN/studio  # only for clipboard mode (reuses the kiwi encoder)
+
+qa:
+  visual_pass_ssim: 0.9               # shared gate for pixel_diff, repair, and qa.ok
 
 qa_ocr: true                          # OCR the render for text-recall QA
 export_wait_s: 0                      # >0 to poll for the plugin's figma_export.png

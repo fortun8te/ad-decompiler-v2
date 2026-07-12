@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.0.0","build":15,"commit":"7bcebf0","dirty":true,"built_at":"2026-07-12T00:41:46Z","label":"v2.0.0+b15.7bcebf0-dirty","source":"git"};
+const PLUGIN_BUILD = {"version":"2.0.0","build":20,"commit":"4bc116f","dirty":true,"built_at":"2026-07-12T01:35:57Z","label":"v2.0.0+b20.4bc116f-dirty","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,
@@ -510,9 +510,27 @@ function requestedFont(style) {
 function rankedFontRequests(style) {
   const rawCandidates = pick(style, "fontCandidates", "font_candidates", "candidates");
   const candidates = Array.isArray(rawCandidates) ? rawCandidates : [];
+  const rawWeights = pick(style, "fontWeightCandidates", "font_weight_candidates");
+  const weightCandidates = Array.isArray(rawWeights) ? rawWeights : [];
   const output = [];
   const hasPrimaryFamily = Boolean(pick(style, "fontFamily", "font_family", "family"));
-  if (hasPrimaryFamily) output.push(Object.assign(requestedFont(style), { score: finite(style.confidence, NaN), source: "primary" }));
+  if (hasPrimaryFamily) {
+    const primary = Object.assign(requestedFont(style), { score: finite(style.confidence, NaN), source: "primary" });
+    if (weightCandidates.length && pick(style, "fontWeight", "font_weight", "weight") !== undefined) {
+      primary.style = null;
+    }
+    output.push(primary);
+    weightCandidates.forEach(function (entry) {
+      const value = typeof entry === "object" ? pick(entry, "value", "weight", "fontWeight", "font_weight") : entry;
+      const weight = finite(value, NaN);
+      if (!Number.isFinite(weight)) return;
+      output.push(Object.assign({}, primary, {
+        weight,
+        score: finite(entry && entry.score, NaN),
+        source: "weight_candidate",
+      }));
+    });
+  }
   candidates.forEach(function (candidate) {
     const source = typeof candidate === "string" ? { fontFamily: candidate } : candidate || {};
     output.push(Object.assign(requestedFont(source), {
@@ -520,6 +538,20 @@ function rankedFontRequests(style) {
       source: source.source || "candidate",
     }));
   });
+  if (!hasPrimaryFamily && weightCandidates.length) {
+    const base = output.length ? output[0] : requestedFont(style);
+    weightCandidates.forEach(function (entry) {
+      const value = typeof entry === "object" ? pick(entry, "value", "weight", "fontWeight", "font_weight") : entry;
+      const weight = finite(value, NaN);
+      if (!Number.isFinite(weight)) return;
+      output.push(Object.assign({}, base, {
+        style: null,
+        weight,
+        score: finite(entry && entry.score, NaN),
+        source: "weight_candidate",
+      }));
+    });
+  }
   if (!output.length) output.push(Object.assign(requestedFont(style), { score: finite(style.confidence, NaN), source: "fallback" }));
   const seen = new Set();
   return output.filter(function (candidate) {

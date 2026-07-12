@@ -8,7 +8,13 @@ from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from src.figma_bridge import make_handler
+from src.figma_bridge import (
+    _estimate_eta,
+    _parse_stage_fractions,
+    _read_history,
+    _record_history,
+    make_handler,
+)
 
 
 def _write_passing_config(tmp_path):
@@ -286,7 +292,7 @@ def test_process_uploads_runs_pipeline_and_stages_inbox(tmp_path, monkeypatch):
         # wrong folder and the plugin would never see it.
         assert len(calls) == 1
         assert calls[0]["cfg"]["figma"]["enabled"] is True
-        assert calls[0]["cfg"]["figma"]["inbox"] == str(inbox)
+        assert os.path.abspath(calls[0]["cfg"]["figma"]["inbox"]) == os.path.abspath(str(inbox))
 
         # the uploaded filename was sanitized into the job dir, not written wherever the
         # caller-supplied filename would otherwise point (e.g. path traversal).
@@ -296,6 +302,85 @@ def test_process_uploads_runs_pipeline_and_stages_inbox(tmp_path, monkeypatch):
         assert manifest["doc_id"] == "upload"
         design = json.loads(urlopen(base + "/design.json", timeout=2).read())
         assert design["id"] == "upload"
+
+        assert status.get("staged") is True
+        assert status.get("doc_id") == "upload"
+        assert status.get("design_url") == "/design.json"
+
+        summary = json.loads(urlopen(f"{base}/run-summary?job_id={queued['job_id']}", timeout=2).read())
+        assert summary["ok"] is True
+        assert summary["staged"] is True
+        assert summary["manifest"]["doc_id"] == "upload"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_process_stages_when_figma_pipeline_stage_skipped(tmp_path, monkeypatch):
+    """Bridge must re-stage even when run_one skips figma_import (resume / wrong inbox)."""
+    _allow_machine_ready(monkeypatch)
+    calls = []
+
+    def run_one(image_path, run_dir, cfg):
+        calls.append(cfg)
+        os.makedirs(run_dir, exist_ok=True)
+        design = {"id": "skipped-figma", "canvas": {"w": 10, "h": 10}, "layers": []}
+        with open(os.path.join(run_dir, "design.json"), "w", encoding="utf-8") as fh:
+            json.dump(design, fh)
+        return {"ok": True, "run_dir": run_dir, "duration_s": 0.01}
+
+    fake = types.ModuleType("run_pipeline")
+    fake.run_one = run_one
+    monkeypatch.setitem(sys.modules, "run_pipeline", fake)
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    config_data = config
+    # config points at a different inbox — bridge must override to its own inbox.
+    import yaml
+    cfg = yaml.safe_load(open(config_data, encoding="utf-8"))
+    cfg["figma"] = {"enabled": True, "mode": "plugin", "inbox": str(tmp_path / "other-inbox")}
+    with open(config_data, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(cfg, fh)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        queued = json.loads(urlopen(Request(base + "/process?filename=ad.png", data=b"x", method="POST"), timeout=2).read())
+        status = _poll_job(base, queued["job_id"])
+        assert status["status"] == "done"
+        assert status["staged"] is True
+        assert status["doc_id"] == "skipped-figma"
+        assert not (tmp_path / "other-inbox" / "inbox.json").exists()
+        manifest = json.loads((inbox / "inbox.json").read_text(encoding="utf-8"))
+        assert manifest["doc_id"] == "skipped-figma"
+        assert os.path.abspath(calls[0]["figma"]["inbox"]) == os.path.abspath(str(inbox))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_run_summary_returns_manifest_for_finished_job(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
+    _install_fake_run_pipeline(monkeypatch)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        queued = json.loads(urlopen(Request(base + "/process?filename=a.png", data=b"x", method="POST"), timeout=2).read())
+        status = _poll_job(base, queued["job_id"])
+        assert status["status"] == "done"
+        summary = json.loads(urlopen(f"{base}/run-summary?job_id={queued['job_id']}", timeout=2).read())
+        assert summary["ok"] is True
+        assert summary["staged"] is True
+        assert summary["manifest"]["doc_id"] == "upload"
+        assert summary["design_url"] == "/design.json"
+        assert summary["run_dir"]
     finally:
         server.shutdown()
         server.server_close()
@@ -522,7 +607,7 @@ def test_process_missing_content_length_returns_400(tmp_path, monkeypatch):
 def test_process_reports_eta_from_history_after_a_prior_run(tmp_path, monkeypatch):
     _allow_machine_ready(monkeypatch)
     """First upload has no history -> no eta_s. Second upload sees the first run's recorded
-    duration and gets a real (median-based) eta_s while running."""
+    duration and gets a stage-weighted eta_s + progress_pct while running."""
     _install_fake_run_pipeline(monkeypatch, sleep_s=0.15)
     inbox = tmp_path / "inbox"
     inbox.mkdir()
@@ -534,8 +619,11 @@ def test_process_reports_eta_from_history_after_a_prior_run(tmp_path, monkeypatc
         first = json.loads(urlopen(Request(base + "/process?filename=a.png", data=b"x", method="POST"), timeout=2).read())
         during_first = json.loads(urlopen(f"{base}/process?job_id={first['job_id']}", timeout=2).read())
         assert "eta_s" not in during_first, "no history yet -> no fabricated ETA"
+        assert "progress_pct" not in during_first
         _poll_job(base, first["job_id"])
-        assert (inbox / ".process_history.json").exists()
+        history = json.loads((inbox / ".process_history.json").read_text(encoding="utf-8"))
+        assert history["durations_s"]
+        assert history["runs"][0]["duration_s"] > 0
 
         second = json.loads(urlopen(Request(base + "/process?filename=b.png", data=b"y", method="POST"), timeout=2).read())
         time.sleep(0.05)
@@ -544,7 +632,136 @@ def test_process_reports_eta_from_history_after_a_prior_run(tmp_path, monkeypatc
         assert "eta_s" in during_second and during_second["eta_s"] >= 0
         assert during_second["eta_sample_size"] == 1
         assert during_second.get("elapsed_s") is not None
+        assert "progress_pct" in during_second
+        assert 0 < during_second["progress_pct"] < 100
         _poll_job(base, second["job_id"])
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_process_poll_returns_stage_from_pipeline_log(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
+
+    def run_one(image_path, run_dir, cfg):
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, "pipeline.log"), "w", encoding="utf-8") as fh:
+            fh.write("[12:00:00] normalize → 1080x1080\n")
+            fh.write("[12:00:02] ocr[doctr] → 3 lines\n")
+            fh.write("[12:00:10] text analysis → 2 blocks, 1 styles\n")
+        time.sleep(0.2)
+        design = {"id": "upload", "canvas": {"w": 10, "h": 10}, "layers": []}
+        design_path = os.path.join(run_dir, "design.json")
+        with open(design_path, "w", encoding="utf-8") as fh:
+            json.dump(design, fh)
+        if (cfg.get("figma") or {}).get("enabled"):
+            from src import figma_import
+            figma_import.import_design(design_path, run_dir, cfg)
+        return {"ok": True, "run_dir": run_dir}
+
+    fake = types.ModuleType("run_pipeline")
+    fake.run_one = run_one
+    monkeypatch.setitem(sys.modules, "run_pipeline", fake)
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        queued = json.loads(urlopen(Request(base + "/process?filename=a.png", data=b"x", method="POST"), timeout=2).read())
+        saw_stage = False
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            status = json.loads(urlopen(f"{base}/process?job_id={queued['job_id']}", timeout=2).read())
+            if status.get("stage") == "text":
+                saw_stage = True
+                break
+            time.sleep(0.05)
+        assert saw_stage, status
+        _poll_job(base, queued["job_id"])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_process_queued_job_has_no_elapsed_or_eta(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
+    _install_fake_run_pipeline(monkeypatch, sleep_s=0.4)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        queued = json.loads(urlopen(Request(base + "/process?filename=a.png", data=b"x", method="POST"), timeout=2).read())
+        status = json.loads(urlopen(f"{base}/process?job_id={queued['job_id']}", timeout=2).read())
+        if status["status"] == "queued":
+            assert "elapsed_s" not in status
+            assert "eta_s" not in status
+        _poll_job(base, queued["job_id"])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_history_records_stage_fractions_from_pipeline_log(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    log_path = run_dir / "pipeline.log"
+    log_path.write_text(
+        "[12:00:00] normalize → 1080x1080\n"
+        "[12:00:10] ocr[doctr] → 3 lines\n"
+        "[12:01:00] text analysis → 2 blocks, 1 styles\n"
+        "[12:01:30] done in 90.0s\n",
+        encoding="utf-8",
+    )
+    fracs = _parse_stage_fractions(str(run_dir), 90.0)
+    assert fracs is not None
+    assert fracs["normalize"] > 0
+    assert fracs["ocr"] > fracs["normalize"]
+    _record_history(str(inbox), 90.0, str(run_dir))
+    history = _read_history(str(inbox))
+    assert history["runs"][0]["stage_fractions"]["ocr"] > 0
+
+
+def test_estimate_eta_uses_stage_weighted_progress(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    history_path = inbox / ".process_history.json"
+    history_path.write_text(
+        json.dumps({
+            "durations_s": [100.0, 110.0],
+            "runs": [
+                {
+                    "duration_s": 100.0,
+                    "stage_fractions": {
+                        "normalize": 0.05, "ocr": 0.35, "text": 0.1,
+                        "residual": 0.05, "qwen": 0.05, "sam": 0.1,
+                        "elements": 0.05, "merge": 0.05, "reconstruct": 0.1,
+                        "layout": 0.05, "design": 0.05, "preview": 0.02,
+                        "figma": 0.01, "export": 0.01, "qa": 0.01,
+                    },
+                },
+                {"duration_s": 110.0},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    early_eta, sample_size, early_pct = _estimate_eta(str(inbox), 5.0, "ocr")
+    late_eta, _, late_pct = _estimate_eta(str(inbox), 70.0, "layout")
+    assert sample_size == 2
+    assert early_eta is not None and late_eta is not None
+    assert late_eta < early_eta
+    assert late_pct > early_pct
+
+
+def test_estimate_eta_returns_none_without_history(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    eta, sample_size, progress_pct = _estimate_eta(str(inbox), 12.0, "ocr")
+    assert eta is None and sample_size == 0 and progress_pct is None

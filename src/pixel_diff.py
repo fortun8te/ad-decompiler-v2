@@ -14,9 +14,11 @@ import json
 import os
 from typing import Optional
 
+from src.qa_config import DEFAULT_VISUAL_PASS_SSIM
+
 
 DEFAULT_THRESHOLDS = {
-    "local_ssim_min": 0.78,
+    "local_ssim_min": DEFAULT_VISUAL_PASS_SSIM,
     "edge_f1_min": 0.68,
     "color_similarity_min": 0.82,
     "editable_ratio_min": 0.15,
@@ -296,6 +298,100 @@ def _observation_key(observation):
     return None
 
 
+def _load_reconstruction(run_dir):
+    path = os.path.join(run_dir, "reconstruction.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _layer_qa_metrics(source):
+    """Pull optional ssim/recall fields from a stats row or candidate meta blob."""
+    if not isinstance(source, dict):
+        return None, None
+    qa = source.get("qa") if isinstance(source.get("qa"), dict) else source
+    ssim = qa.get("ssim")
+    recall = qa.get("recall", qa.get("text_recall"))
+    return ssim, recall
+
+
+def _text_per_layer_entry(layer_id, layer, ssim, recall):
+    if ssim is None and recall is None:
+        return None
+    meta = (layer or {}).get("meta") or {}
+    item = {
+        "id": str(layer_id),
+        "type": "text",
+        "role": meta.get("role") or "text",
+    }
+    if ssim is not None:
+        item["ssim"] = round(float(ssim), 4)
+    if recall is not None:
+        item["recall"] = round(float(recall), 4)
+    scores = [item[key] for key in ("ssim", "recall") if key in item]
+    if scores:
+        item["score"] = round(min(scores), 4)
+    return item
+
+
+def _build_per_layer(reconstruction, design):
+    """Populate text-layer QA rows from reconstruction stats/candidates when available."""
+    reconstruction = reconstruction or {}
+    stats = reconstruction.get("stats") or {}
+    out = []
+    seen = set()
+
+    for entry in stats.get("per_layer") or []:
+        if not isinstance(entry, dict):
+            continue
+        lid = str(entry.get("id") or "")
+        if not lid or lid in seen:
+            continue
+        kind = entry.get("type") or entry.get("role")
+        ssim, recall = _layer_qa_metrics(entry)
+        if kind not in (None, "text") and ssim is None and recall is None:
+            continue
+        item = _text_per_layer_entry(lid, entry, ssim, recall)
+        if item is None:
+            continue
+        if entry.get("role"):
+            item["role"] = entry["role"]
+        out.append(item)
+        seen.add(lid)
+
+    text_layers = [
+        layer for layer in _flatten_layers((design or {}).get("layers") or [])
+        if layer.get("type") == "text"
+    ]
+    candidates = {
+        str(candidate.get("id")): candidate
+        for candidate in (reconstruction.get("candidates") or [])
+        if isinstance(candidate, dict) and candidate.get("id") is not None
+    }
+
+    for layer in text_layers:
+        lid = str(layer.get("id") or "")
+        if not lid or lid in seen:
+            continue
+        meta = layer.get("meta") or {}
+        candidate = candidates.get(lid) or candidates.get(str(meta.get("source_id") or ""))
+        cand_meta = (candidate or {}).get("meta") or {}
+        ssim, recall = _layer_qa_metrics(cand_meta)
+        if ssim is None and recall is None and candidate:
+            ssim, recall = _layer_qa_metrics(candidate)
+        item = _text_per_layer_entry(lid, layer, ssim, recall)
+        if item is None:
+            continue
+        out.append(item)
+        seen.add(lid)
+
+    return out
+
+
 def _duplicate_ownership(layers):
     owners, duplicates = {}, []
     for layer in layers:
@@ -478,14 +574,7 @@ def _structural_audit(
     )
     duplicate_ownership = sorted(set(duplicate_ownership))
 
-    reconstruction = {}
-    reconstruction_path = os.path.join(run_dir, "reconstruction.json")
-    if os.path.exists(reconstruction_path):
-        try:
-            with open(reconstruction_path, encoding="utf-8") as fh:
-                reconstruction = json.load(fh)
-        except Exception:
-            reconstruction = {}
+    reconstruction = _load_reconstruction(run_dir)
 
     if background_path is None:
         candidate = os.path.join(run_dir, "background_clean.png")
@@ -655,6 +744,7 @@ def compare(
             hard_fails.append({**flag, "hard": True})
             seen_fails.add(key)
     structure["hard_fails"] = hard_fails
+    per_layer = _build_per_layer(_load_reconstruction(run_dir), design_data)
 
     return {
         # Compatibility: callers still read `ssim`, now the harder local/multiscale metric.
@@ -674,6 +764,7 @@ def compare(
         "quality_flags": quality_flags,
         "text_recall": None if text_recall is None else round(text_recall, 4),
         "editable_text_recall": structure["editable_text_recall"],
+        "per_layer": per_layer,
         "per_region_max_delta": float(cells.max()),
         "per_region": {"rows": gy, "cols": gx, "mean_delta": cells.round(3).tolist(), "worst": ranked[:8]},
         "diff_png": diff_png,
