@@ -308,3 +308,26 @@ def test_big_lama_size_mismatch_is_resized_not_crashed(monkeypatch):
     assert diagnostics.get("resized_from") == "352x344"
     # pixels outside the mask must stay byte-identical to the source
     assert np.array_equal(out[0, 0], source[0, 0])
+
+
+def test_role_aware_overlap_is_owned_by_large_object_pass(tmp_path, monkeypatch):
+    from PIL import Image
+    source = np.full((20, 30, 3), 100, dtype=np.uint8)
+    Image.fromarray(source).save(tmp_path / "source.png")
+    text = np.zeros((20, 30), dtype=np.uint8); text[8:12, 12:18] = 255
+    large = np.zeros((20, 30), dtype=np.uint8); large[5:15, 5:25] = 255
+    calls = []
+
+    def fake(rgb, mask, cfg=None, return_diagnostics=False):
+        calls.append(mask.copy())
+        out = rgb.copy(); out[mask > 0] = 7
+        result = (out, "fake", {})
+        return result if return_diagnostics else result[:2]
+
+    monkeypatch.setattr(inpaint, "inpaint_array", fake)
+    result = inpaint.inpaint_role_aware(
+        str(tmp_path / "source.png"), {"text": text, "large": large},
+        str(tmp_path / "out.png"), {},
+    )
+    assert [part["role"] for part in result["parts"]] == ["large"]
+    assert np.array_equal(calls[0], large)

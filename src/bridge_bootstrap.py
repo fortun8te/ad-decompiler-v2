@@ -68,6 +68,7 @@ def _cuda_cudnn_warnings(cfg: dict[str, Any]) -> list[str]:
 def prepare(
     config_path: str | os.PathLike[str] | None = None,
     inbox: str | os.PathLike[str] | None = None,
+    port: int | None = None,
     *,
     root: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
@@ -93,11 +94,17 @@ def prepare(
         if not isinstance(figma, dict):
             figma = {}
             cfg["figma"] = figma
-        if not figma.get("enabled"):
-            figma["enabled"] = True
-            figma.setdefault("mode", "plugin")
-            figma.setdefault("inbox", inbox_path.replace("\\", "/"))
-            figma.setdefault("bridge_port", 8790)
+        # The launcher is authoritative for its own inbox/port.  Keeping stale values
+        # here makes the pipeline stage files in one folder while the bridge serves
+        # another, which looks like a successful run that never appears in Figma.
+        expected_inbox = inbox_path.replace("\\", "/")
+        expected_port = int(port or os.environ.get("BRIDGE_PORT", 8790))
+        before = dict(figma)
+        figma["enabled"] = True
+        figma.setdefault("mode", "plugin")
+        figma["inbox"] = expected_inbox
+        figma["bridge_port"] = expected_port
+        if figma != before:
             _save_yaml(cfg_path, cfg)
             patched_figma = True
     else:
@@ -121,6 +128,7 @@ def prepare(
         "created_config": created_config,
         "patched_figma": patched_figma,
         "inbox": inbox_path,
+        "port": int(port or os.environ.get("BRIDGE_PORT", 8790)),
         "font_matching_enabled": font_enabled,
         "gpu_warnings": gpu_warnings,
     }
@@ -133,9 +141,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Bootstrap ad-decompiler bridge files")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--inbox", default=None)
+    ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    status = prepare(config_path=args.config, inbox=args.inbox)
+    status = prepare(config_path=args.config, inbox=args.inbox, port=args.port)
     if args.json:
         print(json.dumps(status, indent=2))
     else:

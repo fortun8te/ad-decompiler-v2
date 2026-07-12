@@ -3,6 +3,14 @@ import json
 from src.run_report import RunReport
 
 
+def _write_complete_qa(tmp_path):
+    (tmp_path / "qa.json").write_text(json.dumps({
+        "ok": True, "hard_fails": [],
+        "structural": {"background": {}, "layer_alpha": [], "element_recall": 1.0,
+                       "hard_fails": []},
+    }), encoding="utf-8")
+
+
 def test_required_sam_fallback_is_visible_and_invalidates_acceptance(tmp_path):
     report = RunReport(
         str(tmp_path), "input.png",
@@ -25,6 +33,7 @@ def test_advisory_qwen_fallback_is_reported_without_invalidating_sam_ocr_run(tmp
         "normalize",
     )
     report.degraded("qwen", "ComfyUI offline")
+    _write_complete_qa(tmp_path)
     report.finish(qa_ok=True)
 
     assert report.data["status"] == "degraded"
@@ -55,6 +64,7 @@ def test_inpaint_fallback_is_required_and_invalidates_acceptance_under_require_a
 def test_inpaint_fallback_is_not_required_without_require_active_models(tmp_path):
     report = RunReport(str(tmp_path), "input.png", {}, "normalize")
     report.degraded("inpaint", "Big-LaMa unavailable; used opencv-telea fallback for background plate")
+    _write_complete_qa(tmp_path)
     report.finish(qa_ok=True)
 
     assert report.acceptable is True
@@ -73,6 +83,7 @@ def test_inpaint_explicit_opencv_mode_is_not_required_even_under_require_active_
     )
     assert "inpaint" not in report.data["policy"]["required_components"]
     report.degraded("inpaint", "opencv-telea backend used for background plate")
+    _write_complete_qa(tmp_path)
     report.finish(qa_ok=True)
 
     saved = json.loads((tmp_path / "runtime_report.json").read_text(encoding="utf-8"))
@@ -94,3 +105,14 @@ def test_inpaint_default_auto_mode_still_required_under_require_active_models(tm
     saved = json.loads((tmp_path / "runtime_report.json").read_text(encoding="utf-8"))
     assert saved["acceptable"] is False
     assert any(v["rule"] == "inpaint-unavailable" for v in saved["violations"])
+
+
+def test_claimed_qa_pass_without_visual_evidence_invalidates_runtime(tmp_path):
+    report = RunReport(str(tmp_path), "input.png", {}, "normalize")
+    (tmp_path / "qa.json").write_text(json.dumps({
+        "ok": True, "hard_fails": [], "structural": {},
+    }), encoding="utf-8")
+    report.finish(qa_ok=True)
+    assert report.data["qa_ok"] is False
+    assert report.data["acceptable"] is False
+    assert any(v["rule"] == "qa-evidence-incomplete" for v in report.data["violations"])

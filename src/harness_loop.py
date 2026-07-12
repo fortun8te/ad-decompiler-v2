@@ -8,8 +8,24 @@ Never lowers QA thresholds. Writes ``harness_loop.json`` with a full audit trail
 from __future__ import annotations
 
 import copy
+import hashlib
+import inspect
 import os
 from typing import Any, Callable, Optional
+
+
+def _invoke_run_one(run_one: Callable[..., dict], image_path: str, run_dir: str,
+                    cfg: dict, start_from: str) -> dict:
+    """Call production and lightweight test/extension runners without guessing arity."""
+    try:
+        parameters = inspect.signature(run_one).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "start_from" in parameters or any(
+        item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+    ):
+        return run_one(image_path, run_dir, cfg, start_from=start_from)
+    return run_one(image_path, run_dir, cfg)
 
 from src.harness import (
     _flag,
@@ -78,15 +94,28 @@ def _qa_summary(qa: dict) -> dict:
     }
 
 
+def _artifact_fingerprint(path: str) -> str | None:
+    """Content fingerprint: mtimes can change even when a runner rewrites stale QA."""
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def _run_critic_pass(run_dir: str, cfg: dict) -> dict:
     try:
         from src.harness_critic import analyze, critic_review
         critic_output = analyze(run_dir, write=False, cfg=cfg)
+        if not isinstance(critic_output, dict):
+            raise TypeError("critic returned malformed output")
         repairs = load_repairs(run_dir, cfg)
         critic_output["filtered_repairs"] = critic_review(repairs, critic_output)
         return critic_output
-    except ImportError:
-        return _fallback_critic(run_dir, cfg)
+    except (ImportError, TypeError, ValueError, KeyError) as exc:
+        fallback = _fallback_critic(run_dir, cfg)
+        fallback["critic_error"] = str(exc)
+        return fallback
 
 
 def _fallback_critic(run_dir: str, cfg: dict) -> dict:
@@ -130,9 +159,11 @@ def _run_fixer_pass(run_dir: str, cfg: dict, critic_output: dict) -> dict:
     try:
         from src.harness_fixer import apply_fixer_round
         patched_cfg, fixes = apply_fixer_round(run_dir, cfg, critic_output)
+        if not isinstance(patched_cfg, dict) or not isinstance(fixes, list):
+            raise TypeError("fixer returned malformed output")
         return {"cfg": patched_cfg, "fixes": fixes}
-    except ImportError:
-        return {"cfg": copy.deepcopy(cfg), "fixes": []}
+    except (ImportError, TypeError, ValueError, KeyError) as exc:
+        return {"cfg": copy.deepcopy(cfg), "fixes": [], "error": str(exc)}
 
 
 def _resume_after_fixer(run_dir: str, cfg: dict, critic_output: dict) -> str:
@@ -159,21 +190,54 @@ def _run_round(
 
     if not skip_pipeline:
         loop_cfg = _cfg_for_pipeline(working_cfg)
-        pipeline_result = run_one(image_path, run_dir, loop_cfg, start_from)
+        qa_path = os.path.join(run_dir, "qa.json")
+        qa_before = _artifact_fingerprint(qa_path)
+        try:
+            pipeline_result = _invoke_run_one(run_one, image_path, run_dir, loop_cfg, start_from)
+            if not isinstance(pipeline_result, dict):
+                raise TypeError(
+                    f"pipeline runner returned {type(pipeline_result).__name__}, expected dict"
+                )
+        except Exception as exc:
+            round_record["pipeline"] = {
+                "ok": False, "start_from": start_from,
+                "error": str(exc), "exception": type(exc).__name__,
+            }
+            round_record["stopped"] = "pipeline_exception"
+            return round_record, working_cfg, True
         round_record["pipeline"] = {
             "ok": bool(pipeline_result.get("ok")),
             "start_from": start_from,
+            "error": pipeline_result.get("error"),
         }
+        if not pipeline_result.get("ok"):
+            round_record["stopped"] = "pipeline_failed"
+            return round_record, working_cfg, True
         qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+        qa_after = _artifact_fingerprint(qa_path)
+        qa_fresh = qa_after is not None and qa_after != qa_before
+        round_record["pipeline"]["qa_fresh"] = qa_fresh
         round_record["qa"] = _qa_summary(qa)
+        production_result = "qa_ok" in pipeline_result or "runtime_ok" in pipeline_result
+        if not qa_fresh and production_result:
+            round_record["stopped"] = "qa_not_refreshed"
+            return round_record, working_cfg, True
         if _qa_accepts(qa, allow_summary=True):
             round_record["stopped"] = "qa_ok"
             return round_record, working_cfg, True
 
     repair_cfg = _cfg_for_pipeline(working_cfg)
-    repair_summary = execute_repairs_fn(
-        run_dir, repair_cfg, max_iterations=repair_iters, run_one=run_one,
-    )
+    try:
+        repair_summary = execute_repairs_fn(
+            run_dir, repair_cfg, max_iterations=repair_iters, run_one=run_one,
+        )
+        if not isinstance(repair_summary, dict):
+            raise TypeError("repair executor returned malformed output")
+    except Exception as exc:
+        repair_summary = {
+            "qa_ok": False, "stopped": "repair_exception", "attempts": [],
+            "error": str(exc), "exception": type(exc).__name__,
+        }
     round_record["repairs"] = repair_summary
     qa = _load_json(os.path.join(run_dir, "qa.json"), {})
     round_record["qa_after_repairs"] = _qa_summary(qa)
@@ -197,6 +261,7 @@ def _run_round(
     round_record["fixer"] = {
         "fixes": fixer_result.get("fixes") or [],
         "fix_count": len(fixer_result.get("fixes") or []),
+        "error": fixer_result.get("error"),
     }
 
     patched_cfg = fixer_result.get("cfg") or working_cfg
@@ -265,12 +330,13 @@ def run_until_acceptable(
             break
 
     final_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+    success_stop = stopped in {"qa_ok", "qa_ok_after_repairs"}
     summary = {
         "run_dir": run_dir,
         "rounds": rounds,
         "rounds_completed": len(rounds),
         "max_rounds": max_rounds,
-        "qa_ok": _qa_accepts(final_qa, allow_summary=True),
+        "qa_ok": success_stop and _qa_accepts(final_qa, allow_summary=True),
         "stopped": stopped,
         "thresholds": threshold_snapshot,
     }

@@ -6,6 +6,8 @@ then re-runs ``run_pipeline.run_one`` until QA passes or ``max_iterations`` is r
 from __future__ import annotations
 
 import copy
+import hashlib
+import inspect
 import json
 import os
 from typing import Any, Callable, Optional
@@ -198,6 +200,10 @@ def config_patches_for(repair: dict) -> dict:
             }
         if params.get("disable_segment_filter"):
             patches.setdefault("vlm", {})["segment_filter"] = {"enabled": False}
+        if params.get("reject_internal_holes"):
+            # Recorded for SAM/mask judges that support alternate-matte selection. It also
+            # forces a fresh detection pass instead of silently reusing a corrupt asset.
+            sam3_patch["reject_internal_holes"] = True
 
     elif stage == "sam3" and action == "revalidate-rejected":
         patches["sam3"] = {
@@ -298,15 +304,60 @@ def _write_json(path: str, data: dict) -> None:
     os.replace(temporary, path)
 
 
+def _artifact_fingerprint(path: str) -> str | None:
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _invoke_run_one(run_one: Callable[..., dict], input_path: str, run_dir: str,
+                    cfg: dict, resume: str) -> dict:
+    """Support production and lightweight runners while preserving the resume stage."""
+    try:
+        parameters = inspect.signature(run_one).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "start_from" in parameters or any(
+        item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+    ):
+        return run_one(input_path, run_dir, cfg, start_from=resume)
+    return run_one(input_path, run_dir, cfg)
+
+
+def _repair_id(repair: dict) -> tuple:
+    return (repair.get("stage"), repair.get("action"), repair.get("target_id"))
+
+
+def _save_harness_summary(run_dir: str, summary: dict) -> dict:
+    _write_json(os.path.join(run_dir, "harness.json"), summary)
+    return summary
+
+
 def load_repairs(run_dir: str, cfg: Optional[dict] = None) -> list:
     """Read repairs from repairs.json, qa.json, or re-run repair.assess."""
     run_dir = os.path.abspath(run_dir)
     repairs_path = os.path.join(run_dir, "repairs.json")
+    qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+    qa_path = os.path.join(run_dir, "qa.json")
     repairs = _load_json(repairs_path, None)
+    # A resumed pipeline can rewrite qa.json without rewriting repairs.json.  In that
+    # case the QA-owned list is authoritative; otherwise the loop can repeat a stale
+    # repair forever and never reach an available alternative.
+    qa_is_newer = (
+        os.path.exists(qa_path)
+        and os.path.exists(repairs_path)
+        and os.stat(qa_path).st_mtime_ns > os.stat(repairs_path).st_mtime_ns
+    )
+    if (
+        qa_is_newer
+        and isinstance(qa.get("repairs"), list)
+        and (qa.get("repairs") or _qa_accepts(qa, allow_summary=True))
+    ):
+        return qa["repairs"]
     if isinstance(repairs, list) and repairs:
         return repairs
-
-    qa = _load_json(os.path.join(run_dir, "qa.json"), {})
     if isinstance(qa.get("repairs"), list) and qa["repairs"]:
         return qa["repairs"]
 
@@ -467,40 +518,43 @@ def execute_repairs(
 
     qa = _load_json(os.path.join(run_dir, "qa.json"), {})
     if _qa_accepts(qa, allow_summary=True):
-        return {
+        return _save_harness_summary(run_dir, {
             "run_dir": run_dir,
             "iterations": 0,
             "qa_ok": True,
             "stopped": "already_ok",
             "attempts": [],
-        }
+        })
 
     input_path = _input_path(run_dir)
     if not input_path:
-        return {
+        return _save_harness_summary(run_dir, {
             "run_dir": run_dir,
             "iterations": 0,
             "qa_ok": False,
             "stopped": "missing_input",
             "error": "could not resolve input image for repair rerun",
             "attempts": [],
-        }
+        })
 
     attempts = []
+    exhausted: set[tuple] = set()
     working_cfg = copy.deepcopy(cfg)
     working_cfg.setdefault("runtime", {})["auto_repair"] = False
 
     for iteration in range(1, max(0, int(max_iterations)) + 1):
         repairs = load_repairs(run_dir, working_cfg)
-        choice = recommended_resume(repairs)
+        candidates = [repair for repair in repairs if _repair_id(repair) not in exhausted]
+        choice = recommended_resume(candidates)
         if not choice:
-            return {
+            stopped = "all_repairs_failed" if repairs and exhausted else "no_actionable_repairs"
+            return _save_harness_summary(run_dir, {
                 "run_dir": run_dir,
                 "iterations": iteration - 1,
                 "qa_ok": _qa_accepts(_load_json(os.path.join(run_dir, "qa.json"), {})),
-                "stopped": "no_actionable_repairs",
+                "stopped": stopped,
                 "attempts": attempts,
-            }
+            })
 
         resume = choice["resume"]
         patches = choice.get("patches") or {}
@@ -509,11 +563,21 @@ def execute_repairs(
         iter_cfg.setdefault("runtime", {})["auto_repair"] = False
 
         qa_path = os.path.join(run_dir, "qa.json")
-        before_qa_ns = os.stat(qa_path).st_mtime_ns if os.path.exists(qa_path) else None
-        result = run_one(input_path, run_dir, iter_cfg, resume)
+        before_qa_fingerprint = _artifact_fingerprint(qa_path)
+        try:
+            result = _invoke_run_one(run_one, input_path, run_dir, iter_cfg, resume)
+            if not isinstance(result, dict):
+                raise TypeError(f"pipeline runner returned {type(result).__name__}, expected dict")
+            pipeline_error = result.get("error")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc), "exception": type(exc).__name__}
+            pipeline_error = str(exc)
         qa = _load_json(os.path.join(run_dir, "qa.json"), {})
-        after_qa_ns = os.stat(qa_path).st_mtime_ns if os.path.exists(qa_path) else None
-        qa_fresh = after_qa_ns is not None and (before_qa_ns is None or after_qa_ns > before_qa_ns)
+        after_qa_fingerprint = _artifact_fingerprint(qa_path)
+        qa_fresh = (
+            after_qa_fingerprint is not None
+            and after_qa_fingerprint != before_qa_fingerprint
+        )
         attempt = {
             "iteration": iteration,
             "resume": resume,
@@ -525,10 +589,18 @@ def execute_repairs(
             },
             "patches": patches,
             "pipeline_ok": bool(result.get("ok")),
+            "pipeline_error": pipeline_error,
+            "qa_fresh": qa_fresh,
             "qa_ok": qa_fresh and _qa_accepts(qa, allow_summary=True),
         }
         attempts.append(attempt)
         working_cfg = iter_cfg
+
+        # A failed stage or a run that produced no new QA cannot prove progress.
+        # Exhaust that exact tactic and let the next repair act as the fallback.
+        has_alternative = any(_repair_id(item) != _repair_id(choice) for item in repairs)
+        if not result.get("ok") or (not qa_fresh and has_alternative):
+            exhausted.add((choice.get("stage"), choice.get("action"), choice.get("target_id")))
 
         if qa_fresh and _qa_accepts(qa, allow_summary=True):
             summary = {
@@ -538,8 +610,7 @@ def execute_repairs(
                 "stopped": "qa_ok",
                 "attempts": attempts,
             }
-            _write_json(os.path.join(run_dir, "harness.json"), summary)
-            return summary
+            return _save_harness_summary(run_dir, summary)
 
     final_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
     summary = {
@@ -549,5 +620,4 @@ def execute_repairs(
         "stopped": "max_iterations",
         "attempts": attempts,
     }
-    _write_json(os.path.join(run_dir, "harness.json"), summary)
-    return summary
+    return _save_harness_summary(run_dir, summary)

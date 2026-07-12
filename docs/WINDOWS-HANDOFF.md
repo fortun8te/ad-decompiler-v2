@@ -6,9 +6,14 @@ Do not call the rebuild successful until a representative batch passes the bench
 
 ## Setup
 
-**Bridge only (1 click):** double-click `Start Bridge.bat`. It bootstraps `config.yaml` +
-`~/figma-inbox` and starts `http://localhost:8790`. Import `figma-plugin/manifest.json` in
+**One click:** double-click `Start Bridge.bat`. The first launch installs the RTX environment,
+creates `config.yaml` + `~/figma-inbox`, checks what is ready, and starts
+`http://localhost:8790`. Later launches are immediate. Import `figma-plugin/manifest.json` in
 Figma Desktop once.
+
+If the bridge is already running it is reused. If another app owns port 8790, the launcher says
+so instead of starting a second broken process. Advanced custom ports also require updating the
+address and allowed development domain in the Figma plugin.
 
 **Full GPU setup + benchmark:**
 
@@ -24,8 +29,8 @@ change the installation manually.
 Use Python 3.12 and current Blackwell-compatible CUDA wheels:
 
 ```powershell
-git clone https://github.com/fortun8te/ad-decompiler
-cd ad-decompiler
+git clone https://github.com/fortun8te/ad-decompiler-v2
+cd ad-decompiler-v2
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
@@ -44,6 +49,45 @@ Keep model weights outside git. Set the local SAM checkpoint and optional font-l
 `config.yaml`. Automatic SAM downloads are disabled. Keep ComfyUI/Qwen in a separate process;
 it is an advisory layer/alpha source, not the element detector.
 
+## Downloads that cannot be bundled
+
+- Python 3.12 and Git.
+- A current NVIDIA driver for the RTX 5080.
+- The official SAM 3 image checkpoint at `C:\models\sam3.pt` (or update its config path).
+- LM Studio with `google/gemma-4-e4b` loaded and its local server enabled.
+- ComfyUI plus the configured Qwen workflow only when `qwen.required: true`.
+- VTracer and two SVG render checkers are installed by `setup_rtx.ps1`; `choco install potrace`
+  adds the optional monochrome backup tracer.
+- Recommended OCR backup: `winget install UB-Mannheim.TesseractOCR`.
+
+Run `.\.venv\Scripts\python.exe doctor.py`. Every failed item now includes a direct `FIX:` line.
+PaddleOCR and Surya are attempted separately because their Windows packages can conflict with
+Blackwell. Either may warn and skip without breaking the working docTR OCR path.
+
+## Prove the models actually run
+
+`doctor.py` checks dependency readiness. It is not runtime proof. Once it says READY, run:
+
+```powershell
+Start Bridge.bat -SelfTest
+```
+
+This executes bounded real OCR, SAM 3, Gemma vision, Big-LaMa, VTracer and Figma staging probes,
+then one integrated synthetic pipeline. It writes `runs\rtx-self-test\latest.json`, the input,
+model artifacts, `runtime_report.json`, and a fingerprinted `self_test.json`. A normal bridge
+restart only reads that cache. It asks for another test after relevant code/config changes or
+seven days. Use `Start Bridge.bat -ForceSelfTest` after changing drivers, CUDA, or model files.
+
+For a remote benchmark over Tailscale:
+
+```powershell
+Start Bridge.bat -Remote
+python scripts\remote_benchmark.py --bridge http://<shown-tailscale-ip>:8790 --input-dir C:\images\benchmark
+```
+
+Remote mode binds only to the machine's Tailscale IP. Figma cross-machine access still requires
+an HTTPS `tailscale serve` URL because Figma blocks mixed-content HTTP hosts.
+
 `doctor.py` must print `READY` before the first run. It blocks a benchmark if CUDA, the active
 OCR engine, or SAM's local image checkpoint is missing; optional fallbacks are shown as warnings.
 Run `pytest -q` after cloning only if you are changing code.
@@ -53,8 +97,9 @@ Every run also writes `runtime_report.json`: `ok` means no model degraded, `degr
 advisory path (normally Qwen) fell back, and a listed `violation` means a required OCR/SAM model
 did not run and the benchmark is invalid. Do not use `--skip-doctor` for acceptance evidence.
 
-Install VTracer and Potrace on `PATH`. Install Big-LaMa if compatible with the environment;
-otherwise the run will label OpenCV as the inpaint fallback.
+VTracer, Big-LaMa, and the SVG render-back checker are installed by setup. Potrace on `PATH` is
+an optional monochrome backup. OpenCV inpainting remains available for diagnosis, but an
+acceptance benchmark will fail until Big-LaMa is working.
 
 ## First real run
 

@@ -898,6 +898,22 @@
     .upload-zone .empty-glyph svg { width: 22px; height: 22px; }
     .upload-busy .empty-glyph { animation: spin 1.1s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    .readiness-strip {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 28px;
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-secondary);
+      background: var(--bg-secondary);
+      font-size: 10.5px;
+    }
+    .readiness-strip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
+    .readiness-strip[data-state="ok"]::before { background: #27ae60; }
+    .readiness-strip[data-state="warn"]::before { background: #e5a93d; }
+    .readiness-strip[data-state="error"]::before { background: #eb5757; }
   </style>
 </head>
 <body>
@@ -918,6 +934,7 @@
         <span id="connectionText">Checking</span>
       </div>
     </header>
+    <div class="readiness-strip" id="readinessStrip" data-state="idle">Checking model readiness…</div>
 
     <main>
       <section class="hero">
@@ -1082,6 +1099,9 @@
       log: [],
       logFlushTimer: null,
       pluginBuild: PLUGIN_BUILD,
+      bridgeHealth: null,
+      lastProcessStatus: null,
+      pollFailures: 0,
     };
 
     let DEBUG_SESSION = null;
@@ -1367,6 +1387,47 @@
       return health;
     }
 
+    function renderBridgeHealth(health) {
+      state.bridgeHealth = health || null;
+      const strip = $("readinessStrip");
+      if (!strip || !health) return;
+      const active = health.active_job;
+      if (active && (active.status === "queued" || active.status === "running")) {
+        strip.dataset.state = "ok";
+        strip.textContent = "Processing " + (active.filename || "image") + " · "
+          + (active.harness_running ? "repairing" : (STAGE_LABELS[active.stage] || active.status));
+        return;
+      }
+      if (health.machine_ready !== true) {
+        const blocker = (health.machine_blockers || [])[0] || {};
+        strip.dataset.state = "error";
+        strip.textContent = "Setup needed" + (blocker.name ? " · " + blocker.name : "")
+          + (blocker.fix ? " · " + blocker.fix : "");
+        return;
+      }
+      const smoke = health.runtime_self_test || {};
+      if (smoke.valid) {
+        strip.dataset.state = "ok";
+        strip.textContent = "Models ready and runtime-tested";
+      } else {
+        strip.dataset.state = "warn";
+        strip.textContent = "Dependencies ready · runtime not proven · run Start Bridge.bat -SelfTest";
+      }
+    }
+
+    function resumeActiveProcess(base, active) {
+      if (!active || !active.job_id || !/^(queued|running)$/.test(String(active.status))) return;
+      if (state.uploading && state.processJobId === active.job_id) return;
+      state.uploading = true;
+      state.processCancelled = false;
+      state.processJobId = active.job_id;
+      state.lastProcessStatus = active;
+      const startedAt = active.started_at ? Number(active.started_at) * 1000
+        : Date.now() - Number(active.elapsed_s || 0) * 1000;
+      setUploadBusy(true, active);
+      pollProcessJob(base, active.job_id, active.filename || "image", startedAt);
+    }
+
     async function refreshLatest(options) {
       if (state.building || state.uploading) return;
       const base = cleanBase();
@@ -1385,15 +1446,26 @@
       setEmpty("Checking the bridge", "Looking for a design.json and its asset manifest…", true);
       setFooter("Connecting to the local bridge");
       try {
-        await probeBridge(base);
+        const health = await probeBridge(base);
+        renderBridgeHealth(health);
+        setConnection("connected", health.machine_ready === true ? "Bridge ready" : "Setup needed");
+        resumeActiveProcess(base, health.active_job);
+        try {
         const manifest = await fetchJson(base + "/inbox.json", 5000);
         const doc = await fetchJson(base + "/design.json", 7000);
         if (!doc || !doc.canvas || !Array.isArray(doc.layers)) throw new Error("design.json is missing canvas or layers");
         state.manifest = manifest;
         state.source = "bridge";
         state.fileMap = new Map();
-        setConnection("connected", "Bridge ready");
         renderDoc(doc, "local bridge");
+        } catch (stagedError) {
+          if (state.source === "bridge") {
+            state.doc = null;
+            state.manifest = null;
+          }
+          if (!health.active_job) setEmpty("Nothing staged", "Upload an image to create an editable design.", false);
+          setFooter(health.active_job ? "Processing continues on the bridge" : "Bridge connected · nothing staged yet");
+        }
       } catch (error) {
         if (state.source === "bridge") {
           state.doc = null;
@@ -1605,6 +1677,7 @@
     }
 
     function statusFootnote(status) {
+      if (status.reconnecting) return "Connection interrupted · retrying automatically";
       if (status.harness_running) return "Running repair passes before staging the design";
       if (status.phase === "upload") return "Uploading to the local bridge";
       if (status.status === "queued") return "Job queued — pipeline will start shortly";
@@ -1760,8 +1833,25 @@
       return { title: "Upload failed", detail: body, hint: errorHint(body) };
     }
 
+    function qaIssuesFromSummary(summary) {
+      if (!summary) return [];
+      const issues = [];
+      const failures = (summary.hard_fails || []).concat(summary.runtime_violations || []);
+      failures.slice(0, 8).forEach(function (item) {
+        issues.push({
+          title: item.rule ? "QA: " + String(item.rule).replace(/-/g, " ") : "Quality check failed",
+          detail: item.detail || item.reason || "The output did not pass this quality gate.",
+          hint: summary.harness_rounds ? "Auto-repair ran " + summary.harness_rounds + " round(s) but this issue remains." : "Open the run evidence and retry from the recommended stage.",
+        });
+      });
+      if (summary.final_qa_ok === false && !issues.length) {
+        issues.push({ title: "Quality check did not pass", detail: "The bridge reported a failed QA result without a specific rule.", hint: "Inspect qa.json in " + (summary.run_dir || "the run folder") + "." });
+      }
+      return issues;
+    }
+
     async function pollProcessJob(base, jobId, filename, startedAt) {
-      if (state.processCancelled) return;
+      if (state.processCancelled || state.processJobId !== jobId) return;
       // Self-scheduling setTimeout (not setInterval) so a slow/hung request can't stack
       // overlapping polls, and a transient network hiccup doesn't kill the whole flow.
       const maxWaitMs = 20 * 60 * 1000; // the job keeps running server-side regardless
@@ -1769,6 +1859,10 @@
       try {
         status = await fetchJson(base + "/process?job_id=" + encodeURIComponent(jobId), 8000);
       } catch (error) {
+        state.pollFailures += 1;
+        const last = Object.assign({}, state.lastProcessStatus || { status: "running" }, { reconnecting: true });
+        setUploadBusy(true, last);
+        setConnection("idle", "Reconnecting");
         if (Date.now() - startedAt > maxWaitMs) {
           setUploadBusy(false);
           state.uploading = false;
@@ -1778,8 +1872,12 @@
         setTimeout(function () { pollProcessJob(base, jobId, filename, startedAt); }, 2500);
         return;
       }
+      state.pollFailures = 0;
+      state.lastProcessStatus = status;
+      setConnection("connected", "Bridge ready");
       applyDebugSession(status);
       if (status.status === "cancelled") {
+        state.processJobId = null;
         state.uploading = false;
         setUploadBusy(false);
         setFooter("Processing cancelled");
@@ -1788,6 +1886,7 @@
       if (status.status === "done") {
         renderProcessStatus({ status: "done", stage: "qa" });
         state.uploading = false;
+        state.processJobId = null;
         await new Promise(function (resolve) { setTimeout(resolve, 350); });
         setUploadBusy(false);
         let summary = null;
@@ -1808,6 +1907,11 @@
           }], "warning");
         }
         await refreshLatest({ silent: false });
+        const qaIssues = qaIssuesFromSummary(summary || status);
+        if (qaIssues.length) showIssues(qaIssues, "error");
+        else if ((summary && summary.harness_rounds) || status.harness_rounds) {
+          setFooter("QA passed after " + ((summary && summary.harness_rounds) || status.harness_rounds) + " repair round(s)");
+        }
         if (!state.doc || state.source !== "bridge") {
           showIssues([{
             title: "No output from bridge",
@@ -1824,10 +1928,16 @@
       }
       if (status.status === "failed") {
         state.uploading = false;
+        state.processJobId = null;
         setUploadBusy(false);
         if (status.agent_debug) forwardAgentDebug(status.agent_debug);
         const err = formatProcessingError(status);
-        showIssues([err], "error");
+        let failedSummary = null;
+        try {
+          failedSummary = await fetchJson(base + "/run-summary?job_id=" + encodeURIComponent(jobId), 5000);
+        } catch (_) { /* the processing error below still remains actionable */ }
+        const qaIssues = qaIssuesFromSummary(failedSummary);
+        showIssues(qaIssues.length ? qaIssues.concat([err]) : [err], "error");
         await flushLogs(true);
         return;
       }

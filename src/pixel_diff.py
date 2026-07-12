@@ -26,6 +26,9 @@ DEFAULT_THRESHOLDS = {
     "background_exact_match_max": 0.995,
     "background_changed_min": 0.01,
     "background_edge_retention_max": 0.90,
+    "background_outside_damage_max": 0.01,
+    "layer_internal_hole_fraction_max": 0.025,
+    "element_survival_min": 0.75,
 }
 
 
@@ -309,6 +312,40 @@ def _load_reconstruction(run_dir):
         return {}
 
 
+def _element_survival_audit(run_dir, reconstruction):
+    """Prove detected non-background elements survived into reconstruction.
+
+    This is intentionally an artifact lineage check, not another vision guess. A visually
+    similar background can conceal a dropped element, but its canonical id cannot disappear
+    from the reconstruction without being reported.
+    """
+    elements = []
+    for name in ("elements.json", "fused_elements.json", "sam3.json"):
+        payload = _load_design(os.path.join(run_dir, name), run_dir)
+        if isinstance(payload, list):
+            elements = payload
+        elif isinstance(payload, dict):
+            elements = payload.get("elements") or payload.get("candidates") or []
+        if elements:
+            break
+    proposed = {
+        str(item.get("id")) for item in elements
+        if isinstance(item, dict) and item.get("id") is not None
+        and str((item.get("meta") or {}).get("role") or item.get("role") or "").lower()
+        != "background"
+    }
+    if not proposed:
+        return None
+    kept = {
+        str(item.get("id")) for item in (reconstruction.get("candidates") or [])
+        if isinstance(item, dict) and item.get("id") is not None and item.get("target") != "drop"
+    }
+    missing = sorted(proposed - kept)
+    return {
+        "proposed": len(proposed), "kept": len(proposed & kept),
+        "recall": round(len(proposed & kept) / len(proposed), 5),
+        "missing_ids": missing,
+    }
 def _layer_qa_metrics(source):
     """Pull optional ssim/recall fields from a stats row or candidate meta blob."""
     if not isinstance(source, dict):
@@ -477,11 +514,15 @@ def _background_audit(source_rgb, background_path, removal_mask):
     if not np.any(mask):
         return {"mask_supplied": mask_supplied, "masked_pixels": 0,
                 "exact_match_ratio": 0.0, "changed_ratio": 1.0,
-                "edge_retention": None, "mean_change": 0.0}
+                "edge_retention": None, "mean_change": 0.0,
+                "outside_changed_ratio": 0.0, "outside_mean_change": 0.0}
     delta = np.abs(source_rgb - background).mean(axis=2)
     exact = float((delta[mask] < 0.5).mean())
     changed = float((delta[mask] > 8.0).mean())
     mean_change = float(delta[mask].mean())
+    outside = ~mask
+    outside_changed = float((delta[outside] > 8.0).mean()) if np.any(outside) else 0.0
+    outside_mean = float(delta[outside].mean()) if np.any(outside) else 0.0
     source_edges = _gradient(
         source_rgb[..., 0] * 0.299 + source_rgb[..., 1] * 0.587 + source_rgb[..., 2] * 0.114
     ) >= 12
@@ -499,7 +540,87 @@ def _background_audit(source_rgb, background_path, removal_mask):
         "changed_ratio": round(changed, 5),
         "edge_retention": None if retained is None else round(retained, 5),
         "mean_change": round(mean_change, 4),
+        "outside_changed_ratio": round(outside_changed, 5),
+        "outside_mean_change": round(outside_mean, 4),
     }
+
+
+def _enclosed_alpha_holes(alpha):
+    """Return enclosed transparent pixels and component count for an RGBA alpha matte.
+
+    Transparency connected to an asset edge is ordinary cutout background. Transparent
+    islands completely enclosed by opaque pixels are materially different: for photos,
+    products, and people they are usually SAM/matting holes. The operation is deterministic
+    and deliberately does not judge icons, where counters and rings are legitimate.
+    """
+    import cv2
+    import numpy as np
+
+    opaque = (np.asarray(alpha) > 16).astype(np.uint8)
+    transparent = (opaque == 0).astype(np.uint8)
+    if not transparent.any():
+        return 0, 0
+    exterior = np.zeros_like(transparent)
+    count, labels = cv2.connectedComponents(transparent, connectivity=8)
+    exterior_labels = set(labels[0, :]) | set(labels[-1, :]) | set(labels[:, 0]) | set(labels[:, -1])
+    for label in exterior_labels:
+        exterior[labels == label] = 1
+    holes = transparent & (exterior == 0)
+    if not holes.any():
+        return 0, 0
+    hole_count = len(set(labels[holes > 0]))
+    return int(holes.sum()), int(hole_count)
+
+
+def _layer_alpha_audit(layers, run_dir, thresholds):
+    """Inspect actual raster mattes so corrupt/empty cutouts cannot pass screenshot QA."""
+    import numpy as np
+    from PIL import Image
+
+    rows = []
+    failures = []
+    hole_roles = {"photo", "product", "person", "people", "portrait", "cutout", "image"}
+    for layer in layers:
+        if layer.get("type") != "image":
+            continue
+        meta = layer.get("meta") or {}
+        role = str(meta.get("role") or "image").lower()
+        if role == "background":
+            continue
+        src = layer.get("src")
+        if not src or str(src).startswith("data:"):
+            continue
+        path = _resolve_path(src, run_dir)
+        if not path or not os.path.exists(path):
+            continue  # missing-assets owns this failure
+        try:
+            image = Image.open(path)
+            if "A" not in image.getbands():
+                continue
+            alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)
+        except Exception:
+            continue  # corrupt assets are reported at the design/import boundary
+        lid = str(layer.get("id") or layer.get("name") or "unnamed")
+        opaque = int((alpha > 16).sum())
+        total = int(alpha.size)
+        coverage = opaque / max(1, total)
+        hole_pixels, hole_count = _enclosed_alpha_holes(alpha)
+        hole_fraction = hole_pixels / max(1, opaque + hole_pixels)
+        row = {
+            "id": lid, "role": role, "alpha_coverage": round(coverage, 5),
+            "internal_hole_pixels": hole_pixels, "internal_hole_count": hole_count,
+            "internal_hole_fraction": round(hole_fraction, 5),
+        }
+        rows.append(row)
+        if opaque == 0:
+            failures.append(("empty-layer-alpha", f"layer {lid} has no visible pixels"))
+        elif (role in hole_roles and hole_pixels >= 16
+              and hole_fraction > thresholds["layer_internal_hole_fraction_max"]):
+            failures.append((
+                "layer-alpha-holes",
+                f"layer {lid} has {hole_count} enclosed alpha hole(s) covering {hole_fraction:.1%}",
+            ))
+    return rows, failures
 
 
 def _add_fail(fails, rule, detail):
@@ -538,14 +659,17 @@ def _structural_audit(
             if not style.get("fontFamily") or style.get("fontResolved") is False:
                 missing_fonts.append(lid)
     schema_errors = []
+    compiler_errors_from_design = []
     for warning in ((design or {}).get("meta") or {}).get("warnings") or []:
         code = str(warning.get("code", "")) if isinstance(warning, dict) else ""
-        if code == "missing-asset":
+        if code in ("missing-asset", "corrupt-asset"):
             missing_assets.append(str(warning.get("layer_id") or warning.get("path") or warning))
         if code in ("missing-font", "font-load-failed"):
             missing_fonts.append(str(warning.get("layer_id") or warning.get("font") or warning))
         if code == "invalid-schema":
             schema_errors.append(str(warning.get("detail") or warning))
+        if code == "layer-compile-error":
+            compiler_errors_from_design.append(str(warning.get("detail") or warning))
 
     figma_report = {}
     report_path = os.path.join(run_dir, "figma_report.json")
@@ -583,6 +707,7 @@ def _structural_audit(
     duplicate_ownership = sorted(set(duplicate_ownership))
 
     reconstruction = _load_reconstruction(run_dir)
+    element_survival = _element_survival_audit(run_dir, reconstruction)
 
     if background_path is None:
         candidate = os.path.join(run_dir, "background_clean.png")
@@ -595,6 +720,7 @@ def _structural_audit(
     elif isinstance(removal_mask, str):
         removal_mask = _resolve_path(removal_mask, run_dir)
     background = _background_audit(source_rgb, background_path, removal_mask)
+    alpha_layers, alpha_failures = _layer_alpha_audit(layers, run_dir, thresholds)
     explicit_leakage = supplied.get("background_leakage")
 
     fails = []
@@ -608,6 +734,10 @@ def _structural_audit(
         _add_fail(fails, "missing-fonts", f"{len(missing_fonts)} unresolved text font(s): " + ", ".join(missing_fonts[:4]))
     if schema_errors:
         _add_fail(fails, "invalid-schema", f"{len(schema_errors)} design.json shape error(s): " + "; ".join(schema_errors[:3]))
+    if compiler_errors_from_design:
+        _add_fail(fails, "layer-compile-errors",
+                  f"{len(compiler_errors_from_design)} layer(s) could not compile: " +
+                  "; ".join(compiler_errors_from_design[:3]))
     source_lines = (source_ocr or {}).get("lines", []) if isinstance(source_ocr, dict) else []
     if source_lines and editable_ratio is not None and editable_ratio < thresholds["editable_ratio_min"]:
         _add_fail(fails, "low-editable-ratio",
@@ -618,6 +748,13 @@ def _structural_audit(
     if duplicate_ownership:
         _add_fail(fails, "duplicate-ownership",
                   f"{len(duplicate_ownership)} observation ownership conflict(s): " + duplicate_ownership[0])
+    if element_survival and element_survival["recall"] < thresholds["element_survival_min"]:
+        _add_fail(
+            fails,
+            "low-element-recall",
+            f"only {element_survival['kept']}/{element_survival['proposed']} detected elements "
+            "survived reconstruction; missing " + ", ".join(element_survival["missing_ids"][:4]),
+        )
     if design and layers:
         background_layers = [layer for layer in layers if (layer.get("meta") or {}).get("role") == "background"]
         if background_layers and any((layer.get("meta") or {}).get("source") != "inpaint" for layer in background_layers):
@@ -636,6 +773,17 @@ def _structural_audit(
                 "background-leakage",
                 "clean plate still matches extracted foreground inside the removal region",
             )
+        if (background.get("mask_supplied")
+                and background.get("outside_changed_ratio", 0.0)
+                > thresholds["background_outside_damage_max"]):
+            _add_fail(
+                fails,
+                "inpaint-outside-mask",
+                "clean plate changed "
+                f"{background['outside_changed_ratio']:.1%} of pixels outside the removal mask",
+            )
+    for rule, detail in alpha_failures:
+        _add_fail(fails, rule, detail)
     if explicit_leakage:
         _add_fail(fails, "background-leakage", f"reported background leakage: {explicit_leakage}")
 
@@ -658,7 +806,10 @@ def _structural_audit(
         "editable_text_recall": None if editable_text_recall is None else round(editable_text_recall, 4),
         "duplicate_ownership": duplicate_ownership,
         "duplicates_removed": int(stats.get("duplicates_removed", supplied.get("duplicates_removed", 0)) or 0),
+        "element_recall": None if element_survival is None else element_survival["recall"],
+        "element_survival": element_survival,
         "background": background,
+        "layer_alpha": alpha_layers,
         "hard_fails": fails,
     }
 

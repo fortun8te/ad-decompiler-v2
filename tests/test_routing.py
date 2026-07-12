@@ -33,3 +33,22 @@ def test_scene_origin_still_wins_over_overlay_like_role():
         CANVAS,
     )
     assert out["target"] == "drop"
+
+
+def test_flat_button_stays_native_primitive_instead_of_being_traced():
+    out = routing.route(
+        {"id": "B1", "kind": "shape", "box": {"x": 10, "y": 10, "w": 120, "h": 40},
+         "radius": 12, "meta": {"role": "button", "flat_fill": True, "simple_graphic": True}},
+        CANVAS,
+    )
+    assert out["target"] == "shape"
+    assert out["meta"]["button_shell"] is True
+
+
+def test_explicit_small_nonprimitive_graphic_is_vectorized():
+    out = routing.route(
+        {"id": "G1", "kind": "shape", "box": {"x": 10, "y": 10, "w": 40, "h": 40},
+         "meta": {"role": "ornament", "simple_graphic": True}},
+        CANVAS,
+    )
+    assert out["target"] == "icon"

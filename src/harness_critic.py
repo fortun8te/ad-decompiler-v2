@@ -38,6 +38,10 @@ STAGE_TO_CATEGORY = {
 RULE_TO_CATEGORY = {
     "background-leakage": "inpaint",
     "unclean-background": "inpaint",
+    "inpaint-outside-mask": "inpaint",
+    "layer-alpha-holes": "sam",
+    "empty-layer-alpha": "sam",
+    "low-element-recall": "sam",
     "missing-assets": "staging",
     "missing-fonts": "text",
     "figma-compiler-errors": "staging",
@@ -223,7 +227,10 @@ def _score_categories(
                 cat = "sam"
             else:
                 cat = "staging"
-        weight = 0.65 if rule in ("background-leakage", "unclean-background") else 0.45
+        weight = 0.65 if rule in (
+            "background-leakage", "unclean-background", "inpaint-outside-mask",
+            "layer-alpha-holes", "empty-layer-alpha",
+        ) else 0.45
         _bump(scores[cat], weight, f"{rule}: {detail}")
 
     for item in runtime.get("degraded") or []:

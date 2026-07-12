@@ -46,6 +46,27 @@ _PROMPT = (
     "Use an empty array [] when no elements are visible."
 )
 
+_PROPOSAL_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["label", "approx_box_fraction"],
+        "properties": {
+            "label": {"type": "string", "enum": sorted(_LABELS)},
+            "approx_box_fraction": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["x", "y", "w", "h"],
+                "properties": {
+                    key: {"type": "number", "minimum": 0, "maximum": 1}
+                    for key in ("x", "y", "w", "h")
+                },
+            },
+        },
+    },
+}
+
 
 def _vlm_cfg(cfg: dict) -> dict:
     root = (cfg or {}).get("vlm") or {}
@@ -168,6 +189,7 @@ def _two_pass_proposals(
                 model=model,
                 timeout_s=timeout_s,
                 max_tokens=max_tokens,
+                response_schema=_PROPOSAL_SCHEMA,
             )
         except Exception:
             return None, "vlm_error"

@@ -51,6 +51,23 @@ def _stage_asset(src: Optional[str], layer_id: str, run_dir: str, warnings: list
     if not resolved:
         warnings.append({"code": "missing-asset", "layer_id": layer_id, "path": src})
         return None
+    # Existing-but-truncated assets are just as unusable as missing files.  Detect them
+    # before copying so preview/Figma never receive a poisoned checkpoint.
+    try:
+        if os.path.getsize(resolved) <= 0:
+            raise ValueError("empty file")
+        if os.path.splitext(resolved)[1].lower() in {
+            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"
+        }:
+            from PIL import Image
+            with Image.open(resolved) as image:
+                image.verify()
+    except (OSError, ValueError, SyntaxError) as exc:
+        warnings.append({
+            "code": "corrupt-asset", "layer_id": layer_id, "path": src,
+            "detail": str(exc),
+        })
+        return None
     assets = os.path.join(run_dir, "assets")
     os.makedirs(assets, exist_ok=True)
     # Assets already in the run are canonical; do not duplicate them on every rebuild.
@@ -131,7 +148,15 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
     }
 
     if target == "group":
-        children = [_compile(child, run_dir, warnings) for child in candidate.get("children") or []]
+        children = []
+        for child in candidate.get("children") or []:
+            try:
+                children.append(_compile(child, run_dir, warnings))
+            except Exception as exc:
+                warnings.append({
+                    "code": "layer-compile-error", "layer_id": child.get("id"),
+                    "detail": str(exc),
+                })
         children.sort(key=lambda child: child.z_index)
         return Layer(
             type="group",
@@ -237,7 +262,15 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
             if candidate.get("text"):
                 kept.append(str(candidate["text"]).strip())
             continue
-        layers.append(_compile(candidate, run_dir, warnings))
+        try:
+            layers.append(_compile(candidate, run_dir, warnings))
+        except Exception as exc:
+            # One malformed entity must not hide all other editable layers. Omit only the
+            # broken entity and make the partial compilation a hard structural QA failure.
+            warnings.append({
+                "code": "layer-compile-error", "layer_id": candidate.get("id"),
+                "detail": str(exc),
+            })
     layers.sort(key=lambda layer: layer.z_index)
     total = _count_layers(layers)
     editable = _count_editable(layers)

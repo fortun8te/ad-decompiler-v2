@@ -436,7 +436,17 @@ def _load_residual_mask(item: dict, width: int, height: int, base_dir: Optional[
         try:
             from PIL import Image
 
-            arr = np.asarray(Image.open(path).convert("L")) > 0
+            with Image.open(path) as image:
+                # Residual cutouts are frequently RGBA. Their transparent RGB is
+                # undefined (often solid white), so luminance would turn the whole
+                # canvas into an object. Match the inpaint boundary: alpha owns
+                # transparency whenever it exists.
+                has_alpha = "A" in image.getbands() or (
+                    image.mode == "P" and "transparency" in image.info
+                )
+                arr = np.asarray(
+                    image.convert("RGBA").getchannel("A") if has_alpha else image.convert("L")
+                ) > 0
             if arr.shape == (height, width):
                 return arr
             b = _clip_box(item.get("box") or {}, width, height)
@@ -510,6 +520,24 @@ def _box_refine_min_score(scfg: dict, residual: list) -> float:
     if residual:
         return 0.32
     return float(scfg.get("confidence", 0.45))
+
+
+def _acceptable_refinement(mask, box: dict, scfg: dict) -> bool:
+    """Reject confident but geometrically unrelated box-prompt masks.
+
+    SAM confidence alone is not enough for ad decomposition: a prompt can snap to a
+    nearby large photograph.  Box overlap and area expansion keep the deterministic
+    residual as the safe fallback without fabricating ownership.
+    """
+    import numpy as np
+
+    area = int(np.count_nonzero(mask))
+    box_area = max(1.0, float(box.get("w", 0)) * float(box.get("h", 0)))
+    if area <= 0:
+        return False
+    if area / box_area > float(scfg.get("max_box_area_ratio", 4.0)):
+        return False
+    return _mask_iou_box(mask, box) >= float(scfg.get("min_box_iou", 0.12))
 
 
 def _residual_ids_in_elements(elements: list) -> set[str]:
@@ -660,12 +688,18 @@ def detect(
     elements = []
     min_score = _text_min_score(scfg)
     box_min_score = _box_refine_min_score(scfg, residual)
+    text_prompt_successes = 0
+    text_prompt_predictions = 0
+    box_prompt_successes = 0
+    box_prompt_predictions = 0
 
     # Open-vocabulary sweep. Duplicates are intentionally retained as observations and
     # resolved once, mask-aware, by element_fusion.fuse().
     for spec in prompts:
         try:
             preds = _prediction_dicts(backend.predict_text(spec["prompt"]), width, height)
+            text_prompt_successes += 1
+            text_prompt_predictions += len(preds)
         except Exception as exc:
             errors.append(f"text:{spec['prompt']}: {exc}")
             continue
@@ -707,6 +741,8 @@ def detect(
         best = None
         try:
             preds = _prediction_dicts(backend.predict_box(box), width, height)
+            box_prompt_successes += 1
+            box_prompt_predictions += len(preds)
             for pred in preds:
                 if float(pred.get("score", 0)) < box_min_score:
                     continue
@@ -715,6 +751,8 @@ def detect(
                 # observation below.
                 mask = pred.get("mask")
                 if mask is None:
+                    continue
+                if not _acceptable_refinement(mask, box, scfg):
                     continue
                 quality = 0.7 * float(pred.get("score", 0)) + 0.3 * _mask_iou_box(mask, box)
                 if best is None or quality > best[0]:
@@ -763,16 +801,38 @@ def detect(
         "residual proposal missing from SAM observations",
     )
 
+    # A backend that accepts calls but emits no masks for every text prompt used to look
+    # perfectly healthy.  Preserve the residual observations, but make the empty model
+    # evidence explicit so acceptance policy and repair logic can react to it.
+    model_element_count = sum(1 for item in elements if item.get("source") == "sam3")
+    empty_model_evidence = model_element_count == 0
+    status = "ok" if not errors and not empty_model_evidence else "partial"
+    notes = list(errors[:8])
+    if empty_model_evidence:
+        notes.append("SAM 3 returned no accepted segmentation masks; residual observations preserved")
     result = {
         "engine": getattr(backend, "name", "sam3"),
-        "status": "ok" if not errors else "partial",
-        "note": "; ".join(errors[:8]) if errors else None,
+        "status": status,
+        "note": "; ".join(notes) if notes else None,
         "source": {"path": img_path, "w": width, "h": height},
         "prompts": [p["prompt"] for p in prompts],
         "elements": elements,
         "thresholds": {
             "text_min_score": min_score,
             "box_refine_min_score": box_min_score,
+        },
+        "diagnostics": {
+            "text_prompts_attempted": len(prompts),
+            "text_prompts_succeeded": text_prompt_successes,
+            "text_predictions": text_prompt_predictions,
+            "box_prompts_attempted": sum(1 for item in residual if _valid_box(item.get("box"))),
+            "box_prompts_succeeded": box_prompt_successes,
+            "box_predictions": box_prompt_predictions,
+            "model_elements": model_element_count,
+            "residual_fallback_elements": sum(
+                1 for item in elements if item.get("source") == "residual-fallback"
+            ),
+            "empty_model_evidence": empty_model_evidence,
         },
     }
     _write_manifest(result, run_dir)

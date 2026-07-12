@@ -146,6 +146,31 @@ def test_vlm_error_degrades_silently(tmp_path, monkeypatch):
     out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), ocr_result, _cfg())
     assert out["lines"][0]["text"] == "SAVF 30%"
     assert out["vlm_ocr_judge"]["lines_errored"] == 1
+    assert out["vlm_ocr_judge"]["notes"][0]["note"] == "vlm_error"
+
+
+def test_judge_resolves_disagreement_even_when_original_was_correct(tmp_path, monkeypatch):
+    monkeypatch.setattr(vlm_client, "multi_pass_answer", lambda *a, **k: ("SAVE 30%", None))
+    out = vlm_ocr_judge.judge_ocr_lines(
+        _image(tmp_path),
+        {"lines": [_line("SAVE 30%", meta={"disagreement": ["SAVE 30%", "SAVF 30%"]})]},
+        _cfg(),
+    )
+    line = out["lines"][0]
+    assert "disagreement" not in line["meta"]
+    assert line["vlm_ocr_judged"] is True
+    assert line["meta"]["vlm_ocr_consensus"]["passes"] == 2
+
+
+def test_judge_rejects_unrelated_third_reading(tmp_path, monkeypatch):
+    monkeypatch.setattr(vlm_client, "multi_pass_answer", lambda *a, **k: ("BUY SHOES TODAY", None))
+    out = vlm_ocr_judge.judge_ocr_lines(
+        _image(tmp_path),
+        {"lines": [_line("SAVE 30%", meta={"disagreement": ["SAVE 30%", "SAVF 30%"]})]},
+        _cfg(),
+    )
+    assert out["lines"][0]["text"] == "SAVE 30%"
+    assert out["vlm_ocr_judge"]["notes"][0]["note"] == "vlm_novel_reading"
 
 
 def test_ocr_read_adds_missed_line(tmp_path, monkeypatch):

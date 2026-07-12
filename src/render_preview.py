@@ -241,6 +241,7 @@ def _text_tile(layer, size):
     line_height = _number(style.get("lineHeight", font_size * 1.2), font_size * 1.2)
     spacing = max(0, round(line_height - font_size))
     align = str(style.get("align", "left")).lower()
+    vertical = str(style.get("verticalAlign", style.get("vertical_align", "top"))).lower()
     fill = style.get("color")
     if fill is None:
         fill_spec = layer.get("fill")
@@ -248,9 +249,16 @@ def _text_tile(layer, size):
             fill = fill_spec
         elif isinstance(fill_spec, dict):
             fill = fill_spec.get("color", "#111111")
-    ImageDraw.Draw(tile).multiline_text(
-        (0, 0), str(layer.get("text", "")), fill=_color(fill or "#111111"),
-        font=font, spacing=spacing, align=align if align in ("left", "center", "right") else "left",
+    draw = ImageDraw.Draw(tile)
+    text = str(layer.get("text", ""))
+    align = align if align in ("left", "center", "right") else "left"
+    bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing, align=align)
+    painted_w, painted_h = max(0, bbox[2] - bbox[0]), max(0, bbox[3] - bbox[1])
+    x = 0 if align == "left" else (width - painted_w) / 2 if align == "center" else width - painted_w
+    y = 0 if vertical == "top" else (height - painted_h) / 2 if vertical in ("center", "middle") else height - painted_h
+    draw.multiline_text(
+        (x - bbox[0], y - bbox[1]), text, fill=_color(fill or "#111111"),
+        font=font, spacing=spacing, align=align,
     )
     return tile
 
@@ -260,8 +268,13 @@ def _image_tile(layer, size, run_dir):
     source = layer.get("src")
     path = source if source and os.path.isabs(source) else os.path.join(run_dir, source or "")
     if not source or not os.path.exists(path):
-        return _rgba(size, "#dddddd", 120)
-    tile = Image.open(path).convert("RGBA").resize(size, Image.Resampling.LANCZOS)
+        # A gray rectangle looks like a valid layer and can inflate visual QA. Missing
+        # assets must stay visibly absent and be rejected by structural QA instead.
+        return Image.new("RGBA", size, (0, 0, 0, 0))
+    try:
+        tile = Image.open(path).convert("RGBA").resize(size, Image.Resampling.LANCZOS)
+    except (OSError, ValueError, SyntaxError):
+        return Image.new("RGBA", size, (0, 0, 0, 0))
     clip = _mask_for_image(layer, size, run_dir)
     return _multiply_alpha(tile, clip) if clip is not None else tile
 
@@ -396,10 +409,27 @@ def render(design_or_path, run_dir, out_name="preview.png"):
     canvas = Image.new("RGBA", (width, height), (255, 255, 255, 255))
     layers_dir = os.path.join(run_dir, "layers")
     os.makedirs(layers_dir, exist_ok=True)
+    # A resumed render can contain fewer layers. Remove stale swatches so the contact
+    # sheet remains evidence for this design rather than a mixture of two revisions.
+    for filename in os.listdir(layers_dir):
+        if filename.endswith(".png"):
+            try:
+                os.unlink(os.path.join(layers_dir, filename))
+            except OSError:
+                pass
+    errors = []
     for index, layer in enumerate(sorted(doc.get("layers", []), key=lambda item: _number(item.get("z_index", item.get("z", 0))))):
-        _draw_layer(canvas, layer, run_dir)
+        try:
+            _draw_layer(canvas, layer, run_dir)
+        except Exception as exc:
+            # Keep rendering independent layers, but make the omission explicit to the
+            # orchestrator. The caller turns these diagnostics into a QA failure.
+            errors.append({"layer_id": layer.get("id"), "detail": str(exc)})
         one = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        _draw_layer(one, layer, run_dir)
+        try:
+            _draw_layer(one, layer, run_dir)
+        except Exception:
+            pass
         safe = "".join(char if char.isalnum() or char in "-_" else "_" for char in (layer.get("name") or layer.get("id")))[:40]
         one.save(os.path.join(layers_dir, f"{index:02d}_{layer.get('type')}_{safe}.png"))
     out = os.path.join(run_dir, out_name)
@@ -407,7 +437,8 @@ def render(design_or_path, run_dir, out_name="preview.png"):
     _contact_sheet(layers_dir, os.path.join(run_dir, "layers_contact.png"))
     def count(items):
         return sum(1 + count(item.get("children") or []) for item in items)
-    return {"preview": out, "layers_dir": layers_dir, "count": count(doc.get("layers", []))}
+    return {"preview": out, "layers_dir": layers_dir,
+            "count": count(doc.get("layers", [])), "errors": errors}
 
 
 def _contact_sheet(layers_dir, out, cols=4, thumb=260):

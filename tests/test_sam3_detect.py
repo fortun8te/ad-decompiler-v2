@@ -84,6 +84,29 @@ def test_prompt_sweep_and_box_refines_every_residual(tmp_path):
     assert os.path.exists(tmp_path / "sam3.json")
 
 
+def test_empty_backend_predictions_are_partial_not_false_success(tmp_path):
+    class EmptySam3:
+        name = "empty-sam3"
+
+        def set_image(self, image):
+            pass
+
+        def predict_text(self, prompt):
+            return []
+
+        def predict_box(self, box):
+            return []
+
+    result = sam3_detect.detect(
+        _image(tmp_path), [], {"sam3": {"prompts": ["product"]}}, backend=EmptySam3()
+    )
+
+    assert result["status"] == "partial"
+    assert result["diagnostics"]["empty_model_evidence"] is True
+    assert result["diagnostics"]["text_prompts_succeeded"] == 1
+    assert "no accepted segmentation masks" in result["note"]
+
+
 def test_no_model_falls_back_to_residual_and_still_saves_mask(tmp_path):
     residual = [
         {"id": "R0", "kind": "icon", "box": {"x": 20, "y": 25, "w": 12, "h": 10}}
@@ -234,3 +257,31 @@ def test_union_residual_guarantees_missing_box_refine(tmp_path):
     covered = {e["provenance"].get("residual_id") for e in result["elements"]}
     assert covered == {"R0", "R1"}
     assert all(e["provenance"].get("residual_id") for e in result["elements"])
+
+
+def test_rgba_residual_fallback_uses_alpha_not_transparent_white_rgb(tmp_path):
+    rgba = np.full((100, 120, 4), 255, dtype=np.uint8)
+    rgba[:, :, 3] = 0
+    rgba[20:30, 10:25, 3] = 255
+    Image.fromarray(rgba, "RGBA").save(tmp_path / "cutout.png")
+    residual = [{"id": "R0", "kind": "icon", "box": {"x": 0, "y": 0, "w": 120, "h": 100},
+                 "mask_path": str(tmp_path / "cutout.png")}]
+    result = sam3_detect.detect(_image(tmp_path), residual,
+                                {"sam3": {"enabled": False}}, str(tmp_path))
+    mask = np.asarray(Image.open(result["elements"][0]["mask_path"])) > 0
+    assert int(mask.sum()) == 150
+
+
+def test_box_refine_rejects_mask_that_snaps_to_unrelated_large_region(tmp_path):
+    class BadSnap(FakeSam3):
+        def predict_box(self, box):
+            mask = np.zeros((100, 120), dtype=bool)
+            mask[:, :80] = True
+            return [{"mask": mask, "score": .99}]
+
+    residual = [{"id": "R0", "kind": "icon", "box": {"x": 95, "y": 70, "w": 10, "h": 10}}]
+    result = sam3_detect.detect(_image(tmp_path), residual,
+                                {"sam3": {"prompts": []}}, str(tmp_path), BadSnap())
+    element = result["elements"][0]
+    assert element["source"] == "residual-fallback"
+    assert element["area"] == 100

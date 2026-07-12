@@ -424,7 +424,27 @@ def _read_plugin_client(inbox):
     return data if isinstance(data, dict) else None
 
 
-def _health_payload(inbox, base_cfg):
+def _runtime_self_test_status(config_path=None):
+    """Cheap cached execution proof. Never imports torch or runs a model."""
+    try:
+        from pathlib import Path
+        from rtx_self_test import cache_status
+        root = Path(_repo_root())
+        config = Path(config_path) if config_path else root / "config.yaml"
+        status = cache_status(root / "runs" / "rtx-self-test", config)
+        latest = status.get("latest") or {}
+        return {
+            "valid": bool(status.get("valid")),
+            "reason": status.get("reason"),
+            "age_s": status.get("age_s"),
+            "finished_at": latest.get("finished_at"),
+            "evidence_path": latest.get("evidence_path"),
+        }
+    except Exception as exc:
+        return {"valid": False, "reason": "unavailable", "detail": str(exc)}
+
+
+def _health_payload(inbox, base_cfg, config_path=None):
     payload = {
         "ok": True,
         "service": "ad-decompiler-bridge",
@@ -432,6 +452,7 @@ def _health_payload(inbox, base_cfg):
         "supports_process": True,
         "bridge_build": _read_bridge_build(),
         "plugin_client": _read_plugin_client(inbox),
+        "runtime_self_test": _runtime_self_test_status(config_path),
     }
     manifest = _read_json_file(os.path.join(inbox, "inbox.json"))
     if manifest:
@@ -557,7 +578,10 @@ def _stage_job_output(inbox, run_dir, cfg):
                 "design_url": "/design.json"}
     try:
         from src import figma_import
-        figma_import.import_design(design_path, run_dir, cfg)
+        import_result = figma_import.import_design(design_path, run_dir, cfg)
+        if not isinstance(import_result, dict) or not import_result.get("ok"):
+            detail = import_result.get("error") if isinstance(import_result, dict) else None
+            raise RuntimeError(detail or "figma import returned malformed output")
         # #region agent log
         _agent_log(
             "figma_bridge.py:_stage_job_output", "figma_import after pipeline",
@@ -575,9 +599,11 @@ def _stage_job_output(inbox, run_dir, cfg):
         )
         # #endregion
     manifest = _read_json_file(os.path.join(inbox, "inbox.json"))
-    staged = bool(manifest)
+    expected_run = os.path.abspath(run_dir)
+    manifest_run = os.path.abspath(str((manifest or {}).get("run_dir") or ""))
+    staged = bool(manifest) and manifest_run == expected_run
     if not staged and staging_error is None:
-        staging_error = "design.json exists but inbox.json was not written"
+        staging_error = "design.json exists but matching inbox.json was not written"
     return {
         "staged": staged,
         "doc_id": (manifest or {}).get("doc_id"),
@@ -668,7 +694,7 @@ def make_handler(inbox, config_path=None):
                     )
                 # #endregion
                 import run_pipeline  # heavy: torch/paddleocr/sam3/... — only imported on first use
-                from src.harness import harness_should_repair, load_qa
+                from src.harness import _flag, _qa_accepts, harness_enabled, harness_should_repair, load_qa
                 from src.harness_loop import max_harness_rounds, run_harness_after_pipeline
                 cfg = _upload_cfg(base_cfg, inbox)
                 result = run_pipeline.run_one(image_path, run_dir, cfg)
@@ -686,7 +712,12 @@ def make_handler(inbox, config_path=None):
                     )
                     already_ran_harness = _run_one_already_ran_harness(result, run_dir)
                     skip_harness = already_ran_harness and repair_reason != "staging_failed"
-                    if should_repair and not skip_harness:
+                    repair_opted_in = (
+                        harness_enabled(cfg)
+                        or qa is not None
+                        or repair_reason == "staging_failed"
+                    )
+                    if repair_opted_in and should_repair and not skip_harness:
                         with jobs_lock:
                             if _job_cancelled(job_id):
                                 return
@@ -761,14 +792,55 @@ def make_handler(inbox, config_path=None):
                                 "stopped": repair_reason,
                                 "qa_ok": (qa or {}).get("ok"),
                             }
+                final_qa = load_qa(run_dir) if os.path.exists(os.path.join(run_dir, "qa.json")) else {}
+                runtime_report = _read_json_file(os.path.join(run_dir, "runtime_report.json")) or {}
+                acceptance_failures = []
+                if not result.get("ok"):
+                    acceptance_failures.append(result.get("error") or "pipeline reported failure")
+                explicit_hard_fails = final_qa.get("hard_fails") or []
+                qa_has_evidence = (
+                    isinstance(final_qa.get("structural"), dict)
+                    or any(key in final_qa for key in ("ssim", "visual_score", "composite"))
+                )
+                if explicit_hard_fails:
+                    qa_passed = False
+                elif qa_has_evidence:
+                    qa_passed = _qa_accepts(final_qa)
+                elif final_qa:
+                    qa_passed = _flag(final_qa.get("ok"), False)
+                else:
+                    # Lightweight embedded runners may only return execution status. The
+                    # remote acceptance benchmark still rejects their missing evidence.
+                    qa_passed = _flag(result.get("qa_ok"), _flag(result.get("ok"), False))
+                if not qa_passed:
+                    failures = final_qa.get("hard_fails") or []
+                    acceptance_failures.append(
+                        (failures[0].get("detail") if failures and isinstance(failures[0], dict) else None)
+                        or "QA did not produce a valid passing report"
+                    )
+                runtime_passed = (
+                    runtime_report.get("acceptable") is True
+                    if "acceptable" in runtime_report
+                    else _flag(result.get("runtime_ok"), True)
+                )
+                if not runtime_passed:
+                    violations = runtime_report.get("violations") or []
+                    acceptance_failures.append(
+                        (violations[0].get("detail") if violations and isinstance(violations[0], dict) else None)
+                        or "runtime report is missing or unacceptable"
+                    )
+                if not staging or not _flag(staging.get("staged")):
+                    acceptance_failures.append((staging or {}).get("staging_error") or "Figma staging did not complete")
+                job_success = not acceptance_failures
+                job_error = None if job_success else "; ".join(dict.fromkeys(acceptance_failures))
                 with jobs_lock:
                     if _job_cancelled(job_id):
                         return
                     jobs[job_id].update(
-                        status="done" if result.get("ok") else "failed",
+                        status="done" if job_success else "failed",
                         result=result, run_dir=run_dir,
-                        error=None if result.get("ok") else (result.get("error") or "pipeline reported failure"),
-                        failed_stage=None if result.get("ok") else result.get("failed_stage"),
+                        error=job_error,
+                        failed_stage=None if job_success else (result.get("failed_stage") or "acceptance"),
                     )
                     if staging:
                         jobs[job_id].update(
@@ -782,7 +854,7 @@ def make_handler(inbox, config_path=None):
                         jobs[job_id].update(_harness_summary_fields(
                             harness_summary, run_dir=run_dir, pipeline_result=result,
                         ))
-                if result.get("ok"):
+                if job_success:
                     _record_history(inbox, time.time() - started, run_dir)
                     _append_plugin_logs(inbox, [{
                         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -796,7 +868,7 @@ def make_handler(inbox, config_path=None):
                         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "level": "error",
                         "title": "Pipeline failed",
-                        "detail": result.get("error") or "pipeline reported failure",
+                        "detail": job_error or result.get("error") or "pipeline acceptance failed",
                         "extra": {"job_id": job_id, "run_dir": run_dir, "result": result},
                     }], manifest)
             except Exception as exc:
@@ -836,7 +908,7 @@ def make_handler(inbox, config_path=None):
 
         def _manifest(self):
             path = os.path.join(inbox, "inbox.json")
-            return json.load(open(path, encoding="utf-8")) if os.path.exists(path) else None
+            return _read_json_file(path)
 
         def _staged_root(self, manifest):
             rel = (manifest or {}).get("staged_dir") or "."
@@ -870,7 +942,28 @@ def make_handler(inbox, config_path=None):
             manifest = self._manifest()
             if u.path == "/health":
                 manifest = self._manifest()
-                payload = _health_payload(inbox, base_cfg)
+                payload = _health_payload(inbox, base_cfg, config_path)
+                with jobs_lock:
+                    active_id = active_job.get("id")
+                    active = dict(jobs.get(active_id) or {}) if active_id else None
+                if active_id and active:
+                    stage = tail_running_stage(active.get("run_dir")) if active.get("run_dir") else None
+                    elapsed = max(0.0, time.time() - float(active.get("started_at") or active.get("queued_at") or time.time()))
+                    eta_s, sample_size, progress_pct = _estimate_eta(inbox, elapsed, stage)
+                    payload["active_job"] = {
+                        "job_id": active_id,
+                        "status": active.get("status"),
+                        "filename": active.get("filename"),
+                        "started_at": active.get("started_at"),
+                        "stage": stage,
+                        "harness_running": bool(active.get("harness_running")),
+                        "elapsed_s": round(elapsed, 1),
+                        "eta_s": eta_s,
+                        "eta_sample_size": sample_size,
+                        "progress_pct": progress_pct,
+                    }
+                else:
+                    payload["active_job"] = None
                 payload["has_run"] = bool(manifest)
                 if manifest:
                     payload["schema_version"] = manifest.get("schema_version")
@@ -914,6 +1007,29 @@ def make_handler(inbox, config_path=None):
                     manifest_run = os.path.abspath(str(manifest.get("run_dir")))
                     if manifest_run != os.path.abspath(str(run_dir)):
                         manifest = None
+                qa = _read_json_file(os.path.join(run_dir, "qa.json")) if run_dir else None
+                runtime = _read_json_file(os.path.join(run_dir, "runtime_report.json")) if run_dir else None
+                structural = (qa or {}).get("structural") or {}
+                hard_fails = (qa or {}).get("hard_fails")
+                structural_hard_fails = structural.get("hard_fails")
+                merged_hard_fails = list(hard_fails or []) if isinstance(hard_fails, list) else []
+                seen_failures = {
+                    (item.get("rule"), item.get("detail"))
+                    for item in merged_hard_fails if isinstance(item, dict)
+                }
+                if isinstance(structural_hard_fails, list):
+                    for item in structural_hard_fails:
+                        key = (item.get("rule"), item.get("detail")) if isinstance(item, dict) else None
+                        if key and key not in seen_failures:
+                            merged_hard_fails.append(item)
+                            seen_failures.add(key)
+                qa_evidence_complete = bool(
+                    isinstance(qa, dict)
+                    and isinstance(hard_fails, list)
+                    and isinstance(structural, dict)
+                    and isinstance(structural_hard_fails, list)
+                    and all(key in structural for key in ("background", "layer_alpha", "element_recall"))
+                )
                 payload = {
                     "ok": True,
                     "job_id": job_id,
@@ -927,6 +1043,16 @@ def make_handler(inbox, config_path=None):
                     "harness_rounds": job.get("harness_rounds"),
                     "harness_stopped": job.get("harness_stopped"),
                     "final_qa_ok": job.get("final_qa_ok"),
+                    "qa_evidence_complete": qa_evidence_complete,
+                    "hard_fails": merged_hard_fails,
+                    "visual_score": (qa or {}).get("visual_score"),
+                    "ssim": (qa or {}).get("ssim"),
+                    "element_recall": structural.get("element_recall"),
+                    "background_audit": structural.get("background"),
+                    "layer_alpha_audit": structural.get("layer_alpha") or [],
+                    "runtime_status": (runtime or {}).get("status"),
+                    "runtime_acceptable": (runtime or {}).get("acceptable") is True,
+                    "runtime_violations": (runtime or {}).get("violations") or [],
                 }
                 return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
             if u.path == "/process":
@@ -1154,7 +1280,7 @@ def main():
     config_path = _resolve_config_path(a.config)
     if not a.no_bootstrap:
         from src.bridge_bootstrap import prepare
-        status = prepare(config_path=config_path, inbox=inbox)
+        status = prepare(config_path=config_path, inbox=inbox, port=a.port)
         config_path = status["config_path"]
         inbox = status["inbox"]
         for warning in status.get("gpu_warnings") or []:
@@ -1170,7 +1296,19 @@ def main():
     safe_print(f"  config: {config_path if os.path.exists(config_path) else '(missing - uploads need config.yaml)'}")
     safe_print("=" * 52)
     safe_print()
-    ThreadingHTTPServer((a.host, a.port), make_handler(inbox, config_path)).serve_forever()
+    try:
+        server = ThreadingHTTPServer((a.host, a.port), make_handler(inbox, config_path))
+    except OSError as exc:
+        safe_print(f"ERROR: Could not start on port {a.port}: {exc}")
+        safe_print(f"Open http://localhost:{a.port}/health in a browser.")
+        safe_print("If it is not the Ad Decompiler bridge, close the app using that port or choose another with --port.")
+        raise SystemExit(2) from None
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        safe_print("\nBridge stopped.")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

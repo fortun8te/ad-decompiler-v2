@@ -169,3 +169,29 @@ def test_resume_refuses_stale_artifacts_from_a_different_source(monkeypatch, tmp
     assert first["ok"]
     assert not second["ok"]
     assert "input image changed" in second["error"]
+
+
+def test_resume_rebuilds_a_truncated_json_checkpoint(monkeypatch, tmp_path):
+    source = tmp_path / "input.png"
+    Image.new("RGB", (64, 48), "white").save(source)
+    run_dir = tmp_path / "run"
+    cfg = {
+        "device": "cpu", "qwen": {"enabled": False}, "sam3": {"enabled": False},
+        "inpaint": {"mode": "opencv"}, "qa_ocr": False,
+        "text_analysis": {"font_matching": {"enabled": False}},
+    }
+    calls = {"ocr": 0}
+
+    def fake_ocr(path, cfg, run_dir=None):
+        calls["ocr"] += 1
+        return {"engine": "fixture", "status": "ok", "errors": [], "lines": []}
+
+    monkeypatch.setattr(run_pipeline.ocr, "run_ocr", fake_ocr)
+    assert run_pipeline.run_one(str(source), str(run_dir), cfg)["ok"]
+    (run_dir / "ocr_raw.json").write_text('{"broken":', encoding="utf-8")
+
+    resumed = run_pipeline.run_one(str(source), str(run_dir), cfg, "qa")
+
+    assert resumed["ok"]
+    assert json.loads((run_dir / "ocr_raw.json").read_text(encoding="utf-8"))["engine"] == "fixture"
+    assert calls["ocr"] >= 2

@@ -62,7 +62,7 @@ def _multi_pass_answer(
             answers.append(_ask_vlm(crop, base_url, model, timeout_s, max_tokens))
         except Exception:
             return None, "vlm_error"
-    if len(set(answers)) != 1:
+    if len({vlm_client.consensus_key(answer) for answer in answers}) != 1:
         return None, "vlm_disagreement"
     return answers[0], None
 

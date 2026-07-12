@@ -327,6 +327,20 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
         if rule in ("background-leakage", "unclean-background"):
             out.append({"stage": "inpaint", "action": "rebuild-clean-plate", "reason": detail,
                         "severity": "high"})
+        elif rule == "inpaint-outside-mask":
+            out.append({"stage": "inpaint", "action": "rebuild-clean-plate", "reason": detail,
+                        "params": {"strict_mask_composite": True}, "severity": "high"})
+        elif rule in ("layer-alpha-holes", "empty-layer-alpha"):
+            target = None
+            if str(detail).startswith("layer "):
+                target = str(detail).split()[1]
+            item = {"stage": "sam3", "action": "rerun-detection", "reason": detail,
+                    "params": {"lower_confidence": False, "enable_element_propose": True,
+                               "reject_internal_holes": True},
+                    "severity": "high"}
+            if target:
+                item["target_id"] = target
+            out.append(item)
         elif rule == "missing-assets":
             out.append({"stage": "reconstruct", "action": "restage-assets", "reason": detail,
                         "severity": "high"})

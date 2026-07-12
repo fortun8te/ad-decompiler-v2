@@ -16,8 +16,15 @@ REQUIRED_ARTIFACTS = (
     "input_manifest.json", "normalized.png", "ocr_raw.json", "ocr.json",
     "residual.json", "qwen.json", "sam3.json", "fused_elements.json",
     "elements.json", "merged.json", "reconstruction.json", "layout.json",
-    "design.json", "runtime_report.json", "qa.json",
+    "design.json", "design_preflight.json", "background_clean.png", "removal_mask.png",
+    "ownership.png", "layers_contact.png", "preview.png", "diff.png",
+    "runtime_report.json", "qa.json",
 )
+
+VISUAL_FAILURE_RULES = frozenset({
+    "background-leakage", "unclean-background", "inpaint-outside-mask",
+    "layer-alpha-holes", "empty-layer-alpha", "low-element-recall",
+})
 
 
 def select_images(source_dir: Path, max_images: int | None = None) -> list[Path]:
@@ -108,11 +115,31 @@ def _entry(run_dir: Path, result: dict) -> dict:
     design = _read(run_dir / "design.json", {})
     runtime = _read(run_dir / "runtime_report.json", {})
     structure = qa.get("structural") or {}
+    hard_fails = qa.get("hard_fails") if isinstance(qa.get("hard_fails"), list) else None
+    structural_hard_fails = structure.get("hard_fails") if isinstance(structure.get("hard_fails"), list) else None
+    merged_hard_fails = list(hard_fails or [])
+    seen_failures = {(item.get("rule"), item.get("detail")) for item in merged_hard_fails if isinstance(item, dict)}
+    for item in structural_hard_fails or []:
+        key = (item.get("rule"), item.get("detail")) if isinstance(item, dict) else None
+        if key and key not in seen_failures:
+            merged_hard_fails.append(item)
+            seen_failures.add(key)
+    qa_evidence_complete = bool(
+        isinstance(qa, dict)
+        and hard_fails is not None
+        and isinstance(qa.get("structural"), dict)
+        and structural_hard_fails is not None
+        and all(key in structure for key in ("background", "layer_alpha", "element_recall"))
+    )
     missing_artifacts = [name for name in REQUIRED_ARTIFACTS
                          if not (run_dir / name).is_file()]
     complete = not missing_artifacts
     runtime_ok = bool(runtime.get("acceptable")) if runtime else False
-    qa_ok = bool(qa.get("ok")) if qa else False
+    qa_ok = bool(qa.get("ok")) and qa_evidence_complete and not merged_hard_fails
+    visual_failure_rules = [
+        item.get("rule") for item in merged_hard_fails
+        if isinstance(item, dict) and item.get("rule") in VISUAL_FAILURE_RULES
+    ]
     return {
         "id": run_dir.name,
         "pipeline_ok": bool(result.get("ok")) and complete,
@@ -124,17 +151,27 @@ def _entry(run_dir: Path, result: dict) -> dict:
         "runtime_violations": runtime.get("violations") or [],
         "duration_s": result.get("duration_s"),
         "qa_ok": qa_ok and complete,
+        "qa_evidence_complete": qa_evidence_complete,
         "visual_score": qa.get("visual_score"),
         "ssim": qa.get("ssim"),
         "text_recall": qa.get("text_recall"),
         "editable_text_recall": qa.get("editable_text_recall"),
         "edge_f1": qa.get("edge_f1"),
         "color_similarity": qa.get("color_similarity"),
-        "hard_fails": qa.get("hard_fails") or [],
+        "hard_fails": merged_hard_fails,
+        "visual_failure_rules": visual_failure_rules,
         "duplicate_observations_removed": (reconstruction.get("stats") or {}).get("duplicates_removed", 0),
         "vectorized": (reconstruction.get("stats") or {}).get("vectorized", 0),
         "vector_fallback": (reconstruction.get("stats") or {}).get("vector_fallback", 0),
-        "background_leakage": bool(any(item.get("rule") == "background-leakage" for item in qa.get("hard_fails") or [])),
+        "background_leakage": "background-leakage" in visual_failure_rules,
+        "inpaint_outside_mask": "inpaint-outside-mask" in visual_failure_rules,
+        "layer_alpha_holes": "layer-alpha-holes" in visual_failure_rules,
+        "empty_layer_alpha": "empty-layer-alpha" in visual_failure_rules,
+        "low_element_recall": "low-element-recall" in visual_failure_rules,
+        "element_recall": structure.get("element_recall"),
+        "element_survival": structure.get("element_survival"),
+        "background_audit": structure.get("background"),
+        "layer_alpha_audit": structure.get("layer_alpha") or [],
         "missing_assets": structure.get("missing_assets") or [],
         "missing_fonts": structure.get("missing_fonts") or [],
         "font_substitutions": structure.get("font_substitutions") or [],
@@ -156,8 +193,8 @@ def _markdown(report: dict) -> str:
         "",
         f"Images: {summary['images']}  |  QA passing: {summary['qa_passing']}  |  Runtime accepted: {summary.get('runtime_accepted', '—')}",
         "",
-        "| image | QA | runtime | seconds | visual | text | edge | duplicates removed | hard fails |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| image | QA | evidence | runtime | seconds | visual | text | edge | element recall | hard fails |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in report["runs"]:
         fails = ", ".join(item.get("rule", "unknown") for item in row["hard_fails"]) or "—"
@@ -165,8 +202,8 @@ def _markdown(report: dict) -> str:
             value = row.get(key)
             return "—" if value is None else f"{float(value):.3f}"
         lines.append(
-            f"| {row['id']} | {'pass' if row['qa_ok'] else 'fail'} | {row.get('runtime_status') or ('ok' if row.get('runtime_ok') else 'unknown')} | {metric('duration_s')} | {metric('visual_score')} | "
-            f"{metric('text_recall')} | {metric('edge_f1')} | {row['duplicate_observations_removed']} | {fails} |"
+            f"| {row['id']} | {'pass' if row['qa_ok'] else 'fail'} | {'complete' if row.get('qa_evidence_complete') else 'missing'} | {row.get('runtime_status') or ('ok' if row.get('runtime_ok') else 'unknown')} | {metric('duration_s')} | {metric('visual_score')} | "
+            f"{metric('text_recall')} | {metric('edge_f1')} | {metric('element_recall')} | {fails} |"
         )
     lines.extend([
         "",
@@ -192,6 +229,10 @@ def main():
                         help="benchmark only the first N images after stable filename sorting (for example, 5)")
     parser.add_argument("--skip-doctor", action="store_true",
                         help="development only; benchmark normally refuses an unready model machine")
+    parser.add_argument("--deep-smoke", action="store_true",
+                        help="run bounded actual OCR/SAM/VLM/Big-LaMa/vector/Figma probes before images")
+    parser.add_argument("--probe-timeout", type=float, default=120,
+                        help="maximum seconds for each isolated deep-smoke probe")
     args = parser.parse_args()
     source_dir = Path(args.input_dir)
     output = Path(args.output)
@@ -207,6 +248,12 @@ def main():
         (output / "doctor.json").write_text(json.dumps(preflight, indent=2), encoding="utf-8")
         if not preflight.get("ok"):
             print(json.dumps({"benchmark": "blocked", "doctor": preflight.get("blockers")}, indent=2))
+            raise SystemExit(2)
+    if args.deep_smoke:
+        from runtime_smoke import run_all
+        smoke = run_all(cfg, output / "runtime-smoke", timeout_s=args.probe_timeout)
+        if not smoke.get("ok"):
+            print(json.dumps({"benchmark": "blocked", "runtime_smoke": smoke.get("checks")}, indent=2))
             raise SystemExit(2)
     try:
         images = select_images(source_dir, args.max_images)
@@ -240,6 +287,12 @@ def main():
             "mean_text_recall": _mean(runs, "text_recall"),
             "mean_edge_f1": _mean(runs, "edge_f1"),
             "background_leakage_runs": sum(1 for row in runs if row["background_leakage"]),
+            "inpaint_outside_mask_runs": sum(1 for row in runs if row["inpaint_outside_mask"]),
+            "layer_alpha_hole_runs": sum(1 for row in runs if row["layer_alpha_holes"]),
+            "empty_layer_alpha_runs": sum(1 for row in runs if row["empty_layer_alpha"]),
+            "low_element_recall_runs": sum(1 for row in runs if row["low_element_recall"]),
+            "qa_evidence_complete_runs": sum(1 for row in runs if row["qa_evidence_complete"]),
+            "mean_element_recall": _mean(runs, "element_recall"),
             "runs_with_hard_fails": sum(1 for row in runs if row["hard_fails"]),
             "auto_fixed_runs": sum(1 for row in runs if row.get("auto_fixed")),
             "harness_rounds_total": sum(row.get("harness_rounds", 0) for row in runs),

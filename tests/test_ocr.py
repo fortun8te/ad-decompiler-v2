@@ -149,6 +149,11 @@ def test_reconcile_uses_engine_calibration_and_exact_text_support():
     assert fused[0]["meta"]["support_engines"] == ["ppocr-v6", "surya"]
     assert len(fused[0]["meta"]["provenance"]) == 3
     assert "disagreement" in fused[0]["meta"]
+    consensus = fused[0]["meta"]["consensus"]
+    assert consensus["engine_count"] == 3
+    assert consensus["support_count"] == 2
+    assert consensus["dissent_count"] == 1
+    assert 0 < consensus["confidence"] < fused[0]["conf"]
 
 
 def test_targeted_retry_collapses_word_fragments_into_one_line(tmp_path):
@@ -359,6 +364,47 @@ def test_run_ocr_uses_tesseract_fallback_when_all_configured_fail(tmp_path, monk
     assert result["engine"] == "tesseract"
     assert result["lines"][0]["text"] == "FALLBACK"
     assert any(item.get("role") == "fallback" for item in result["errors"])
+
+
+def test_run_ocr_uses_fallback_when_configured_engines_silently_return_empty(tmp_path, monkeypatch):
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (160, 80), "white").save(image_path)
+    calls = []
+
+    def fake_backend(name, path, cfg, use_cache=True):
+        calls.append(name)
+        if name == "tesseract":
+            return {"engine": name, "lines": [
+                _line("RECOVERED", 0.75, _box(5, 5, 50, 12), name),
+            ]}
+        return {"engine": name, "lines": []}
+
+    monkeypatch.setattr(ocr, "_run_backend", fake_backend)
+    monkeypatch.setattr(ocr, "_fallback_engine_names", lambda cfg: ["tesseract"])
+    result = ocr.run_ocr(
+        str(image_path),
+        {"ocr": {"primary": "ppocr-v6", "challengers": ["surya"], "retry_2x": False}},
+    )
+
+    assert calls == ["ppocr-v6", "surya", "tesseract"]
+    assert result["engine"] == "tesseract"
+    assert result["lines"][0]["text"] == "RECOVERED"
+    assert result["status"] == "partial"
+
+
+def test_run_ocr_empty_evidence_is_not_reported_healthy(tmp_path, monkeypatch):
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (160, 80), "white").save(image_path)
+    monkeypatch.setattr(
+        ocr, "_run_backend", lambda name, path, cfg, use_cache=True: {"engine": name, "lines": []}
+    )
+    monkeypatch.setattr(ocr, "_fallback_engine_names", lambda cfg: [])
+
+    result = ocr.run_ocr(str(image_path), {"ocr": {"primary": "ppocr-v6"}})
+
+    assert result["lines"] == []
+    assert result["status"] == "partial"
+    assert any(item.get("role") == "empty-evidence" for item in result["errors"])
 
 
 def test_run_ocr_failure_message_includes_cudnn_guidance(tmp_path, monkeypatch):

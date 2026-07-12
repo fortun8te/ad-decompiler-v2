@@ -271,3 +271,83 @@ def test_execute_repairs_reads_max_rounds_from_config(tmp_path):
 
     assert len(calls) == 2
     assert summary["stopped"] == "max_iterations"
+
+
+def test_execute_repairs_tries_alternative_after_pipeline_exception(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    (run_dir / "runtime_report.json").write_text(
+        json.dumps({"input": str(input_path)}), encoding="utf-8")
+    (run_dir / "qa.json").write_text(json.dumps({"ok": False}), encoding="utf-8")
+    (run_dir / "repairs.json").write_text(json.dumps([
+        {"stage": "ocr", "action": "rerun", "severity": "high"},
+        {"stage": "qwen", "action": "retry", "severity": "medium"},
+    ]), encoding="utf-8")
+    calls = []
+
+    def fake_run_one(path, rd, cfg, start_from="normalize"):
+        calls.append(start_from)
+        if start_from == "ocr":
+            raise RuntimeError("ocr backend crashed")
+        (run_dir / "qa.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+        return {"ok": True}
+
+    summary = harness.execute_repairs(
+        str(run_dir), {}, max_iterations=3, run_one=fake_run_one)
+
+    assert calls == ["ocr", "qwen"]
+    assert summary["qa_ok"] is True
+    assert summary["attempts"][0]["pipeline_error"] == "ocr backend crashed"
+    assert json.loads((run_dir / "harness.json").read_text())["qa_ok"] is True
+
+
+def test_execute_repairs_tries_alternative_when_runner_leaves_stale_qa(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    (run_dir / "runtime_report.json").write_text(json.dumps({"input": str(input_path)}))
+    (run_dir / "qa.json").write_text(json.dumps({"ok": False}))
+    (run_dir / "repairs.json").write_text(json.dumps([
+        {"stage": "ocr", "action": "rerun", "severity": "high"},
+        {"stage": "qwen", "action": "retry", "severity": "medium"},
+    ]))
+    calls = []
+
+    def runner(path, rd, cfg, start_from="normalize"):
+        calls.append(start_from)
+        if start_from == "qwen":
+            (run_dir / "qa.json").write_text(json.dumps({"ok": True}))
+        return {"ok": True}
+
+    summary = harness.execute_repairs(str(run_dir), {}, max_iterations=3, run_one=runner)
+    assert calls == ["ocr", "qwen"]
+    assert summary["qa_ok"] is True
+    assert summary["attempts"][0]["qa_fresh"] is False
+
+
+def test_execute_repairs_supports_three_argument_runner(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    (run_dir / "runtime_report.json").write_text(
+        json.dumps({"input": str(input_path)}), encoding="utf-8")
+    (run_dir / "qa.json").write_text(json.dumps({"ok": False}), encoding="utf-8")
+    (run_dir / "repairs.json").write_text(json.dumps([
+        {"stage": "ocr", "action": "rerun", "severity": "high"},
+    ]), encoding="utf-8")
+    calls = []
+
+    def three_arg_runner(path, rd, cfg):
+        calls.append((path, rd, cfg))
+        (run_dir / "qa.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+        return {"ok": True}
+
+    summary = harness.execute_repairs(
+        str(run_dir), {}, max_iterations=1, run_one=three_arg_runner)
+
+    assert len(calls) == 1
+    assert summary["qa_ok"] is True

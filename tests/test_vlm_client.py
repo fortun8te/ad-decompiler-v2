@@ -117,3 +117,39 @@ def test_ask_vlm_empty_content_without_reasoning_returns_empty_string(monkeypatc
     })
     result = vlm_client.ask_vlm(b"x", "prompt")
     assert result == ""
+
+
+def test_ask_vlm_accepts_typed_text_parts(monkeypatch):
+    _capture_request(monkeypatch, {
+        "choices": [{"message": {"content": [
+            {"type": "output_text", "text": "{\"role\":"},
+            {"type": "text", "text": "\"wordmark\"}"},
+        ]}}],
+    })
+    assert vlm_client.ask_vlm(b"x", "prompt") == '{"role":"wordmark"}'
+
+
+def test_ask_vlm_sends_strict_json_schema_when_requested(monkeypatch):
+    captured = _capture_request(monkeypatch, {
+        "choices": [{"message": {"content": '{"role":"wordmark"}'}}],
+    })
+    schema = {"type": "object", "required": ["role"]}
+    vlm_client.ask_vlm(b"x", "prompt", response_schema=schema)
+    fmt = captured["body"]["response_format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["json_schema"]["strict"] is True
+    assert fmt["json_schema"]["schema"] == schema
+
+
+def test_multi_pass_consensus_canonicalizes_json_and_code_fences(monkeypatch):
+    answers = iter(['{"label":"keep","score":1}', '```json\n{ "score": 1, "label": "keep" }\n```'])
+    crops = []
+    monkeypatch.setattr(vlm_client, "ask_vlm",
+                        lambda crop, *args, **kwargs: crops.append(crop) or next(answers))
+    answer, note = vlm_client.multi_pass_answer(
+        b"crop", "prompt", base_url="x", model="m", timeout_s=1, max_tokens=500,
+        passes=2, response_schema={"type": "object"}, crop_variants=[b"tight", b"wide"],
+    )
+    assert note is None
+    assert json.loads(answer)["label"] == "keep"
+    assert crops == [b"tight", b"wide"]

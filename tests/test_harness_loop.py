@@ -184,3 +184,41 @@ def test_harness_after_pipeline_skips_initial_run(tmp_path, monkeypatch):
 def test_in_harness_loop_guard():
     assert harness_loop.in_harness_loop({"runtime": {"harness": {"_in_loop": True}}})
     assert not harness_loop.in_harness_loop({"runtime": {"harness": {"enabled": True}}})
+
+
+def test_pipeline_exception_is_reported_and_summary_is_written(tmp_path):
+    input_path, run_dir = _seed_run(tmp_path)
+
+    def broken_runner(*args, **kwargs):
+        raise RuntimeError("GPU worker exited")
+
+    summary = harness_loop.run_until_acceptable(
+        input_path, run_dir, {}, max_rounds=2, run_one=broken_runner)
+
+    assert summary["qa_ok"] is False
+    assert summary["stopped"] == "pipeline_exception"
+    assert summary["rounds"][0]["pipeline"]["error"] == "GPU worker exited"
+    assert json.loads((tmp_path / "run" / "harness_loop.json").read_text())["qa_ok"] is False
+
+
+def test_production_runner_cannot_reuse_stale_passing_qa(tmp_path):
+    input_path, run_dir = _seed_run(tmp_path, qa_ok=True)
+
+    def stale_runner(path, rd, cfg, start_from="normalize"):
+        return {"ok": True, "qa_ok": True, "runtime_ok": True}
+
+    summary = harness_loop.run_until_acceptable(
+        input_path, run_dir, {}, max_rounds=2, run_one=stale_runner)
+    assert summary["qa_ok"] is False
+    assert summary["stopped"] == "qa_not_refreshed"
+    assert summary["rounds"][0]["pipeline"]["qa_fresh"] is False
+
+
+def test_malformed_critic_falls_back_with_visible_error(tmp_path, monkeypatch):
+    input_path, run_dir = _seed_run(tmp_path)
+    monkeypatch.setattr("src.harness_critic.analyze", lambda *a, **k: None)
+
+    output = harness_loop._run_critic_pass(run_dir, {})
+
+    assert output["critic_error"] == "critic returned malformed output"
+    assert isinstance(output["filtered_repairs"], list)

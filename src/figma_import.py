@@ -24,16 +24,26 @@ DEFAULT_INBOX = os.environ.get("FIGMA_INBOX", os.path.expanduser("~/figma-inbox"
 def import_design(design_path: str, run_dir: str, cfg: dict | None = None) -> dict:
     cfg = cfg or {}
     mode = (cfg.get("figma") or {}).get("mode", "plugin")
-    if mode == "clipboard":
-        return _clipboard(design_path, run_dir, cfg)
-    return _stage_for_plugin(design_path, run_dir, cfg)
+    try:
+        if mode == "clipboard":
+            return _clipboard(design_path, run_dir, cfg)
+        if mode != "plugin":
+            return {"ok": False, "mode": mode, "error": f"unsupported Figma mode: {mode}"}
+        return _stage_for_plugin(design_path, run_dir, cfg)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return {"ok": False, "mode": mode, "error": str(exc),
+                "exception": type(exc).__name__}
 
 
 def _stage_for_plugin(design_path, run_dir, cfg) -> dict:
     inbox = (cfg.get("figma") or {}).get("inbox", DEFAULT_INBOX)
     os.makedirs(inbox, exist_ok=True)
+    if not os.path.isfile(design_path):
+        raise FileNotFoundError(f"design.json not found: {design_path}")
     with open(design_path, encoding="utf-8") as fh:
         design = json.load(fh)
+    if not isinstance(design, dict) or not isinstance(design.get("layers", []), list):
+        raise ValueError("design.json must be an object with a layers list")
     doc_id = "".join(c if c.isalnum() or c in "-_" else "-"
                      for c in str(design.get("id") or os.path.basename(run_dir)))[:80] or "run"
     staged_root = os.path.join(inbox, "runs", doc_id)

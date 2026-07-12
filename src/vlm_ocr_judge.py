@@ -11,6 +11,7 @@ the canvas exceeds ``max_image_pixels``. Disabled by default and never raises.
 from __future__ import annotations
 
 import copy
+from difflib import SequenceMatcher
 
 from src import vlm_client
 
@@ -156,6 +157,8 @@ def _resolve_options(cfg: dict) -> dict:
         "padding": int(merged.get("padding") if merged.get("padding") is not None else _DEFAULT_PADDING),
         "passes": passes,
         "max_lines": merged.get("max_lines"),
+        "allow_novel_reading": bool(merged.get("allow_novel_reading", False)),
+        "min_reading_similarity": float(merged.get("min_reading_similarity", .55)),
         "ocr_read_enabled": bool(read.get("enabled", False)),
         "ocr_read_cols": int(read.get("grid_cols") or _DEFAULT_GRID_COLS),
         "ocr_read_rows": int(read.get("grid_rows") or _DEFAULT_GRID_ROWS),
@@ -182,6 +185,8 @@ def _judge_disagreements(
         crop = vlm_client.crop_box_bytes(image, line["box"], options["padding"])
         if crop is None:
             continue
+        wider_crop = vlm_client.crop_box_bytes(image, line["box"], options["padding"] + 2)
+        crop_variants = [crop] + ([wider_crop] if wider_crop and wider_crop != crop else [])
         checked += 1
         answer, note = vlm_client.multi_pass_answer(
             crop,
@@ -191,6 +196,7 @@ def _judge_disagreements(
             timeout_s=options["timeout_s"],
             max_tokens=options["max_tokens"],
             passes=options["passes"],
+            crop_variants=crop_variants,
         )
         original = str(line.get("text", ""))
         if note == "vlm_disagreement":
@@ -204,15 +210,29 @@ def _judge_disagreements(
             continue
         if note == "vlm_error":
             errors += 1
+            notes.append({"line_id": line.get("id"), "note": "vlm_error", "ocr_text": original})
             continue
-        if answer is not None and _looks_plausible(original, answer) and answer != original:
-            line["ocr_text"] = original
-            line["text"] = answer
+        if answer is not None and _looks_plausible(original, answer):
+            normalized_answer = answer.casefold().strip()
+            similarity = max((SequenceMatcher(None, normalized_answer, reading.casefold().strip()).ratio()
+                              for reading in readings), default=0.0)
+            if not options["allow_novel_reading"] and similarity < options["min_reading_similarity"]:
+                disagreements += 1
+                notes.append({"line_id": line.get("id"), "note": "vlm_novel_reading",
+                              "answer": answer, "readings": readings,
+                              "similarity": round(similarity, 4)})
+                continue
+            if answer != original:
+                line["ocr_text"] = original
+                line["text"] = answer
+                corrected += 1
             line["vlm_ocr_judged"] = True
             meta = copy.deepcopy(line.get("meta") or {})
             meta.pop("disagreement", None)
+            meta["vlm_ocr_consensus"] = {"answer": answer, "passes": options["passes"],
+                                         "crop_variants": len(crop_variants),
+                                         "reading_similarity": round(similarity, 4)}
             line["meta"] = meta
-            corrected += 1
     return checked, corrected, disagreements, errors, notes
 
 

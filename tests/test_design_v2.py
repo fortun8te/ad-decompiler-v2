@@ -47,6 +47,18 @@ def test_vector_layer_keeps_raster_preview_fallback(tmp_path):
     assert doc.layers[0].src.replace("\\", "/") == "assets/icon_icon.png"
 
 
+def test_corrupt_raster_is_rejected_before_design_compile(tmp_path):
+    asset = tmp_path / "broken.png"
+    asset.write_bytes(b"not a png")
+    doc = build_design_json.build([{
+        "id": "photo", "target": "image", "box": {"x": 0, "y": 0, "w": 4, "h": 4},
+        "src": str(asset),
+    }], {"w": 4, "h": 4}, str(tmp_path))
+    assert doc.layers[0].src is None
+    assert doc.layers[0].meta["compiler_error"] == "missing image asset"
+    assert "corrupt-asset" in {warning["code"] for warning in doc.meta["warnings"]}
+
+
 def test_atomic_figma_staging_contains_manifest_and_assets(tmp_path):
     run = tmp_path / "run"
     run.mkdir()

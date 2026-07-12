@@ -75,15 +75,28 @@ python3 run_pipeline.py --input image.png --output runs/example --resume qa
 
 ## RTX 5080 setup
 
-On Windows, the easiest path is:
+On Windows, the easiest path is now one file:
 
 ```powershell
-.\setup_rtx.ps1
-.\start_rtx.ps1 -InputDir C:\images\benchmark
+Start Bridge.bat
 ```
 
-`start_rtx.bat` can be double-clicked. It starts the local bridge, checks the machine, and runs
-the benchmark. Figma Desktop still needs the development plugin manifest imported once.
+Double-click it. On the first run it installs the RTX environment, creates and aligns
+`config.yaml`, reports any model file still needed, then starts the bridge. Later launches are
+immediate and safely reuse an already-running bridge. It never updates the repo unless you run
+`Start Bridge.bat -Update`.
+
+Figma Desktop needs `figma-plugin\manifest.json` imported once. For a full benchmark, run
+`.\start_rtx.ps1 -InputDir C:\images\benchmark` after the bridge reports the machine ready.
+
+After the model files and LM Studio are ready, run `Start Bridge.bat -SelfTest` once. It really
+runs the configured OCR, SAM 3, Gemma vision, Big-LaMa, VTracer, Figma staging, and one integrated
+synthetic pipeline. Proof is saved under `runs\rtx-self-test`. Normal restarts only read that
+small proof; they do not reload models. Use `-ForceSelfTest` after driver/model changes.
+
+For remote Tailscale benchmarking, use `Start Bridge.bat -Remote`. It binds only to this PC's
+Tailscale address, never every network interface. Pass the shown URL to
+`scripts\remote_benchmark.py --bridge <url>`.
 
 Use Python 3.12 and current CUDA 12.8/PyTorch wheels. Keep ComfyUI/Qwen in its own process.
 
@@ -96,9 +109,9 @@ git clone https://github.com/facebookresearch/sam3.git C:\src\sam3
 pip install -e C:\src\sam3
 ```
 
-Download the official SAM checkpoint once, put its local path in `config.yaml`, and install
-Big-LaMa if wanted. Automatic SAM downloads are disabled by default. OpenCV remains a visibly
-lower-quality fallback.
+Download the official SAM image checkpoint once and put its local path in `config.yaml`.
+The setup script installs Big-LaMa because acceptance runs require it; OpenCV remains a visibly
+lower-quality emergency fallback and cannot pass the production readiness gate.
 
 ## Figma
 
@@ -106,9 +119,10 @@ lower-quality fallback.
 
 **Mac:** double-click `start_bridge.command`, or run `./start_bridge.sh`.
 
-The launcher creates `config.yaml` (from the example), enables plugin staging, creates the
-inbox folder, stamps the plugin build number, and starts the bridge. No doctor check — just
-bridge-ready.
+The launcher installs the environment on its first run, creates `config.yaml`, keeps its inbox
+and port aligned with the bridge, stamps the plugin build number, and starts the bridge. Missing
+models do not hide the bridge: the launcher and plugin show the exact remaining fixes, while
+uploads stay blocked until required quality tools are ready.
 
 **Build numbers:** `Start Bridge.bat` / `start_bridge.sh` auto-stamp the plugin as
 `v{VERSION}+b{git-commit-count}.{sha}` (see the badge in the plugin header). The bridge

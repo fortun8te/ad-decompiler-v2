@@ -95,3 +95,26 @@ def test_preview_text_uses_layer_fill_when_style_color_is_absent(tmp_path):
         "text": "A", "style": {"fontSize": 18}, "fill": {"color": "#ff0000"},
     }])
     assert any(pixel[0] > pixel[1] * 2 for pixel in preview.getdata())
+
+
+def test_preview_honors_text_horizontal_and_vertical_alignment(tmp_path):
+    left_top = np.asarray(_render(tmp_path / "a", [{
+        "id": "copy", "type": "text", "box": {"x": 0, "y": 0, "w": 70, "h": 40},
+        "text": "Hi", "style": {"fontSize": 16, "align": "left", "verticalAlign": "top"},
+    }], size=(70, 40)))
+    right_bottom = np.asarray(_render(tmp_path / "b", [{
+        "id": "copy", "type": "text", "box": {"x": 0, "y": 0, "w": 70, "h": 40},
+        "text": "Hi", "style": {"fontSize": 16, "align": "right", "verticalAlign": "bottom"},
+    }], size=(70, 40)))
+    first_ink = np.argwhere(np.any(left_top < 220, axis=2))
+    second_ink = np.argwhere(np.any(right_bottom < 220, axis=2))
+    assert second_ink[:, 1].mean() > first_ink[:, 1].mean() + 20
+    assert second_ink[:, 0].mean() > first_ink[:, 0].mean() + 10
+
+
+def test_preview_does_not_draw_fake_gray_for_missing_image(tmp_path):
+    preview = _render(tmp_path, [{
+        "id": "missing", "type": "image", "box": {"x": 10, "y": 10, "w": 20, "h": 20},
+        "src": "does-not-exist.png",
+    }])
+    assert preview.getpixel((15, 15)) == (255, 255, 255)

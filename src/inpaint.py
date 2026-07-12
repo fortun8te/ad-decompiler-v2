@@ -333,6 +333,23 @@ def build_union_mask(canvas: tuple[int, int], observations: Iterable[dict],
 
 def _opencv_inpaint(rgb, mask, radius: int = 5, method=None):
     cv2, np, _ = _deps()
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    # Flat ad plates are common and OpenCV's diffusion otherwise drags the
+    # button/product colour deep into a wide hole.  When the exterior ring is
+    # genuinely uniform, its robust median is a more faithful deterministic fill.
+    ring_radius = max(2, int(radius))
+    kernel = np.ones((2 * ring_radius + 1, 2 * ring_radius + 1), np.uint8)
+    ring = (cv2.dilate(binary, kernel, iterations=1) > 0) & (binary == 0)
+    exterior = np.asarray(rgb, dtype=np.uint8)[ring]
+    plate = np.median(exterior, axis=0) if exterior.size else np.zeros(3)
+    near_plate = np.max(np.abs(exterior.astype(np.float32) - plate), axis=1) <= 8.0 if exterior.size else []
+    # Use a robust majority test rather than raw variance: imperfect masks leave a
+    # thin strip of the foreground in the ring, but it should not veto an otherwise
+    # uniform plate.
+    if exterior.shape[0] >= 16 and float(np.mean(near_plate)) >= 0.72:
+        result = np.asarray(rgb, dtype=np.uint8).copy()
+        result[binary > 0] = plate.astype(np.uint8)
+        return result
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     flag = cv2.INPAINT_NS if str(method or "telea").lower() in ("ns", "navier-stokes", "navier_stokes") else cv2.INPAINT_TELEA
     result = cv2.inpaint(bgr, mask.astype(np.uint8), max(1, radius), flag)
@@ -553,16 +570,42 @@ def inpaint_role_aware(image_path: str, masks: dict, output_path: str,
     source = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
     text_mask = solidify_mask(masks.get("text")) if masks.get("text") is not None else np.zeros(source.shape[:2], dtype=np.uint8)
     large_mask = solidify_mask(masks.get("large")) if masks.get("large") is not None else np.zeros(source.shape[:2], dtype=np.uint8)
-    large_mask = cv2.bitwise_and(large_mask, cv2.bitwise_not(text_mask))
+    overlap = cv2.bitwise_and(text_mask, large_mask)
+    # Ownership masks are intentionally disjoint, so a label carved out of its
+    # button may have no literal overlap. Treat touching/near-touching text as part
+    # of the removable large object; otherwise its cut-out island survives.
+    if not np.any(overlap) and np.any(text_mask) and np.any(large_mask):
+        near_large = cv2.dilate(large_mask, np.ones((5, 5), np.uint8), iterations=1)
+        nearby = cv2.bitwise_and(text_mask, near_large)
+        near_fraction = float(np.count_nonzero(nearby)) / max(1, np.count_nonzero(text_mask))
+        ty, tx = np.where(text_mask > 0)
+        ly, lx = np.where(large_mask > 0)
+        contained = bool(
+            tx.size and lx.size
+            and tx.min() >= lx.min() and tx.max() <= lx.max()
+            and ty.min() >= ly.min() and ty.max() <= ly.max()
+        )
+        if near_fraction >= 0.8 or contained:
+            large_mask = cv2.bitwise_or(large_mask, text_mask)
+            overlap = cv2.bitwise_and(text_mask, large_mask)
     working = source.copy()
     parts = []
+    # When text sits on a removable button/card, the large object must own the
+    # overlap. Filling the label first and then excluding it from the button pass
+    # leaves a blue/white island in the clean plate. For disjoint masks retain the
+    # legacy text-first ordering; for overlap, remove the complete large object first
+    # and only repair text pixels that lie outside it.
+    if np.any(overlap):
+        working, backend, diagnostics = inpaint_array(working, large_mask, cfg, return_diagnostics=True)
+        parts.append({"role": "large", "backend": backend, "masked_fraction": round(float(np.count_nonzero(large_mask)) / large_mask.size, 6), "diagnostics": diagnostics})
+        text_mask = cv2.bitwise_and(text_mask, cv2.bitwise_not(large_mask))
     if np.any(text_mask):
         text_cfg = dict(cfg)
         text_cfg["inpaint"] = dict(cfg.get("inpaint") or {})
         text_cfg["inpaint"].update({"mode": "opencv", "opencv_method": "telea"})
         working, backend, diagnostics = inpaint_array(working, text_mask, text_cfg, return_diagnostics=True)
         parts.append({"role": "text", "backend": backend, "masked_fraction": round(float(np.count_nonzero(text_mask)) / text_mask.size, 6), "diagnostics": diagnostics})
-    if np.any(large_mask):
+    if np.any(large_mask) and not np.any(overlap):
         working, backend, diagnostics = inpaint_array(working, large_mask, cfg, return_diagnostics=True)
         parts.append({"role": "large", "backend": backend, "masked_fraction": round(float(np.count_nonzero(large_mask)) / large_mask.size, 6), "diagnostics": diagnostics})
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)

@@ -36,6 +36,49 @@ def test_preprocess_upscales_tiny_icons(tmp_path):
             os.unlink(out)
 
 
+def test_normalize_trace_size_restores_original_crop_coordinates(tmp_path):
+    source = tmp_path / "source.png"
+    traced = tmp_path / "traced.png"
+    Image.new("RGBA", (16, 8), (0, 0, 0, 0)).save(source)
+    Image.new("RGBA", (96, 48), (0, 0, 0, 0)).save(traced)
+    svg = (
+        '<svg viewBox="0 0 96 48">'
+        '<path d="M12 6L84 6L84 42Z" fill="#123456"/></svg>'
+    )
+
+    normalized = vectorize._normalize_trace_size(svg, str(traced), str(source))
+    paths = vectorize._parse_svg_paths(normalized)
+
+    assert 'viewBox="0 0 16 8"' in normalized
+    assert "M2.00 1.00" in paths[0]["d"]
+    assert "L14.00 7.00" in paths[0]["d"]
+    assert paths[0]["fill"] == "#123456"
+
+
+def test_vectorize_scores_and_returns_original_size_after_upscale(tmp_path, monkeypatch):
+    source = tmp_path / "tiny.png"
+    Image.new("RGBA", (16, 16), (10, 20, 30, 255)).save(source)
+    seen_sizes = []
+
+    monkeypatch.setattr(vectorize, "_count_colors", lambda _p: 3)
+    monkeypatch.setattr(vectorize, "_run_vtracer", lambda *_a, **_k: (
+        '<svg viewBox="0 0 96 96"><path d="M0 0L96 0L96 96Z" fill="#0a141e"/></svg>', None
+    ))
+    monkeypatch.setattr(vectorize, "_run_potrace", lambda *_a, **_k: (None, "skip"))
+    monkeypatch.setattr(vectorize, "_run_contour_simplify", lambda *_a, **_k: (None, "skip"))
+
+    def score(_svg, path):
+        seen_sizes.append(Image.open(path).size)
+        return 0.99
+
+    monkeypatch.setattr(vectorize, "_score_render", score)
+    result = vectorize.vectorize_crop(str(source), {}, role="icon")
+
+    assert result["ok"] is True
+    assert seen_sizes == [(16, 16)]
+    assert "L16.00 16.00" in result["paths"][0]["d"]
+
+
 def test_check_binaries_reports_paths(monkeypatch):
     monkeypatch.setattr(vectorize.shutil, "which", lambda name: f"/bin/{name}")
     status = vectorize.check_binaries({})
@@ -180,6 +223,20 @@ def test_vtracer_python_api_is_used_when_binary_is_unavailable(tmp_path, monkeyp
         "mode": "polygon", "colormode": "color", "filter_speckle": 3,
     })]
     assert not os.path.exists(calls[0][1])
+
+
+def test_backend_probe_accepts_python_vtracer(monkeypatch):
+    import sys
+    import types
+
+    monkeypatch.setattr(vectorize, "_resolve_binary", lambda *_args: None)
+    monkeypatch.setitem(sys.modules, "vtracer", types.SimpleNamespace(
+        convert_image_to_svg_py=lambda *_args, **_kwargs: None,
+    ))
+
+    status = vectorize.check_binaries({})
+
+    assert status["vtracer"] == {"ok": True, "path": "python:vtracer"}
 
 
 def test_potrace_threshold_chain_for_monochrome(tmp_path, monkeypatch):

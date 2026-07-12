@@ -100,6 +100,7 @@ class TextNode extends BaseNode {
     super("TEXT");
     this._characters = "";
     this._fontSize = 12;
+    this._rangeStyled = false;
     this.fontName = { family: "Inter", style: "Regular" };
     this.textAutoResize = "WIDTH_AND_HEIGHT";
     this.lineHeight = { unit: "AUTO" };
@@ -123,12 +124,22 @@ class TextNode extends BaseNode {
   }
 
   set fontSize(value) {
+    if (this._rangeStyled) throw new Error("cannot assign whole-node fontSize after range styles");
     this._fontSize = Number(value);
     this.recalculate();
   }
 
   get fontSize() {
     return this._fontSize;
+  }
+
+  set fontName(value) {
+    if (this._rangeStyled) throw new Error("cannot assign whole-node fontName after range styles");
+    this._fontName = value;
+  }
+
+  get fontName() {
+    return this._fontName;
   }
 
   recalculate() {
@@ -145,8 +156,8 @@ class TextNode extends BaseNode {
     if (this.textAutoResize === "HEIGHT") this.width = width;
   }
 
-  setRangeFontName() {}
-  setRangeFontSize() {}
+  setRangeFontName() { this._rangeStyled = true; }
+  setRangeFontSize() { this._rangeStyled = true; }
   setRangeFills() {}
   setRangeLetterSpacing() {}
   setRangeLineHeight() {}
@@ -365,6 +376,22 @@ const sceneV2 = {
         strokes: [{ color: "#111111", width: 1 }],
       },
       z_index: 1.5,
+    },
+    {
+      id: "mixed-copy",
+      type: "text",
+      name: "Mixed copy",
+      box: { x: 300, y: 230, w: 220, h: 40 },
+      visible_box: { x: 304, y: 234, w: 212, h: 32 },
+      text: "Mixed emphasis",
+      text_runs: [
+        { start: 0, end: 5, style: { fontFamily: "Inter", fontStyle: "Bold", fontSize: 18 } },
+        { start: 5, end: 14, style: { fontFamily: "Inter", fontStyle: "Regular", fontSize: 18 } },
+      ],
+      style: { fontFamily: "Inter", fontSize: 18, lineHeight: 24, align: "right", verticalAlign: "bottom" },
+      constraints: { horizontal: "stretch", vertical: "stretch" },
+      meta: { baseline_first: { x0: 304, y0: 259, x1: 516, y1: 259 } },
+      z_index: 1.6,
     },
     {
       id: "photo",
@@ -670,6 +697,17 @@ assert.equal(
   "weight candidates resolve the bold installed style for the primary family"
 );
 
+const mixedCopy = nodeForLayer(firstRoot, "mixed-copy");
+assert.ok(mixedCopy, "mixed-style text compiles instead of failing on Figma mixed font properties");
+assert.equal(mixedCopy.textAlignHorizontal, "RIGHT");
+assert.equal(mixedCopy.textAlignVertical, "BOTTOM");
+assert.equal(mixedCopy.lineHeight.unit, "PIXELS");
+assert.equal(mixedCopy.lineHeight.value, 24);
+assert.equal(mixedCopy.constraints.horizontal, "LEFT_RIGHT");
+assert.equal(mixedCopy.constraints.vertical, "TOP_BOTTOM");
+assert.equal(JSON.parse(mixedCopy.getPluginData("adDecompilerBaseline")).y0, 259,
+  "OCR baseline evidence survives into the compiled text node");
+
 function approxEqual(actual, expected, label) {
   assert.ok(Math.abs(actual - expected) < 1e-6, `${label}: expected ${expected}, got ${actual}`);
 }
@@ -847,6 +885,12 @@ assert.ok(!("version" in manifest) && !("build" in manifest), "manifest.json has
   assert.ok(script[1].includes("async function pollProcessJob("), "ui.html defines pollProcessJob()");
   assert.ok(script[1].includes('base + "/process?filename="'), "uploadImage() posts to /process?filename=");
   assert.ok(script[1].includes('"/process?job_id="'), "pollProcessJob() polls /process?job_id=");
+  assert.ok(html.includes('id="readinessStrip"'), "ui.html shows machine/runtime readiness");
+  assert.ok(script[1].includes("function renderBridgeHealth("), "UI renders doctor and self-test status");
+  assert.ok(script[1].includes("function resumeActiveProcess("), "UI resumes an active bridge job after reopen");
+  assert.ok(script[1].includes("function qaIssuesFromSummary("), "UI renders QA and runtime failure evidence");
+  assert.ok(script[1].includes("Connection interrupted · retrying automatically"), "polling exposes reconnect state");
+  assert.ok(script[1].includes("state.processJobId !== jobId"), "stale poll callbacks cannot mutate a newer job");
 
   const feMatch = script[1].match(/function formatElapsed\(ms\)[\s\S]*?\n {4}\}/);
   assert.ok(feMatch, "ui.html defines formatElapsed()");

@@ -30,6 +30,8 @@ _LABELS = frozenset({
 })
 _DECISIONS = frozenset({"keep", "drop", "review"})
 _REFINE_ROLES = frozenset({"button", "icon", "product"})
+_DROP_LABELS = frozenset({"text_artifact", "background_bleed", "junk"})
+_KEEP_LABELS = frozenset({"product", "person", "icon", "button", "badge"})
 
 _PROMPT = (
     "This crop shows one segmented element from a digital advertisement. "
@@ -51,6 +53,19 @@ _REFINE_PROMPT = (
     "- icon: small graphic, badge, logo mark, or pictogram\n"
     "- product: physical product, package, bottle, jar, tube, or device"
 )
+
+_CLASSIFY_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "required": ["decision", "label"],
+    "properties": {
+        "decision": {"type": "string", "enum": sorted(_DECISIONS)},
+        "label": {"type": "string", "enum": sorted(_LABELS)},
+    },
+}
+_REFINE_SCHEMA = {
+    "type": "object", "additionalProperties": False, "required": ["role"],
+    "properties": {"role": {"type": "string", "enum": sorted(_REFINE_ROLES)}},
+}
 
 
 def _vlm_cfg(cfg: dict) -> dict:
@@ -89,6 +104,13 @@ def _parse_classification(raw: str) -> dict | None:
     label = str(data.get("label", "")).strip().lower()
     if decision not in _DECISIONS or label not in _LABELS:
         return None
+    # Judge semantic consistency in addition to JSON shape. A model response such as
+    # {"decision":"drop","label":"product"} must not delete a real asset merely
+    # because repeated deterministic calls reproduced the same contradiction.
+    if (decision == "drop" and label not in _DROP_LABELS) or (
+        decision == "keep" and label not in _KEEP_LABELS
+    ):
+        return {"decision": "review", "label": label, "judge": "decision-label-conflict"}
     return {"decision": decision, "label": label}
 
 
@@ -146,6 +168,7 @@ def _refine_role(
         timeout_s=timeout_s,
         max_tokens=max_tokens,
         passes=passes,
+        response_schema=_REFINE_SCHEMA,
     )
     if note:
         return None, note
@@ -193,9 +216,17 @@ def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[di
             results.append(element)
             continue
 
-        crop = vlm_client.crop_box_bytes(image, element["box"], padding)
+        try:
+            crop = vlm_client.crop_box_bytes(image, element["box"], padding)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            results.append(_annotate(
+                element, decision="review", label="unknown", note="invalid_crop_geometry"
+            ))
+            continue
         if crop is None:
-            results.append(element)
+            results.append(_annotate(
+                element, decision="review", label="unknown", note="invalid_crop_geometry"
+            ))
             continue
 
         answer, note = vlm_client.multi_pass_answer(
@@ -206,10 +237,13 @@ def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[di
             timeout_s=timeout_s,
             max_tokens=max_tokens,
             passes=passes,
+            response_schema=_CLASSIFY_SCHEMA,
         )
 
         if note == "vlm_error":
-            results.append(element)
+            results.append(_annotate(
+                element, decision="review", label="unknown", note="vlm_error"
+            ))
             continue
         if note == "vlm_disagreement":
             results.append(_annotate(element, decision="review", label="junk", note="vlm_disagreement"))
@@ -217,7 +251,9 @@ def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[di
 
         parsed = _parse_classification(answer or "")
         if parsed is None:
-            results.append(element)
+            results.append(_annotate(
+                element, decision="review", label="unknown", note="vlm_parse_error"
+            ))
             continue
 
         decision = parsed["decision"]

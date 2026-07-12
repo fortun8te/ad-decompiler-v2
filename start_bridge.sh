@@ -29,7 +29,7 @@ bridge_up() {
 
 ensure_venv
 "$PYTHON" "$ROOT/scripts/stamp_plugin_build.py" --quiet
-"$PYTHON" -m src.bridge_bootstrap --config config.yaml --inbox "$INBOX"
+"$PYTHON" -m src.bridge_bootstrap --config config.yaml --inbox "$INBOX" --port "$PORT"
 
 if bridge_up; then
   echo ""

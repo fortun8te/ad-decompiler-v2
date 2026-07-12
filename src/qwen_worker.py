@@ -65,13 +65,18 @@ def _finalize(layer_pngs, run_dir):
     os.makedirs(out_dir, exist_ok=True)
     layers = []
     for i, src in enumerate(layer_pngs):
-        rel = os.path.join("qwen_layers", f"Q{i}.png")
-        dst = os.path.join(run_dir, rel)
+        # Validate before publishing. A zero-alpha image is not a layer and used to pass
+        # through as a successful Qwen observation, only to fail much later in fusion.
         img = Image.open(src).convert("RGBA")
-        img.save(dst)
         box = _tight_bbox(np.asarray(img))
+        if box["w"] <= 0 or box["h"] <= 0:
+            continue
+        index = len(layers)
+        rel = os.path.join("qwen_layers", f"Q{index}.png")
+        dst = os.path.join(run_dir, rel)
+        img.save(dst)
         layers.append(
-            {"id": f"Q{i}", "png": rel, "box": box, "kind_hint": "unknown"}
+            {"id": f"Q{index}", "png": rel, "box": box, "kind_hint": "unknown"}
         )
     return layers
 
@@ -82,6 +87,22 @@ def _write_manifest(schema, layers, run_dir, note=None):
     if note:
         with open(os.path.join(run_dir, "qwen.note.txt"), "w", encoding="utf-8") as f:
             f.write(note + "\n")
+    else:
+        # A recovered retry must clear an older failure marker.  Leaving this file behind
+        # makes qwen_degradation() report a false failure even though fresh layers exist.
+        try:
+            os.remove(os.path.join(run_dir, "qwen.note.txt"))
+        except FileNotFoundError:
+            pass
+
+
+def _last_note(run_dir: str) -> str:
+    path = os.path.join(run_dir, "qwen.note.txt")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
 
 
 # ── ComfyUI backend ──────────────────────────────────────────────────────────────────
@@ -278,28 +299,42 @@ def propose_layers(img_path: str, run_dir: str, cfg: Optional[dict] = None):
         note = "qwen: disabled (SAM/residual pipeline remains active)"
         _write_manifest(schema, [], run_dir, note)
         return []
-    mode = qcfg.get("mode", "comfyui")
-    try:
-        if mode == "comfyui":
-            return _run_comfyui(img_path, run_dir, cfg, schema)
-        elif mode in ("direct-diffusers", "diffusers", "direct"):
-            return _run_diffusers(img_path, run_dir, cfg, schema)
-        else:
-            note = f"qwen: unknown mode '{mode}'"
-            print("[qwen]", note)
-            _write_manifest(schema, [], run_dir, note)
-            return []
-    except ImportError as e:
-        # heavy dep missing -> degrade, don't throw
-        note = f"qwen: backend deps missing -> {e}"
-        print("[qwen]", note)
-        _write_manifest(schema, [], run_dir, note)
-        return []
-    except Exception as e:  # pragma: no cover - defensive; contract says never throw
-        note = f"qwen: unexpected error -> {e}"
-        print("[qwen]", note)
-        _write_manifest(schema, [], run_dir, note)
-        return []
+    primary_mode = str(qcfg.get("mode", "comfyui"))
+    configured_fallbacks = qcfg.get("fallback_modes") or []
+    if isinstance(configured_fallbacks, str):
+        configured_fallbacks = [configured_fallbacks]
+    modes = list(dict.fromkeys([primary_mode, *[str(item) for item in configured_fallbacks]]))
+    failures = []
+    for mode in modes:
+        attempt_cfg = dict(cfg)
+        attempt_cfg["qwen"] = {**qcfg, "mode": mode}
+        try:
+            if mode == "comfyui":
+                layers = _run_comfyui(img_path, run_dir, attempt_cfg, schema)
+            elif mode in ("direct-diffusers", "diffusers", "direct"):
+                layers = _run_diffusers(img_path, run_dir, attempt_cfg, schema)
+            else:
+                layers = []
+                _write_manifest(schema, [], run_dir, f"qwen: unknown mode '{mode}'")
+        except ImportError as exc:
+            layers = []
+            _write_manifest(schema, [], run_dir, f"qwen({mode}): backend deps missing -> {exc}")
+        except Exception as exc:  # pragma: no cover - defensive boundary around each backend
+            layers = []
+            _write_manifest(schema, [], run_dir, f"qwen({mode}): unexpected error -> {exc}")
+        if layers:
+            # Backends normally write the manifest themselves. Re-write on recovery so a
+            # stale note from the failed first attempt cannot survive.
+            _write_manifest(schema, layers, run_dir)
+            if failures:
+                print(f"[qwen] recovered with {mode} after {len(failures)} failed backend(s)")
+            return layers
+        failures.append(_last_note(run_dir) or f"qwen({mode}): produced no usable layers")
+
+    note = " | ".join(failures) if failures else "qwen: no backend modes configured"
+    print("[qwen]", note)
+    _write_manifest(schema, [], run_dir, note)
+    return []
 
 
 if __name__ == "__main__":  # CPU-safe smoke: no backend -> graceful [] + note

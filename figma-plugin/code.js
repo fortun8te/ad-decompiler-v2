@@ -648,10 +648,10 @@ function lineHeightValue(value) {
   if (typeof value === "object") {
     const unit = normalizedToken(value.unit || "PIXELS");
     if (unit === "AUTO") return { unit: "AUTO" };
-    return { unit: unit === "PERCENT" || unit === "PERCENTAGE" ? "PERCENT" : "PIXELS", value: finite(value.value, 0) };
+    return { unit: unit === "PERCENT" || unit === "PERCENTAGE" ? "PERCENT" : "PIXELS", value: Math.max(0.01, finite(value.value, 0)) };
   }
   if (typeof value === "string" && value.trim().endsWith("%")) return { unit: "PERCENT", value: finite(parseFloat(value), 100) };
-  return { unit: "PIXELS", value: Math.max(0, finite(value, 0)) };
+  return { unit: "PIXELS", value: Math.max(0.01, finite(value, 0)) };
 }
 
 function spacingValue(value) {
@@ -764,6 +764,44 @@ function initialFontSize(style, layer) {
 }
 
 async function fitTextWithCandidates(node, layer, style, context, hasRuns) {
+  // Once range styles are applied Figma exposes fontName/fontSize as `mixed` and rejects
+  // whole-node assignments. Keep the editable runs intact; wrapping and placement are still
+  // safe because fitTextToVisibleBox deliberately avoids global size changes for runs.
+  if (hasRuns) {
+    await fitTextToVisibleBox(node, layer, style, context, true);
+    const target = localBox(layer, context, true);
+    const content = node.characters || "";
+    const multiline = content.indexOf("\n") >= 0 || style.multiline === true || finite(pick(style, "lineCount", "line_count"), 1) > 1;
+    let dimensions = await renderedTextDimensions(node);
+    if (!renderedFits(dimensions, target, multiline)) {
+      const widthRatio = multiline ? 1 : target.w / Math.max(0.01, dimensions.width);
+      const heightRatio = target.h / Math.max(0.01, dimensions.height);
+      const ratio = clamp(Math.min(1, widthRatio, heightRatio) * 0.995, 0.2, 1);
+      const runs = normalizedRuns(layer, content);
+      for (let index = 0; index < runs.length; index += 1) {
+        const run = runs[index];
+        const runStyle = run.style || {};
+        const runSize = finite(pick(runStyle, "fontSize", "font_size", "size"), initialFontSize(style, layer));
+        node.setRangeFontSize(run.start, run.end, Math.max(1, runSize * ratio));
+        const runLineHeight = pick(runStyle, "lineHeight", "line_height", "leading");
+        if (runLineHeight !== undefined) {
+          const scaled = lineHeightValue(runLineHeight);
+          if (scaled.unit === "PIXELS") scaled.value = Math.max(0.01, scaled.value * ratio);
+          node.setRangeLineHeight(run.start, run.end, scaled);
+        }
+      }
+      await fitTextToVisibleBox(node, layer, style, context, true);
+      dimensions = await renderedTextDimensions(node);
+    }
+    if (!renderedFits(dimensions, target, multiline)) {
+      context.error(
+        "Mixed text overflow",
+        (layer.name || layerId(layer)) + ": rendered " + dimensions.width.toFixed(1) + "×" + dimensions.height.toFixed(1) +
+          " exceeds " + target.w.toFixed(1) + "×" + target.h.toFixed(1)
+      );
+    }
+    return { rank: 0, overflow: Math.max(0, dimensions.width - target.w) + Math.max(0, dimensions.height - target.h), fontName: node.fontName, fontSize: node.fontSize };
+  }
   const requests = rankedFontRequests(style);
   const target = localBox(layer, context, true);
   let best = { rank: 0, overflow: Number.POSITIVE_INFINITY, fontName: node.fontName, fontSize: node.fontSize };
@@ -992,6 +1030,10 @@ async function createTextLayer(layer, parent, context) {
   const runs = await applyTextRuns(node, layer, content, context);
   const fitWinner = await fitTextWithCandidates(node, layer, style, context, runs.length > 0);
   await attachTextStyle(node, layer, style, fitWinner.fontName, context, runs.length > 0);
+  const baselineEvidence = layer.meta && (layer.meta.baseline || layer.meta.baseline_first || layer.meta.baselineFirst);
+  if (baselineEvidence) {
+    try { node.setPluginData("adDecompilerBaseline", JSON.stringify(baselineEvidence)); } catch (_) {}
+  }
   applyStrokes(node, layer, context);
   applyCommon(node, layer, context);
   return node;

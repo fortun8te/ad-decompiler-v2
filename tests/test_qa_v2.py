@@ -182,6 +182,105 @@ def test_cleaned_background_passes_leakage_gate(tmp_path):
     assert result["structural"]["background"]["changed_ratio"] > 0.1
 
 
+def test_inpaint_changes_outside_removal_mask_are_hard_failure(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    background = tmp_path / "background_clean.png"
+    removal = tmp_path / "removal_mask.png"
+    image = Image.new("RGB", (100, 80), "white")
+    ImageDraw.Draw(image).rectangle((40, 30, 59, 49), fill="black")
+    image.save(source)
+    image.save(render)
+    cleaned = image.copy()
+    ImageDraw.Draw(cleaned).rectangle((0, 0, 19, 19), fill="red")  # illegal exterior damage
+    ImageDraw.Draw(cleaned).rectangle((40, 30, 59, 49), fill="white")
+    cleaned.save(background)
+    mask = Image.new("L", image.size, 0)
+    ImageDraw.Draw(mask).rectangle((38, 28, 61, 51), fill=255)
+    mask.save(removal)
+
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [
+            {"id": "background", "type": "image", "src": "background_clean.png",
+             "meta": {"role": "background", "source": "inpaint"}},
+            {"id": "object", "type": "shape", "box": {"x": 40, "y": 30, "w": 20, "h": 20}},
+        ], "meta": {"editable_ratio": 0.5}},
+    )
+
+    assert "inpaint-outside-mask" in _rules(result)
+    assert result["structural"]["background"]["outside_changed_ratio"] > 0.01
+
+
+def test_product_alpha_internal_hole_is_detected_and_repairable(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (100, 80), "white")
+    image.save(source)
+    image.save(render)
+    asset = Image.new("RGBA", (40, 40), (20, 80, 160, 255))
+    ImageDraw.Draw(asset).rectangle((12, 12, 27, 27), fill=(0, 0, 0, 0))
+    asset.save(tmp_path / "product.png")
+    design = {"layers": [
+        {"id": "product", "type": "image", "src": "product.png",
+         "box": {"x": 20, "y": 20, "w": 40, "h": 40}, "meta": {"role": "product"}},
+    ], "meta": {"editable_ratio": 0.0}}
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
+
+    assert "layer-alpha-holes" in _rules(result)
+    row = result["structural"]["layer_alpha"][0]
+    assert row["internal_hole_count"] == 1
+    repairs = repair.assess(design, result, {}, {"run_dir": str(tmp_path)})
+    mask_repair = next(item for item in repairs if item.get("target_id") == "product")
+    assert (mask_repair["stage"], mask_repair["action"]) == ("sam3", "rerun-detection")
+    assert mask_repair["params"]["reject_internal_holes"] is True
+
+
+def test_icon_alpha_holes_are_not_false_positive(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (80, 80), "white")
+    image.save(source)
+    image.save(render)
+    icon = Image.new("RGBA", (32, 32), (0, 0, 0, 255))
+    ImageDraw.Draw(icon).ellipse((8, 8, 23, 23), fill=(0, 0, 0, 0))
+    icon.save(tmp_path / "ring.png")
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [{"id": "ring", "type": "image", "src": "ring.png",
+                             "box": {"x": 10, "y": 10, "w": 32, "h": 32},
+                             "meta": {"role": "icon"}}], "meta": {}},
+    )
+    assert "layer-alpha-holes" not in _rules(result)
+
+
+def test_detected_elements_dropped_before_reconstruction_are_hard_failure(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (80, 60), "white")
+    image.save(source)
+    image.save(render)
+    (tmp_path / "elements.json").write_text(json.dumps([
+        {"id": "E0", "role": "product"},
+        {"id": "E1", "role": "badge"},
+        {"id": "E2", "role": "icon"},
+        {"id": "E3", "role": "shape"},
+    ]), encoding="utf-8")
+    (tmp_path / "reconstruction.json").write_text(json.dumps({
+        "candidates": [{"id": "E0", "target": "image"}],
+        "stats": {},
+    }), encoding="utf-8")
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    assert "low-element-recall" in _rules(result)
+    assert result["structural"]["element_recall"] == 0.25
+    assert result["structural"]["element_survival"]["missing_ids"] == ["E1", "E2", "E3"]
+    repairs = repair.assess({}, result, {}, {"run_dir": str(tmp_path)})
+    assert any(item.get("action") == "rerun-detection" for item in repairs)
+
+
 def test_single_background_without_removal_work_can_legitimately_match_source(tmp_path):
     source = tmp_path / "source.png"
     render = tmp_path / "render.png"

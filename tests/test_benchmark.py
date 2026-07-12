@@ -16,7 +16,13 @@ def _fixture_run(tmp_path, *, qa=None, harness_loop=None, harness_legacy=None, c
         "edge_f1": 0.60,
         "color_similarity": 0.90,
         "hard_fails": [{"rule": "missing-assets", "detail": "product crop absent"}],
-        "structural": {"missing_assets": ["assets/product.png"]},
+        "structural": {
+            "missing_assets": ["assets/product.png"],
+            "background": {"outside_changed_ratio": 0.0},
+            "layer_alpha": [],
+            "element_recall": 1.0,
+            "hard_fails": [{"rule": "missing-assets", "detail": "product crop absent"}],
+        },
     }))
     (run / "reconstruction.json").write_text(encoding="utf-8", data=json.dumps({
         "stats": {"duplicates_removed": 2, "vectorized": 1, "vector_fallback": 3},
@@ -30,7 +36,9 @@ def _fixture_run(tmp_path, *, qa=None, harness_loop=None, harness_legacy=None, c
     for name in (
         "input_manifest.json", "normalized.png", "ocr_raw.json", "ocr.json",
         "residual.json", "qwen.json", "sam3.json", "fused_elements.json",
-        "elements.json", "merged.json", "layout.json",
+        "elements.json", "merged.json", "layout.json", "design_preflight.json",
+        "background_clean.png", "removal_mask.png", "ownership.png", "layers_contact.png",
+        "preview.png", "diff.png",
     ):
         (run / name).write_text("{}", encoding="utf-8")
     if harness_loop is not None:
@@ -134,3 +142,30 @@ def test_benchmark_entry_rejects_partial_run_even_if_result_claims_success(tmp_p
     assert row["qa_ok"] is False
     assert row["runtime_ok"] is False
     assert "qa.json" in row["missing_artifacts"]
+
+
+def test_benchmark_fault_injection_cannot_omit_visual_gate_evidence(tmp_path):
+    run = _fixture_run(tmp_path, qa={
+        "ok": True, "visual_score": 0.99, "ssim": 0.99, "hard_fails": [],
+        "structural": {},  # simulates an old/broken GPU smoke omitting mask evidence
+    })
+    row = _entry(run, {"ok": True})
+    assert row["qa_evidence_complete"] is False
+    assert row["qa_ok"] is False
+
+
+def test_benchmark_scorecard_surfaces_each_visual_failure_rule(tmp_path):
+    rules = ["inpaint-outside-mask", "layer-alpha-holes", "empty-layer-alpha", "low-element-recall"]
+    run = _fixture_run(tmp_path, qa={
+        "ok": False, "visual_score": 0.99, "ssim": 0.99,
+        "hard_fails": [{"rule": rule, "detail": "injected"} for rule in rules],
+        "structural": {"background": {}, "layer_alpha": [], "element_recall": 0.25,
+                       "hard_fails": [{"rule": rule, "detail": "injected"} for rule in rules]},
+    })
+    row = _entry(run, {"ok": True})
+    assert set(row["visual_failure_rules"]) == set(rules)
+    assert row["inpaint_outside_mask"] is True
+    assert row["layer_alpha_holes"] is True
+    assert row["empty_layer_alpha"] is True
+    assert row["low_element_recall"] is True
+    assert "inpaint-outside-mask" in _markdown({"summary": {"images": 1, "qa_passing": 0}, "runs": [row]})

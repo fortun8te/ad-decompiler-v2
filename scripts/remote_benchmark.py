@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-DEFAULT_BRIDGE = "http://100.74.135.83:8790"
+DEFAULT_BRIDGE = os.environ.get("AD_DECOMPILER_BRIDGE", "http://localhost:8790")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 DEFAULT_POLL_INTERVAL_S = 2.0
 DEFAULT_BUSY_RETRY_S = 3.0
@@ -234,8 +235,17 @@ def _duration_from_status(status: dict[str, Any], *, wall_s: float | None) -> fl
 
 
 def _qa_ok_from_payload(status: dict[str, Any], summary: dict[str, Any] | None) -> bool | None:
-    if summary and summary.get("final_qa_ok") is not None:
-        return bool(summary["final_qa_ok"])
+    if summary:
+        # Remote GPU evidence is fail-closed. A bridge saying "QA passed" is insufficient
+        # when the actual mask/inpaint/layer failure list was omitted.
+        if summary.get("qa_evidence_complete") is not True:
+            return False
+        if summary.get("hard_fails"):
+            return False
+        if summary.get("runtime_acceptable") is not True:
+            return False
+        if summary.get("final_qa_ok") is not None:
+            return bool(summary["final_qa_ok"])
     if status.get("final_qa_ok") is not None:
         return bool(status["final_qa_ok"])
     result = status.get("result") or {}
@@ -287,6 +297,16 @@ def benchmark_image(
         "staged": (summary or status).get("staged"),
         "doc_id": (summary or status).get("doc_id"),
         "bridge": bridge,
+        "qa_evidence_complete": bool((summary or {}).get("qa_evidence_complete")),
+        "hard_fails": (summary or {}).get("hard_fails") or [],
+        "visual_score": (summary or {}).get("visual_score"),
+        "ssim": (summary or {}).get("ssim"),
+        "element_recall": (summary or {}).get("element_recall"),
+        "background_audit": (summary or {}).get("background_audit"),
+        "layer_alpha_audit": (summary or {}).get("layer_alpha_audit") or [],
+        "runtime_status": (summary or {}).get("runtime_status"),
+        "runtime_acceptable": (summary or {}).get("runtime_acceptable") is True,
+        "runtime_violations": (summary or {}).get("runtime_violations") or [],
         **harness,
     }
     if status.get("status") == "failed":
@@ -322,6 +342,16 @@ def build_report(
             "done": done,
             "failed": sum(1 for row in runs if row.get("status") == "failed"),
             "qa_passing": qa_passing,
+            "qa_evidence_complete": sum(1 for row in runs if row.get("qa_evidence_complete")),
+            "runtime_accepted": sum(1 for row in runs if row.get("runtime_acceptable")),
+            "runs_with_hard_fails": sum(1 for row in runs if row.get("hard_fails")),
+            "mask_inpaint_failure_runs": sum(1 for row in runs if any(
+                item.get("rule") in {
+                    "background-leakage", "inpaint-outside-mask", "layer-alpha-holes",
+                    "empty-layer-alpha", "low-element-recall",
+                }
+                for item in (row.get("hard_fails") or []) if isinstance(item, dict)
+            )),
             "final_qa_passing": final_qa_passing,
             "harness_rounds_total": sum(int(row.get("harness_rounds") or 0) for row in runs),
             "mean_duration_s": mean_duration,
@@ -342,8 +372,8 @@ def markdown_report(report: dict[str, Any]) -> str:
             f"QA passing: {summary['qa_passing']}  |  Final QA: {summary['final_qa_passing']}"
         ),
         "",
-        "| image | status | QA | final QA | seconds | harness rounds | harness stopped | staged |",
-        "| --- | --- | --- | --- | ---: | ---: | --- | --- |",
+        "| image | status | QA | evidence | runtime | final QA | seconds | hard fails | staged |",
+        "| --- | --- | --- | --- | --- | --- | ---: | --- | --- |",
     ]
     for row in report["runs"]:
         duration = row.get("duration_s")
@@ -354,13 +384,16 @@ def markdown_report(report: dict[str, Any]) -> str:
             if row.get("final_qa_ok") is None
             else ("pass" if row["final_qa_ok"] else "fail")
         )
-        harness_rounds = row.get("harness_rounds")
-        harness_rounds_cell = "—" if harness_rounds is None else str(harness_rounds)
-        harness_stopped = row.get("harness_stopped") or "—"
+        evidence = "complete" if row.get("qa_evidence_complete") else "missing"
+        runtime = row.get("runtime_status") or ("ok" if row.get("runtime_acceptable") else "fail")
+        fails = ", ".join(
+            item.get("rule", "unknown") for item in (row.get("hard_fails") or [])
+            if isinstance(item, dict)
+        ) or "—"
         staged = "—" if row.get("staged") is None else ("yes" if row["staged"] else "no")
         lines.append(
-            f"| {row['filename']} | {row.get('status', '—')} | {qa} | {final_qa} | "
-            f"{duration_cell} | {harness_rounds_cell} | {harness_stopped} | {staged} |"
+            f"| {row['filename']} | {row.get('status', '—')} | {qa} | {evidence} | {runtime} | {final_qa} | "
+            f"{duration_cell} | {fails} | {staged} |"
         )
     if summary.get("mean_duration_s") is not None:
         lines.extend(["", f"Mean duration: **{summary['mean_duration_s']:.1f}s**"])
@@ -448,8 +481,19 @@ def main(argv: list[str] | None = None) -> int:
         timeout_s=args.timeout,
     )
     print(json.dumps(report["summary"], indent=2))
-    all_done = report["summary"]["done"] == report["summary"]["images"]
-    return 0 if all_done else 2
+    summary = report["summary"]
+    total = summary["images"]
+    accepted = (
+        total > 0
+        and summary["done"] == total
+        and summary["qa_passing"] == total
+        and summary["final_qa_passing"] == total
+        and summary["qa_evidence_complete"] == total
+        and summary["runtime_accepted"] == total
+        and summary["runs_with_hard_fails"] == 0
+        and all(row.get("staged") is True for row in report["runs"])
+    )
+    return 0 if accepted else 2
 
 
 if __name__ == "__main__":

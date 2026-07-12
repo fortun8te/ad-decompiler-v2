@@ -398,6 +398,11 @@ def check_binaries(cfg=None):
     vtracer = _resolve_binary(cfg, "color_engine", "vtracer")
     potrace = _resolve_binary(cfg, "binary_engine", "potrace")
     try:
+        from vtracer import convert_image_to_svg_py as _vtracer_python  # noqa: F401
+        python_vtracer = True
+    except Exception:
+        python_vtracer = False
+    try:
         import cairosvg  # noqa: F401
         gate = True
     except ImportError:
@@ -420,7 +425,10 @@ def check_binaries(cfg=None):
     except Exception:
         resvg_ok = False
     return {
-        "vtracer": {"ok": bool(vtracer), "path": vtracer or "not on PATH (cargo install vtracer)"},
+        "vtracer": {
+            "ok": bool(vtracer or python_vtracer),
+            "path": vtracer or ("python:vtracer" if python_vtracer else "pip install vtracer"),
+        },
         "potrace": {"ok": bool(potrace), "path": potrace or "not on PATH (brew/choco install potrace)"},
         "contour": {"ok": contour, "path": "opencv-python" if contour else "not installed (pip install opencv-python)"},
         "cairosvg": {"ok": gate, "path": "installed" if gate else "pip install cairosvg (quality gate)"},
@@ -604,6 +612,31 @@ def _contour_paths_to_svg(paths, w, h):
         lines.append(f'<path d="{item["d"]}" fill="{item["fill"]}"/>')
     lines.append("</svg>")
     return "".join(lines)
+
+
+def _normalize_trace_size(svg_text, traced_png, source_png):
+    """Bake preprocessing resize into path coordinates and restore the source viewBox.
+
+    Tiny crops are intentionally enlarged before tracing.  Returning those enlarged path
+    coordinates made the editable icon overflow its real crop even though the trace gate
+    passed.  The gate and exported paths must always live in original crop coordinates.
+    """
+    try:
+        from PIL import Image
+        with Image.open(traced_png) as traced, Image.open(source_png) as source:
+            tw, th = traced.size
+            sw, sh = source.size
+        if (tw, th) == (sw, sh) or min(tw, th, sw, sh) <= 0:
+            return svg_text
+        matrix = (sw / float(tw), 0.0, 0.0, sh / float(th), 0.0, 0.0)
+        paths = _parse_svg_paths(svg_text)
+        scaled = [
+            {"d": _abs_path(item["d"], matrix), "fill": item.get("fill", "#000000")}
+            for item in paths
+        ]
+        return _contour_paths_to_svg(scaled, sw, sh) if scaled else svg_text
+    except Exception:
+        return svg_text
 
 
 def _run_contour_simplify(png_path, cfg):
@@ -810,8 +843,9 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
                 if not svg:
                     note = err
                     continue
+                svg = _normalize_trace_size(svg, work_path, png_path)
                 result, _ = _evaluate_trace(
-                    svg, work_path, "vtracer", cfg, role, n_colors,
+                    svg, png_path, "vtracer", cfg, role, n_colors,
                     preset_note=f"preset={i}",
                 )
                 if result and consider(result):
@@ -826,8 +860,9 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
                     note = err
                     continue
                 svg = _recolor_potrace_svg(svg, _opaque_fill(work_path))
+                svg = _normalize_trace_size(svg, work_path, png_path)
                 result, _ = _evaluate_trace(
-                    svg, work_path, "potrace", cfg, role, n_colors,
+                    svg, png_path, "potrace", cfg, role, n_colors,
                     preset_note=f"thr={thr}",
                 )
                 if result and consider(result):
@@ -847,7 +882,8 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
 
         svg, err = _run_contour_simplify(work_path, cfg)
         if svg:
-            result, _ = _evaluate_trace(svg, work_path, "contour", cfg, role, n_colors)
+            svg = _normalize_trace_size(svg, work_path, png_path)
+            result, _ = _evaluate_trace(svg, png_path, "contour", cfg, role, n_colors)
             if result and consider(result):
                 return result
         else:

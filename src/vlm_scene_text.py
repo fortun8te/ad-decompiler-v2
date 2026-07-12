@@ -30,6 +30,13 @@ _PROMPT = (
     "- wordmark: brand logo lettering or stylized mark, not regular body copy"
 )
 
+_ROLE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["role"],
+    "properties": {"role": {"type": "string", "enum": sorted(_ROLES)}},
+}
+
 
 def _scene_cfg(cfg: dict) -> dict:
     root = (cfg or {}).get("vlm") or {}
@@ -143,6 +150,7 @@ def classify_scene_text(image_path: str, ocr_result: dict, cfg: dict) -> dict:
             timeout_s=timeout_s,
             max_tokens=max_tokens,
             passes=passes,
+            response_schema=_ROLE_SCHEMA,
         )
         if note == "vlm_disagreement":
             disagreements += 1

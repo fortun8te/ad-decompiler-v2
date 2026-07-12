@@ -32,6 +32,48 @@ def _check(name, ok, detail, required=False):
     return {"name": name, "ok": bool(ok), "required": bool(required), "detail": str(detail)}
 
 
+def _fix_for(check: dict) -> str | None:
+    """Plain, copyable next action for failed checks shown by launchers and /health."""
+    if check.get("ok"):
+        return None
+    name = str(check.get("name", "")).lower()
+    if name == "python":
+        return "Install Python 3.12, then run setup_rtx.ps1 again."
+    if name in ("cuda", "torch"):
+        return "Update the NVIDIA driver, then rerun setup_rtx.ps1."
+    if name == "doctr gpu":
+        return "Rerun setup_rtx.ps1; if CUDA still fails, set device: cpu temporarily."
+    if name == "cudnn":
+        return "Rerun setup_rtx.ps1 after updating the NVIDIA driver."
+    if name == "sam3 package":
+        return "Rerun setup_rtx.ps1 to install the official SAM 3 code."
+    if name in ("sam3 checkpoint", "sam3 bpe"):
+        return "Download the official SAM 3 image checkpoint, then set its path under sam3 in config.yaml."
+    if name.startswith("ocr:") or name.startswith("ocr fallback:"):
+        return "Rerun setup_rtx.ps1. For Tesseract, run: winget install UB-Mannheim.TesseractOCR"
+    if name == "tesseract binary":
+        return "Run: winget install UB-Mannheim.TesseractOCR, then restart the bridge."
+    if name == "vlm server":
+        return f"Start LM Studio's local server and load {_DEFAULT_VLM_MODEL}."
+    if name == "vlm model identity":
+        return f"Set vlm.model to {_DEFAULT_VLM_MODEL} in config.yaml and load that model in LM Studio."
+    if name == "comfyui":
+        return "Start ComfyUI on port 8188, or set qwen.required: false."
+    if name == "qwen workflow":
+        return "Put the Qwen workflow JSON at the config path, or set qwen.required: false."
+    if name.startswith("big-lama") or name.startswith("inpaint stack"):
+        return "Run: .venv\\Scripts\\python.exe -m pip install simple-lama-inpainting"
+    if name == "vectorize:vtracer":
+        return "Rerun setup_rtx.ps1 to install the VTracer Python backend."
+    if name == "vectorize:potrace":
+        return "Run: choco install potrace, then restart the bridge."
+    if name == "vectorization stack":
+        return "Rerun setup_rtx.ps1 to install VTracer and the SVG render-back checker."
+    if "vectorize gate" in name:
+        return "Rerun setup_rtx.ps1 to install the SVG render-back checker."
+    return None
+
+
 def _module(name):
     return importlib.util.find_spec(name) is not None
 
@@ -147,6 +189,9 @@ def _vlm_feature_enabled(cfg: dict) -> bool:
     if (vlm.get("element_propose") or {}).get("enabled"):
         return True
     return False
+
+
+_DEFAULT_VLM_MODEL = "google/gemma-4-e4b"
 
 
 def _tesseract_binary() -> str | None:
@@ -269,18 +314,32 @@ def inspect(cfg, root: Path) -> dict:
     vlm = cfg.get("vlm") or {}
     if _vlm_feature_enabled(cfg):
         base = str(vlm.get("base_url", "http://127.0.0.1:1234/v1")).rstrip("/")
-        model = str(vlm.get("model", ""))
+        model = str(vlm.get("model") or _DEFAULT_VLM_MODEL)
         # /models answering 200 does NOT mean the configured model is loaded — LM Studio
         # returns an empty list after it idles a model out, and then every VLM call 400s
         # ("No models loaded"). That exact failure silently zeroed all VLM corrections in
         # a 16-image benchmark, so check for the model by id, not just server liveness.
         loaded, detail = _vlm_model_loaded(base, model)
-        checks.append(_check("VLM server", loaded, detail, required=False))
+        vlm_required = bool(runtime.get("require_active_models", False))
+        checks.append(_check("VLM server", loaded, detail, required=vlm_required))
+        # Keep the requested identity explicit in doctor.json. This prevents a run being
+        # presented as Gemma 4 e4b evidence when the config quietly points at another VLM.
+        gemma_identity = model.casefold() == _DEFAULT_VLM_MODEL.casefold()
+        checks.append(_check(
+            "VLM model identity",
+            gemma_identity,
+            f"configured={model}; expected={_DEFAULT_VLM_MODEL}",
+            required=vlm_required,
+        ))
 
     try:
         from src.vectorize import check_binaries as _vectorize_binaries
     except Exception:
         _vectorize_binaries = None
+    vector_required = bool(
+        runtime.get("require_active_models", False)
+        and (cfg.get("vectorize") or {}).get("enabled", True)
+    )
     if _vectorize_binaries:
         # None of these are required checks -- a broken/missing native dependency here
         # must never crash the whole readiness report (see the cairosvg/libcairo OSError
@@ -291,18 +350,35 @@ def inspect(cfg, root: Path) -> dict:
         except Exception as exc:
             vz = {}
             checks.append(_check("vectorize:binaries", False, f"probe failed: {exc}", required=False))
-        for name in ("vtracer", "potrace", "cairosvg"):
+        for name in ("vtracer", "potrace", "cairosvg", "resvg"):
             info = vz.get(name) or {}
             detail = info.get("path", "unknown")
-            if name == "cairosvg":
+            if name in ("cairosvg", "resvg"):
                 checks.append(_check(
-                    "cairosvg (vectorize gate)", info.get("ok"), detail, required=False,
+                    f"{name} (vectorize gate)", info.get("ok"), detail, required=False,
                 ))
             else:
                 checks.append(_check(f"vectorize:{name}", info.get("ok"), detail, required=False))
+        tracer_ok = bool((vz.get("vtracer") or {}).get("ok"))
+        gate_ok = bool(
+            (vz.get("cairosvg") or {}).get("ok")
+            or (vz.get("resvg") or {}).get("ok")
+        )
+        checks.append(_check(
+            "vectorization stack",
+            tracer_ok and gate_ok,
+            "needs color-capable VTracer plus CairoSVG or resvg render-back validation; Potrace remains a monochrome fallback",
+            required=vector_required,
+        ))
     else:
-        for binary in ("vtracer", "potrace"):
-            checks.append(_check(f"vectorize:{binary}", bool(shutil.which(binary)), "on PATH"))
+        tracer_paths = {binary: shutil.which(binary) for binary in ("vtracer", "potrace")}
+        for binary, binary_path in tracer_paths.items():
+            checks.append(_check(f"vectorize:{binary}", bool(binary_path), binary_path or "not on PATH"))
+        checks.append(_check(
+            "vectorization stack", False,
+            "vectorization probe unavailable; install VTracer or Potrace and CairoSVG",
+            required=vector_required,
+        ))
     # Big-LaMa quality directly determines the clean background plate. Under
     # require_active_models it must be a real acceptance condition like SAM/OCR,
     # not silently optional — an OpenCV fallback degrades plate quality (see
@@ -341,6 +417,10 @@ def inspect(cfg, root: Path) -> dict:
         ))
     checks.append(_check("Figma bridge", _module("requests"), "required only for plugin staging"))
 
+    for item in checks:
+        fix = _fix_for(item)
+        if fix:
+            item["fix"] = fix
     blockers = [item for item in checks if item["required"] and not item["ok"]]
     warnings = [item for item in checks if not item["required"] and not item["ok"]]
     return {
@@ -349,6 +429,7 @@ def inspect(cfg, root: Path) -> dict:
         "policy": {
             "require_active_models": bool(runtime.get("require_active_models", False)),
             "qwen_required": _required_qwen(cfg),
+            "vectorization_required": vector_required,
         },
         "ocr_fallback": fallback,
         "checks": checks,
@@ -391,9 +472,17 @@ def main():
     parser = argparse.ArgumentParser(description="Check whether this machine can run the configured decompiler")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--json", action="store_true", help="print only JSON")
+    parser.add_argument("--deep", action="store_true",
+                        help="execute bounded real OCR/SAM/VLM/inpaint/vector/Figma staging probes")
+    parser.add_argument("--deep-output", default="runs/runtime-smoke")
+    parser.add_argument("--probe-timeout", type=float, default=120)
     args = parser.parse_args()
     cfg = load_cfg(args.config)
     result = inspect(cfg, Path(__file__).resolve().parent)
+    if args.deep and result.get("ok"):
+        from runtime_smoke import run_all
+        result["runtime_smoke"] = run_all(cfg, args.deep_output, timeout_s=args.probe_timeout)
+        result["ok"] = bool(result["runtime_smoke"].get("ok"))
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -401,6 +490,11 @@ def main():
         for item in result["checks"]:
             state = "OK" if item["ok"] else ("BLOCK" if item["required"] else "WARN")
             print(f"{state:5} {item['name']}: {item['detail']}")
+            if not item["ok"] and item.get("fix"):
+                print(f"      FIX: {item['fix']}")
+        if args.deep:
+            for item in (result.get("runtime_smoke") or {}).get("checks", []):
+                print(f"{'OK' if item.get('ok') else 'BLOCK':5} runtime:{item['name']}: {item.get('detail')}")
     raise SystemExit(0 if result["ok"] else 2)
 
 

@@ -212,6 +212,9 @@ def test_plugin_log_endpoint_appends_text_and_json(tmp_path):
 
 def test_health_includes_ocr_ready_summary(tmp_path, monkeypatch):
     _allow_machine_ready(monkeypatch)
+    monkeypatch.setattr("src.figma_bridge._runtime_self_test_status", lambda config_path=None: {
+        "valid": True, "reason": "passed", "evidence_path": "self_test.json",
+    })
     inbox = tmp_path / "inbox"
     inbox.mkdir()
     config = _write_passing_config(tmp_path)
@@ -223,6 +226,31 @@ def test_health_includes_ocr_ready_summary(tmp_path, monkeypatch):
         assert health["ocr_ready"]["ok"] is True
         assert health["ocr_ready"]["primary"] == "doctr"
         assert health["machine_ready"] is True
+        assert health["runtime_self_test"]["valid"] is True
+        assert health["active_job"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_health_exposes_active_job_for_plugin_reconnect(tmp_path, monkeypatch):
+    _allow_machine_ready(monkeypatch)
+    _install_fake_run_pipeline(monkeypatch, sleep_s=0.5)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        queued = json.loads(urlopen(Request(
+            base + "/process?filename=reconnect.png", data=b"x", method="POST",
+        ), timeout=2).read())
+        health = json.loads(urlopen(base + "/health", timeout=4).read())
+        assert health["active_job"]["job_id"] == queued["job_id"]
+        assert health["active_job"]["filename"] == "reconnect.png"
+        assert health["active_job"]["status"] in ("queued", "running")
+        _poll_job(base, queued["job_id"])
     finally:
         server.shutdown()
         server.server_close()
@@ -1027,3 +1055,24 @@ def test_repo_update_http_endpoint(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+def test_stage_job_output_rejects_stale_manifest(tmp_path, monkeypatch):
+    from src import figma_bridge
+
+    inbox = tmp_path / "inbox"
+    run_dir = tmp_path / "run"
+    inbox.mkdir()
+    run_dir.mkdir()
+    (run_dir / "design.json").write_text(json.dumps({"layers": []}), encoding="utf-8")
+    (inbox / "inbox.json").write_text(json.dumps({
+        "doc_id": "old", "run_dir": str(tmp_path / "old-run"),
+        "summary": {"layers": 99},
+    }), encoding="utf-8")
+    monkeypatch.setattr("src.figma_import.import_design", lambda *a, **k: {
+        "ok": False, "error": "disk full",
+    })
+
+    result = figma_bridge._stage_job_output(
+        str(inbox), str(run_dir), {"figma": {"inbox": str(inbox)}})
+
+    assert result["staged"] is False
+    assert result["staging_error"] == "disk full"

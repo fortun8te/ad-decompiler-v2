@@ -85,6 +85,8 @@ def _fallback_route(candidate: dict, canvas: dict, cfg: dict) -> dict:
 # ── candidate builders ───────────────────────────────────────────────────────────────
 def _text_candidate(line):
     meta = dict(line.get("meta") or {})
+    if line.get("baseline"):
+        meta["baseline"] = dict(line["baseline"])
     meta.update({
         "source": "ocr",
         "role": line.get("role") or meta.get("role") or "text",
@@ -129,6 +131,17 @@ def _text_sources(ocr):
                         "fontStyleCandidates", "confidence"):
                 if key in representative:
                     block_style.setdefault(key, representative[key])
+        # Blocks are the actual downstream text nodes. Preserve paragraph facts on the
+        # block itself rather than relying on the first OCR line's one-line style.
+        block_style.setdefault("align", block.get("alignment") or
+                               (members[0].get("style") or {}).get("align") if members else "LEFT")
+        if block.get("line_height") is not None:
+            block_style["lineHeight"] = block["line_height"]
+        block_style["lineCount"] = max(1, len(members), str(block.get("text") or "").count("\n") + 1)
+        if members and members[0].get("baseline"):
+            block.setdefault("meta", {})["baseline_first"] = dict(members[0]["baseline"])
+        if members and members[-1].get("baseline"):
+            block.setdefault("meta", {})["baseline_last"] = dict(members[-1]["baseline"])
         block["style"] = block_style
         block["ink_box"] = block.get("painted_box") or block.get("box")
         block["conf"] = (sum(float(line.get("conf", 1)) for line in members) / len(members)

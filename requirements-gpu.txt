@@ -14,11 +14,11 @@ scipy>=1.11
 pillow>=10.2
 requests>=2.31
 
-# ── OCR: primary + challengers + baseline ──
-paddleocr>=3.0            # PP-OCRv6 pipeline (primary)
-paddlepaddle-gpu>=3.0     # CUDA build of Paddle; use `paddlepaddle` for CPU-only boxes
-surya-ocr>=0.6            # challenger (torch-based)
-python-doctr[torch]>=0.8  # challenger (torch-based)
+# ── OCR: reliable Blackwell primary ──
+python-doctr[torch]>=0.8  # primary on RTX 50-series (uses the working PyTorch CUDA stack)
+# Paddle and Surya are useful optional fallbacks, but their Windows wheels can conflict
+# with the Blackwell PyTorch environment. setup_rtx.ps1 tries them separately and does not
+# discard an otherwise working install if either optional backend is unavailable.
 # pytesseract>=0.3.10     # OPTIONAL Tesseract baseline; also needs the tesseract binary
 #                           (choco install tesseract  /  apt install tesseract-ocr)
 
@@ -32,16 +32,13 @@ python-pptx>=0.6          # imported by the layered pipeline's PSD/layer export 
 
 # ── vectorize rasterization gate ──
 cairosvg>=2.7             # rasterize traced SVG for the fidelity check
-# vtracer + potrace are external BINARIES, not pip packages:
-#   vtracer:  cargo install vtracer            (or grab a release from
-#             https://github.com/visioncortex/vtracer/releases and put it on PATH)
+resvg>=0.2.0              # prebuilt Windows fallback when native Cairo is unavailable
+affine>=2.4                # transform helper used by the resvg Python binding
+# The official Python VTracer binding is the primary color-vector backend and avoids a
+# separate Windows binary install. The CLI remains supported when present.
+vtracer>=0.6.11
+# Potrace is an optional secondary binary backend for monochrome art:
 #   potrace:  choco install potrace            (Windows)  /  brew install potrace (mac)
-
-# ── optional upscaler for compressed Meta Library assets ──
-# realesrgan is often painful to pin against modern torch; prefer the spandrel route
-# inside ComfyUI, OR install standalone:
-#   pip install realesrgan basicsr        # may need basicsr patched for torchvision>=0.17
-# If realesrgan won't build, skip it and set cfg.upscale.enabled=false.
 
 # ── SAM 3 (install the official repository after this file) ──
 #   git clone https://github.com/facebookresearch/sam3.git C:\src\sam3

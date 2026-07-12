@@ -97,6 +97,9 @@ def test_poll_process_waits_until_terminal_state():
                     "job_id": "job1",
                     "duration_s": 12.5,
                     "final_qa_ok": True,
+                    "qa_evidence_complete": True,
+                    "hard_fails": [],
+                    "runtime_acceptable": True,
                     "harness_rounds": 1,
                     "harness_stopped": "qa_ok",
                     "staged": True,
@@ -157,6 +160,9 @@ def test_benchmark_image_collects_qa_harness_and_duration(tmp_path):
                     "staged": True,
                     "doc_id": "sample-doc",
                     "final_qa_ok": True,
+                    "qa_evidence_complete": True,
+                    "hard_fails": [],
+                    "runtime_acceptable": True,
                     "harness_rounds": 2,
                     "harness_stopped": "qa_ok",
                     "manifest": {"doc_id": "sample-doc"},
@@ -200,6 +206,9 @@ def test_run_benchmark_writes_json_and_markdown(tmp_path):
                         "job_id": job,
                         "duration_s": 4.0,
                         "final_qa_ok": True,
+                        "qa_evidence_complete": True,
+                        "hard_fails": [],
+                        "runtime_acceptable": True,
                         "harness_rounds": 0,
                         "harness_stopped": "already_ok",
                         "staged": True,
@@ -213,6 +222,9 @@ def test_run_benchmark_writes_json_and_markdown(tmp_path):
                         "status": "done",
                         "staged": True,
                         "final_qa_ok": True,
+                        "qa_evidence_complete": True,
+                        "hard_fails": [],
+                        "runtime_acceptable": True,
                         "harness_rounds": 0,
                         "harness_stopped": "already_ok",
                     },
@@ -249,6 +261,39 @@ def test_run_benchmark_writes_json_and_markdown(tmp_path):
     assert "Remote bridge benchmark" in md_path.read_text(encoding="utf-8")
 
 
+def test_remote_gpu_smoke_done_but_missing_evidence_exits_failure(tmp_path, monkeypatch):
+    report = {
+        "runs": [{"status": "done", "qa_ok": False, "final_qa_ok": True, "staged": True}],
+        "summary": {
+            "images": 1, "done": 1, "qa_passing": 0, "final_qa_passing": 1,
+            "qa_evidence_complete": 0, "runtime_accepted": 1, "runs_with_hard_fails": 0,
+        },
+    }
+    monkeypatch.setattr(rb, "run_benchmark", lambda **kwargs: report)
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir()
+    assert rb.main(["--input-dir", str(input_dir), "--output", str(tmp_path / "out")]) == 2
+
+
+def test_remote_gpu_smoke_hard_fail_is_preserved_in_row(tmp_path):
+    image = tmp_path / "fault.png"
+    image.write_bytes(b"\x89PNG")
+    bridge = "http://bridge.test"
+    http = FakeHttp({
+        ("POST", f"{bridge}/process?filename=fault.png"): lambda url, data: (
+            202, {"ok": True, "job_id": "fault", "status": "queued"}),
+        ("GET", f"{bridge}/process?job_id=fault"): lambda url: (
+            200, {"ok": True, "status": "done", "final_qa_ok": True}),
+        ("GET", f"{bridge}/run-summary?job_id=fault"): lambda url: (
+            200, {"ok": True, "status": "done", "final_qa_ok": True,
+                  "qa_evidence_complete": True, "runtime_acceptable": True,
+                  "hard_fails": [{"rule": "layer-alpha-holes", "detail": "injected"}]}),
+    })
+    row = rb.benchmark_image(bridge, image, http=http, poll_interval_s=0, busy_retry_s=0)
+    assert row["qa_ok"] is False
+    assert row["hard_fails"][0]["rule"] == "layer-alpha-holes"
+
+
 def test_run_benchmark_generate_synthetic_when_empty(tmp_path, monkeypatch):
     input_dir = tmp_path / "empty"
     input_dir.mkdir()
@@ -262,7 +307,9 @@ def test_run_benchmark_generate_synthetic_when_empty(tmp_path, monkeypatch):
 
         def get_json(self, url):
             if "/run-summary" in url:
-                return 200, {"ok": True, "final_qa_ok": True, "harness_rounds": 0, "harness_stopped": "already_ok"}
+                return 200, {"ok": True, "final_qa_ok": True, "qa_evidence_complete": True,
+                             "hard_fails": [], "runtime_acceptable": True,
+                             "harness_rounds": 0, "harness_stopped": "already_ok"}
             return 200, {"ok": True, "status": "done", "duration_s": 1.0, "final_qa_ok": True, "harness_rounds": 0}
 
     # Only exercise the synthetic path + one successful image without running all five uploads.

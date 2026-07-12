@@ -14,6 +14,9 @@ $Python = Join-Path (Get-Location) ".venv\Scripts\python.exe"
 if (-not (Test-Path $Python)) {
   Write-Host "The environment is not installed yet. Running setup..."
   & powershell -ExecutionPolicy Bypass -File ".\setup_rtx.ps1"
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Python)) {
+    throw "Setup did not finish. Fix the messages above, then run this launcher again."
+  }
 }
 
 if (-not $SkipDoctor) {
@@ -22,16 +25,25 @@ if (-not $SkipDoctor) {
 }
 
 $bridgeProcess = $null
+$bridgeWasAlreadyRunning = $false
 if (-not $NoBridge) {
   & $Python "$((Get-Location).Path)\scripts\stamp_plugin_build.py" --quiet
   & $Python -m src.bridge_bootstrap --config config.yaml --inbox "$HOME\figma-inbox" | Out-Null
-  Write-Host "Starting the local Figma bridge on http://localhost:8790..."
-  $bridgeProcess = Start-Process -FilePath $Python -ArgumentList @(
-    "-m", "src.figma_bridge", "--inbox", "$HOME\figma-inbox", "--port", "8790"
-  ) -PassThru
-  Start-Sleep -Seconds 1
-  if ($bridgeProcess.HasExited) {
-    throw "The Figma bridge exited immediately (exit code $($bridgeProcess.ExitCode)). Port 8790 may already be in use by a previous run -- check Task Manager for a stray python.exe, or rerun with -NoBridge."
+  try {
+    $health = Invoke-RestMethod -Uri "http://127.0.0.1:8790/health" -TimeoutSec 3
+    $bridgeWasAlreadyRunning = $health.ok -and $health.service -eq "ad-decompiler-bridge"
+  } catch { }
+  if ($bridgeWasAlreadyRunning) {
+    Write-Host "Using the bridge that is already running on http://localhost:8790."
+  } else {
+    Write-Host "Starting the local Figma bridge on http://localhost:8790..."
+    $bridgeProcess = Start-Process -FilePath $Python -ArgumentList @(
+      "-m", "src.figma_bridge", "--inbox", "$HOME\figma-inbox", "--port", "8790", "--config", "config.yaml", "--no-bootstrap"
+    ) -PassThru
+    Start-Sleep -Seconds 1
+    if ($bridgeProcess.HasExited) {
+      throw "The bridge could not start. Port 8790 may be used by another app; close it or double-click Start Bridge.bat for a clearer check."
+    }
   }
 }
 

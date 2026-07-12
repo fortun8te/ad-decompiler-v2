@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any, Literal, Optional
 import json
+import os
+import tempfile
 
 SCHEMA_VERSION = 2
 
@@ -226,13 +228,30 @@ def validate_design(doc: Any) -> list[str]:
 
 
 def dump(obj: Any, path: str) -> None:
-    """Write any dataclass (or dict/list of them) to pretty JSON."""
+    """Atomically write any dataclass (or dict/list of them) to pretty JSON.
+
+    Pipeline artifacts are resume checkpoints. A killed worker must leave either the prior
+    complete checkpoint or the new complete checkpoint, never half a JSON document.
+    """
     def enc(o):
         if hasattr(o, "__dataclass_fields__"):
             return asdict(o)
         raise TypeError(type(o))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2, default=enc)
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2, default=enc)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def load(path: str) -> Any:

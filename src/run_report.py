@@ -125,6 +125,60 @@ class RunReport:
         return not self.data.get("violations") and self.data.get("status") != "failed"
 
     def finish(self, *, error: str | None = None, qa_ok: bool | None = None) -> None:
+        qa_path = os.path.join(os.path.dirname(self.path), "qa.json")
+        qa = None
+        try:
+            with open(qa_path, encoding="utf-8") as handle:
+                candidate = json.load(handle)
+            if isinstance(candidate, dict):
+                qa = candidate
+        except Exception:
+            qa = None
+        if qa is not None:
+            structural = qa.get("structural") if isinstance(qa.get("structural"), dict) else {}
+            hard_fails = qa.get("hard_fails") if isinstance(qa.get("hard_fails"), list) else None
+            structural_hard_fails = (
+                structural.get("hard_fails")
+                if isinstance(structural.get("hard_fails"), list) else None
+            )
+            merged_hard_fails = list(hard_fails or [])
+            seen = {(item.get("rule"), item.get("detail")) for item in merged_hard_fails if isinstance(item, dict)}
+            for item in structural_hard_fails or []:
+                key = (item.get("rule"), item.get("detail")) if isinstance(item, dict) else None
+                if key and key not in seen:
+                    merged_hard_fails.append(item)
+                    seen.add(key)
+            evidence_complete = bool(
+                hard_fails is not None
+                and structural_hard_fails is not None
+                and all(key in structural for key in ("background", "layer_alpha", "element_recall"))
+            )
+            self.data["qa_evidence"] = {
+                "complete": evidence_complete,
+                "hard_fails": merged_hard_fails,
+                "visual_score": qa.get("visual_score"),
+                "ssim": qa.get("ssim"),
+                "element_recall": structural.get("element_recall"),
+                "background": structural.get("background"),
+                "layer_alpha": structural.get("layer_alpha") or [],
+            }
+            if qa_ok is True and (not evidence_complete or merged_hard_fails):
+                qa_ok = False
+                violation = {
+                    "rule": "qa-evidence-incomplete" if not evidence_complete else "qa-hard-fails-present",
+                    "detail": "QA acceptance contradicted required visual failure evidence",
+                    "hard": True,
+                }
+                if violation not in self.data["violations"]:
+                    self.data["violations"].append(violation)
+        elif qa_ok is True:
+            qa_ok = False
+            self.data["qa_evidence"] = {"complete": False, "hard_fails": []}
+            violation = {
+                "rule": "qa-evidence-missing", "detail": "qa.json could not be read", "hard": True,
+            }
+            if violation not in self.data["violations"]:
+                self.data["violations"].append(violation)
         if error:
             self.data["status"] = "failed"
             self.data["error"] = str(error)

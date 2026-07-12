@@ -110,6 +110,33 @@ def test_empty_inputs():
     assert merge_layers.merge({"lines": []}, [], [], CANVAS, {}) == []
 
 
+def test_paragraph_block_preserves_wrapping_alignment_line_height_and_baselines():
+    lines = [
+        {"id": "L0", "text": "First", "conf": .99,
+         "box": {"x": 20, "y": 20, "w": 100, "h": 20},
+         "baseline": {"x0": 20, "y0": 36, "x1": 120, "y1": 36},
+         "style": {"fontFamily": "Inter", "fontSize": 16}},
+        {"id": "L1", "text": "Second", "conf": .98,
+         "box": {"x": 20, "y": 44, "w": 110, "h": 20},
+         "baseline": {"x0": 20, "y0": 60, "x1": 130, "y1": 60},
+         "style": {"fontFamily": "Inter", "fontSize": 16}},
+    ]
+    block = {
+        "id": "B0", "line_ids": ["L0", "L1"], "text": "First\nSecond",
+        "box": {"x": 20, "y": 20, "w": 110, "h": 44},
+        "painted_box": {"x": 22, "y": 22, "w": 106, "h": 40},
+        "alignment": "CENTER", "line_height": 24, "role": "body", "meta": {},
+    }
+    candidate = _by_id(merge_layers.merge(
+        {"lines": lines, "blocks": [block], "styles": []}, [], [], CANVAS, {}
+    ))["c_B0"]
+    assert candidate["style"]["lineCount"] == 2
+    assert candidate["style"]["lineHeight"] == 24
+    assert candidate["style"]["align"] == "CENTER"
+    assert candidate["meta"]["baseline_first"]["y0"] == 36
+    assert candidate["meta"]["baseline_last"]["y0"] == 60
+
+
 def test_low_fidelity_block_meta_survives_the_block_path_into_the_candidate():
     """Regression for the block-path fidelity drop: production OCR always carries a
     non-empty "blocks" array (text_analysis._make_blocks emits >=1 block per line), so

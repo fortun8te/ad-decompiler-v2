@@ -18,6 +18,8 @@ def test_doctor_marks_active_missing_sam_and_primary_ocr_as_blockers(tmp_path, m
     assert not report["ok"]
     assert {item["name"] for item in report["blockers"]} >= {"ocr:ppocr-v6", "sam3 package", "sam3 checkpoint"}
     assert any(item["name"] == "ocr challenger:surya" for item in report["warnings"])
+    sam = next(item for item in report["blockers"] if item["name"] == "sam3 checkpoint")
+    assert "config.yaml" in sam["fix"]
 
 
 def test_doctor_accepts_a_minimal_cpu_configuration(tmp_path, monkeypatch):
@@ -73,6 +75,27 @@ def test_doctor_leaves_big_lama_optional_without_require_active_models(tmp_path,
 
     assert any(item["name"] == "Big-LaMa" for item in report["warnings"])
     assert not any(item["name"] == "Big-LaMa" for item in report["blockers"])
+
+
+def test_doctor_requires_real_vectorization_stack_for_acceptance(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: True)
+    monkeypatch.setattr("doctor._torch", lambda device: {
+        "name": "torch", "ok": True, "required": False, "detail": "cpu"
+    })
+    monkeypatch.setattr("src.vectorize.check_binaries", lambda cfg: {
+        "vtracer": {"ok": False, "path": "missing"},
+        "potrace": {"ok": False, "path": "missing"},
+        "cairosvg": {"ok": True, "path": "python:cairosvg"},
+        "resvg": {"ok": False, "path": "missing"},
+    })
+
+    report = inspect({
+        "device": "cpu", "ocr": {"primary": "doctr"}, "qwen": {"enabled": False},
+        "runtime": {"require_active_models": True}, "inpaint": {"mode": "opencv"},
+    }, Path(tmp_path))
+
+    assert any(item["name"] == "vectorization stack" for item in report["blockers"])
+    assert report["policy"]["vectorization_required"] is True
 
 
 def test_doctor_reports_inpaint_stack_ok_when_lama_installed_even_if_comfyui_down(tmp_path, monkeypatch):
@@ -222,3 +245,17 @@ def test_doctor_warns_when_vlm_enabled_but_server_unreachable(tmp_path, monkeypa
     }, Path(tmp_path))
 
     assert any(item["name"] == "VLM server" and not item["ok"] for item in report["warnings"])
+
+
+def test_doctor_requires_exact_gemma_identity_for_active_model_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: True)
+    monkeypatch.setattr("doctor._torch", lambda device: {"name": "torch", "ok": True, "required": False, "detail": "cpu"})
+    monkeypatch.setattr("doctor._vlm_model_loaded", lambda base, model: (True, f"{model} loaded"))
+    cfg = {
+        "device": "cpu", "qwen": {"enabled": False}, "sam3": {"enabled": False},
+        "inpaint": {"mode": "opencv"}, "runtime": {"require_active_models": True},
+        "vlm": {"enabled": True, "model": "some-other-model"},
+        "ocr": {"primary": "easyocr", "auto_fallback_tesseract": False},
+    }
+    report = inspect(cfg, tmp_path)
+    assert any(item["name"] == "VLM model identity" for item in report["blockers"])

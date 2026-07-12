@@ -979,6 +979,8 @@ def _geometry_metrics(lines: Iterable[dict]) -> dict:
 
 def _cross_check_metrics(lines: list[dict], configured: list[str], successful: list[str]) -> dict:
     disagreements = sum(1 for line in lines if (line.get("meta") or {}).get("disagreement"))
+    agreements = [float((line.get("meta") or {}).get("agreement", 1.0)) for line in lines]
+    supported = sum(1 for line in lines if len((line.get("meta") or {}).get("support_engines") or []) > 1)
     required = list(dict.fromkeys(str(name) for name in configured))
     present = list(dict.fromkeys(str(name) for name in successful))
     missing = [name for name in required if name not in present]
@@ -990,6 +992,9 @@ def _cross_check_metrics(lines: list[dict], configured: list[str], successful: l
         "complete": not required or not missing,
         "lines_checked": len(lines) if len(present) > 1 else 0,
         "disagreements": disagreements,
+        "consensus_lines": supported,
+        "consensus_ratio": round(supported / len(lines), 4) if lines and len(present) > 1 else None,
+        "mean_text_agreement": round(sum(agreements) / len(agreements), 4) if agreements else None,
         "fail_closed": bool(required and bool(missing)),
     }
 
@@ -1373,6 +1378,20 @@ def _reconcile(primary_lines, challenger_sets, iou_thresh=0.42, cfg=None):
             ) / len(members), 4),
             "provenance": provenance,
         })
+        engine_count = len(set(engines))
+        support_count = len(supporting_engines)
+        agreement = float(meta["agreement"])
+        # Keep detector confidence and consensus confidence separate. Downstream judges can
+        # still select a high-confidence disputed line for review, while acceptance/reporting
+        # sees that only one engine actually supported the chosen transcription.
+        meta["consensus"] = {
+            "engine_count": engine_count,
+            "support_count": support_count,
+            "dissent_count": max(0, engine_count - support_count),
+            "unanimous": support_count == engine_count,
+            "confidence": round(min(1.0, winner["conf"] * (.55 + .45 * agreement) *
+                                    (support_count / max(1, engine_count)) ** .35), 4),
+        }
         unique_texts = sorted({member.get("text", "") for member in members})
         if len({_text_key(value) for value in unique_texts}) > 1:
             meta["disagreement"] = unique_texts
@@ -1607,7 +1626,13 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         if payload.get("lines"):
             successful_challengers.append(name)
 
-    if not engines_used:
+    # A backend call that returned successfully but found zero lines is not useful OCR
+    # evidence.  This distinction matters on broken GPU/runtime combinations which can
+    # return an empty prediction instead of raising.  Try the configured fallback chain
+    # whenever *all* configured engines are empty, not only when they threw exceptions.
+    configured_has_evidence = bool(primary_lines) or any(bool(lines) for lines in challenger_sets)
+    empty_configured = bool(engines_used) and not configured_has_evidence
+    if not configured_has_evidence:
         configured = {primary_name, *challenger_names}
         for name in _fallback_engine_names(cfg):
             if name in configured:
@@ -1629,10 +1654,18 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
             primary_lines = _targeted_retry(
                 img_path, payload.get("lines", []), name, cfg
             )
+            if not primary_lines:
+                fallback_errors.append({
+                    "engine": name,
+                    "error": "backend returned no text observations",
+                    "role": "fallback",
+                })
+                continue
             engines_used = [primary_engine]
+            challenger_sets = []
             errors.append({
                 "engine": name,
-                "detail": "recovered via fallback after configured engines failed",
+                "detail": "recovered via fallback after configured engines failed or returned empty",
                 "role": "fallback",
             })
             print(f"[ocr] using fallback engine '{primary_engine}' after configured backends failed")
@@ -1655,6 +1688,16 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         )
         # #endregion
         raise RuntimeError(message)
+
+    # All engines may legitimately see no text (for example, a photo-only creative), so
+    # do not invent OCR or abort.  Keep the run usable but visibly degraded: an empty model
+    # response must never be reported as a fully healthy OCR stage.
+    if empty_configured and not primary_lines and not any(challenger_sets):
+        errors.append({
+            "engine": "+".join(dict.fromkeys(engines_used)),
+            "error": "all available OCR engines returned no text observations",
+            "role": "empty-evidence",
+        })
 
     merged = _reconcile(primary_lines, challenger_sets, cfg=cfg) if challenger_sets else _reconcile(
         primary_lines, [], cfg=cfg

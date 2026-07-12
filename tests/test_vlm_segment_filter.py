@@ -39,6 +39,35 @@ def test_vlm_error_degrades_without_dropping(tmp_path, monkeypatch):
     out = vlm_segment_filter.filter_elements(_image(tmp_path), elements, cfg)
     assert len(out) == 1
     assert out[0]["id"] == "E0"
+    assert out[0]["meta"]["vlm_segment"]["note"] == "vlm_error"
+
+
+def test_contradictory_drop_is_reviewed_not_deleted(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        vlm_segment_filter.vlm_client, "multi_pass_answer",
+        lambda *a, **k: ('{"decision": "drop", "label": "product"}', None),
+    )
+    elements = [{"id": "E0", "box": {"x": 10, "y": 10, "w": 40, "h": 30}}]
+    cfg = {"vlm": {"segment_filter": {"enabled": True}}}
+
+    out = vlm_segment_filter.filter_elements(_image(tmp_path), elements, cfg)
+
+    assert len(out) == 1
+    assert out[0]["meta"]["vlm_segment"]["decision"] == "review"
+    assert out[0]["meta"]["vlm_uncertain"] is True
+
+
+def test_bad_geometry_is_reviewed_without_aborting_other_elements(tmp_path):
+    elements = [
+        {"id": "bad", "box": {"x": "not-a-number", "y": 0, "w": 10, "h": 10}},
+        {"id": "plain"},
+    ]
+    cfg = {"vlm": {"segment_filter": {"enabled": True}}}
+
+    out = vlm_segment_filter.filter_elements(_image(tmp_path), elements, cfg)
+
+    assert [item["id"] for item in out] == ["bad", "plain"]
+    assert out[0]["meta"]["vlm_segment"]["note"] == "invalid_crop_geometry"
 
 
 def test_refine_role_sets_meta_role_after_keep(tmp_path, monkeypatch):

@@ -20,7 +20,7 @@ from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  vlm_proofread, vlm_ocr_judge, vlm_font_judge, vlm_scene_text,
                  vlm_segment_filter, vlm_element_propose, vram)
 from src.run_report import RunReport, qwen_degradation
-from src.schema import dump, load
+from src.schema import dump, load, validate_design
 from src.harness import harness_enabled, harness_max_rounds, recommended_resume
 from src.harness_loop import in_harness_loop, run_harness_after_pipeline
 from src.qa_config import pixel_diff_thresholds, visual_pass_ssim
@@ -120,13 +120,62 @@ def _write_json_atomic(path, data):
     os.replace(temporary, path)
 
 
+def _artifact_ready(path: str) -> bool:
+    """Return false for missing, corrupt, or structurally unusable checkpoints."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        if os.path.getsize(path) <= 0:
+            return False
+        lower = path.lower()
+        if lower.endswith(".json"):
+            value = load(path)
+            name = os.path.basename(path)
+            if value is None:
+                return False
+            if name == "canvas.json":
+                return isinstance(value, dict) and all(
+                    isinstance(value.get(key), (int, float)) and value[key] > 0
+                    for key in ("w", "h")
+                )
+            if name in ("ocr_raw.json", "ocr.json"):
+                return isinstance(value, dict) and isinstance(value.get("lines", []), list)
+            if name in ("residual.json", "qwen.json", "fused_elements.json",
+                        "elements.json", "merged.json", "layout.json"):
+                return isinstance(value, list)
+            if name == "sam3.json":
+                return isinstance(value, dict) and isinstance(value.get("elements", []), list)
+            if name == "reconstruction.json":
+                if not (isinstance(value, dict) and isinstance(value.get("candidates"), list)
+                        and isinstance(value.get("stats"), dict)):
+                    return False
+                for key in ("background", "removal_mask", "ownership"):
+                    asset = value.get(key)
+                    if not asset or not _artifact_ready(os.path.join(os.path.dirname(path), asset)):
+                        return False
+                return True
+            if name == "design.json":
+                return not validate_design(value)
+            if name == "qa.json":
+                return isinstance(value, dict) and isinstance(value.get("hard_fails", []), list)
+            return True
+        if lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")):
+            from PIL import Image
+            with Image.open(path) as image:
+                image.verify()
+            return True
+        return True
+    except (OSError, ValueError, TypeError, SyntaxError, json.JSONDecodeError):
+        return False
+
+
 def run_one(input_path, run_dir, cfg, start_from="normalize"):
     os.makedirs(run_dir, exist_ok=True)
     cfg = copy.deepcopy(cfg or {})
     cfg["run_dir"] = os.path.abspath(run_dir)
     report = RunReport(run_dir, input_path, cfg, start_from)
     A = lambda n: os.path.join(run_dir, n)          # artifact path
-    exists = lambda n: os.path.exists(A(n))
+    exists = lambda n: _artifact_ready(A(n))
     begin = STAGES.index(start_from) if start_from in STAGES else 0
     canvas = None
     t0 = time.time()
@@ -155,11 +204,14 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         return STAGES.index(name) >= begin
 
     current_stage = "normalize"
+    dirty = False
+    design_updated = False
     try:
         # 1 normalize
-        if stage("normalize") or not exists("normalized.png"):
+        if stage("normalize") or dirty or not exists("normalized.png"):
             current_stage = "normalize"
             norm_path, canvas = normalize.load_normalize(input_path, run_dir, cfg)
+            dirty = True
             _log(run_dir, f"normalize → {canvas['w']}x{canvas['h']}")
         else:
             canvas = load(A("canvas.json"))
@@ -167,8 +219,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         norm_path = A("normalized.png")
 
         # 2 OCR facts, followed by painted-text/style/hierarchy analysis.
-        if stage("ocr") or not exists("ocr_raw.json"):
+        if stage("ocr") or dirty or not exists("ocr_raw.json"):
             current_stage = "ocr"
+            dirty = True
             raw_ocr = ocr.run_ocr(norm_path, cfg, run_dir=run_dir)
             ocr_judge = ((cfg.get("vlm") or {}).get("ocr_judge") or {})
             if ocr_judge.get("enabled"):
@@ -194,8 +247,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                     vp_note += f", ensemble-proofread {vp['ensemble_disagreement_checked']}"
             _log(run_dir, f"ocr[{raw_ocr.get('engine')}] → {len(raw_ocr.get('lines', []))} lines{oj_note}{vp_note}")
         raw_ocr = load(A("ocr_raw.json")) if exists("ocr_raw.json") else load(A("ocr.json"))
-        if stage("text") or not exists("ocr.json"):
+        if stage("text") or dirty or not exists("ocr.json"):
             current_stage = "text"
+            dirty = True
             ocr_res = text_analysis.analyze_text(norm_path, raw_ocr, cfg)
             scene_text = ((cfg.get("vlm") or {}).get("scene_text") or {})
             if scene_text.get("enabled"):
@@ -222,8 +276,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         ocr_res = load(A("ocr.json"))
 
         # 3 deterministic residual proposals. This also writes box-local masks.
-        if stage("residual") or not exists("residual.json"):
+        if stage("residual") or dirty or not exists("residual.json"):
             current_stage = "residual"
+            dirty = True
             residual = element_detect.detect(norm_path, ocr_res, cfg, run_dir=run_dir)
             dump(residual, A("residual.json"))
             _log(run_dir, f"residual proposals → {len(residual)}")
@@ -240,6 +295,8 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             and sam_element_count < int(ep_cfg.get("lightweight_grid_below_sam_count"))
         )
         should_enrich = ep_cfg.get("enabled") and (
+            dirty
+            or
             stage("sam")
             or not exists("sam3.json")
             or ep_cfg.get("lightweight_grid")
@@ -258,15 +315,17 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             _log(run_dir, f"vlm element propose → +{added} proposals ({len(residual)} total)")
 
         # 4 optional Qwen layers are advisory observations/assets, never the scene graph.
-        if stage("qwen") or not exists("qwen.json"):
+        if stage("qwen") or dirty or not exists("qwen.json"):
             current_stage = "qwen"
+            dirty = True
             qwen = qwen_worker.propose_layers(norm_path, run_dir, cfg)
             dump(qwen, A("qwen.json")); _log(run_dir, f"qwen → {len(qwen)} layers")
         qwen = load(A("qwen.json"))
 
         # 5 SAM 3 image prompt sweep + box-refine every residual, then mask-aware fusion.
-        if stage("sam") or not exists("sam3.json"):
+        if stage("sam") or dirty or not exists("sam3.json"):
             current_stage = "sam"
+            dirty = True
             vram.stage_boundary("qwen", "sam", cfg, run_dir, log_fn=lambda msg: _log(run_dir, msg))
             sam = _sam_with_safe_retry(norm_path, residual, cfg, run_dir, report)
             _log(run_dir, f"sam3[{sam.get('status')}] → {len(sam.get('elements', []))} observations")
@@ -279,8 +338,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         report.stage("sam", str(sam.get("status") or "ok"), detail=sam.get("note"),
                      artifacts=["sam3.json", "sam3_masks"])
         runtime_violations = _model_health(raw_ocr, sam, run_dir, cfg, report)
-        if stage("elements") or not exists("elements.json"):
+        if stage("elements") or dirty or not exists("elements.json"):
             current_stage = "elements"
+            dirty = True
             fused = element_fusion.fuse(sam3=sam, residual=residual, qwen=qwen,
                                         canvas=canvas, cfg=cfg, run_dir=run_dir)
             dump(fused, A("fused_elements.json"))
@@ -294,12 +354,16 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         els = load(A("elements.json")) if exists("elements.json") else load(A("fused_elements.json"))
 
         # 6 merge/routing creates semantic candidates; reconstruction gives pixels one owner.
-        if stage("merge") or not exists("merged.json"):
+        if stage("merge") or dirty or not exists("merged.json"):
+            current_stage = "merge"
+            dirty = True
             merged = merge_layers.merge(ocr_res, els, qwen, canvas, cfg, run_dir=run_dir)
             dump(merged, A("merged.json")); _log(run_dir, f"merge → {len(merged)} candidates")
         merged = load(A("merged.json"))
 
-        if stage("reconstruct") or not exists("reconstruction.json"):
+        if stage("reconstruct") or dirty or not exists("reconstruction.json"):
+            current_stage = "reconstruct"
+            dirty = True
             vram.stage_boundary("merge", "reconstruct", cfg, run_dir, log_fn=lambda msg: _log(run_dir, msg))
             reconstruction = reconstruct.reconstruct(norm_path, ocr_res, merged, run_dir, cfg)
             _log(run_dir, "reconstruct → "
@@ -325,14 +389,35 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             pass_note = f"; passes={passes}" if passes else ""
             report.stage("inpaint", "ok", detail=f"backend={inpaint_backend}{comfy_note}{pass_note}")
 
-        if stage("layout") or not exists("layout.json"):
-            tree = layout.infer(reconstruction.get("candidates", []), canvas, cfg)
+        if stage("layout") or dirty or not exists("layout.json"):
+            current_stage = "layout"
+            dirty = True
+            try:
+                tree = layout.infer(reconstruction.get("candidates", []), canvas, cfg)
+            except Exception as exc:
+                # Layout is an optimization, not the source of visual pixels. Preserve the
+                # canonical flat scene and mark it failed instead of losing the whole design.
+                tree = []
+                for candidate in reconstruction.get("candidates", []):
+                    if not isinstance(candidate, dict) or candidate.get("target") == "drop":
+                        continue
+                    item = copy.deepcopy(candidate)
+                    item.setdefault("constraints", {"horizontal": "LEFT", "vertical": "TOP"})
+                    item.setdefault("meta", {})["layout_fallback"] = True
+                    tree.append(item)
+                detail = f"layout inference failed; preserved {len(tree)} flat layer(s): {exc}"
+                report.stage("layout", "fallback", detail=detail, artifacts=["layout.json"])
+                report.degraded("layout", detail, required=True)
+                runtime_violations = report.violations
             dump(tree, A("layout.json"))
             _log(run_dir, f"layout → {len(tree)} root layers")
         tree = load(A("layout.json"))
 
         # 8 schema-v2 Figma scene graph (source of truth)
-        if stage("design") or not exists("design.json"):
+        if stage("design") or dirty or not exists("design.json"):
+            current_stage = "design"
+            dirty = True
+            design_updated = True
             kept = [c.get("text") for c in reconstruction.get("candidates", [])
                     if c.get("target") == "drop" and c.get("text")]
             doc = build_design_json.build(
@@ -342,9 +427,18 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             _log(run_dir, f"design.json → {len(doc.layers)} layers, kept_in_photo={len(doc.kept_in_photo)}")
 
         # 8.5 LOCAL PREVIEW — see the layers without Figma (default on)
-        if stage("preview") and cfg.get("preview", True):
+        need_local_preview = bool(cfg.get("preview", True)) or (
+            (stage("diff") or stage("qa")) and not exists("figma_export.png")
+        )
+        if need_local_preview and (stage("preview") or dirty or not exists("preview.png")):
+            current_stage = "preview"
             pv = render_preview.render(A("design.json"), run_dir)
             _log(run_dir, f"preview → {pv['preview']} ({pv['count']} layers in layers/, see layers_contact.png)")
+            if pv.get("errors"):
+                detail = f"{len(pv['errors'])} preview layer(s) failed; first: {pv['errors'][0].get('detail')}"
+                report.stage("preview", "partial", detail=detail, artifacts=["preview.png"])
+                report.degraded("preview", detail, required=True)
+                runtime_violations = report.violations
 
         # 9 figma import (optional — Figma export can come later)
         if stage("figma") and cfg.get("figma", {}).get("enabled", False):
@@ -357,13 +451,49 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             _log(run_dir, f"export: {exp.get('note', exp.get('path'))}")
 
         # 11 diff + 12 qa — QA against the Figma render if present, else the local preview
-        qa_render = A("figma_export.png") if exists("figma_export.png") else \
+        # A stale Figma export must not judge a newly rebuilt design. Until this run exports
+        # again, the freshly generated local preview is the only matching render.
+        use_figma_export = exists("figma_export.png") and (not design_updated or stage("export"))
+        qa_render = A("figma_export.png") if use_figma_export else \
             (A("preview.png") if exists("preview.png") else None)
         if (stage("diff") or stage("qa")) and qa_render:
-            ren_ocr = ocr.run_ocr(qa_render, cfg, run_dir=run_dir) if cfg.get("qa_ocr", True) else None
-            qa_partial = pixel_diff.compare(norm_path, qa_render, run_dir,
-                                            source_ocr=ocr_res, render_ocr=ren_ocr,
-                                            thresholds=pixel_diff_thresholds(cfg))
+            current_stage = "qa"
+            ren_ocr = None
+            if cfg.get("qa_ocr", True):
+                try:
+                    ren_ocr = ocr.run_ocr(qa_render, cfg, run_dir=run_dir)
+                except Exception as exc:
+                    # Pixel/structural judges remain useful when render OCR is down. Keep
+                    # text_recall unknown and make that loss of evidence explicit.
+                    detail = f"render OCR judge failed: {exc}"
+                    report.degraded("qa-ocr", detail, required=True)
+                    runtime_violations = report.violations
+            try:
+                qa_partial = pixel_diff.compare(norm_path, qa_render, run_dir,
+                                                source_ocr=ocr_res, render_ocr=ren_ocr,
+                                                thresholds=pixel_diff_thresholds(cfg))
+            except Exception as exc:
+                # A minimal independent pixel judge keeps the run inspectable, but can never
+                # turn a primary QA crash into success.
+                import numpy as np
+                from PIL import Image
+                source_image = Image.open(norm_path).convert("RGB")
+                render_image = Image.open(qa_render).convert("RGB").resize(source_image.size)
+                delta = np.abs(np.asarray(source_image, dtype=np.float32) -
+                               np.asarray(render_image, dtype=np.float32))
+                mae = float(delta.mean())
+                Image.fromarray(np.clip(delta.mean(axis=2) * 3, 0, 255).astype(np.uint8)).save(A("diff.png"))
+                qa_partial = {
+                    "ssim": 0.0, "visual_score": round(max(0.0, 1.0 - mae / 255.0), 4),
+                    "rgb_mae": round(mae, 4), "text_recall": None,
+                    "quality_flags": [{"rule": "qa-primary-failed", "detail": str(exc)}],
+                    "structural": {},
+                    "hard_fails": [{"rule": "qa-primary-failed", "detail": str(exc), "hard": True}],
+                }
+                detail = f"primary QA failed; independent pixel judge recorded MAE={mae:.2f}: {exc}"
+                report.stage("qa", "fallback", detail=detail, artifacts=["diff.png"])
+                report.degraded("qa", detail, required=True)
+                runtime_violations = report.violations
             design_data = load(A("design.json"))
             structural_fails = []
             warnings = (design_data.get("meta") or {}).get("warnings") or []

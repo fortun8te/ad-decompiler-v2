@@ -23,7 +23,7 @@ VECTORIZE_ROLES = (
     "icon", "badge", "logo", "arrow", "symbol", "pictogram", "chip", "divider", "chrome",
 )
 # Flat UI chrome shapes that are often simple enough to trace instead of primitive-fit.
-VECTORIZE_SHAPE_ROLES = ("badge", "chip", "button", "divider")
+PRIMITIVE_SHAPE_ROLES = ("badge", "chip", "button", "divider", "card")
 
 # Below this combined ink/font-match confidence, a text candidate cannot be faithfully
 # reproduced as editable text (glyph too hard to isolate, or the closest font/effect
@@ -131,11 +131,10 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
     if kind == "shape":
         role = meta.get("role")
         small = _area_frac(c.get("box", {}), canvas) <= ICON_MAX_AREA_FRAC
-        if small and (
-            meta.get("flat_fill")
-            or meta.get("simple_graphic")
-            or role in VECTORIZE_SHAPE_ROLES
-        ):
+        # A solid button/card/chip is already an editable native primitive. Tracing it
+        # creates needless paths and worse corner geometry. Only explicitly non-primitive
+        # artwork should enter the vector tracer from the generic shape branch.
+        if small and meta.get("simple_graphic") and role not in PRIMITIVE_SHAPE_ROLES:
             c["target"] = "icon"
             return c
         c["target"] = "shape"

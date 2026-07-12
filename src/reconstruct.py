@@ -94,6 +94,12 @@ def deduplicate(candidates: list, threshold: float = 0.86):
             # Text and its backing button/shape are intentionally nested, not duplicates.
             if {candidate.get("target"), other.get("target")} == {"text", "shape"}:
                 continue
+            # Strong overlap is not sufficient when semantics differ: a product
+            # commonly sits inside a broad photo observation and both are needed.
+            # Only generic/unknown labels may collapse into a semantic winner.
+            generic_roles = {None, "", "object", "image", "photo-fragment"}
+            if role != other_role and role not in generic_roles and other_role not in generic_roles:
+                continue
             if role != other_role and candidate.get("target") != other.get("target"):
                 continue
             if _iou(candidate.get("box", {}), other.get("box", {})) >= threshold:
@@ -636,7 +642,15 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         raster_src = _write_asset(image, assets_dir, cid)
         if target == "icon":
             role = (c.get("meta") or {}).get("role")
-            traced = vectorize.vectorize_crop(np.asarray(image), cfg, role=role)
+            # Harness repairs are target-scoped.  A bad trace on one icon must not flatten
+            # every otherwise-good vector in the run.
+            vector_cfg = cfg
+            repair_target = ((cfg.get("harness") or {}).get("target_id"))
+            if repair_target and repair_target != cid and (cfg.get("vectorize") or {}).get("force_raster_fallback"):
+                vector_cfg = dict(cfg)
+                vector_cfg["vectorize"] = dict(cfg.get("vectorize") or {})
+                vector_cfg["vectorize"].pop("force_raster_fallback", None)
+            traced = vectorize.vectorize_crop(np.asarray(image), vector_cfg, role=role)
             c["meta"]["vectorize"] = {
                 k: traced.get(k) for k in ("ok", "engine", "score", "note")
             }
