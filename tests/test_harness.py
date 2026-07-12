@@ -145,6 +145,60 @@ def test_harness_layout_and_inpaint_patches():
     assert layout["layout"]["min_container_frac"] == 0.001
 
 
+def test_harness_should_repair_on_qa_or_staging_failure():
+    ok_result = {"ok": True, "runtime_ok": True}
+    assert harness.harness_should_repair(ok_result, qa={"ok": True}, staging={"staged": True}) == (False, "ok")
+    assert harness.harness_should_repair(ok_result, qa={"ok": False}, staging={"staged": True}) == (True, "qa_failed")
+    assert harness.harness_should_repair(ok_result, qa={"ok": True}, staging={"staged": False}) == (True, "staging_failed")
+    assert harness.harness_should_repair(
+        {"ok": True, "runtime_ok": False}, qa=None, staging={"staged": True},
+    ) == (True, "runtime_degraded")
+    assert harness.harness_should_repair({"ok": False}, qa={"ok": False}) == (False, "pipeline_failed")
+
+
+def test_harness_loop_skips_when_qa_ok(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "qa.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+    pipeline = {"ok": True, "runtime_ok": True, "run_dir": str(run_dir)}
+
+    loop = harness.harness_loop(str(run_dir), {}, pipeline_result=pipeline, staging={"staged": True})
+
+    assert loop["repaired"] is False
+    assert loop["reason"] == "ok"
+
+
+def test_harness_loop_runs_repairs_on_failed_qa(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    (run_dir / "runtime_report.json").write_text(json.dumps({"input": str(input_path)}), encoding="utf-8")
+    (run_dir / "qa.json").write_text(json.dumps({
+        "ok": False,
+        "repairs": [{"stage": "ocr", "action": "rerun", "severity": "high"}],
+    }), encoding="utf-8")
+    calls = []
+
+    def fake_run_one(path, rd, cfg, start_from="normalize"):
+        calls.append(start_from)
+        (run_dir / "qa.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+        return {"ok": True, "run_dir": rd}
+
+    loop = harness.harness_loop(
+        str(run_dir),
+        {},
+        pipeline_result={"ok": True, "runtime_ok": True},
+        staging={"staged": True},
+        run_one=fake_run_one,
+    )
+
+    assert loop["repaired"] is True
+    assert loop["reason"] == "qa_failed"
+    assert calls == ["ocr"]
+    assert loop["pipeline_result"]["qa_ok"] is True
+
+
 def test_repair_assess_pairs_with_recommended_resume(tmp_path):
     qa = {
         "text_recall": 0.6,
@@ -156,3 +210,27 @@ def test_repair_assess_pairs_with_recommended_resume(tmp_path):
     assert choice is not None
     assert choice["resume"] == "ocr"
     assert (tmp_path / "repairs.json").exists()
+
+
+def test_execute_repairs_reads_max_rounds_from_config(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    (run_dir / "runtime_report.json").write_text(json.dumps({"input": str(input_path)}), encoding="utf-8")
+    (run_dir / "repairs.json").write_text(json.dumps([
+        {"stage": "qwen", "action": "retry", "reason": "alpha noisy", "severity": "medium"},
+    ]), encoding="utf-8")
+    (run_dir / "qa.json").write_text(json.dumps({"ok": False}), encoding="utf-8")
+
+    calls = []
+
+    def fake_run_one(path, rd, cfg, start_from="normalize"):
+        calls.append(start_from)
+        return {"ok": True, "run_dir": rd}
+
+    cfg = {"runtime": {"harness": {"max_rounds": 2}}}
+    summary = harness.execute_repairs(str(run_dir), cfg, run_one=fake_run_one)
+
+    assert len(calls) == 2
+    assert summary["stopped"] == "max_iterations"

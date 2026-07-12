@@ -22,19 +22,27 @@ STAGE_ALIASES = {
 # Actions the harness can drive without human review.
 ACTIONABLE = {
     ("ocr", "rerun"),
+    ("ocr", "boost-stack"),
     ("text-analysis", "restore-editable-text"),
     ("text-analysis", "refit-colors-effects"),
     ("text-analysis", "resolve-fonts"),
     ("qwen", "retry"),
+    ("vlm", "boost-stack"),
     ("inpaint", "rebuild-clean-plate"),
+    ("inpaint", "force-lama"),
     ("reconstruct", "inspect-worst-regions"),
     ("reconstruct", "restage-assets"),
     ("layout", "refit-geometry"),
+    ("layout", "tighten-containers"),
     ("design", "restore-native-nodes"),
+    ("design", "rebuild-schema"),
     ("figma", "fix-compiler-report"),
+    ("figma", "restage-inbox"),
     ("merge", "dedup"),
     ("merge", "enforce-single-owner"),
     ("vectorize", "raster-fallback"),
+    ("sam3", "rerun-detection"),
+    ("sam3", "revalidate-rejected"),
 }
 
 
@@ -103,10 +111,58 @@ def config_patches_for(repair: dict) -> dict:
         if layout_patch:
             patches["layout"] = layout_patch
 
+    elif (stage, action) in {
+        ("figma", "restage-inbox"),
+        ("ocr", "boost-stack"),
+        ("vlm", "boost-stack"),
+        ("inpaint", "force-lama"),
+        ("layout", "tighten-containers"),
+    }:
+        from src.harness_fixer import config_patches_for_fixer
+
+        patches = deep_merge(patches, config_patches_for_fixer(repair))
+
     elif stage == "reconstruct" and action == "inspect-worst-regions":
         regions = params.get("regions") or []
         if regions:
             patches["reconstruct"] = {"focus_regions": regions[:4]}
+
+    elif stage == "reconstruct" and action == "restage-assets":
+        patches["reconstruct"] = {"restage_assets": True}
+
+    elif stage == "design" and action == "restore-native-nodes":
+        patches["design"] = {"restore_native_nodes": True}
+
+    elif stage == "design" and action == "rebuild-schema":
+        patches["design"] = {"rebuild_schema": True}
+
+    elif stage == "figma" and action == "fix-compiler-report":
+        patches["figma"] = {"enabled": True, "reimport": True}
+
+    elif stage == "sam3" and action == "rerun-detection":
+        sam3_patch: dict[str, Any] = {"enabled": True}
+        if params.get("lower_confidence"):
+            sam3_patch["confidence"] = float(params.get("confidence", 0.38))
+        patches["sam3"] = sam3_patch
+        if params.get("enable_element_propose"):
+            patches.setdefault("vlm", {})["element_propose"] = {"enabled": True}
+        if params.get("disable_segment_filter"):
+            patches.setdefault("vlm", {})["segment_filter"] = {"enabled": False}
+
+    elif stage == "sam3" and action == "revalidate-rejected":
+        patches["sam3"] = {
+            "enabled": True,
+            "confidence": float(params.get("confidence", 0.40)),
+        }
+        patches["vlm"] = {
+            "segment_filter": {
+                "enabled": not params.get("disable_segment_filter"),
+                "reject_mode": params.get("reject_mode", "remove"),
+            }
+        }
+
+    elif stage == "vectorize" and action == "raster-fallback":
+        patches["vectorize"] = {"force_raster_fallback": True}
 
     target_id = repair.get("target_id")
     if target_id:
@@ -126,10 +182,15 @@ def resume_stage_for(repair: dict) -> Optional[str]:
 
     if stage == "ocr":
         return "ocr"
+    if stage == "sam3":
+        return "sam"
     if stage == "text-analysis":
         return "text"
     if stage == "qwen":
         return "qwen"
+    if stage == "vlm" and action == "boost-stack":
+        focus = (repair.get("params") or {}).get("focus", "elements")
+        return "text" if focus == "text" else "elements"
     if stage in ("inpaint", "vectorize", "reconstruct"):
         return "reconstruct"
     if stage == "layout":
@@ -229,16 +290,119 @@ def _input_path(run_dir: str) -> Optional[str]:
     return normalized if os.path.exists(normalized) else None
 
 
+def load_qa(run_dir: str) -> dict:
+    """Read qa.json when present."""
+    return _load_json(os.path.join(os.path.abspath(run_dir), "qa.json"), {})
+
+
+def harness_enabled(cfg: Optional[dict]) -> bool:
+    """True when the failure-proof harness should run after QA/staging issues."""
+    runtime = (cfg or {}).get("runtime") or {}
+    harness = runtime.get("harness") or {}
+    if "enabled" in harness:
+        return bool(harness["enabled"])
+    return bool(runtime.get("auto_repair"))
+
+
+def harness_max_rounds(cfg: Optional[dict]) -> int:
+    """Max repair rounds from config (default 3)."""
+    runtime = (cfg or {}).get("runtime") or {}
+    harness = runtime.get("harness") or {}
+    if harness.get("max_rounds") is not None:
+        return max(0, int(harness["max_rounds"]))
+    if runtime.get("harness_max_iterations") is not None:
+        return max(0, int(runtime["harness_max_iterations"]))
+    if runtime.get("auto_repair_max_iterations") is not None:
+        return max(0, int(runtime["auto_repair_max_iterations"]))
+    return 3
+
+
+def harness_should_repair(
+    pipeline_result: Optional[dict],
+    *,
+    qa: Optional[dict] = None,
+    staging: Optional[dict] = None,
+) -> tuple[bool, str]:
+    """Decide whether to run repairs before reporting a job done to the plugin."""
+    result = pipeline_result or {}
+    if not result.get("ok"):
+        return False, "pipeline_failed"
+
+    if staging is not None and not staging.get("staged"):
+        return True, "staging_failed"
+
+    if isinstance(qa, dict) and qa.get("ok") is False:
+        return True, "qa_failed"
+
+    if not qa and result.get("runtime_ok") is False:
+        return True, "runtime_degraded"
+
+    return False, "ok"
+
+
+def harness_loop(
+    run_dir: str,
+    cfg: Optional[dict] = None,
+    *,
+    pipeline_result: Optional[dict] = None,
+    staging: Optional[dict] = None,
+    max_iterations: Optional[int] = None,
+    run_one: Optional[Callable[..., dict]] = None,
+) -> dict:
+    """After a completed pipeline run, repair QA/staging failures before returning done."""
+    run_dir = os.path.abspath(run_dir)
+    cfg = copy.deepcopy(cfg or {})
+    pipeline_result = dict(pipeline_result or {})
+
+    qa_path = os.path.join(run_dir, "qa.json")
+    qa = load_qa(run_dir) if os.path.exists(qa_path) else None
+    should, reason = harness_should_repair(pipeline_result, qa=qa, staging=staging)
+    if not should:
+        if qa is not None:
+            pipeline_result.setdefault("qa_ok", bool(qa.get("ok")))
+        return {
+            "repaired": False,
+            "reason": reason,
+            "pipeline_result": pipeline_result,
+        }
+
+    iterations = max_iterations
+    if iterations is None:
+        iterations = harness_max_rounds(cfg)
+
+    repair_summary = execute_repairs(
+        run_dir,
+        cfg,
+        max_iterations=iterations,
+        run_one=run_one,
+    )
+    pipeline_result["repair"] = repair_summary
+    pipeline_result["qa_ok"] = bool(repair_summary.get("qa_ok"))
+
+    final_qa = load_qa(run_dir) if os.path.exists(qa_path) else {}
+    if final_qa:
+        pipeline_result["qa_ok"] = bool(final_qa.get("ok"))
+
+    return {
+        "repaired": True,
+        "reason": reason,
+        "repair": repair_summary,
+        "pipeline_result": pipeline_result,
+    }
+
+
 def execute_repairs(
     run_dir: str,
     cfg: Optional[dict] = None,
-    max_iterations: int = 2,
+    max_iterations: Optional[int] = None,
     *,
     run_one: Optional[Callable[..., dict]] = None,
 ) -> dict:
     """Apply actionable repairs by resuming the pipeline from mapped stages."""
     run_dir = os.path.abspath(run_dir)
     cfg = copy.deepcopy(cfg or {})
+    if max_iterations is None:
+        max_iterations = harness_max_rounds(cfg)
     if run_one is None:
         import run_pipeline
         run_one = run_pipeline.run_one

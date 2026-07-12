@@ -760,6 +760,124 @@ def test_estimate_eta_uses_stage_weighted_progress(tmp_path):
     assert late_pct > early_pct
 
 
+def test_process_triggers_auto_repair_on_failed_qa(tmp_path, monkeypatch):
+    """Bridge upload jobs must run harness_loop when QA fails before reporting done."""
+    _allow_machine_ready(monkeypatch)
+    repair_calls = []
+
+    def fake_execute_repairs(run_dir, cfg, max_iterations=2, run_one=None):
+        repair_calls.append(run_dir)
+        qa_path = os.path.join(run_dir, "qa.json")
+        if os.path.exists(qa_path):
+            qa = json.loads(open(qa_path, encoding="utf-8").read())
+            qa["ok"] = True
+            with open(qa_path, "w", encoding="utf-8") as fh:
+                json.dump(qa, fh)
+        return {"stopped": "qa_ok", "qa_ok": True, "iterations": 1, "attempts": []}
+
+    monkeypatch.setattr("src.harness.execute_repairs", fake_execute_repairs)
+
+    def run_one(image_path, run_dir, cfg, start_from="normalize"):
+        os.makedirs(run_dir, exist_ok=True)
+        design = {"id": "repair-test", "canvas": {"w": 10, "h": 10}, "layers": []}
+        with open(os.path.join(run_dir, "design.json"), "w", encoding="utf-8") as fh:
+            json.dump(design, fh)
+        with open(os.path.join(run_dir, "qa.json"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "ok": False,
+                "repairs": [{"stage": "ocr", "action": "rerun", "severity": "high"}],
+            }, fh)
+        with open(os.path.join(run_dir, "runtime_report.json"), "w", encoding="utf-8") as fh:
+            json.dump({"input": image_path}, fh)
+        return {"ok": True, "run_dir": run_dir, "runtime_ok": True, "duration_s": 0.01}
+
+    fake = types.ModuleType("run_pipeline")
+    fake.run_one = run_one
+    monkeypatch.setitem(sys.modules, "run_pipeline", fake)
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        request = Request(base + "/process?filename=qa-fail.png", data=b"\x89PNG", method="POST",
+                          headers={"Content-Type": "application/octet-stream"})
+        queued = json.loads(urlopen(request, timeout=2).read())
+        status = _poll_job(base, queued["job_id"])
+        assert status["status"] == "done", status
+        assert len(repair_calls) == 1
+        assert status["result"].get("repair", {}).get("qa_ok") is True
+        assert status["result"].get("qa_ok") is True
+        assert status.get("harness_rounds") == 1
+        assert status.get("harness_stopped") == "qa_ok"
+        assert status.get("final_qa_ok") is True
+        assert status.get("staged") is True
+        assert status.get("doc_id") == "repair-test"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_process_triggers_auto_repair_when_staging_fails(tmp_path, monkeypatch):
+    """Failed figma staging should trigger repair before the plugin sees done."""
+    _allow_machine_ready(monkeypatch)
+    repair_calls = []
+
+    def fake_execute_repairs(run_dir, cfg, max_iterations=2, run_one=None):
+        repair_calls.append(run_dir)
+        return {"stopped": "already_ok", "qa_ok": True, "iterations": 0, "attempts": []}
+
+    monkeypatch.setattr("src.harness.execute_repairs", fake_execute_repairs)
+
+    stage_calls = {"n": 0}
+    original_stage = __import__("src.figma_bridge", fromlist=["_stage_job_output"])._stage_job_output
+
+    def flaky_stage(inbox, run_dir, cfg):
+        stage_calls["n"] += 1
+        if stage_calls["n"] == 1:
+            return {"staged": False, "doc_id": None, "layer_count": None,
+                    "staging_error": "inbox.json missing", "design_url": "/design.json"}
+        return original_stage(inbox, run_dir, cfg)
+
+    monkeypatch.setattr("src.figma_bridge._stage_job_output", flaky_stage)
+
+    def run_one(image_path, run_dir, cfg, start_from="normalize"):
+        os.makedirs(run_dir, exist_ok=True)
+        design = {"id": "stage-repair", "canvas": {"w": 10, "h": 10}, "layers": []}
+        with open(os.path.join(run_dir, "design.json"), "w", encoding="utf-8") as fh:
+            json.dump(design, fh)
+        with open(os.path.join(run_dir, "qa.json"), "w", encoding="utf-8") as fh:
+            json.dump({"ok": True}, fh)
+        return {"ok": True, "run_dir": run_dir, "runtime_ok": True, "duration_s": 0.01}
+
+    fake = types.ModuleType("run_pipeline")
+    fake.run_one = run_one
+    monkeypatch.setitem(sys.modules, "run_pipeline", fake)
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        request = Request(base + "/process?filename=stage.png", data=b"x", method="POST")
+        queued = json.loads(urlopen(request, timeout=2).read())
+        status = _poll_job(base, queued["job_id"])
+        assert status["status"] == "done", status
+        assert len(repair_calls) == 1
+        assert stage_calls["n"] >= 2
+        assert status.get("harness_rounds") == 0
+        assert status.get("harness_stopped") == "already_ok"
+        assert status.get("final_qa_ok") is True
+        assert status.get("staged") is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_estimate_eta_returns_none_without_history(tmp_path):
     inbox = tmp_path / "inbox"
     inbox.mkdir()

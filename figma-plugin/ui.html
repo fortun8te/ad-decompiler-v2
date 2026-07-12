@@ -1067,7 +1067,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.0.0","build":22,"commit":"ddeb1e0","dirty":true,"built_at":"2026-07-12T01:47:00Z","label":"v2.0.0+b22.ddeb1e0-dirty","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.0.0","build":23,"commit":"d4a0fbd","dirty":true,"built_at":"2026-07-12T01:49:09Z","label":"v2.0.0+b23.d4a0fbd-dirty","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -1508,6 +1508,7 @@
     }
 
     function stepLabelForStatus(status) {
+      if (status.harness_running) return "Auto-fixing";
       if (status.phase === "upload") return "Uploading";
       if (status.status === "queued") return "Queued";
       if (status.status === "done") return "Step " + PROCESS_STAGE_ORDER.length + " / " + PROCESS_STAGE_ORDER.length;
@@ -1594,6 +1595,7 @@
     }
 
     function statusFootnote(status) {
+      if (status.harness_running) return "Running repair passes before staging the design";
       if (status.phase === "upload") return "Uploading to the local bridge";
       if (status.status === "queued") return "Job queued — pipeline will start shortly";
       if (status.status === "done") return "Pipeline finished";
@@ -1612,13 +1614,15 @@
 
     function renderProcessStatus(status) {
       const percent = percentForProcessStatus(status);
-      const stageLabel = status.phase === "upload"
-        ? "Uploading image"
-        : status.status === "queued"
-          ? "Queued for processing"
-          : status.status === "done"
-            ? "Finishing up"
-            : (STAGE_LABELS[status.stage] || "Starting pipeline");
+      const stageLabel = status.harness_running
+        ? "Auto-fixing…"
+        : status.phase === "upload"
+          ? "Uploading image"
+          : status.status === "queued"
+            ? "Queued for processing"
+            : status.status === "done"
+              ? "Finishing up"
+              : (STAGE_LABELS[status.stage] || "Starting pipeline");
       $("processPercent").textContent = percent + "%";
       $("processStepCount").textContent = stepLabelForStatus(status);
       $("uploadBusyTitle").textContent = stageLabel;
@@ -1644,6 +1648,9 @@
     }
 
     function progressLine(status) {
+      if (status.harness_running) {
+        return "Auto-fixing… · repair pass in progress";
+      }
       const stage = STAGE_LABELS[status.stage] || "Starting up";
       if (typeof status.eta_s === "number") {
         const eta = status.eta_s <= 2 ? "almost done" : "~" + formatElapsed(status.eta_s * 1000) + " left";

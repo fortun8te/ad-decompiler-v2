@@ -21,7 +21,8 @@ from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  vlm_segment_filter, vlm_element_propose, vram)
 from src.run_report import RunReport, qwen_degradation
 from src.schema import dump, load
-from src.harness import execute_repairs, recommended_resume
+from src.harness import harness_enabled, harness_max_rounds, recommended_resume
+from src.harness_loop import in_harness_loop, run_harness_after_pipeline
 from src.qa_config import pixel_diff_thresholds, visual_pass_ssim
 
 configure_stdio()
@@ -387,19 +388,29 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             report.finish(qa_ok=None)
 
         repair_summary = None
-        runtime_cfg = cfg.get("runtime") or {}
-        if runtime_cfg.get("auto_repair") and os.path.exists(A("qa.json")):
-            qa_state = load(A("qa.json"))
-            if not qa_state.get("ok"):
-                repair_summary = execute_repairs(run_dir, cfg)
-                _log(run_dir, f"auto_repair → {repair_summary.get('stopped')} "
-                     f"after {repair_summary.get('iterations', 0)} iteration(s)")
+        if not in_harness_loop(cfg) and harness_enabled(cfg):
+            needs_repair = False
+            if os.path.exists(A("qa.json")):
+                needs_repair = not load(A("qa.json")).get("ok")
+            elif not report.acceptable:
+                needs_repair = True
+            if needs_repair:
+                max_rounds = harness_max_rounds(cfg)
+                repair_summary = run_harness_after_pipeline(
+                    input_path, run_dir, cfg, max_rounds=max_rounds)
+                _log(run_dir, f"harness → {repair_summary.get('stopped')} "
+                     f"after {repair_summary.get('rounds_completed', 0)}/{max_rounds} round(s)")
 
         result = {"ok": True, "run_dir": run_dir, "duration_s": elapsed,
                   "runtime_ok": report.acceptable, "runtime_status": report.data.get("status")}
+        if os.path.exists(A("qa.json")):
+            result["qa_ok"] = bool(load(A("qa.json")).get("ok"))
         if repair_summary is not None:
             result["repair"] = repair_summary
+            result["harness"] = repair_summary if harness_enabled(cfg) else None
             result["qa_ok"] = bool(repair_summary.get("qa_ok"))
+            result["harness_rounds"] = repair_summary.get("rounds_completed")
+            result["harness_stopped"] = repair_summary.get("stopped")
         return result
     except Exception as e:
         _log(run_dir, f"ERROR: {e}\n{traceback.format_exc()}")

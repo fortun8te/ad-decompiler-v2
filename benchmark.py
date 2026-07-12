@@ -8,6 +8,7 @@ from pathlib import Path
 
 from doctor import inspect as inspect_machine
 from run_pipeline import STAGES, load_cfg, run_one
+from src.harness import harness_enabled
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -18,6 +19,70 @@ def _read(path: Path, fallback):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return fallback
+
+
+def _harness_telemetry(run_dir: Path) -> dict:
+    """Summarize harness_loop.json (or legacy harness.json) for benchmark rows."""
+    loop_path = run_dir / "harness_loop.json"
+    legacy_path = run_dir / "harness.json"
+    loop = _read(loop_path, None)
+    if loop is None:
+        loop = _read(legacy_path, {})
+
+    qa = _read(run_dir / "qa.json", {})
+    rounds = loop.get("rounds") or loop.get("attempts") or []
+    round_count = loop.get("round_count")
+    if round_count is None:
+        round_count = loop.get("iterations")
+    if round_count is None:
+        round_count = len(rounds)
+
+    final_qa_ok = loop.get("final_qa_ok")
+    if final_qa_ok is None:
+        final_qa_ok = loop.get("qa_ok")
+    if final_qa_ok is None:
+        final_qa_ok = qa.get("ok")
+
+    auto_fixed = loop.get("auto_fixed")
+    if auto_fixed is None:
+        initial_qa_ok = loop.get("initial_qa_ok")
+        if initial_qa_ok is None and rounds:
+            first = rounds[0] if isinstance(rounds[0], dict) else {}
+            initial_qa_ok = first.get("qa_ok_before")
+        if initial_qa_ok is None:
+            stopped = loop.get("stopped")
+            if stopped == "already_ok":
+                initial_qa_ok = True
+            elif stopped == "qa_ok" and int(round_count or 0) > 0:
+                initial_qa_ok = False
+        auto_fixed = bool(initial_qa_ok is False and final_qa_ok)
+    elif loop.get("stopped") == "already_ok":
+        auto_fixed = False
+
+    telemetry = {
+        "auto_fixed": bool(auto_fixed),
+        "harness_rounds": int(round_count or 0),
+        "final_qa_ok": bool(final_qa_ok),
+    }
+    if loop:
+        telemetry["harness"] = {
+            "stopped": loop.get("stopped"),
+            "round_count": int(round_count or 0),
+            "auto_fixed": bool(auto_fixed),
+            "final_qa_ok": bool(final_qa_ok),
+        }
+        if rounds:
+            telemetry["harness"]["rounds"] = rounds
+
+    for key, name in (
+        ("harness_loop_path", "harness_loop.json"),
+        ("critic_path", "critic.json"),
+        ("fixer_path", "fixer.json"),
+    ):
+        path = run_dir / name
+        if path.exists():
+            telemetry[key] = str(path)
+    return telemetry
 
 
 def _entry(run_dir: Path, result: dict) -> dict:
@@ -51,6 +116,7 @@ def _entry(run_dir: Path, result: dict) -> dict:
         "font_substitutions": structure.get("font_substitutions") or [],
         "editable_ratio": (design.get("meta") or {}).get("editable_ratio"),
         "run_dir": str(run_dir),
+        **_harness_telemetry(run_dir),
     }
 
 
@@ -92,8 +158,12 @@ def main():
     parser.add_argument("--output", default="runs/benchmark", help="benchmark report/run root")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--resume", default="normalize", choices=STAGES)
-    parser.add_argument("--auto-repair", action="store_true",
-                        help="enable runtime.auto_repair for each benchmark image")
+    parser.add_argument(
+        "--auto-repair",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="enable runtime.auto_repair / harness loop (default: on when harness enabled in config)",
+    )
     parser.add_argument("--skip-doctor", action="store_true",
                         help="development only; benchmark normally refuses an unready model machine")
     args = parser.parse_args()
@@ -101,8 +171,11 @@ def main():
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     cfg = load_cfg(args.config)
-    if args.auto_repair:
-        cfg.setdefault("runtime", {})["auto_repair"] = True
+    auto_repair = args.auto_repair if args.auto_repair is not None else harness_enabled(cfg)
+    if auto_repair:
+        runtime = cfg.setdefault("runtime", {})
+        runtime["auto_repair"] = True
+        runtime.setdefault("harness", {})["enabled"] = True
     if not args.skip_doctor:
         preflight = inspect_machine(cfg, Path(__file__).resolve().parent)
         (output / "doctor.json").write_text(json.dumps(preflight, indent=2), encoding="utf-8")
@@ -138,6 +211,9 @@ def main():
             "mean_edge_f1": _mean(runs, "edge_f1"),
             "background_leakage_runs": sum(1 for row in runs if row["background_leakage"]),
             "runs_with_hard_fails": sum(1 for row in runs if row["hard_fails"]),
+            "auto_fixed_runs": sum(1 for row in runs if row.get("auto_fixed")),
+            "harness_rounds_total": sum(row.get("harness_rounds", 0) for row in runs),
+            "final_qa_passing": sum(1 for row in runs if row.get("final_qa_ok")),
         },
     }
     (output / "benchmark.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

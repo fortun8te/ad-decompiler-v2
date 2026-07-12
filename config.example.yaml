@@ -59,7 +59,11 @@ vlm:
 # CPU development, but enabled OCR/SAM fallbacks become QA failures instead of quiet boxes.
 runtime:
   require_active_models: true
-  auto_repair: false                  # re-run mapped repair stages after QA failure
+  auto_repair: true                   # re-run mapped repair stages after QA failure
+  harness:
+    enabled: true                     # failure-proof repair loop after QA/staging issues
+    max_rounds: 3                     # pipeline + repair + critic + fixer cycles
+    repair_iterations: 2              # execute_repairs attempts per harness round
   auto_retry:
     sam_disable_compile: true         # one safe retry only when compile=true fails
   vram:

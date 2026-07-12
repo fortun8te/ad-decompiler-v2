@@ -435,6 +435,24 @@ def _upload_cfg(base_cfg, inbox):
     return cfg
 
 
+def _harness_summary_fields(loop_result):
+    """Normalize harness_loop output for job poll responses."""
+    loop_result = loop_result or {}
+    repair = loop_result.get("repair") or {}
+    pipeline_result = loop_result.get("pipeline_result") or {}
+    if loop_result.get("repaired"):
+        return {
+            "harness_rounds": repair.get("iterations", 0),
+            "harness_stopped": repair.get("stopped"),
+            "final_qa_ok": pipeline_result.get("qa_ok"),
+        }
+    return {
+        "harness_rounds": 0,
+        "harness_stopped": loop_result.get("reason", "ok"),
+        "final_qa_ok": pipeline_result.get("qa_ok"),
+    }
+
+
 def _stage_job_output(inbox, run_dir, cfg):
     """Always re-stage design.json into the bridge inbox before reporting job done."""
     design_path = os.path.join(run_dir, "design.json")
@@ -555,14 +573,77 @@ def make_handler(inbox, config_path=None):
                     )
                 # #endregion
                 import run_pipeline  # heavy: torch/paddleocr/sam3/... — only imported on first use
+                from src.harness import harness_loop, harness_should_repair, load_qa
                 cfg = _upload_cfg(base_cfg, inbox)
                 result = run_pipeline.run_one(image_path, run_dir, cfg)
                 with jobs_lock:
                     if _job_cancelled(job_id):
                         return
                 staging = None
+                loop_result = None
                 if result.get("ok"):
                     staging = _stage_job_output(inbox, run_dir, cfg)
+                    qa_path = os.path.join(run_dir, "qa.json")
+                    qa = load_qa(run_dir) if os.path.exists(qa_path) else None
+                    should_repair, repair_reason = harness_should_repair(
+                        result, qa=qa, staging=staging,
+                    )
+                    if should_repair:
+                        with jobs_lock:
+                            if _job_cancelled(job_id):
+                                return
+                            jobs[job_id]["harness_running"] = True
+                        _append_plugin_logs(inbox, [{
+                            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "level": "info",
+                            "title": "Auto-fix started",
+                            "detail": job_id,
+                            "extra": {
+                                "job_id": job_id,
+                                "run_dir": run_dir,
+                                "reason": repair_reason,
+                            },
+                        }], manifest)
+                        try:
+                            loop_result = harness_loop(
+                                run_dir,
+                                cfg,
+                                pipeline_result=result,
+                                staging=staging,
+                            )
+                            if loop_result.get("repaired"):
+                                result = loop_result["pipeline_result"]
+                                staging = _stage_job_output(inbox, run_dir, cfg)
+                                _agent_log(
+                                    "figma_bridge.py:run_job", "harness repair loop",
+                                    data={
+                                        "reason": loop_result.get("reason"),
+                                        "stopped": (loop_result.get("repair") or {}).get("stopped"),
+                                        "qa_ok": result.get("qa_ok"),
+                                        "staged": (staging or {}).get("staged"),
+                                    },
+                                    hypothesis_id="H5", run_dir=run_dir,
+                                )
+                        finally:
+                            with jobs_lock:
+                                jobs[job_id]["harness_running"] = False
+                        _append_plugin_logs(inbox, [{
+                            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "level": "info",
+                            "title": "Auto-fix finished",
+                            "detail": job_id,
+                            "extra": {
+                                "job_id": job_id,
+                                "run_dir": run_dir,
+                                "harness": _harness_summary_fields(loop_result),
+                            },
+                        }], manifest)
+                    else:
+                        loop_result = {
+                            "repaired": False,
+                            "reason": repair_reason,
+                            "pipeline_result": result,
+                        }
                 with jobs_lock:
                     if _job_cancelled(job_id):
                         return
@@ -580,6 +661,8 @@ def make_handler(inbox, config_path=None):
                             staging_error=staging.get("staging_error"),
                             design_url=staging.get("design_url"),
                         )
+                    if loop_result is not None:
+                        jobs[job_id].update(_harness_summary_fields(loop_result))
                 if result.get("ok"):
                     _record_history(inbox, time.time() - started, run_dir)
                     _append_plugin_logs(inbox, [{
@@ -722,6 +805,9 @@ def make_handler(inbox, config_path=None):
                     "staging_error": job.get("staging_error"),
                     "run_dir": run_dir,
                     "manifest": manifest,
+                    "harness_rounds": job.get("harness_rounds"),
+                    "harness_stopped": job.get("harness_stopped"),
+                    "final_qa_ok": job.get("final_qa_ok"),
                 }
                 return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
             if u.path == "/process":
