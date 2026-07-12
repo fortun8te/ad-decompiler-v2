@@ -229,8 +229,15 @@ def _record_history(inbox, duration_s, run_dir=None):
 
 
 def _atomic_write(path, data: bytes):
-    """Atomic replace with one retry on Windows transient file locks."""
-    for attempt in range(2):
+    """Atomic replace with retries on Windows transient file locks.
+
+    os.replace() can raise PermissionError (WinError 5) on Windows when the
+    destination is momentarily open by another thread/process (e.g. a
+    background job thread racing the request thread in _append_plugin_logs).
+    Retry a few times with a short backoff before giving up.
+    """
+    attempts = 3
+    for attempt in range(attempts):
         fd, temp_path = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path) or ".")
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -242,7 +249,7 @@ def _atomic_write(path, data: bytes):
                 os.unlink(temp_path)
             except OSError:
                 pass
-            if attempt == 0:
+            if attempt < attempts - 1:
                 time.sleep(0.05)
                 continue
             raise
@@ -442,7 +449,15 @@ def _health_payload(inbox, base_cfg):
         doctor = _doctor_inspect(cfg, repo_root)
         payload["machine_ready"] = doctor.get("ok")
         payload["machine_blockers"] = doctor.get("blockers") or []
-        payload["ocr_ready"] = _ocr_ready_summary(cfg, repo_root)
+        # Reuse the already-computed inspect() report instead of letting
+        # ocr_ready_summary re-run inspect() (which re-probes ComfyUI/VLM and
+        # nearly doubled /health latency under a cold, firewall-dropped port).
+        # Fall back to the two-arg call if a monkeypatched ocr_ready_summary
+        # (e.g. in tests) doesn't accept the report= kwarg.
+        try:
+            payload["ocr_ready"] = _ocr_ready_summary(cfg, repo_root, report=doctor)
+        except TypeError:
+            payload["ocr_ready"] = _ocr_ready_summary(cfg, repo_root)
     except Exception as exc:
         payload["machine_ready"] = False
         payload["machine_blockers"] = [{"name": "doctor", "detail": str(exc)}]

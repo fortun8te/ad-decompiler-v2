@@ -91,11 +91,12 @@ def _cudnn(device):
         return _check("cudnn", False, f"probe failed: {exc}", required=False)
 
 
-def _http(url, timeout=0.5):
+def _http(url, timeout=0.3):
     # Short timeout on purpose: this is a liveness probe (e.g. ComfyUI on :8188), and
     # /health calls it. A refused port fails instantly; a firewall-*dropped* port would
     # otherwise hang for the full timeout, so keep it small — a real local backend
-    # answers in well under 0.5s.
+    # answers in well under 0.3s. Cold /health also pays a one-time torch import cost
+    # (~1s), so probes must stay well under the bridge tests' 2s client timeout.
     try:
         import urllib.request
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -220,6 +221,16 @@ def inspect(cfg, root: Path) -> dict:
             bpe = os.path.expandvars(os.path.expanduser(str(bpe)))
             checks.append(_check("sam3 BPE", os.path.isfile(bpe), bpe, required=True))
 
+    # ComfyUI liveness is probed at most once per inspect() call and the result reused
+    # below (Big-LaMa/inpaint stack check) -- probing the same base URL twice doubled
+    # /health latency under a cold firewall-dropped port (see doctor.py timing notes).
+    comfy_probe_cache: dict[str, bool] = {}
+
+    def _comfy_probe(base: str) -> bool:
+        if base not in comfy_probe_cache:
+            comfy_probe_cache[base] = _http(f"{base}/system_stats")
+        return comfy_probe_cache[base]
+
     qwen = cfg.get("qwen") or {}
     if qwen.get("enabled", True):
         mode = str(qwen.get("mode", "comfyui"))
@@ -229,7 +240,7 @@ def inspect(cfg, root: Path) -> dict:
                 workflow = root / workflow
             checks.append(_check("qwen workflow", workflow.is_file(), str(workflow), required=_required_qwen(cfg)))
             base = str(cfg.get("backend_url", "http://127.0.0.1:8188")).rstrip("/")
-            checks.append(_check("ComfyUI", _http(f"{base}/system_stats"), base, required=_required_qwen(cfg)))
+            checks.append(_check("ComfyUI", _comfy_probe(base), base, required=_required_qwen(cfg)))
         else:
             checks.append(_check("Qwen layered pipeline", _module("diffusers"), "git diffusers build",
                                  required=_required_qwen(cfg)))
@@ -244,7 +255,15 @@ def inspect(cfg, root: Path) -> dict:
     except Exception:
         _vectorize_binaries = None
     if _vectorize_binaries:
-        vz = _vectorize_binaries(cfg)
+        # None of these are required checks -- a broken/missing native dependency here
+        # must never crash the whole readiness report (see the cairosvg/libcairo OSError
+        # this guards against; check_binaries() also degrades that specific case, but this
+        # is the last line of defense for any other native-lib surprise).
+        try:
+            vz = _vectorize_binaries(cfg)
+        except Exception as exc:
+            vz = {}
+            checks.append(_check("vectorize:binaries", False, f"probe failed: {exc}", required=False))
         for name in ("vtracer", "potrace", "cairosvg"):
             info = vz.get(name) or {}
             detail = info.get("path", "unknown")
@@ -270,19 +289,25 @@ def inspect(cfg, root: Path) -> dict:
     qwen_enabled = bool((cfg.get("qwen") or {}).get("enabled", True))
     if qwen_enabled and str((cfg.get("qwen") or {}).get("mode", "comfyui")).lower() == "comfyui":
         base = str(cfg.get("backend_url", "http://127.0.0.1:8188")).rstrip("/")
-        comfy_ok = _http(f"{base}/system_stats")
+        comfy_ok = _comfy_probe(base)
         comfy_detail = base if comfy_ok else f"{base} unreachable"
     checks.append(_check("Big-LaMa", lama_ok,
                           "optional; OpenCV fallback exists" if not inpaint_required
                           else "required by runtime.require_active_models; OpenCV fallback degrades background plate",
                           required=inpaint_required))
     if inpaint_mode in ("auto", "big-lama", "lama", "simple-lama"):
-        stack_ok = lama_ok and (comfy_ok or not qwen_enabled)
+        # Background inpainting (Big-LaMa) and Qwen's layered decomposition (ComfyUI) are
+        # unrelated capabilities -- Qwen is advisory (see run_report._required's comment:
+        # "it must not make the main SAM/OCR scene graph look unavailable merely because a
+        # separate ComfyUI process is offline"). Gating inpaint readiness on ComfyUI made
+        # this BLOCK even when Big-LaMa alone is installed and the real pipeline already
+        # completes fine with ComfyUI down (qwen degrades to its own fallback separately).
+        stack_ok = lama_ok
         stack_detail = (
-            f"ComfyUI={comfy_detail}; Big-LaMa={'installed' if lama_ok else 'missing'}"
+            f"Big-LaMa={'installed' if lama_ok else 'missing'}; ComfyUI={comfy_detail} (qwen is advisory, not required here)"
         )
         checks.append(_check(
-            "inpaint stack (ComfyUI+Big-LaMa)",
+            "inpaint stack (Big-LaMa)",
             stack_ok,
             stack_detail,
             required=inpaint_required and inpaint_mode == "auto",

@@ -374,6 +374,13 @@ def check_binaries(cfg=None):
         gate = True
     except ImportError:
         gate = False
+    except Exception:
+        # cairosvg is pip-installed but its native libcairo binding (cairocffi) raises
+        # OSError, not ImportError, when the system libcairo-2 DLL/so/dylib is missing
+        # (common on a bare Windows box). check_binaries() feeds doctor.inspect(), and an
+        # unhandled exception here previously crashed readiness reporting entirely instead
+        # of just marking this one optional gate unavailable.
+        gate = False
     return {
         "vtracer": {"ok": bool(vtracer), "path": vtracer or "not on PATH (cargo install vtracer)"},
         "potrace": {"ok": bool(potrace), "path": potrace or "not on PATH (brew/choco install potrace)"},
