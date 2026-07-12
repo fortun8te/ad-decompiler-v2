@@ -6,7 +6,8 @@ OCR engine has no way to catch that a *reading* is wrong, only how confident it 
 
 This module crops each OCR line below a confidence threshold, sends the crop to a local
 vision-language model (LM Studio's OpenAI-compatible /v1/chat/completions), and asks it to
-transcribe the crop verbatim. If the VLM's answer differs from OCR's, the VLM reading wins.
+transcribe the crop verbatim. Corrections require two independent VLM passes that agree
+with each other before OCR text is replaced.
 
 Disabled by default (vlm.enabled: false) and fails silently: any network/timeout/parse
 error just returns the original OCR lines unchanged, so a missing/stopped LM Studio never
@@ -26,6 +27,7 @@ _DEFAULT_CONFIDENCE_THRESHOLD = 0.85
 _DEFAULT_TIMEOUT_S = 20
 _DEFAULT_MAX_TOKENS = 500
 _DEFAULT_PADDING = 3
+_DEFAULT_PASSES = 2
 
 _PROMPT = (
     "This crop contains exactly ONE line of text from an ad. Transcribe only that one line, "
@@ -89,11 +91,36 @@ def _looks_plausible(original: str, candidate: str) -> bool:
     return True
 
 
+def _multi_pass_answer(
+    crop: bytes,
+    *,
+    base_url: str,
+    model: str,
+    timeout_s: float,
+    max_tokens: int,
+    passes: int,
+) -> tuple[str | None, str | None]:
+    """Run the VLM up to `passes` times. Returns (accepted_answer, note).
+
+    accepted_answer is set only when every pass succeeded and all answers match.
+    note is vlm_disagreement when passes succeeded but disagreed, or vlm_error when
+    any pass raised."""
+    answers: list[str | None] = []
+    for _ in range(max(1, passes)):
+        try:
+            answers.append(_ask_vlm(crop, base_url, model, timeout_s, max_tokens))
+        except Exception:
+            return None, "vlm_error"
+    if len(set(answers)) != 1:
+        return None, "vlm_disagreement"
+    return answers[0], None
+
+
 def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     """Return a copy of ocr_result with low-confidence lines' text replaced by a VLM
-    reading of the same crop, when the VLM produces a plausible, different transcription.
-    Never raises -- any failure (LM Studio not running, bad response, PIL error) leaves the
-    affected line's OCR text untouched."""
+    reading of the same crop when two independent passes agree. Never raises -- any failure
+    (LM Studio not running, bad response, PIL error) leaves the affected line's OCR text
+    untouched."""
     vcfg = (cfg or {}).get("vlm") or {}
     if not vcfg.get("enabled", False):
         return ocr_result
@@ -108,6 +135,7 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     max_tokens = int(vcfg.get("max_tokens", _DEFAULT_MAX_TOKENS))
     padding = int(vcfg.get("padding", _DEFAULT_PADDING))
     max_lines = vcfg.get("max_lines")
+    passes = int(vcfg.get("passes", _DEFAULT_PASSES))
 
     candidates = [ln for ln in lines if float(ln.get("conf", 1.0)) < threshold and ln.get("box")]
     if max_lines is not None:
@@ -123,17 +151,31 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
 
     checked = 0
     corrected = 0
+    disagreements = 0
+    errors = 0
+    notes: list[dict] = []
     for line in candidates:
         crop = _crop_bytes(image, line["box"], padding)
         if crop is None:
             continue
         checked += 1
-        try:
-            answer = _ask_vlm(crop, base_url, model, timeout_s, max_tokens)
-        except Exception:
-            continue
+        answer, note = _multi_pass_answer(
+            crop,
+            base_url=base_url,
+            model=model,
+            timeout_s=timeout_s,
+            max_tokens=max_tokens,
+            passes=passes,
+        )
         original = str(line.get("text", ""))
-        if _looks_plausible(original, answer) and answer != original:
+        if note == "vlm_disagreement":
+            disagreements += 1
+            notes.append({"line_id": line.get("id"), "note": "vlm_disagreement", "ocr_text": original})
+            continue
+        if note == "vlm_error":
+            errors += 1
+            continue
+        if answer is not None and _looks_plausible(original, answer) and answer != original:
             line["ocr_text"] = original
             line["text"] = answer
             line["vlm_corrected"] = True
@@ -141,7 +183,13 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
 
     result = dict(ocr_result)
     result["vlm_proofread"] = {
-        "model": model, "threshold": threshold,
-        "lines_checked": checked, "lines_corrected": corrected,
+        "model": model,
+        "threshold": threshold,
+        "passes": passes,
+        "lines_checked": checked,
+        "lines_corrected": corrected,
+        "lines_disagreed": disagreements,
+        "lines_errored": errors,
+        "notes": notes,
     }
     return result

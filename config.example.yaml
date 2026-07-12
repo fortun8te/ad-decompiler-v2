@@ -10,6 +10,7 @@ vlm:
   base_url: http://127.0.0.1:1234/v1
   model: google/gemma-4-e4b            # any vision-capable local model works
   confidence_threshold: 0.85           # only lines below this OCR confidence get checked
+  passes: 2                           # both passes must agree before OCR text is replaced
 
 # An RTX acceptance run must show which model actually ran. Disabled models remain valid for
 # CPU development, but enabled OCR/SAM fallbacks become QA failures instead of quiet boxes.

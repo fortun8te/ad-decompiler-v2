@@ -37,22 +37,61 @@ def test_no_low_confidence_lines_skips_vlm_call(tmp_path, monkeypatch):
     assert out["lines"][0]["text"] == "UPFRONT"
 
 
-def test_low_confidence_line_gets_corrected(tmp_path, monkeypatch):
+def test_low_confidence_line_gets_corrected_when_both_passes_agree(tmp_path, monkeypatch):
     monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: "UPFRONT")
     ocr_result = {"lines": [_line("UPERONT", 0.5)]}
-    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85}}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2}}
     out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
     line = out["lines"][0]
     assert line["text"] == "UPFRONT"
     assert line["ocr_text"] == "UPERONT"
     assert line["vlm_corrected"] is True
     assert out["vlm_proofread"]["lines_corrected"] == 1
+    assert out["vlm_proofread"]["passes"] == 2
+
+
+def test_euro_price_line_corrected_when_both_passes_agree(tmp_path, monkeypatch):
+    monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: "€63 → €49")
+    ocr_result = {"lines": [_line("E63 tf40 L", 0.4)]}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2}}
+    out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
+    assert out["lines"][0]["text"] == "€63 → €49"
+
+
+def test_passes_disagree_leaves_original_and_logs_note(tmp_path, monkeypatch):
+    answers = iter(["UPFRONT", "UPERONT"])
+    monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: next(answers))
+    ocr_result = {"lines": [_line("UPERONT", 0.5)]}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2}}
+    out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
+    line = out["lines"][0]
+    assert line["text"] == "UPERONT"
+    assert "vlm_corrected" not in line
+    assert out["vlm_proofread"]["lines_disagreed"] == 1
+    assert out["vlm_proofread"]["notes"][0]["note"] == "vlm_disagreement"
+
+
+def test_one_pass_error_leaves_original(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def _flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "UPFRONT"
+        raise ConnectionError("timeout")
+
+    monkeypatch.setattr(vlm_proofread, "_ask_vlm", _flaky)
+    ocr_result = {"lines": [_line("UPERONT", 0.5)]}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2}}
+    out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
+    assert out["lines"][0]["text"] == "UPERONT"
+    assert out["vlm_proofread"]["lines_errored"] == 1
 
 
 def test_vlm_agreeing_with_ocr_leaves_line_unmarked(tmp_path, monkeypatch):
     monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: "UPERONT")
     ocr_result = {"lines": [_line("UPERONT", 0.5)]}
-    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85}}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2}}
     out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
     line = out["lines"][0]
     assert line["text"] == "UPERONT"
@@ -60,21 +99,17 @@ def test_vlm_agreeing_with_ocr_leaves_line_unmarked(tmp_path, monkeypatch):
 
 
 def test_implausible_answer_is_rejected(tmp_path, monkeypatch):
-    # A VLM answer many times longer than the source line reads as a truncated
-    # reasoning trace, not a real transcription -- must not overwrite the OCR text.
     monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: "x" * 300)
     ocr_result = {"lines": [_line("UPERONT", 0.5)]}
-    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85}}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2}}
     out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
     assert out["lines"][0]["text"] == "UPERONT"
 
 
 def test_multiline_answer_is_rejected(tmp_path, monkeypatch):
-    # A newline means the model read past this line's crop into a neighboring line --
-    # never a legitimate transcription of a single OCR line.
     monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: "vezels\neiwitten")
     ocr_result = {"lines": [_line("eiwitten", 0.5)]}
-    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85}}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2}}
     out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
     assert out["lines"][0]["text"] == "eiwitten"
 
@@ -82,7 +117,7 @@ def test_multiline_answer_is_rejected(tmp_path, monkeypatch):
 def test_empty_answer_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: "")
     ocr_result = {"lines": [_line("UPERONT", 0.5)]}
-    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85}}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2}}
     out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
     assert out["lines"][0]["text"] == "UPERONT"
 
@@ -92,7 +127,7 @@ def test_vlm_error_degrades_silently(tmp_path, monkeypatch):
         raise ConnectionError("LM Studio not running")
     monkeypatch.setattr(vlm_proofread, "_ask_vlm", _boom)
     ocr_result = {"lines": [_line("UPERONT", 0.5)]}
-    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85}}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "passes": 2}}
     out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
     assert out["lines"][0]["text"] == "UPERONT"
     assert out["vlm_proofread"]["lines_corrected"] == 0
@@ -111,6 +146,6 @@ def test_max_lines_caps_vlm_calls(tmp_path, monkeypatch):
     monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: calls.append(1) or "fixed")
     ocr_result = {"lines": [_line(f"bad{i}", 0.1, {"x": i * 10, "y": 0, "w": 5, "h": 5})
                              for i in range(5)]}
-    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "max_lines": 2}}
+    cfg = {"vlm": {"enabled": True, "confidence_threshold": 0.85, "max_lines": 2, "passes": 2}}
     vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
-    assert len(calls) == 2
+    assert len(calls) == 4
