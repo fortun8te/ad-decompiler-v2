@@ -400,8 +400,15 @@
 
     .progress-bar { width: 0; height: 100%; border-radius: inherit; background: var(--brand); transition: width 180ms ease; }
 
-    .cancel-button { margin-top: 8px; padding: 2px 0; background: transparent; color: var(--text-secondary); font-size: 10.5px; }
+    .cancel-button {
+      margin-top: 10px;
+      padding: 4px 0;
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 10.5px;
+    }
     .cancel-button:hover { color: var(--text); }
+    #uploadBusy .cancel-button { width: 100%; }
 
     .issue-panel { border: 1px solid color-mix(in srgb, var(--text-warning) 25%, var(--border)); background: var(--warning-bg); }
     .issue-panel[data-tone="error"] { border-color: color-mix(in srgb, var(--text-danger) 25%, var(--border)); background: var(--danger-bg); }
@@ -929,6 +936,7 @@
               <span class="timing-total hidden" id="processTotal">—</span>
             </div>
             <div class="scan-meta upload-copy" id="uploadBusyCopy">Starting pipeline…</div>
+            <button class="cancel-button" id="cancelProcess" type="button">Cancel</button>
           </div>
         </div>
       </section>
@@ -1040,7 +1048,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.0.0","build":12,"commit":"4f7dd0c","dirty":true,"built_at":"2026-07-12T00:28:30Z","label":"v2.0.0+b12.4f7dd0c-dirty","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.0.0","build":13,"commit":"f8dbb7c","dirty":true,"built_at":"2026-07-12T00:34:56Z","label":"v2.0.0+b13.f8dbb7c-dirty","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -1049,6 +1057,8 @@
       fileMap: new Map(),
       building: false,
       uploading: false,
+      processJobId: null,
+      processCancelled: false,
       previewUrl: null,
       log: [],
       logFlushTimer: null,
@@ -1610,6 +1620,7 @@
     }
 
     async function pollProcessJob(base, jobId, filename, startedAt) {
+      if (state.processCancelled) return;
       // Self-scheduling setTimeout (not setInterval) so a slow/hung request can't stack
       // overlapping polls, and a transient network hiccup doesn't kill the whole flow.
       const maxWaitMs = 20 * 60 * 1000; // the job keeps running server-side regardless
@@ -1624,6 +1635,12 @@
           return;
         }
         setTimeout(function () { pollProcessJob(base, jobId, filename, startedAt); }, 2500);
+        return;
+      }
+      if (status.status === "cancelled") {
+        state.uploading = false;
+        setUploadBusy(false);
+        setFooter("Processing cancelled");
         return;
       }
       if (status.status === "done") {
@@ -1695,6 +1712,8 @@
         }
         if (!payload.job_id) throw new Error("Bridge accepted the upload but did not return a job id.");
         recordLog("info", "Upload queued", payload.job_id, { filename: file.name });
+        state.processCancelled = false;
+        state.processJobId = payload.job_id;
         pollProcessJob._lastKey = null;
         pollProcessJob(base, payload.job_id, file.name, Date.now());
       } catch (error) {
@@ -1705,6 +1724,24 @@
           : formatUploadError(error, null, null);
         showIssues([issue], "error");
         await flushLogs(true);
+      }
+    }
+
+    async function cancelProcessing() {
+      if (!state.uploading) return;
+      state.processCancelled = true;
+      state.uploading = false;
+      const jobId = state.processJobId;
+      state.processJobId = null;
+      setUploadBusy(false);
+      setFooter("Processing cancelled");
+      recordLog("info", "Processing cancelled", jobId || "");
+      await flushLogs(true);
+      const base = cleanBase();
+      if (jobId && validBridge(base)) {
+        try {
+          await fetch(base + "/process/cancel?job_id=" + encodeURIComponent(jobId), { method: "POST" });
+        } catch (_) { /* bridge may be offline; UI already stopped polling */ }
       }
     }
 
@@ -1958,6 +1995,10 @@
       send("cancel");
       $("cancelImport").disabled = true;
       $("progressLabel").textContent = "Cancelling safely…";
+    });
+    $("cancelProcess").addEventListener("click", function (event) {
+      event.stopPropagation();
+      cancelProcessing();
     });
     $("issueDismiss").addEventListener("click", hideIssues);
     $("loadFiles").addEventListener("click", function () { $("fileInput").click(); });

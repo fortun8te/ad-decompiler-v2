@@ -41,7 +41,8 @@ def test_stamp_plugin_build_writes_build_info_and_manifest(tmp_path, monkeypatch
     assert info["label"].startswith("v1.2.3+b99.deadbeef")
     assert "const PLUGIN_BUILD =" in (plugin / "code.js").read_text(encoding="utf-8")
     manifest = json.loads((plugin / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["build"] == 99
+    assert "build" not in manifest
+    assert "version" not in manifest
 
 
 def test_stamp_plugin_build_cli_runs():

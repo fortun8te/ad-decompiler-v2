@@ -166,13 +166,12 @@ def stamp_files(info: dict | None = None, *, force: bool = False) -> dict:
     )
     UI_HTML.write_text(html, encoding="utf-8")
 
+    # Figma's manifest validator only allows documented keys — keep build metadata in
+    # build-info.json + PLUGIN_BUILD constants, not manifest.json.
     if MANIFEST.exists():
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-        manifest["version"] = info["version"]
-        manifest["build"] = info["build"]
-        manifest["commit"] = info["commit"]
-        manifest["built_at"] = info["built_at"]
-        manifest["label"] = info["label"]
+        for key in ("version", "build", "commit", "built_at", "label", "icon"):
+            manifest.pop(key, None)
         MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     return info

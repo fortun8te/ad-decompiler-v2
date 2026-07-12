@@ -28,6 +28,8 @@ import argparse, json, os, re, statistics, sys, tempfile, threading, time, trace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+from src.console_io import configure_stdio, safe_print
+
 
 def _safe_name(name, fallback="upload"):
     """Basename-only, alnum/dot/dash/underscore, non-empty — never a path component."""
@@ -185,9 +187,13 @@ def _save_plugin_client(inbox, build_info):
 
 def make_handler(inbox, config_path=None):
     jobs = {}
-    jobs_lock = threading.Lock()
+    jobs_lock = threading.RLock()
     base_cfg = _load_cfg(config_path)
     active_job = {"id": None}
+
+    def _job_cancelled(job_id):
+        with jobs_lock:
+            return jobs.get(job_id, {}).get("status") == "cancelled"
 
     def run_job(job_id, image_path, run_dir):
         started = time.time()
@@ -197,6 +203,8 @@ def make_handler(inbox, config_path=None):
                 manifest = json.load(fh)
         except (OSError, ValueError, TypeError):
             pass
+        if _job_cancelled(job_id):
+            return
         _append_plugin_logs(inbox, [{
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "level": "info",
@@ -205,6 +213,8 @@ def make_handler(inbox, config_path=None):
             "extra": {"job_id": job_id, "run_dir": run_dir},
         }], manifest)
         with jobs_lock:
+            if _job_cancelled(job_id):
+                return
             jobs[job_id]["status"] = "running"
             jobs[job_id]["started_at"] = started
             jobs[job_id]["run_dir"] = run_dir
@@ -218,6 +228,8 @@ def make_handler(inbox, config_path=None):
             cfg["figma"] = {**cfg.get("figma", {}), "enabled": True, "mode": "plugin", "inbox": inbox}
             result = run_pipeline.run_one(image_path, run_dir, cfg)
             with jobs_lock:
+                if _job_cancelled(job_id):
+                    return
                 jobs[job_id].update(
                     status="done" if result.get("ok") else "failed",
                     result=result, run_dir=run_dir,
@@ -242,7 +254,10 @@ def make_handler(inbox, config_path=None):
                 }], manifest)
         except Exception as exc:
             with jobs_lock:
-                jobs[job_id].update(status="failed", error=str(exc), traceback=traceback.format_exc(), run_dir=run_dir)
+                if not _job_cancelled(job_id):
+                    jobs[job_id].update(status="failed", error=str(exc), traceback=traceback.format_exc(), run_dir=run_dir)
+            if _job_cancelled(job_id):
+                return
             _append_plugin_logs(inbox, [{
                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "level": "error",
@@ -427,6 +442,25 @@ def make_handler(inbox, config_path=None):
                     _save_plugin_client(inbox, plugin_build)
                 _append_plugin_logs(inbox, events, self._manifest())
                 return self._send(200, b'{"ok":true}', "application/json")
+            if route == "/process/cancel":
+                job_id = parse_qs(urlparse(self.path).query).get("job_id", [""])[0]
+                with jobs_lock:
+                    job = jobs.get(job_id)
+                    if not job:
+                        return self._send(404, b'{"ok":false,"error":"unknown job_id"}', "application/json")
+                    if job.get("status") not in ("done", "failed", "cancelled"):
+                        job["status"] = "cancelled"
+                        job["error"] = "cancelled by user"
+                    if active_job["id"] == job_id:
+                        active_job["id"] = None
+                _append_plugin_logs(inbox, [{
+                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "level": "info",
+                    "title": "Processing cancelled",
+                    "detail": job_id,
+                }], self._manifest())
+                return self._send(200, json.dumps({"ok": True, "job_id": job_id, "status": "cancelled"}).encode(),
+                                   "application/json")
             if route == "/process":
                 n = self._content_length(max_bytes=64 * 1024 * 1024)
                 if n is None:
@@ -469,6 +503,7 @@ def make_handler(inbox, config_path=None):
 
 
 def main():
+    configure_stdio()
     ap = argparse.ArgumentParser()
     ap.add_argument("--inbox", default=os.path.expanduser("~/figma-inbox"))
     ap.add_argument("--port", type=int, default=8790)
@@ -489,14 +524,14 @@ def main():
     else:
         os.makedirs(inbox, exist_ok=True)
     host_label = "localhost" if a.host in ("127.0.0.1", "localhost") else a.host
-    print()
-    print("=" * 52)
-    print("  Ad Decompiler bridge")
-    print(f"  http://{host_label}:{a.port}/health")
-    print(f"  inbox:  {inbox}")
-    print(f"  config: {config_path if os.path.exists(config_path) else '(missing — uploads need config.yaml)'}")
-    print("=" * 52)
-    print()
+    safe_print()
+    safe_print("=" * 52)
+    safe_print("  Ad Decompiler bridge")
+    safe_print(f"  http://{host_label}:{a.port}/health")
+    safe_print(f"  inbox:  {inbox}")
+    safe_print(f"  config: {config_path if os.path.exists(config_path) else '(missing - uploads need config.yaml)'}")
+    safe_print("=" * 52)
+    safe_print()
     ThreadingHTTPServer((a.host, a.port), make_handler(inbox, config_path)).serve_forever()
 
 

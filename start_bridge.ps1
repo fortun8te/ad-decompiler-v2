@@ -5,6 +5,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -Path $Root
 $Python = Join-Path $Root ".venv\Scripts\python.exe"

@@ -13,11 +13,14 @@ from __future__ import annotations
 import argparse, copy, hashlib, os, sys, time, glob, traceback, json
 
 sys.path.insert(0, os.path.dirname(__file__))
+from src.console_io import configure_stdio, safe_print
 from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  element_fusion, qwen_worker, merge_layers, reconstruct, layout,
                  build_design_json, figma_import, pixel_diff, repair, render_preview)
 from src.run_report import RunReport, qwen_degradation
 from src.schema import dump, load
+
+configure_stdio()
 
 STAGES = ["normalize", "ocr", "text", "residual", "qwen", "sam", "elements",
           "merge", "reconstruct", "layout", "design", "preview", "figma",
@@ -38,7 +41,7 @@ def load_cfg(path):
 
 def _log(run_dir, msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    safe_print(line, flush=True)
     with open(os.path.join(run_dir, "pipeline.log"), "a", encoding="utf-8") as f:
         f.write(line + "\n")
 

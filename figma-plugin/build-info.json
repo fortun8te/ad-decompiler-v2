@@ -1,9 +1,9 @@
 {
   "version": "2.0.0",
-  "build": 12,
-  "commit": "4f7dd0c",
+  "build": 13,
+  "commit": "f8dbb7c",
   "dirty": true,
-  "built_at": "2026-07-12T00:28:30Z",
-  "label": "v2.0.0+b12.4f7dd0c-dirty",
+  "built_at": "2026-07-12T00:34:56Z",
+  "label": "v2.0.0+b13.f8dbb7c-dirty",
   "source": "git"
 }

@@ -285,6 +285,25 @@ def test_process_rejects_concurrent_uploads(tmp_path, monkeypatch):
         server.server_close()
 
 
+def test_process_cancel_endpoint_marks_job_cancelled(tmp_path, monkeypatch):
+    _install_fake_run_pipeline(monkeypatch, sleep_s=0.5)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        queued = json.loads(urlopen(Request(base + "/process?filename=a.png", data=b"x", method="POST"), timeout=2).read())
+        cancel = Request(base + "/process/cancel?job_id=" + queued["job_id"], method="POST")
+        payload = json.loads(urlopen(cancel, timeout=2).read())
+        assert payload["status"] == "cancelled"
+        status = json.loads(urlopen(base + "/process?job_id=" + queued["job_id"], timeout=2).read())
+        assert status["status"] == "cancelled"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_process_reports_pipeline_failure_without_crashing_the_bridge(tmp_path, monkeypatch):
     _install_fake_run_pipeline(monkeypatch, ok=False)
     inbox = tmp_path / "inbox"
