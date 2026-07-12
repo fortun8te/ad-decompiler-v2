@@ -61,6 +61,17 @@ def test_finalize_rejects_fully_transparent_fake_layers(tmp_path):
     assert not (tmp_path / "qwen_layers" / "Q0.png").exists()
 
 
+def test_http_error_detail_preserves_comfy_validation_reason_and_is_bounded():
+    class _Response:
+        def json(self):
+            return {"node_errors": {"1": {"errors": [{"details": "missing model"}]}}}
+
+    detail = qwen_worker._http_error_detail(_Response(), limit=48)
+
+    assert "node_errors" in detail
+    assert len(detail) <= 48
+
+
 # ── Flux Fill inpaint backend ─────────────────────────────────────────────────────────
 def _mask_pair():
     rgb = np.zeros((8, 8, 3), dtype=np.uint8)

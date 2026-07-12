@@ -312,6 +312,42 @@ def _load_reconstruction(run_dir):
         return {}
 
 
+def _normalized_element_id(value):
+    """Normalize canonical element ids without conflating other detector namespaces."""
+    import re
+
+    match = re.fullmatch(r"(?:c_)?e0*(\d+)", str(value or "").strip(), re.IGNORECASE)
+    return f"E{int(match.group(1))}" if match else None
+
+
+def _candidate_element_lineage(candidate):
+    """Return canonical element ids owned by a surviving reconstruction candidate."""
+    if not isinstance(candidate, dict):
+        return set()
+    values = [candidate.get("id")]
+    meta = candidate.get("meta") or {}
+    values.extend((meta.get("source_id"), meta.get("canonical_id"), meta.get("element_id")))
+
+    provenance = meta.get("provenance") or {}
+    if isinstance(provenance, list):
+        observations = provenance
+    elif isinstance(provenance, dict):
+        observations = provenance.get("observations") or []
+    else:
+        observations = []
+    observations = list(observations) + list(meta.get("observations") or [])
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        # Residual E ids are a separate detector namespace and cannot be assumed to
+        # identify fused/canonical E ids.  Only explicitly canonical lineage is safe.
+        source = str(observation.get("source") or "").strip().lower()
+        if source in {"element", "elements", "fused", "fused-element", "fused_elements", "canonical"}:
+            values.extend((observation.get("id"), observation.get("element_id")))
+
+    return {normalized for value in values if (normalized := _normalized_element_id(value))}
+
+
 def _element_survival_audit(run_dir, reconstruction):
     """Prove detected non-background elements survived into reconstruction.
 
@@ -328,22 +364,24 @@ def _element_survival_audit(run_dir, reconstruction):
             elements = payload.get("elements") or payload.get("candidates") or []
         if elements:
             break
-    proposed = {
-        str(item.get("id")) for item in elements
+    proposed_by_id = {
+        normalized: str(item.get("id")) for item in elements
         if isinstance(item, dict) and item.get("id") is not None
         and str((item.get("meta") or {}).get("role") or item.get("role") or "").lower()
         != "background"
+        if (normalized := _normalized_element_id(item.get("id")))
     }
-    if not proposed:
+    if not proposed_by_id:
         return None
-    kept = {
-        str(item.get("id")) for item in (reconstruction.get("candidates") or [])
-        if isinstance(item, dict) and item.get("id") is not None and item.get("target") != "drop"
-    }
-    missing = sorted(proposed - kept)
+    kept = set()
+    for item in reconstruction.get("candidates") or []:
+        if isinstance(item, dict) and item.get("target") != "drop":
+            kept.update(_candidate_element_lineage(item))
+    survived = set(proposed_by_id) & kept
+    missing = sorted(proposed_by_id[item] for item in set(proposed_by_id) - kept)
     return {
-        "proposed": len(proposed), "kept": len(proposed & kept),
-        "recall": round(len(proposed & kept) / len(proposed), 5),
+        "proposed": len(proposed_by_id), "kept": len(survived),
+        "recall": round(len(survived) / len(proposed_by_id), 5),
         "missing_ids": missing,
     }
 def _layer_qa_metrics(source):

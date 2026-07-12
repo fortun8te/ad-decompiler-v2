@@ -68,6 +68,42 @@ def test_text_and_large_removals_use_role_aware_backends(tmp_path, monkeypatch):
     assert result["stats"]["inpaint"]["parts"][0]["backend"] == "opencv-telea"
 
 
+def test_reconstruct_wires_enriched_canonical_observations_to_regional_inpaint(tmp_path, monkeypatch):
+    source = tmp_path / "regional.png"
+    _source(source, (120, 90))
+    product_mask = Image.new("L", (50, 50), 255)
+    product_mask.save(tmp_path / "product-mask.png")
+    candidates = [
+        {"id": "product", "target": "image", "box": {"x": 35, "y": 25, "w": 50, "h": 50},
+         "mask": {"src": "product-mask.png"}, "meta": {"role": "product"}},
+        {"id": "label", "target": "text", "text": "SALE",
+         "box": {"x": 45, "y": 40, "w": 30, "h": 12},
+         "visible_box": {"x": 45, "y": 40, "w": 30, "h": 12},
+         "meta": {"role": "offer", "parent_id": "product"}},
+    ]
+    captured = {}
+
+    def fake_regional(image_path, observations, union, output_path, cfg, run_dir=None):
+        captured["observations"] = observations
+        captured["union"] = union.copy()
+        Image.open(image_path).save(output_path)
+        return {"ok": True, "path": output_path, "backend": "regional",
+                "strategy": "regional", "backend_class": "active"}
+
+    monkeypatch.setattr(reconstruct.inpaint, "inpaint_regional", fake_regional)
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, candidates, str(tmp_path),
+        {"inpaint": {"mode": "opencv", "regional": {"enabled": True}}},
+    )
+
+    assert result["stats"]["inpaint"]["backend"] == "regional"
+    by_id = {item["id"]: item for item in captured["observations"]}
+    assert by_id["product"]["target"] == "image"
+    assert by_id["product"]["role"] == "product"
+    assert by_id["label"]["parent_id"] == "product"
+    assert np.any(captured["union"])
+
+
 def test_duplicate_observations_collapse_before_asset_work(tmp_path):
     source = tmp_path / "source.png"
     _source(source)

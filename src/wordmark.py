@@ -11,6 +11,12 @@ import re
 GENERIC_SHORT_COPY = re.compile(
     r"^(buy now|shop now|learn more|swipe up|tap here|new|sale|save|free shipping|"
     r"limited time|order now|subscribe)$", re.I)
+_UI_LABEL = re.compile(
+    r"^(post|following|follow|followed|volgend|back|next|previous|menu|close|cancel|"
+    r"done|share|reply|comment|like|save|bookmark|home|search|profile|settings)$",
+    re.I,
+)
+_SOCIAL_HANDLE = re.compile(r"^@[A-Za-z0-9_.-]+$")
 _PICTOGRAM = re.compile(r"[♡♥❤★☆✦✧]|^[•●◦·]\s*")
 _ALLCAPS_SHORT = re.compile(r"^[A-ZÀ-ÖØ-Þ& ]+$")
 _LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
@@ -34,8 +40,13 @@ def is_wordmark_candidate(line: dict, canvas: dict, opts: dict | None = None) ->
         return False
     if line.get("id") in force_wm:
         return True
+    # Short social/UI labels occupy exactly the same header slots as brand marks.  The
+    # old positional heuristic consequently rasterized ordinary editable copy such as
+    # ``Post`` and ``@UpfrontFood`` in ad9.  Handles and known interface labels are text;
+    # an explicit upstream ``force_wordmark_ids`` decision can still override this.
     if (len(text) > opts.get("max_chars", 28) or re.search(r"[\n.!?]", text)
-            or re.search(r"\d", text) or GENERIC_SHORT_COPY.match(text)):
+            or re.search(r"\d", text) or GENERIC_SHORT_COPY.match(text)
+            or _UI_LABEL.match(text) or _SOCIAL_HANDLE.match(text)):
         return False
 
     center_x = x + w / 2

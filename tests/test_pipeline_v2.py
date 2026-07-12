@@ -148,6 +148,49 @@ def test_qa_ok_is_false_when_edge_or_color_fidelity_fails_even_at_high_ssim(monk
     assert "edge-fidelity" in {item["rule"] for item in qa["hard_fails"]}
 
 
+def test_render_qa_ocr_is_separate_from_canonical_source_ocr(monkeypatch, tmp_path):
+    source = tmp_path / "input.png"
+    Image.new("RGB", (120, 80), "white").save(source)
+    calls = []
+
+    def fake_ocr(path, cfg, run_dir=None):
+        calls.append((path, run_dir))
+        text = "SOURCE COPY" if os.path.basename(path) == "normalized.png" else "RENDER COPY"
+        return {
+            "engine": "fixture", "status": "ok", "errors": [],
+            "source": {"path": path, "w": 120, "h": 80}, "ms": 1,
+            "lines": [{"id": "L0", "text": text, "conf": .99,
+                       "box": {"x": 5, "y": 5, "w": 80, "h": 20},
+                       "quad": [[5, 5], [85, 5], [85, 25], [5, 25]], "words": []}],
+        }
+
+    monkeypatch.setattr(run_pipeline.ocr, "run_ocr", fake_ocr)
+    run_dir = tmp_path / "run"
+    result = run_pipeline.run_one(
+        str(source), str(run_dir),
+        {
+            "device": "cpu", "qwen": {"enabled": False}, "sam3": {"enabled": False},
+            "inpaint": {"mode": "opencv"},
+            "text_analysis": {"font_matching": {"enabled": False}},
+            "figma": {"enabled": False}, "qa_ocr": True,
+        },
+    )
+
+    assert result["ok"] is True
+    canonical = json.loads((run_dir / "ocr.json").read_text(encoding="utf-8"))
+    rendered = json.loads((run_dir / "render_ocr.json").read_text(encoding="utf-8"))
+    assert canonical["source"]["path"] == str(run_dir / "normalized.png")
+    assert canonical["lines"][0]["text"] == "SOURCE COPY"
+    assert rendered["source"]["path"] == str(run_dir / "preview.png")
+    assert rendered["lines"][0]["text"] == "RENDER COPY"
+    assert rendered["provenance"] == {
+        "kind": "render-qa",
+        "render_path": str((run_dir / "preview.png").resolve()),
+        "source_ocr_path": str((run_dir / "ocr.json").resolve()),
+    }
+    assert calls[-1][1] == "", "render QA OCR must disable run_ocr's ocr.json writer"
+
+
 def test_resume_refuses_stale_artifacts_from_a_different_source(monkeypatch, tmp_path):
     image_a = tmp_path / "a.png"
     image_b = tmp_path / "b.png"

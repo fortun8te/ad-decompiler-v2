@@ -50,6 +50,16 @@ def test_heart_wordmark_detected():
     assert is_wordmark_candidate(line, CANVAS) is True
 
 
+def test_social_ui_labels_and_handles_are_not_wordmarks():
+    cases = [
+        {"id": "post", "text": "Post", "box": {"x": 487, "y": 55, "w": 101, "h": 35}},
+        {"id": "following", "text": "Volgend", "box": {"x": 867, "y": 154, "w": 133, "h": 31}},
+        {"id": "handle", "text": "@UpfrontFood", "box": {"x": 185, "y": 198, "w": 226, "h": 30}},
+    ]
+    assert all(is_wordmark_candidate(line, {"w": 1080, "h": 1080}) is False for line in cases)
+    assert all(routing.route(line, {"w": 1080, "h": 1080})["target"] == "text" for line in cases)
+
+
 def test_body_copy_is_not_wordmark():
     line = {"id": "L5", "text": "Clinically proven to reduce noise by 20 decibels overall.",
             "box": {"x": 80, "y": 300, "w": 900, "h": 40}}

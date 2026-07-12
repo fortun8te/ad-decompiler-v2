@@ -105,6 +105,26 @@ def _last_note(run_dir: str) -> str:
         return ""
 
 
+def _http_error_detail(response, limit: int = 1800) -> str:
+    """Return bounded ComfyUI validation detail for an unsuccessful request.
+
+    ComfyUI's useful explanation (missing model, invalid node input, absent custom node)
+    lives in the JSON response body.  Logging only ``400 Bad Request`` made a configured
+    but incomplete backend indistinguishable from a broken workflow.
+    """
+    if response is None:
+        return ""
+    try:
+        payload = response.json()
+        detail = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        detail = str(getattr(response, "text", "") or "")
+    detail = " ".join(detail.split())
+    if not detail:
+        return ""
+    return detail[: max(0, int(limit))]
+
+
 # ── ComfyUI backend ──────────────────────────────────────────────────────────────────
 def _run_comfyui(img_path, run_dir, cfg, schema):
     try:
@@ -164,6 +184,7 @@ def _run_comfyui(img_path, run_dir, cfg, schema):
             node["inputs"]["length"] = _length_for_layers(layers_n)
 
     client_id = str(uuid.uuid4())
+    resp = None
     try:
         resp = requests.post(
             f"{base}/prompt",
@@ -173,7 +194,9 @@ def _run_comfyui(img_path, run_dir, cfg, schema):
         resp.raise_for_status()
         prompt_id = resp.json()["prompt_id"]
     except Exception as e:
-        note = f"qwen(comfyui): /prompt failed ({e})"
+        detail = _http_error_detail(resp)
+        suffix = f"; validation={detail}" if detail else ""
+        note = f"qwen(comfyui): /prompt failed ({e}){suffix}"
         print("[qwen]", note)
         _write_manifest(schema, [], run_dir, note)
         return []

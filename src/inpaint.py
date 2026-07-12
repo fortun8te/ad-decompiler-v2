@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from typing import Iterable, Optional
 
 
@@ -355,6 +356,233 @@ def build_union_mask(canvas: tuple[int, int], observations: Iterable[dict],
     return union
 
 
+def _mask_bbox(mask):
+    """Return the tight exclusive ``(x0, y0, x1, y1)`` bounds of a mask."""
+    _, np, _ = _deps()
+    ys, xs = np.where(np.asarray(mask) > 0)
+    if not xs.size:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _observation_mask(item: dict, canvas: tuple[int, int], run_dir=None):
+    """Materialize one canonical observation's dilated binary removal mask."""
+    cv2, np, _ = _deps()
+    width, height = canvas
+    if item.get("keep_in_background") or item.get("is_background"):
+        return np.zeros((height, width), dtype=np.uint8)
+    mask = item.get("mask_array")
+    if mask is None:
+        path = item.get("mask_path") or item.get("mask_src")
+        if not path and isinstance(item.get("mask"), dict):
+            path = item["mask"].get("src")
+        mask = mask_on_canvas(path, item.get("box") or {}, canvas, run_dir)
+    mask = solidify_mask(mask)
+    radius = max(0, int(item.get("dilate", 0)))
+    if radius:
+        mask = cv2.dilate(mask, np.ones((2 * radius + 1, 2 * radius + 1), np.uint8))
+    return mask
+
+
+def build_inpaint_regions(canvas: tuple[int, int], observations: Iterable[dict], union_mask,
+                          cfg: Optional[dict] = None, run_dir: Optional[str] = None):
+    """Group canonical removals without globally bridging unrelated objects.
+
+    Regions begin at the semantic-candidate boundary.  Duplicate masks and text nested in a
+    removable product/button/card are joined, but nearby headline/product masks are not.  The
+    returned masks are disjoint and their OR is exactly ``union_mask``.
+    """
+    cv2, np, _ = _deps()
+    width, height = canvas
+    rcfg = ((cfg or {}).get("inpaint") or {}).get("regional") or {}
+    containment = float(rcfg.get("nested_containment", 0.88))
+    duplicate_overlap = float(rcfg.get("duplicate_overlap", 0.65))
+    items = []
+    for index, source in enumerate(observations):
+        mask = _observation_mask(source, canvas, run_dir)
+        area = int(np.count_nonzero(mask))
+        bbox = _mask_bbox(mask)
+        if not area or bbox is None:
+            continue
+        meta = source.get("meta") or {}
+        items.append({
+            "id": str(source.get("id") or f"region-{index}"),
+            "target": str(source.get("target") or "image"),
+            "role": str(source.get("role") or meta.get("role") or ""),
+            "parent_id": source.get("parent_id") or meta.get("parent_id"),
+            "mask": mask, "area": area, "bbox": bbox,
+        })
+
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def join(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    owner_roles = {"product", "person", "photo", "button", "badge", "chip", "card", "shape"}
+    for i, left in enumerate(items):
+        for j in range(i + 1, len(items)):
+            right = items[j]
+            intersection = int(np.count_nonzero((left["mask"] > 0) & (right["mask"] > 0)))
+            overlap = intersection / max(1, min(left["area"], right["area"]))
+            explicit_parent = (
+                left["parent_id"] == right["id"] or right["parent_id"] == left["id"]
+            )
+            nested_text = False
+            if {left["target"], right["target"]} & {"text"}:
+                text = left if left["target"] == "text" else right
+                owner = right if text is left else left
+                x0, y0, x1, y1 = text["bbox"]
+                ox0, oy0, ox1, oy1 = owner["bbox"]
+                bbox_contained = x0 >= ox0 and y0 >= oy0 and x1 <= ox1 and y1 <= oy1
+                owner_semantic = owner["target"] in ("image", "shape") and (
+                    owner["role"].lower() in owner_roles or owner["area"] > text["area"] * 2
+                )
+                nested_text = owner_semantic and (overlap >= containment or bbox_contained)
+            if explicit_parent or overlap >= duplicate_overlap or nested_text:
+                join(i, j)
+
+    grouped = {}
+    for index, item in enumerate(items):
+        grouped.setdefault(find(index), []).append(item)
+
+    regions = []
+    for members in grouped.values():
+        mask = np.zeros((height, width), dtype=np.uint8)
+        for member in members:
+            mask = cv2.bitwise_or(mask, member["mask"])
+        regions.append({
+            "ids": [member["id"] for member in members],
+            "targets": sorted(set(member["target"] for member in members)),
+            "roles": sorted(set(member["role"] for member in members if member["role"])),
+            "mask": mask,
+            "group_reason": "semantic-overlap" if len(members) > 1 else "candidate",
+        })
+
+    # Largest first gives later small crops already-clean context. Assign every union pixel
+    # once so overlapping-but-unmerged artistic elements cannot be regenerated twice.
+    regions.sort(key=lambda r: int(np.count_nonzero(r["mask"])), reverse=True)
+    wanted = solidify_mask(union_mask)
+    assigned = np.zeros_like(wanted)
+    for region in regions:
+        region["mask"] = cv2.bitwise_and(region["mask"], wanted)
+        region["mask"] = cv2.bitwise_and(region["mask"], cv2.bitwise_not(assigned))
+        assigned = cv2.bitwise_or(assigned, region["mask"])
+    missing = cv2.bitwise_and(wanted, cv2.bitwise_not(assigned))
+    if np.any(missing):
+        regions.append({
+            "ids": ["union-remainder"], "targets": [], "roles": [],
+            "mask": missing, "group_reason": "union-coverage",
+        })
+    regions = [region for region in regions if np.any(region["mask"])]
+    return regions
+
+
+def _regional_crop(mask, cfg: Optional[dict] = None):
+    """Mask-derived crop with adaptive context; returns bounds and model padding."""
+    bbox = _mask_bbox(mask)
+    if bbox is None:
+        return None
+    h, w = mask.shape[:2]
+    regional = ((cfg or {}).get("inpaint") or {}).get("regional") or {}
+    min_context = int(regional.get("min_context", 64))
+    max_context = int(regional.get("max_context", 96))
+    min_crop = int(regional.get("min_crop", 256))
+    alignment = max(1, int(regional.get("alignment", 16)))
+    x0, y0, x1, y1 = bbox
+    span = max(x1 - x0, y1 - y0)
+    context = min(max_context, max(min_context, int(round(span * .18))))
+    x0, y0 = max(0, x0 - context), max(0, y0 - context)
+    x1, y1 = min(w, x1 + context), min(h, y1 + context)
+    if x1 - x0 < min_crop:
+        extra = min_crop - (x1 - x0)
+        x0, x1 = max(0, x0 - extra // 2), min(w, x1 + extra - extra // 2)
+        x0 = max(0, x1 - min_crop)
+    if y1 - y0 < min_crop:
+        extra = min_crop - (y1 - y0)
+        y0, y1 = max(0, y0 - extra // 2), min(h, y1 + extra - extra // 2)
+        y0 = max(0, y1 - min_crop)
+    crop_w, crop_h = x1 - x0, y1 - y0
+    pad_right = (-crop_w) % alignment
+    pad_bottom = (-crop_h) % alignment
+    return (x0, y0, x1, y1), (0, 0, pad_right, pad_bottom), context
+
+
+def _background_model(rgb, mask, global_union, cfg: Optional[dict] = None):
+    """Fit a robust local affine RGB plate and report exterior complexity."""
+    cv2, np, _ = _deps()
+    regional = ((cfg or {}).get("inpaint") or {}).get("regional") or {}
+    ring_radius = max(4, int(regional.get("ring_radius", 24)))
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    ring = (cv2.dilate(binary, np.ones((2 * ring_radius + 1,) * 2, np.uint8)) > 0)
+    ring &= binary == 0
+    ring &= np.asarray(global_union) == 0
+    ys, xs = np.where(ring)
+    minimum = int(regional.get("min_ring_samples", 64))
+    if xs.size < minimum:
+        return None, {"ring_samples": int(xs.size), "model": "insufficient"}
+    if xs.size > 20000:
+        take = np.linspace(0, xs.size - 1, 20000).astype(int)
+        xs, ys = xs[take], ys[take]
+    height, width = binary.shape
+    design = np.column_stack([
+        np.ones(xs.size), xs.astype(np.float32) / max(1, width - 1),
+        ys.astype(np.float32) / max(1, height - 1),
+    ])
+    values = np.asarray(rgb, dtype=np.float32)[ys, xs]
+    gray = cv2.cvtColor(np.asarray(rgb, dtype=np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    gradient = np.sqrt(gx * gx + gy * gy)[ys, xs]
+    # Large product masks are frequently incomplete, so their ring can contain a strip
+    # of package/chocolate pixels. If a clear plate colour still dominates, fit that mode
+    # directly instead of misclassifying the contamination as photographic context.
+    plate = np.median(values, axis=0)
+    tolerance = float(regional.get("dominant_plate_tolerance", 12.0))
+    near_plate = np.max(np.abs(values - plate), axis=1) <= tolerance
+    dominant_fraction = float(np.mean(near_plate))
+    dominant_required = float(regional.get("dominant_plate_fraction", 0.55))
+    if dominant_fraction >= dominant_required and int(np.count_nonzero(near_plate)) >= minimum:
+        coeff = np.zeros((3, 3), dtype=np.float32)
+        coeff[0] = np.median(values[near_plate], axis=0)
+        error = np.max(np.abs(values[near_plate] - coeff[0]), axis=1)
+        model_name = "dominant-flat-rgb"
+    else:
+        coeff, *_ = np.linalg.lstsq(design, values, rcond=None)
+        error = np.max(np.abs(values - design @ coeff), axis=1)
+        keep = error <= np.percentile(error, 80)
+        if int(np.count_nonzero(keep)) >= minimum:
+            coeff, *_ = np.linalg.lstsq(design[keep], values[keep], rcond=None)
+            error = np.max(np.abs(values - design @ coeff), axis=1)
+        model_name = "affine-rgb"
+    diagnostics = {
+        "ring_samples": int(xs.size), "model": model_name,
+        "dominant_fraction": round(dominant_fraction, 4),
+        "residual_median": round(float(np.median(error)), 4),
+        "residual_p90": round(float(np.percentile(error, 90)), 4),
+        "gradient_p90": round(float(np.percentile(gradient, 90)), 4),
+    }
+    return coeff, diagnostics
+
+
+def _render_background_model(shape, coeff):
+    _, np, _ = _deps()
+    height, width = shape[:2]
+    yy, xx = np.mgrid[0:height, 0:width]
+    design = np.stack([
+        np.ones_like(xx, dtype=np.float32), xx.astype(np.float32) / max(1, width - 1),
+        yy.astype(np.float32) / max(1, height - 1),
+    ], axis=-1)
+    return np.clip(design @ coeff, 0, 255).astype(np.uint8)
+
+
 def _opencv_inpaint(rgb, mask, radius: int = 5, method=None):
     cv2, np, _ = _deps()
     binary = (np.asarray(mask) > 0).astype(np.uint8)
@@ -613,6 +841,152 @@ def inpaint_once(image_path: str, mask, output_path: str, cfg: Optional[dict] = 
         "backend": backend,
         "masked_fraction": round(float(np.count_nonzero(mask_arr)) / mask_arr.size, 6),
         "diagnostics": diagnostics,
+    }
+
+
+def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
+                     output_path: str, cfg: Optional[dict] = None,
+                     run_dir: Optional[str] = None) -> dict:
+    """Build one clean plate through crop-local, per-canonical-region inpainting.
+
+    The public artifact remains one canonical union mask and one background plate.  Internally,
+    unrelated holes are never shown to a generative backend together, and every union pixel is
+    assigned to exactly one region.
+    """
+    cv2, np, Image = _deps()
+    cfg = cfg or {}
+    source = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+    union = solidify_mask(union_mask)
+    if union.shape != source.shape[:2]:
+        raise ValueError(f"inpaint mask {union.shape} does not match image {source.shape[:2]}")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if not np.any(union):
+        shutil.copyfile(image_path, output_path)
+        return {"ok": True, "path": output_path, "backend": "none", "strategy": "regional",
+                "masked_fraction": 0.0, "regions": [], "backend_counts": {}}
+
+    regions = build_inpaint_regions(
+        (source.shape[1], source.shape[0]), observations, union, cfg, run_dir,
+    )
+    working = source.copy()
+    regional_cfg = ((cfg.get("inpaint") or {}).get("regional") or {})
+    flat_residual = float(regional_cfg.get("flat_residual_p90", 10.0))
+    flat_gradient = float(regional_cfg.get("flat_gradient_p90", 10.0))
+    flux_residual = float(regional_cfg.get("flux_residual_p90", 18.0))
+    flux_gradient = float(regional_cfg.get("flux_gradient_p90", 18.0))
+    flux_max_fraction = float(regional_cfg.get("flux_max_canvas_fraction", 0.025))
+    base_mode = str((cfg.get("inpaint") or {}).get("mode", "auto")).lower()
+    comfy = (cfg.get("inpaint") or {}).get("comfy") or {}
+    flux_allowed = base_mode in ("flux", "flux-comfy", "flux_comfy") or (
+        base_mode == "auto" and bool(comfy.get("enabled"))
+    )
+    records, backend_counts = [], {}
+    processed = np.zeros_like(union)
+
+    for number, region in enumerate(regions, start=1):
+        mask = solidify_mask(region["mask"])
+        region_fraction = float(np.count_nonzero(mask)) / max(1, mask.size)
+        crop_spec = _regional_crop(mask, cfg)
+        if crop_spec is None:
+            continue
+        (x0, y0, x1, y1), padding, context = crop_spec
+        _, _, pad_right, pad_bottom = padding
+        crop_rgb = working[y0:y1, x0:x1].copy()
+        crop_mask = mask[y0:y1, x0:x1].copy()
+        crop_union = union[y0:y1, x0:x1]
+        if pad_right or pad_bottom:
+            crop_rgb = cv2.copyMakeBorder(crop_rgb, 0, pad_bottom, 0, pad_right, cv2.BORDER_REPLICATE)
+            crop_mask = cv2.copyMakeBorder(crop_mask, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=0)
+            crop_union = cv2.copyMakeBorder(crop_union, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=0)
+
+        coeff, complexity = _background_model(crop_rgb, crop_mask, crop_union, cfg)
+        analytic = bool(
+            coeff is not None
+            and complexity["residual_p90"] <= flat_residual
+            # A panel boundary can raise ring gradient even when a constant/affine model
+            # explains the actual colours almost perfectly (ad9's black/charcoal bars).
+            and (complexity["gradient_p90"] <= flat_gradient
+                 or complexity["residual_p90"] <= flat_residual * .4)
+        )
+        if (coeff is not None and complexity.get("model") == "dominant-flat-rgb"
+                and complexity["residual_p90"] <= flat_residual):
+            analytic = True
+        complex_background = bool(
+            coeff is not None and (
+                complexity["residual_p90"] >= flux_residual
+                or complexity["gradient_p90"] >= flux_gradient
+            )
+        )
+        requested = "analytic-affine" if analytic else "big-lama"
+        if not analytic:
+            if base_mode == "opencv":
+                requested = "opencv"
+            elif base_mode in ("lama", "big-lama", "simple-lama"):
+                requested = "big-lama"
+            # A high residual around a large product/text mask often means the mask is
+            # incomplete and the ring still sees foreground pixels. Flux interprets that
+            # as photographic context and regenerates the product. Reserve it for genuinely
+            # local complex holes; large regions and text-only regions use conservative LaMa.
+            elif (flux_allowed and complex_background
+                  and region_fraction <= flux_max_fraction
+                  and set(region["targets"]) != {"text"}):
+                requested = "flux-comfy"
+
+        started = time.monotonic()
+        backend_diagnostics = {}
+        if requested == "analytic-affine":
+            generated = _render_background_model(crop_rgb.shape, coeff)
+            used = "analytic-affine"
+            backend_diagnostics["backend_choice"] = used
+        else:
+            region_cfg = dict(cfg)
+            region_cfg["inpaint"] = dict(cfg.get("inpaint") or {})
+            region_cfg["inpaint"]["mode"] = requested
+            # A regional crop is already the coarse context window. Calling the global
+            # coarse-to-fine wrapper would run Flux twice and invite a second hallucination.
+            generated, used, backend_diagnostics = _inpaint_single_pass(
+                crop_rgb, crop_mask, region_cfg,
+            )
+            generated = np.asarray(generated, dtype=np.uint8)
+            if generated.shape[:2] != crop_rgb.shape[:2]:
+                backend_diagnostics["resized_from"] = f"{generated.shape[1]}x{generated.shape[0]}"
+                generated = cv2.resize(generated, (crop_rgb.shape[1], crop_rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+        original_h, original_w = y1 - y0, x1 - x0
+        generated = np.asarray(generated, dtype=np.uint8)[:original_h, :original_w]
+        local_mask = crop_mask[:original_h, :original_w] > 0
+        target = working[y0:y1, x0:x1]
+        target[local_mask] = generated[local_mask]
+        processed = cv2.bitwise_or(processed, mask)
+        backend_counts[used] = backend_counts.get(used, 0) + 1
+        records.append({
+            "index": number, "ids": region["ids"], "targets": region["targets"],
+            "roles": region["roles"], "group_reason": region["group_reason"],
+            "bbox": {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0},
+            "model_size": {"w": crop_rgb.shape[1], "h": crop_rgb.shape[0]},
+            "context": context,
+            "masked_fraction_canvas": round(region_fraction, 6),
+            "masked_fraction_crop": round(float(np.count_nonzero(crop_mask)) / crop_mask.size, 6),
+            "complexity": complexity, "route": requested, "backend": used,
+            "diagnostics": backend_diagnostics,
+            "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+        })
+
+    # Defense-in-depth: regional compositing must never change a byte outside the canonical union.
+    result = source.copy()
+    selected = union > 0
+    result[selected] = working[selected]
+    Image.fromarray(result).save(output_path)
+    degraded = any(name.startswith("opencv") for name in backend_counts)
+    return {
+        "ok": True, "path": output_path, "backend": "regional", "strategy": "regional",
+        "backend_class": "fallback" if degraded else "active",
+        "backend_counts": backend_counts,
+        "masked_fraction": round(float(np.count_nonzero(union)) / union.size, 6),
+        "region_count": len(records), "regions": records,
+        "coverage_fraction": round(
+            float(np.count_nonzero((processed > 0) & (union > 0))) / max(1, np.count_nonzero(union)), 6
+        ),
     }
 
 

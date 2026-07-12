@@ -319,7 +319,9 @@ def inspect(cfg, root: Path) -> dict:
 
     # Flux Fill inpaint backend (ComfyUI GGUF). Advisory unless inpaint.comfy.required.
     # Reports ComfyUI reachability, the workflow file, and (when comfy_dir is known) the
-    # presence of the GGUF/CLIP/VAE/LoRA model files.
+    # presence of the GGUF/CLIP/VAE model files used by the checked-in workflow.
+    # A generic Flux-dev turbo LoRA is intentionally not required: Flux Fill has a
+    # different mask-concatenated input shape and that LoRA makes the workflow fail.
     inpaint_cfg_flux = cfg.get("inpaint") or {}
     comfy_inpaint = inpaint_cfg_flux.get("comfy") or {}
     inpaint_mode_flux = str(inpaint_cfg_flux.get("mode", "auto")).lower()
@@ -339,14 +341,12 @@ def inspect(cfg, root: Path) -> dict:
             "t5xxl": "t5xxl_fp8_e4m3fn.safetensors",
             "clip_l": "clip_l.safetensors",
             "vae": "ae.safetensors",
-            "lora": "flux1-turbo-alpha.safetensors",
         }
         flux_subdirs = {
             "unet_gguf": ["unet", "diffusion_models"],
             "t5xxl": ["clip", "text_encoders"],
             "clip_l": ["clip", "text_encoders"],
             "vae": ["vae"],
-            "lora": ["loras"],
         }
         if comfy_dir:
             comfy_dir = os.path.expandvars(os.path.expanduser(str(comfy_dir)))
@@ -368,7 +368,7 @@ def inspect(cfg, root: Path) -> dict:
         else:
             checks.append(_check(
                 "flux inpaint models", True,
-                "set inpaint.comfy.comfy_dir to verify the GGUF/CLIP/VAE/LoRA files",
+                "set inpaint.comfy.comfy_dir to verify the GGUF/CLIP/VAE files",
                 required=False,
             ))
 

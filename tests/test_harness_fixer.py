@@ -127,6 +127,28 @@ def test_apply_fixer_round_applies_critic_suggestions(tmp_path, monkeypatch):
     assert cfg["layout"]["min_container_frac"] == 0.001
 
 
+def test_apply_fixer_round_accepts_real_critic_contract_and_stage_action_ids(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _minimal_design(run_dir)
+    critic_output = {
+        "prioritized_issues": [
+            {"category": "text", "severity": "high"},
+            {"category": "layout", "severity": "medium"},
+        ],
+        "suggested_fix_ids": [
+            "text-analysis:resolve-fonts:c_L9",
+            "layout:refit-geometry",
+        ],
+    }
+
+    cfg, fixes = harness_fixer.apply_fixer_round(str(run_dir), {}, critic_output)
+
+    assert "boost-vlm-stack" in fixes
+    assert cfg["vlm"]["scene_text"]["enabled"] is True
+    assert "tighten-containers" in fixes
+
+
 def test_harness_actionable_includes_fixer_actions():
     for pair in [
         ("figma", "restage-inbox"),

@@ -211,6 +211,36 @@ inpaint:
   opencv_method: auto                  # auto picks the lower-seam Telea/NS fallback
   mask_feather: 1                      # minimal edge soften on the union mask (0 = off)
   multipass_fraction: 0.12             # coarse→fine when removal area exceeds this fraction
+  regional:
+    enabled: true                       # crop-local routing; preserves one canonical union/plate
+    min_context: 64
+    max_context: 96
+    min_crop: 256
+    alignment: 16
+    ring_radius: 24
+    dominant_plate_fraction: 0.55
+    dominant_plate_tolerance: 12
+    flat_residual_p90: 10
+    flat_gradient_p90: 10
+    flux_residual_p90: 18
+    flux_gradient_p90: 18
+    flux_max_canvas_fraction: 0.025     # never ask Flux to invent a large product/text hole
+    nested_containment: 0.88
+    duplicate_overlap: 0.65
+  # Flux Fill is used only for crop-local regions whose exterior is genuinely complex.
+  # Plain/gradient plates route to analytic fill or Big-LaMa to avoid invented objects.
+  comfy:
+    enabled: false                     # enable on the RTX/ComfyUI workstation
+    base_url: http://127.0.0.1:8188
+    workflow: workflows/flux_fill_inpaint_api.json
+    steps: 20
+    cfg: 1.0
+    guidance: 3.5
+    denoise: 1.0
+    seed: 0
+    prompt: "clean seamless background, empty, no text, no objects"
+    negative_prompt: "text, logo, object, product, person"
+    required: false
   # Per-target removal-mask dilation (pixels). Buttons need more bleed so anti-aliased
   # shells and re-edits do not leave halos; photos stay tight to protect surroundings.
   mask_dilate:

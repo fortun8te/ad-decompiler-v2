@@ -432,3 +432,146 @@ def test_role_aware_overlap_is_owned_by_large_object_pass(tmp_path, monkeypatch)
     )
     assert [part["role"] for part in result["parts"]] == ["large"]
     assert np.array_equal(calls[0], large)
+
+
+def test_regional_groups_contained_text_with_product_and_preserves_union():
+    product = np.zeros((80, 100), dtype=np.uint8)
+    product[20:70, 30:80] = 255
+    text = np.zeros_like(product)
+    text[35:43, 42:68] = 255
+    observations = [
+        {"id": "product", "target": "image", "role": "product", "mask_array": product},
+        {"id": "label", "target": "text", "role": "body", "mask_array": text},
+    ]
+    union = np.maximum(product, text)
+
+    regions = inpaint.build_inpaint_regions((100, 80), observations, union)
+
+    assert len(regions) == 1
+    assert set(regions[0]["ids"]) == {"product", "label"}
+    assert np.array_equal(regions[0]["mask"], union)
+
+
+def test_regional_does_not_bridge_nearby_unrelated_candidates():
+    left = np.zeros((80, 120), dtype=np.uint8); left[20:40, 10:45] = 255
+    right = np.zeros_like(left); right[20:40, 52:90] = 255  # seven-pixel gap
+    union = np.maximum(left, right)
+    observations = [
+        {"id": "headline", "target": "text", "role": "headline", "mask_array": left},
+        {"id": "product", "target": "image", "role": "product", "mask_array": right},
+    ]
+
+    regions = inpaint.build_inpaint_regions((120, 80), observations, union)
+
+    assert len(regions) == 2
+    rebuilt = np.zeros_like(union)
+    for region in regions:
+        rebuilt = np.maximum(rebuilt, region["mask"])
+    assert np.array_equal(rebuilt, union)
+
+
+def test_regional_flat_plate_uses_analytic_fill_and_keeps_exterior_exact(tmp_path):
+    from PIL import Image
+    source = np.full((96, 128, 3), (18, 24, 30), dtype=np.uint8)
+    source[35:60, 45:85] = (240, 30, 10)
+    mask = np.zeros((96, 128), dtype=np.uint8); mask[35:60, 45:85] = 255
+    Image.fromarray(source).save(tmp_path / "source.png")
+    cfg = {"inpaint": {"regional": {"enabled": True, "min_context": 12,
+                                      "max_context": 16, "min_crop": 64}}}
+
+    result = inpaint.inpaint_regional(
+        str(tmp_path / "source.png"),
+        [{"id": "badge", "target": "shape", "role": "badge", "mask_array": mask}],
+        mask, str(tmp_path / "out.png"), cfg,
+    )
+    output = np.asarray(Image.open(tmp_path / "out.png").convert("RGB"))
+
+    assert result["backend_counts"] == {"analytic-affine": 1}
+    assert np.array_equal(output[mask == 0], source[mask == 0])
+    assert np.max(np.abs(output[mask > 0].astype(int) - np.array([18, 24, 30]))) <= 1
+
+
+def test_regional_dominant_flat_plate_ignores_foreground_ring_contamination(tmp_path):
+    from PIL import Image
+    source = np.full((100, 120, 3), 245, dtype=np.uint8)
+    source[25:75, 40:80] = (90, 35, 15)
+    # Deliberately incomplete product mask leaves a contaminated strip in the ring.
+    mask = np.zeros((100, 120), dtype=np.uint8); mask[30:70, 45:75] = 255
+    Image.fromarray(source).save(tmp_path / "source.png")
+    cfg = {"inpaint": {"regional": {"enabled": True, "min_context": 16,
+        "max_context": 20, "min_crop": 64, "dominant_plate_fraction": 0.55}}}
+
+    result = inpaint.inpaint_regional(
+        str(tmp_path / "source.png"),
+        [{"id": "product", "target": "image", "role": "product", "mask_array": mask}],
+        mask, str(tmp_path / "out.png"), cfg,
+    )
+    record = result["regions"][0]
+
+    assert record["complexity"]["model"] == "dominant-flat-rgb"
+    assert record["route"] == "analytic-affine"
+
+
+def test_regional_flux_is_crop_local_aligned_and_single_pass(tmp_path, monkeypatch):
+    from PIL import Image
+    yy, xx = np.mgrid[0:123, 0:157]
+    source = np.stack([(xx * 11) % 255, (yy * 17) % 255, ((xx + yy) * 7) % 255], axis=-1).astype(np.uint8)
+    mask = np.zeros((123, 157), dtype=np.uint8); mask[42:73, 61:96] = 255
+    Image.fromarray(source).save(tmp_path / "source.png")
+    calls = []
+
+    def fake_single(rgb, inner_mask, cfg):
+        calls.append((rgb.shape, cfg["inpaint"]["mode"]))
+        return np.full_like(rgb, 7), "flux-comfy", {"backend_choice": "flux-comfy"}
+
+    monkeypatch.setattr(inpaint, "_inpaint_single_pass", fake_single)
+    cfg = {"inpaint": {"mode": "auto", "comfy": {"enabled": True}, "regional": {
+        "enabled": True, "min_context": 10, "max_context": 12, "min_crop": 64,
+        "flat_residual_p90": -1, "flat_gradient_p90": -1,
+        "flux_residual_p90": -1, "flux_gradient_p90": -1,
+        "flux_max_canvas_fraction": 0.10,
+    }}}
+
+    result = inpaint.inpaint_regional(
+        str(tmp_path / "source.png"),
+        [{"id": "photo-object", "target": "image", "role": "product", "mask_array": mask}],
+        mask, str(tmp_path / "out.png"), cfg,
+    )
+    output = np.asarray(Image.open(tmp_path / "out.png").convert("RGB"))
+
+    assert len(calls) == 1
+    assert calls[0][1] == "flux-comfy"
+    assert calls[0][0][0] % 16 == 0 and calls[0][0][1] % 16 == 0
+    assert result["regions"][0]["route"] == "flux-comfy"
+    assert np.array_equal(output[mask == 0], source[mask == 0])
+    assert np.all(output[mask > 0] == 7)
+
+
+def test_regional_large_complex_hole_routes_to_lama_not_flux(tmp_path, monkeypatch):
+    from PIL import Image
+    source = np.zeros((100, 100, 3), dtype=np.uint8)
+    source[:, ::2] = 255
+    mask = np.zeros((100, 100), dtype=np.uint8); mask[20:80, 20:80] = 255
+    Image.fromarray(source).save(tmp_path / "source.png")
+    calls = []
+
+    def fake_single(rgb, inner_mask, cfg):
+        calls.append(cfg["inpaint"]["mode"])
+        return np.full_like(rgb, 127), "big-lama", {"backend_choice": "big-lama"}
+
+    monkeypatch.setattr(inpaint, "_inpaint_single_pass", fake_single)
+    cfg = {"inpaint": {"mode": "auto", "comfy": {"enabled": True}, "regional": {
+        "enabled": True, "min_context": 4, "max_context": 8, "min_crop": 32,
+        "flat_residual_p90": -1, "flat_gradient_p90": -1,
+        "flux_residual_p90": -1, "flux_gradient_p90": -1,
+        "flux_max_canvas_fraction": 0.025,
+    }}}
+
+    result = inpaint.inpaint_regional(
+        str(tmp_path / "source.png"),
+        [{"id": "product", "target": "image", "role": "product", "mask_array": mask}],
+        mask, str(tmp_path / "out.png"), cfg,
+    )
+
+    assert calls == ["big-lama"]
+    assert result["backend_counts"] == {"big-lama": 1}

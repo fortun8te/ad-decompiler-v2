@@ -281,6 +281,40 @@ def test_detected_elements_dropped_before_reconstruction_are_hard_failure(tmp_pa
     assert any(item.get("action") == "rerun-detection" for item in repairs)
 
 
+def test_element_survival_follows_canonical_ids_and_provenance(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (80, 60), "white")
+    image.save(source)
+    image.save(render)
+    (tmp_path / "fused_elements.json").write_text(json.dumps([
+        {"id": "E000", "role": "logo"},
+        {"id": "E004", "role": "badge"},
+        {"id": "E013", "role": "icon"},
+    ]), encoding="utf-8")
+    (tmp_path / "reconstruction.json").write_text(json.dumps({
+        "candidates": [
+            # The reconstruction canonicalizes/prefixes ids.
+            {"id": "c_E004", "target": "image"},
+            # A renamed owner can still prove survival through explicit canonical provenance.
+            {"id": "owner-1", "target": "shape", "meta": {"provenance": {"observations": [
+                {"source": "fused_elements", "id": "E0"},
+                # A residual id with the same spelling is a different namespace.
+                {"source": "residual", "id": "E13"},
+            ]}}},
+        ],
+        "stats": {},
+    }), encoding="utf-8")
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    survival = result["structural"]["element_survival"]
+    assert survival == {
+        "proposed": 3, "kept": 2, "recall": 0.66667, "missing_ids": ["E013"]
+    }
+    assert "low-element-recall" in _rules(result)
+
+
 def test_single_background_without_removal_work_can_legitimately_match_source(tmp_path):
     source = tmp_path / "source.png"
     render = tmp_path / "render.png"

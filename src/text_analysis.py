@@ -709,14 +709,34 @@ def _line_advance(font, line: str, tracking: float) -> float:
     return width + tracking * max(0, len(line) - 1)
 
 
+def _glyph_height(font, lines: list[str], fallback: float) -> float:
+    """Visible glyph height, excluding the font's usually-large line gap.
+
+    OCR boxes describe painted ink, while ``getmetrics`` describes a line cell.  Fitting
+    the latter into an ink box over-shrinks type; growing the box to fit it caused the
+    opposite ad9 failure.  Pillow's glyph bounds are the closest deterministic proxy used
+    by both the design builder and preview renderer.
+    """
+    heights = []
+    for line in lines:
+        if not line:
+            continue
+        try:
+            bounds = font.getbbox(line)
+            heights.append(max(0.0, float(bounds[3] - bounds[1])))
+        except Exception:
+            pass
+    return max(heights, default=max(1.0, float(fallback)))
+
+
 def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
     """Return ``(box, auto_resize, style_patch)`` sized so ``text`` cannot clip.
 
-    ``auto_resize`` is a Figma hint: ``"WIDTH"`` for a single-line label (the box
-    grows horizontally from its alignment anchor), ``"HEIGHT"`` for a fixed-width
-    paragraph (fontSize/letterSpacing shrink to the width, height grows), or
-    ``"NONE"`` when measurement is unavailable.  ``style_patch`` carries any reduced
-    ``fontSize``/``letterSpacing`` for the paragraph case; it is empty otherwise.
+    The input box is painted source geometry, not a disposable layout suggestion.  Font
+    substitutions therefore shrink to that geometry instead of expanding it by hundreds
+    of pixels. ``auto_resize`` remains a Figma hint (``WIDTH`` for labels, ``HEIGHT`` for
+    paragraphs); ``style_patch`` carries the fitted size/tracking used by both preview and
+    Figma.
     """
     fitted = dict(box or {})
     text = str(text or "")
@@ -730,60 +750,66 @@ def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
     font = _fit_font(style, font_size)
     if font is None:
         return fitted, "NONE", {}
-    try:
-        ascent, descent = font.getmetrics()
-    except Exception:
-        ascent, descent = font_size * 0.8, font_size * 0.2
-    pad = max(2.0, font_size * 0.12)
-
-    widths = [_line_advance(font, line, tracking) for line in lines]
+    # Tracking larger than 12% of the em is almost always an OCR/font-substitution
+    # compensation artefact.  Scale it with the chosen font size rather than letting a
+    # fixed -4px value crush a much smaller fitted font.
+    tracking_limit = font_size * 0.12
+    bounded_tracking = max(-tracking_limit, min(tracking_limit, tracking))
+    widths = [_line_advance(font, line, bounded_tracking) for line in lines]
     content_w = max(widths + [0.0])
     line_count = max(1, len(lines))
-
-    if line_count <= 1:
-        # Auto-width label: grow the box from its alignment anchor to fit the run.
-        needed = content_w + 2.0 * pad
-        current_w = _num(fitted.get("w"))
-        if needed > current_w:
-            extra = needed - current_w
-            if align == "RIGHT":
-                fitted["x"] = round(_num(fitted.get("x")) - extra, 2)
-            elif align == "CENTER":
-                fitted["x"] = round(_num(fitted.get("x")) - extra / 2.0, 2)
-            fitted["w"] = round(needed, 2)
-        min_h = ascent + descent + 2.0 * pad
-        if min_h > _num(fitted.get("h")):
-            fitted["h"] = round(min_h, 2)
-        return fitted, "WIDTH", {}
-
-    # Fixed-width paragraph: shrink glyphs to the available width, then grow height.
     patch: dict = {}
-    avail = max(1.0, _num(fitted.get("w")) - 2.0 * pad)
-    if content_w > avail:
-        # Glyph width is very close to linear in point size, so scale directly and
-        # tighten letter spacing only for the small residual — keeps the paragraph
-        # readable rather than crushing it with tracking alone.
-        target_scale = max(0.5, avail / content_w)
+    avail_w = max(1.0, _num(fitted.get("w"), content_w or 1.0))
+    glyph_h = _glyph_height(font, lines, font_size)
+    content_h = (line_count - 1) * line_height + glyph_h
+    avail_h = max(1.0, _num(fitted.get("h"), content_h or 1.0))
+    width_scale = min(1.0, avail_w / max(1.0, content_w))
+    # Preserve measured inter-line spacing: only the glyph portion scales.  This keeps
+    # OCR-derived baselines stable while making substituted glyphs fit the painted box.
+    glyph_room = max(1.0, avail_h - (line_count - 1) * line_height)
+    height_scale = min(1.0, glyph_room / max(1.0, glyph_h))
+    target_scale = min(width_scale, height_scale)
+    fit_tracking = bounded_tracking
+    if target_scale < 0.999:
         new_size = max(1.0, font_size * target_scale)
-        fit_font = _fit_font(style, new_size) or font
-        current = max((_line_advance(fit_font, line, tracking) for line in lines), default=0.0)
-        fit_tracking = tracking
-        if current > avail:
-            longest = max((len(line) for line in lines), default=1)
-            fit_tracking = tracking - (current - avail) / max(1, longest - 1)
-        if new_size < font_size - 0.01:
-            patch["fontSize"] = round(new_size, 2)
-        if fit_tracking < tracking - 0.01:
-            patch["letterSpacing"] = round(fit_tracking, 3)
-        try:
-            ascent, descent = fit_font.getmetrics()
-        except Exception:
-            pass
+        fit_tracking = bounded_tracking * target_scale
+        patch["fontSize"] = round(new_size, 2)
+        patch["letterSpacing"] = round(fit_tracking, 3)
+    elif abs(bounded_tracking - tracking) > 0.001:
+        patch["letterSpacing"] = round(bounded_tracking, 3)
 
-    content_h = (line_count - 1) * line_height + ascent + descent + 2.0 * pad
-    if content_h > _num(fitted.get("h")):
-        fitted["h"] = round(content_h, 2)
-    return fitted, "HEIGHT", patch
+    # Rounding/font hinting can leave a small residual.  Correct it with bounded tracking,
+    # never by growing the source box.  This is deterministic and shared by both renderers.
+    effective_size = patch.get("fontSize", font_size)
+    fit_font = _fit_font({**style, **patch}, effective_size) or font
+    measured = [(_line_advance(fit_font, line, fit_tracking), line) for line in lines]
+    current, widest_line = max(measured, default=(0.0, ""), key=lambda item: item[0])
+    # Match the painted width when a modest tracking correction can do so. This prevents
+    # height fitting from leaving a substituted font visibly 15–20% too narrow, while the
+    # em-relative clamp rejects the extreme tracking that previously crushed ad9 copy.
+    source_width_is_tight = content_w >= avail_w * 0.72
+    if source_width_is_tight and abs(current - avail_w) > 0.25 and len(widest_line) > 1:
+        correction = (avail_w - current) / (len(widest_line) - 1)
+        floor, ceiling = -effective_size * 0.12, effective_size * 0.12
+        fit_tracking = max(floor, min(ceiling, fit_tracking + correction))
+        patch["letterSpacing"] = round(fit_tracking, 3)
+
+    # At very small sizes Pillow rounds to whole-pixel font sizes, so the linear estimate
+    # can still overshoot by a pixel.  A short bounded refinement keeps the contract exact
+    # without opening the box or resorting to extreme tracking.
+    for _ in range(4):
+        effective_size = patch.get("fontSize", font_size)
+        fit_tracking = patch.get("letterSpacing", bounded_tracking)
+        fit_font = _fit_font({**style, **patch}, effective_size) or font
+        current = max((_line_advance(fit_font, line, fit_tracking) for line in lines), default=0.0)
+        if current <= avail_w + 0.25:
+            break
+        ratio = max(0.5, min(0.99, avail_w / max(1.0, current)))
+        new_size = max(1.0, effective_size * ratio)
+        patch["fontSize"] = round(new_size, 2)
+        patch["letterSpacing"] = round(max(-new_size * 0.12, fit_tracking * ratio), 3)
+
+    return fitted, "WIDTH" if line_count <= 1 else "HEIGHT", patch
 
 
 def _fallback_font_candidates(weight: int, options: dict, top_k: int, italic: bool = False) -> list[dict]:

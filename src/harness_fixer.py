@@ -208,9 +208,30 @@ def fix_layout(cfg: dict | None = None) -> tuple[dict, list[str]]:
 
 
 def _issue_for_category(critic_output: dict, category: str) -> dict | None:
-    for issue in critic_output.get("issues") or []:
+    for issue in ((critic_output.get("issues") or []) +
+                  (critic_output.get("prioritized_issues") or [])):
         if str(issue.get("category") or "").lower() == category:
             return issue
+    return None
+
+
+def _handler_for_fix_id(fix_id: str) -> str | None:
+    """Accept both fixer aliases and the critic's ``stage:action[:target]`` ids."""
+    key = str(fix_id or "").strip()
+    handler = FIX_DISPATCH.get(key)
+    if handler:
+        return handler
+    stage = key.split(":", 1)[0].lower()
+    if stage in {"ocr"}:
+        return "fix_ocr_stack"
+    if stage in {"sam", "sam3", "element", "elements", "text", "text-analysis", "vlm"}:
+        return "fix_vlm_stack"
+    if stage in {"inpaint"}:
+        return "fix_inpaint"
+    if stage in {"layout"}:
+        return "fix_layout"
+    if stage in {"figma", "staging"}:
+        return "fix_staging"
     return None
 
 
@@ -224,7 +245,8 @@ def _collect_fix_ids(critic_output: dict) -> list[str]:
             seen.add(key)
             ordered.append(key)
 
-    for issue in critic_output.get("issues") or []:
+    for issue in ((critic_output.get("issues") or []) +
+                  (critic_output.get("prioritized_issues") or [])):
         for fix_id in issue.get("suggested_fix_ids") or []:
             add(fix_id)
     for fix_id in critic_output.get("suggested_fix_ids") or []:
@@ -244,7 +266,7 @@ def apply_fixer_round(
     fixes_applied: list[str] = []
 
     for fix_id in _collect_fix_ids(critic_output):
-        handler = FIX_DISPATCH.get(fix_id)
+        handler = _handler_for_fix_id(fix_id)
         if handler == "fix_staging":
             cfg, applied = fix_staging(run_dir, cfg)
         elif handler == "fix_ocr_stack":
@@ -273,7 +295,7 @@ def apply_fixer_round(
 def repair_for_fix(fix_id: str, issue: dict | None = None) -> dict | None:
     """Map a fixer id to a harness-actionable repair record."""
     issue = issue or {}
-    handler = FIX_DISPATCH.get(fix_id)
+    handler = _handler_for_fix_id(fix_id)
     if handler == "fix_staging":
         return {"stage": "figma", "action": "restage-inbox", "reason": "figma inbox missing or stale"}
     if handler == "fix_ocr_stack":

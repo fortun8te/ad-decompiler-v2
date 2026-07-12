@@ -831,6 +831,11 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         # A full-canvas raster is the plate itself. Everything else is removed from the plate.
         is_background = bool(c.get("meta", {}).get("role") == "background" or area_frac > 0.92)
         observation = {
+            "id": c.get("id"),
+            "target": c.get("target"),
+            "role": (c.get("meta") or {}).get("role"),
+            "parent_id": (c.get("meta") or {}).get("parent_id"),
+            "meta": c.get("meta") or {},
             "box": box,
             "mask_array": masks.get(c.get("id")),
             "is_background": is_background,
@@ -847,20 +852,26 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     mask_path = os.path.join(run_dir, "removal_mask.png")
     Image.fromarray(union).save(mask_path)
     background_path = os.path.join(run_dir, "background_clean.png")
-    text_union = inpaint.build_union_mask(
-        (w, h), text_removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg), cfg=cfg,
-    )
-    large_union = inpaint.build_union_mask(
-        (w, h), large_removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg), cfg=cfg,
-    )
-    if np.any(text_union) and np.any(large_union):
-        large_union = cv2.bitwise_and(large_union, cv2.bitwise_not(text_union))
-    if text_removal and large_removal:
-        inpaint_result = inpaint.inpaint_role_aware(
-            image_path, {"text": text_union, "large": large_union}, background_path, cfg,
+    regional_enabled = bool(((cfg.get("inpaint") or {}).get("regional") or {}).get("enabled", False))
+    if regional_enabled:
+        inpaint_result = inpaint.inpaint_regional(
+            image_path, removal, union, background_path, cfg, run_dir,
         )
     else:
-        inpaint_result = inpaint.inpaint_once(image_path, union, background_path, cfg)
+        text_union = inpaint.build_union_mask(
+            (w, h), text_removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg), cfg=cfg,
+        )
+        large_union = inpaint.build_union_mask(
+            (w, h), large_removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg), cfg=cfg,
+        )
+        if np.any(text_union) and np.any(large_union):
+            large_union = cv2.bitwise_and(large_union, cv2.bitwise_not(text_union))
+        if text_removal and large_removal:
+            inpaint_result = inpaint.inpaint_role_aware(
+                image_path, {"text": text_union, "large": large_union}, background_path, cfg,
+            )
+        else:
+            inpaint_result = inpaint.inpaint_once(image_path, union, background_path, cfg)
 
     # Visual ownership map plus a machine-readable legend.
     ownership_path = os.path.join(run_dir, "ownership.png")

@@ -12,27 +12,26 @@ def _max_line_advance(text, style):
     return max((_line_advance(font, line, tracking) for line in text.split("\n")), default=0.0)
 
 
-def test_single_line_label_grows_width_from_left_anchor():
+def test_single_line_label_fits_painted_width_without_expanding_geometry():
     text = "The quick brown fox jumps over"
     style = {"fontSize": 40, "align": "LEFT", "letterSpacing": 0}
     box = {"x": 100.0, "y": 50.0, "w": 40.0, "h": 44.0}
     fitted, auto, patch = fit_text_box(text, style, box)
     assert auto == "WIDTH"
-    assert patch == {}
-    assert fitted["x"] == 100.0                       # left anchor stays put
-    assert fitted["w"] >= _max_line_advance(text, style)  # nothing clips
-    assert fitted["w"] > box["w"]
+    assert fitted == box                              # painted target stays authoritative
+    fitted_style = {**style, **patch}
+    assert patch["fontSize"] < style["fontSize"]
+    assert _max_line_advance(text, fitted_style) <= box["w"] + 1.0
 
 
-def test_single_line_right_aligned_label_grows_leftward():
+def test_single_line_right_aligned_label_keeps_source_anchor_and_box():
     text = "121K weergaven"
     style = {"fontSize": 36, "align": "RIGHT", "letterSpacing": 0}
     box = {"x": 900.0, "y": 50.0, "w": 40.0, "h": 40.0}
-    fitted, auto, _ = fit_text_box(text, style, box)
+    fitted, auto, patch = fit_text_box(text, style, box)
     assert auto == "WIDTH"
-    # The right edge is the anchor for right-aligned text, so it must not move.
-    assert round(fitted["x"] + fitted["w"], 1) == round(box["x"] + box["w"], 1)
-    assert fitted["x"] < box["x"]
+    assert fitted == box
+    assert patch["fontSize"] < style["fontSize"]
 
 
 def test_label_that_already_fits_is_left_unchanged():
@@ -52,10 +51,23 @@ def test_paragraph_shrinks_to_fit_width_and_grows_height():
     assert auto == "HEIGHT"
     assert fitted["w"] == 300.0                        # fixed-width paragraph
     assert patch.get("fontSize", style["fontSize"]) < style["fontSize"]
-    assert fitted["h"] > box["h"]                      # grew to hold both lines
+    assert fitted["h"] == box["h"]                     # target geometry stays fixed
     # After applying the patch, every line fits inside the box width.
     shrunk = {**style, **patch}
     assert _max_line_advance(text, shrunk) <= box["w"] + 1.0
+
+
+def test_ad9_like_line_stays_close_to_painted_geometry_without_pathological_tracking():
+    text = "De Vakantiegeldsale komt eraan, waarbij je 20%"
+    style = {"fontSize": 50, "align": "LEFT", "letterSpacing": -4.0, "lineHeight": 58}
+    box = {"x": 46.4, "y": 416.6, "w": 835.3, "h": 36.9}
+    fitted, auto, patch = fit_text_box(text, style, box)
+    fitted_style = {**style, **patch}
+    assert auto == "WIDTH"
+    assert fitted == box
+    assert fitted_style["fontSize"] < 50
+    assert abs(fitted_style["letterSpacing"]) <= fitted_style["fontSize"] * 0.12 + 0.01
+    assert _max_line_advance(text, fitted_style) <= box["w"] + 1.0
 
 
 def test_build_design_json_emits_autoresize_hint(tmp_path):

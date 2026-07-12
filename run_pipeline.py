@@ -461,7 +461,16 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             ren_ocr = None
             if cfg.get("qa_ocr", True):
                 try:
-                    ren_ocr = ocr.run_ocr(qa_render, cfg, run_dir=run_dir)
+                    # QA OCR is an observation of the rendered output, not a new source
+                    # observation.  Do not let run_ocr's default artifact writer replace
+                    # the canonical source-derived ocr.json used by resumed stages.
+                    ren_ocr = ocr.run_ocr(qa_render, cfg, run_dir="")
+                    ren_ocr["provenance"] = {
+                        "kind": "render-qa",
+                        "render_path": os.path.abspath(qa_render),
+                        "source_ocr_path": os.path.abspath(A("ocr.json")),
+                    }
+                    dump(ren_ocr, A("render_ocr.json"))
                 except Exception as exc:
                     # Pixel/structural judges remain useful when render OCR is down. Keep
                     # text_recall unknown and make that loss of evidence explicit.
