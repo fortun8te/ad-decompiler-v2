@@ -21,6 +21,8 @@ if (-not $SkipDoctor) {
 
 $bridgeProcess = $null
 if (-not $NoBridge) {
+  & $Python "$((Get-Location).Path)\scripts\stamp_plugin_build.py" --quiet
+  & $Python -m src.bridge_bootstrap --config config.yaml --inbox "$HOME\figma-inbox" | Out-Null
   Write-Host "Starting the local Figma bridge on http://localhost:8790..."
   $bridgeProcess = Start-Process -FilePath $Python -ArgumentList @(
     "-m", "src.figma_bridge", "--inbox", "$HOME\figma-inbox", "--port", "8790"

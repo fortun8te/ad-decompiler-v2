@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import threading
 import time
@@ -29,6 +30,7 @@ def test_bridge_serves_staged_run_and_persists_plugin_report(tmp_path):
     try:
         health = json.loads(urlopen(base + "/health", timeout=2).read())
         assert health["ok"] is True and health["has_run"] is True
+        assert health.get("supports_process") is True
         design = json.loads(urlopen(base + "/design.json", timeout=2).read())
         assert design["id"] == "demo"
         report = {"version": 1, "doc_id": "demo", "report": {"ok": True, "assets": {"missing": 0}}}
@@ -154,6 +156,71 @@ def _poll_job(base, job_id, timeout=5):
     raise TimeoutError(f"job {job_id} did not finish in {timeout}s")
 
 
+def test_plugin_log_endpoint_appends_text_and_json(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    manifest = {"run_dir": str(run_dir), "doc_id": "demo"}
+    (inbox / "inbox.json").write_text(encoding="utf-8", data=json.dumps(manifest))
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        events = [
+            {"at": "2026-07-12T00:00:00Z", "level": "info", "title": "Upload started", "detail": "ad.png"},
+            {"at": "2026-07-12T00:00:05Z", "level": "warn", "title": "Font substituted", "detail": "A → B"},
+        ]
+        request = Request(base + "/log", data=json.dumps({"events": events}).encode(), method="POST",
+                          headers={"Content-Type": "application/json"})
+        assert json.loads(urlopen(request, timeout=2).read())["ok"] is True
+        inbox_log = (inbox / "plugin.log").read_text(encoding="utf-8")
+        assert "Upload started" in inbox_log and "Font substituted" in inbox_log
+        assert json.loads((inbox / "plugin_events.json").read_text(encoding="utf-8"))[0]["title"] == "Upload started"
+        assert (run_dir / "plugin.log").exists()
+        assert json.loads((run_dir / "plugin_events.json").read_text(encoding="utf-8"))[1]["level"] == "warn"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_health_includes_bridge_and_plugin_client_build(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "plugin_client.json").write_text(
+        json.dumps({"label": "v2.0.0+b5.abc", "build": 5, "seen_at": "2026-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        health = json.loads(urlopen(base + "/health", timeout=2).read())
+        assert health["plugin_client"]["build"] == 5
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_log_endpoint_records_plugin_build_client(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        payload = {
+            "events": [{"at": "2026-07-12T00:00:00Z", "level": "info", "title": "Plugin started", "detail": "v2+b1"}],
+            "plugin_build": {"version": "2.0.0", "build": 7, "commit": "abc", "label": "v2.0.0+b7.abc"},
+        }
+        request = Request(base + "/log", data=json.dumps(payload).encode(), method="POST",
+                          headers={"Content-Type": "application/json"})
+        assert json.loads(urlopen(request, timeout=2).read())["ok"] is True
+        client = json.loads((inbox / "plugin_client.json").read_text(encoding="utf-8"))
+        assert client["build"] == 7
+        assert client["seen_at"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_process_uploads_runs_pipeline_and_stages_inbox(tmp_path, monkeypatch):
     calls = _install_fake_run_pipeline(monkeypatch)
     inbox = tmp_path / "inbox"
@@ -193,7 +260,7 @@ def test_process_uploads_runs_pipeline_and_stages_inbox(tmp_path, monkeypatch):
         server.server_close()
 
 
-def test_process_rejects_a_second_upload_while_one_is_running(tmp_path, monkeypatch):
+def test_process_rejects_concurrent_uploads(tmp_path, monkeypatch):
     _install_fake_run_pipeline(monkeypatch, sleep_s=0.3)
     inbox = tmp_path / "inbox"
     inbox.mkdir()
@@ -234,6 +301,39 @@ def test_process_reports_pipeline_failure_without_crashing_the_bridge(tmp_path, 
         # the bridge itself must still be serving other routes after a failed job.
         health = json.loads(urlopen(base + "/health", timeout=2).read())
         assert health["ok"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_process_failed_job_includes_error_detail(tmp_path, monkeypatch):
+    calls = []
+
+    def run_one(image_path, run_dir, cfg):
+        calls.append(run_dir)
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, "pipeline.log"), "w", encoding="utf-8") as fh:
+            fh.write("ocr[1] starting\n")
+        raise RuntimeError("CUDA out of memory")
+
+    fake = types.ModuleType("run_pipeline")
+    fake.run_one = run_one
+    monkeypatch.setitem(sys.modules, "run_pipeline", fake)
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), None))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        request = Request(base + "/process?filename=broken.jpg", data=b"z", method="POST")
+        queued = json.loads(urlopen(request, timeout=2).read())
+        status = _poll_job(base, queued["job_id"])
+        assert status["status"] == "failed"
+        assert "CUDA out of memory" in status["error"]
+        assert status.get("error_detail")
+        assert status.get("failed_stage") == "ocr"
+        assert "traceback" not in status
     finally:
         server.shutdown()
         server.server_close()

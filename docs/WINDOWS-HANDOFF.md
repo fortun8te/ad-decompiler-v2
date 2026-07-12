@@ -6,7 +6,11 @@ Do not call the rebuild successful until a representative batch passes the bench
 
 ## Setup
 
-Fast path: double-click `start_rtx.bat`, or run:
+**Bridge only (1 click):** double-click `Start Bridge.bat`. It bootstraps `config.yaml` +
+`~/figma-inbox` and starts `http://localhost:8790`. Import `figma-plugin/manifest.json` in
+Figma Desktop once.
+
+**Full GPU setup + benchmark:**
 
 ```powershell
 .\setup_rtx.ps1

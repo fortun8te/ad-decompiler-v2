@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+execFileSync("python3", ["scripts/stamp_plugin_build.py", "--quiet"], { cwd: repoRoot });
 
 let nextId = 1;
 
@@ -700,6 +706,16 @@ assert.deepEqual(manifest.networkAccess.devAllowedDomains, ["http://localhost:87
 assert.ok(manifest.networkAccess.devAllowedDomains.every((d) => !/^https?:\/\/(127\.0\.0\.1|100\.)/.test(d)),
   "no IP-literal hosts (Figma's manifest validator rejects them, and IPs aren't trustworthy for HTTPS)");
 assert.ok(fs.existsSync("figma-plugin/icon.svg"), "plugin icon asset exists");
+assert.equal(manifest.icon, "icon.png", "manifest.json routes the plugin icon");
+assert.ok(fs.existsSync(`figma-plugin/${manifest.icon}`), "manifest icon file exists beside manifest.json");
+assert.equal(typeof manifest.build, "number", "manifest.json carries an automatic build number");
+assert.ok(manifest.label, "manifest.json carries a human-readable build label");
+assert.ok(fs.existsSync("figma-plugin/build-info.json"), "build-info.json exists");
+const buildInfo = JSON.parse(fs.readFileSync("figma-plugin/build-info.json", "utf8"));
+assert.equal(buildInfo.build, manifest.build, "manifest build matches build-info.json");
+assert.ok(code.includes("const PLUGIN_BUILD = "), "code.js embeds PLUGIN_BUILD");
+assert.ok(html.includes("const PLUGIN_BUILD = "), "ui.html embeds PLUGIN_BUILD");
+assert.ok(html.includes('id="buildBadge"'), "ui.html shows build badge");
 
 {
   const cleanBaseMatch = script[1].match(/function cleanBase\(\)[\s\S]*?\n {4}\}/);

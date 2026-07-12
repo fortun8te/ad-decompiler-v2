@@ -4,11 +4,24 @@
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
-  "editorType": ["figma"],
+  "icon": "icon.png",
+  "editorType": [
+    "figma"
+  ],
   "documentAccess": "dynamic-page",
   "networkAccess": {
-    "allowedDomains": ["none"],
-    "devAllowedDomains": ["http://localhost:8790", "https://*.ts.net"],
+    "allowedDomains": [
+      "none"
+    ],
+    "devAllowedDomains": [
+      "http://localhost:8790",
+      "https://*.ts.net"
+    ],
     "reasoning": "Loads a local reconstruction run and its assets, then sends the finished Figma preview back to the QA bridge. Same-machine dev uses http://localhost:8790 (loopback is a Secure-Context exemption, so plain HTTP is allowed). Cross-machine (e.g. Figma Desktop on a Mac, bridge on a headless RTX box) must use HTTPS: Figma's plugin UI runs over HTTPS and Chromium's mixed-content rule blocks HTTPS->HTTP fetches to any non-loopback host, so the bridge is fronted by `tailscale serve` which provides a real cert for the *.ts.net MagicDNS name. IP-literal hosts (127.0.0.1, 100.x) are rejected by Figma's manifest validator and are not trustworthy for HTTPS, so the *.ts.net hostname must be used."
-  }
+  },
+  "version": "2.0.0",
+  "build": 12,
+  "commit": "4f7dd0c",
+  "built_at": "2026-07-12T00:28:30Z",
+  "label": "v2.0.0+b12.4f7dd0c-dirty"
 }

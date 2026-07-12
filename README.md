@@ -102,7 +102,22 @@ lower-quality fallback.
 
 ## Figma
 
+**One click (Windows):** double-click `Start Bridge.bat` in the repo folder.
+
+**Mac:** double-click `start_bridge.command`, or run `./start_bridge.sh`.
+
+The launcher creates `config.yaml` (from the example), enables plugin staging, creates the
+inbox folder, stamps the plugin build number, and starts the bridge. No doctor check — just
+bridge-ready.
+
+**Build numbers:** `Start Bridge.bat` / `start_bridge.sh` auto-stamp the plugin as
+`v{VERSION}+b{git-commit-count}.{sha}` (see the badge in the plugin header). The bridge
+records the last seen plugin build at `GET /health` → `plugin_client` and in
+`~/figma-inbox/plugin_client.json`.
+
 ```bash
+./start_bridge.sh
+# or manually:
 python3 -m src.figma_bridge --inbox ~/figma-inbox --port 8790
 ```
 
