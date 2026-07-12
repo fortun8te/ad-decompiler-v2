@@ -13,9 +13,9 @@ def test_one_click_launcher_runs_complete_setup_and_tracks_it():
     setup = _read("setup_rtx.ps1")
 
     assert "setup_rtx.ps1\" -SkipDoctor" in launcher
-    assert ".rtx-setup-v3" in launcher
+    assert ".rtx-setup-v4" in launcher
     assert "[switch]$SkipDoctor" in setup
-    assert ".rtx-setup-v3" in setup
+    assert ".rtx-setup-v4" in setup
 
 
 def test_optional_ocr_backends_cannot_break_core_gpu_install():

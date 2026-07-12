@@ -420,10 +420,11 @@ def check_binaries(cfg=None):
     except Exception:
         contour = False
     try:
-        import resvg  # noqa: F401
-        resvg_ok = True
+        import resvg_py  # noqa: F401
+        resvg_path = "python:resvg_py"
     except Exception:
-        resvg_ok = False
+        resvg_cli = shutil.which("resvg")
+        resvg_path = resvg_cli or None
     return {
         "vtracer": {
             "ok": bool(vtracer or python_vtracer),
@@ -432,7 +433,11 @@ def check_binaries(cfg=None):
         "potrace": {"ok": bool(potrace), "path": potrace or "not on PATH (brew/choco install potrace)"},
         "contour": {"ok": contour, "path": "opencv-python" if contour else "not installed (pip install opencv-python)"},
         "cairosvg": {"ok": gate, "path": "installed" if gate else "pip install cairosvg (quality gate)"},
-        "resvg": {"ok": resvg_ok, "path": "installed" if resvg_ok else "not installed (pip install resvg)"},
+        # The legacy `resvg` Python package exposes a native usvg.Tree. That tree is
+        # thread-affine and recent builds fail with "tree is unsendable" when render()
+        # moves work internally. resvg_py deliberately accepts SVG text and returns
+        # PNG bytes in one call, so no native object crosses a thread/process boundary.
+        "resvg": {"ok": bool(resvg_path), "path": resvg_path or "not installed (pip install resvg_py)"},
     }
 
 
@@ -731,6 +736,46 @@ def _count_colors(png_path):
         return 100000
 
 
+def _render_resvg_bytes(svg_text, width, height):
+    """Render without ever exporting a native resvg/usvg tree from its owner thread.
+
+    Prefer resvg_py's single-call API. A standalone CLI is the isolation fallback: it
+    exchanges only files/bytes with a child process. The legacy Python Tree API is
+    intentionally not called because its objects are not safely sendable.
+    """
+    try:
+        import resvg_py
+        data = resvg_py.svg_to_bytes(
+            svg_string=svg_text,
+            width=int(width),
+            height=int(height),
+        )
+        return bytes(data), "resvg_py"
+    except Exception as safe_error:
+        executable = shutil.which("resvg")
+        if not executable:
+            return None, f"resvg_py unavailable/failed: {safe_error}"
+        svg_path = tempfile.NamedTemporaryFile(suffix=".svg", delete=False).name
+        png_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
+        try:
+            with open(svg_path, "w", encoding="utf-8") as handle:
+                handle.write(svg_text)
+            subprocess.run(
+                [executable, "--width", str(int(width)), "--height", str(int(height)), svg_path, png_path],
+                check=True, capture_output=True, timeout=30,
+            )
+            with open(png_path, "rb") as handle:
+                return handle.read(), "resvg-cli"
+        except Exception as cli_error:
+            return None, f"resvg_py failed: {safe_error}; resvg CLI failed: {cli_error}"
+        finally:
+            for path in (svg_path, png_path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
 def _score_render(svg_text, png_path):
     """Rasterize the trace and score both silhouette and colour fidelity."""
     np = _require_np()
@@ -753,20 +798,11 @@ def _score_render(svg_text, png_path):
         ras = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
     except Exception:
         try:
-            import resvg
-            tree = resvg.usvg.Tree.from_str(svg_text, resvg.usvg.Options.default())
-            # resvg's Python binding otherwise returns a fully transparent surface
-            # for an SVG without an explicit background.  A transparent background
-            # is still required for the alpha silhouette, so clear it explicitly.
-            png_bytes = resvg.render(
-                # resvg follows affine's flattened order (a, c, e, b, d, f).
-                # A one-pixel translation avoids its origin-edge clipping bug;
-                # crop that padding back off below.
-                tree, (1.0, 0.0, 1.0, 0.0, 1.0, 1.0),
-                bg_size=(w + 2, h + 2), bg_color=(0, 0, 0, 0),
-            )
+            png_bytes, _renderer = _render_resvg_bytes(svg_text, w, h)
+            if not png_bytes:
+                raise RuntimeError(_renderer)
             import io
-            ras = Image.open(io.BytesIO(png_bytes)).convert("RGBA").crop((1, 1, w + 1, h + 1))
+            ras = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
         except Exception:
             return 0.0  # no rasterizer -> caller treats as ungated (score 0 -> not ok)
     ras_arr = np.asarray(ras.resize((w, h))).astype(np.float32)

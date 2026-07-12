@@ -71,7 +71,7 @@ def test_propagates_printed_role_to_blocks(tmp_path, monkeypatch):
     assert out["blocks"][0]["meta"]["scene_text_role"] == "printed_on_product"
 
 
-def test_merge_drops_vlm_printed_on_product_without_geometry(tmp_path):
+def test_merge_keeps_uncorroborated_vlm_printed_label_editable(tmp_path):
     ocr = {
         "lines": [{
             "id": "L0", "text": "50ml", "conf": 0.9,
@@ -81,8 +81,20 @@ def test_merge_drops_vlm_printed_on_product_without_geometry(tmp_path):
     }
     cands = merge_layers.merge(ocr, [], [], {"w": 600, "h": 600}, {})
     text = next(c for c in cands if c["id"] == "c_L0")
+    assert text["target"] == "text"
+    assert text["meta"].get("scene_text_uncorroborated") is True
+
+
+def test_merge_drops_printed_label_when_product_geometry_corroborates_it(tmp_path):
+    ocr = {"lines": [{"id": "L0", "text": "50ml", "conf": .9,
+            "box": {"x": 40, "y": 30, "w": 80, "h": 24},
+            "meta": {"scene_text_role": "printed_on_product"}}]}
+    elements = [{"id": "E0", "box": {"x": 20, "y": 10, "w": 150, "h": 100},
+                 "kind": "photo-fragment", "role": "product"}]
+    text = next(c for c in merge_layers.merge(ocr, elements, [], {"w": 600, "h": 600}, {})
+                if c["id"] == "c_L0")
     assert text["target"] == "drop"
-    assert text["meta"].get("kept_in_photo") is True
+    assert text["meta"]["scene_text_corroborated"] is True
 
 
 def test_merge_respects_overlay_copy_over_geometry(tmp_path):

@@ -8,11 +8,21 @@ def test_printed_on_product_text_is_scene_owned_and_dropped():
     out = routing.route(
         {"id": "L0", "text": "ORIGINAL", "kind": "text",
          "box": {"x": 10, "y": 10, "w": 100, "h": 20},
-         "meta": {"scene_text_role": "printed_on_product"}},
+         "meta": {"scene_text_role": "printed_on_product", "scene_text_corroborated": True}},
         CANVAS,
     )
     assert out["target"] == "drop"
     assert out["meta"]["kept_in_photo"] is True
+
+
+def test_uncorroborated_vlm_scene_label_cannot_delete_ocr_text():
+    out = routing.route(
+        {"id": "L0", "text": "SHOP NOW", "kind": "text",
+         "box": {"x": 10, "y": 10, "w": 100, "h": 20},
+         "meta": {"scene_text_role": "printed_on_product"}},
+        CANVAS,
+    )
+    assert out["target"] == "text"
 
 
 def test_overlay_copy_remains_native_text():

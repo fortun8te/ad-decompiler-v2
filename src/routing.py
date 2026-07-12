@@ -82,7 +82,8 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
         # scene text printed on a product/photo → never a layer
         if (
             meta.get("origin") == "scene"
-            or meta.get("scene_text_role") == "printed_on_product"
+            or (meta.get("scene_text_role") == "printed_on_product"
+                and meta.get("scene_text_corroborated") is True)
             or c.get("kept_in_photo")
         ):
             c["target"] = "drop"; meta["kept_in_photo"] = True

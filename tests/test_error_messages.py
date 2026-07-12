@@ -70,6 +70,22 @@ def test_classify_processing_error_docker():
     assert "Start Bridge.bat" in out["error_hint"]
 
 
+def test_layout_container_repair_is_not_misclassified_as_docker():
+    out = classify_processing_error(
+        error="QA did not pass after layout tighten-containers repair",
+        failed_stage="acceptance",
+        agent_debug=[{
+            "location": "harness_fixer.py:fix_layout",
+            "message": "tighten container inference",
+            "data": {"engine": "tighten-containers"},
+        }],
+    )
+
+    assert out["error_code"] == "pipeline_failed"
+    assert out["user_title"] == "Stopped during acceptance"
+    assert "tighten-containers" in out["user_detail"]
+
+
 def test_classify_processing_error_dependency_missing():
     out = classify_processing_error(error="ModuleNotFoundError: No module named 'paddleocr'")
     assert out["error_code"] == "dependency_missing"

@@ -1752,7 +1752,8 @@
       if (code === "windows_encoding" || /charmap|codec can't encode|UnicodeEncodeError/i.test(blob)) {
         return "Windows encoding issue. Always use Start Bridge.bat (sets UTF-8). Manual start: run $env:PYTHONUTF8=1 in PowerShell first.";
       }
-      if (code === "docker_not_supported" || (/docker|container/i.test(blob) && !/ModuleNotFoundError/i.test(blob))) {
+      const actualContainerError = /\bdocker(?:file)?\b|docker daemon|\bcontainerd\b|\/\.dockerenv|(?:inside|within|running in|started in) (?:an? )?(?:docker )?container\b|unsupported container (?:runtime|setup)/i.test(blob);
+      if (code === "docker_not_supported" || (actualContainerError && !/ModuleNotFoundError/i.test(blob))) {
         return "Run the bridge directly on your Windows GPU PC with Start Bridge.bat — not inside Docker.";
       }
       if (code === "cudnn_unavailable" || /cudnn|CUDNN/i.test(blob)) {

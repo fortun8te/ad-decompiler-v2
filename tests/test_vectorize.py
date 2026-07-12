@@ -98,9 +98,9 @@ def test_check_backends_reports_trace_and_gate_health(monkeypatch):
 
 
 def test_check_binaries_reports_resvg(monkeypatch):
-    monkeypatch.setitem(sys.modules, "resvg", types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "resvg_py", types.SimpleNamespace())
     status = vectorize.check_binaries({})
-    assert status["resvg"] == {"ok": True, "path": "installed"}
+    assert status["resvg"] == {"ok": True, "path": "python:resvg_py"}
 
 
 def test_score_render_falls_back_to_resvg(tmp_path, monkeypatch):
@@ -108,35 +108,59 @@ def test_score_render_falls_back_to_resvg(tmp_path, monkeypatch):
     Image.new("RGBA", (10, 10), (255, 0, 0, 255)).save(source)
     calls = []
 
-    class FakeTree:
-        @staticmethod
-        def from_str(svg, opts):
-            calls.append(("tree", svg, opts))
-            return object()
-
-    def render(tree, transform, bg_size, bg_color):
-        calls.append(("render", transform, bg_size, bg_color))
-        padded = Image.new("RGBA", (12, 12), (255, 0, 0, 255))
+    def render(**kwargs):
+        calls.append(kwargs)
+        padded = Image.new("RGBA", (kwargs["width"], kwargs["height"]), (255, 0, 0, 255))
         buf = __import__("io").BytesIO()
         padded.save(buf, format="PNG")
         return buf.getvalue()
 
-    fake_resvg = types.SimpleNamespace(
-        usvg=types.SimpleNamespace(
-            Tree=FakeTree,
-            Options=types.SimpleNamespace(default=lambda: object()),
-        ),
-        render=render,
-    )
+    fake_resvg = types.SimpleNamespace(svg_to_bytes=render)
     monkeypatch.setitem(sys.modules, "cairosvg", None)
-    monkeypatch.setitem(sys.modules, "resvg", fake_resvg)
+    monkeypatch.setitem(sys.modules, "resvg_py", fake_resvg)
 
     score = vectorize._score_render(
         '<svg width="10" height="10"><rect width="10" height="10" fill="red"/></svg>',
         str(source),
     )
     assert score == 1.0
-    assert calls[1] == ("render", (1.0, 0.0, 1.0, 0.0, 1.0, 1.0), (12, 12), (0, 0, 0, 0))
+    assert calls == [{
+        "svg_string": '<svg width="10" height="10"><rect width="10" height="10" fill="red"/></svg>',
+        "width": 10,
+        "height": 10,
+    }]
+
+
+def test_resvg_safe_api_is_thread_safe_and_legacy_tree_is_never_used(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    source = tmp_path / "source.png"
+    Image.new("RGBA", (8, 8), (10, 20, 30, 255)).save(source)
+    calls = []
+
+    def safe_render(**kwargs):
+        calls.append((type(kwargs["svg_string"]).__name__, kwargs["width"], kwargs["height"]))
+        buf = __import__("io").BytesIO()
+        Image.new("RGBA", (8, 8), (10, 20, 30, 255)).save(buf, format="PNG")
+        return buf.getvalue()
+
+    class UnsendableTree:
+        @staticmethod
+        def from_str(*_args):
+            raise RuntimeError("tree is unsendable")
+
+    monkeypatch.setitem(sys.modules, "cairosvg", None)
+    monkeypatch.setitem(sys.modules, "resvg_py", types.SimpleNamespace(svg_to_bytes=safe_render))
+    monkeypatch.setitem(sys.modules, "resvg", types.SimpleNamespace(
+        usvg=types.SimpleNamespace(Tree=UnsendableTree),
+        render=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("must not run")),
+    ))
+    svg = '<svg width="8" height="8"><rect width="8" height="8" fill="#0a141e"/></svg>'
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        scores = list(pool.map(lambda _: vectorize._score_render(svg, str(source)), range(12)))
+
+    assert scores == [1.0] * 12
+    assert calls == [("str", 8, 8)] * 12
 
 
 def test_resolve_binary_finds_repo_bin_windows_executable(tmp_path, monkeypatch):

@@ -312,6 +312,31 @@ def _artifact_fingerprint(path: str) -> str | None:
         return None
 
 
+def _qa_progress(before: dict, after: dict) -> tuple[bool, dict]:
+    """Return meaningful metric progress, not merely a rewritten qa.json."""
+    before, after = before or {}, after or {}
+    deltas = {}
+    tolerances = {
+        "ssim": 0.005, "visual_score": 0.005, "text_recall": 0.01,
+        "editable_text_recall": 0.01, "edge_f1": 0.005,
+        "color_similarity": 0.005,
+    }
+    improved = _qa_accepts(after, allow_summary=True)
+    for key, minimum in tolerances.items():
+        old, new = before.get(key), after.get(key)
+        if isinstance(new, (int, float)):
+            delta = None if not isinstance(old, (int, float)) else float(new) - float(old)
+            deltas[key] = None if delta is None else round(delta, 6)
+            if old is None or delta >= minimum:
+                improved = True
+    before_fails = before.get("hard_fails") or []
+    after_fails = after.get("hard_fails") or []
+    deltas["hard_fails"] = len(after_fails) - len(before_fails)
+    if len(after_fails) < len(before_fails):
+        improved = True
+    return bool(improved), deltas
+
+
 def _invoke_run_one(run_one: Callable[..., dict], input_path: str, run_dir: str,
                     cfg: dict, resume: str) -> dict:
     """Support production and lightweight runners while preserving the resume stage."""
@@ -563,6 +588,7 @@ def execute_repairs(
         iter_cfg.setdefault("runtime", {})["auto_repair"] = False
 
         qa_path = os.path.join(run_dir, "qa.json")
+        qa_before = copy.deepcopy(qa)
         before_qa_fingerprint = _artifact_fingerprint(qa_path)
         try:
             result = _invoke_run_one(run_one, input_path, run_dir, iter_cfg, resume)
@@ -578,6 +604,7 @@ def execute_repairs(
             after_qa_fingerprint is not None
             and after_qa_fingerprint != before_qa_fingerprint
         )
+        qa_improved, metric_deltas = _qa_progress(qa_before, qa) if qa_fresh else (False, {})
         attempt = {
             "iteration": iteration,
             "resume": resume,
@@ -591,6 +618,8 @@ def execute_repairs(
             "pipeline_ok": bool(result.get("ok")),
             "pipeline_error": pipeline_error,
             "qa_fresh": qa_fresh,
+            "qa_improved": qa_improved,
+            "metric_deltas": metric_deltas,
             "qa_ok": qa_fresh and _qa_accepts(qa, allow_summary=True),
         }
         attempts.append(attempt)
@@ -598,8 +627,7 @@ def execute_repairs(
 
         # A failed stage or a run that produced no new QA cannot prove progress.
         # Exhaust that exact tactic and let the next repair act as the fallback.
-        has_alternative = any(_repair_id(item) != _repair_id(choice) for item in repairs)
-        if not result.get("ok") or (not qa_fresh and has_alternative):
+        if not result.get("ok") or not qa_fresh or not qa_improved:
             exhausted.add((choice.get("stage"), choice.get("action"), choice.get("target_id")))
 
         if qa_fresh and _qa_accepts(qa, allow_summary=True):

@@ -25,6 +25,7 @@ text/style, or src(alpha png)+mask, or source_crop, plus meta{source,role,confid
 from __future__ import annotations
 import importlib
 import os
+import copy
 from typing import Optional
 
 
@@ -119,9 +120,11 @@ def _text_sources(ocr):
     styles = {style.get("id"): style for style in (ocr.get("styles") or [])}
     lines = {line.get("id"): line for line in (ocr.get("lines") or [])}
     out = []
+    represented_line_ids = set()
     for raw in blocks:
         block = dict(raw)
         members = [lines[line_id] for line_id in block.get("line_ids", []) if line_id in lines]
+        represented_line_ids.update(line.get("id") for line in members if line.get("id"))
         style_id = block.get("style_id")
         block_style = dict(block.get("style") or styles.get(style_id) or
                            (members[0].get("style") if members else {}) or {})
@@ -150,6 +153,11 @@ def _text_sources(ocr):
                              if members else float(block.get("rotation", 0)))
         block["repeated_style_id"] = style_id
         out.append(block)
+    # A partial/malformed block list must never delete otherwise valid OCR observations.
+    # This happened in a live run where OCR saw text but only the surviving blocks reached
+    # merge/design, producing text_recall=0. Preserve every orphan as its own text node.
+    out.extend(copy.deepcopy(line) for line_id, line in lines.items()
+               if line_id and line_id not in represented_line_ids)
     return out
 
 
@@ -262,10 +270,20 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     for c in text_cands:
         scene_text_role = c["meta"].get("scene_text_role")
         if scene_text_role == "printed_on_product":
-            c["kept_in_photo"] = True
-            c["meta"]["origin"] = "scene"
-            c["meta"]["role"] = "scene-text"
-            continue
+            # A VLM crop classification is advisory. It can easily see a product near
+            # overlay copy and label every word "printed". Only bake/drop text when a
+            # separately detected product/package region geometrically corroborates it.
+            corroborated = any(_inside_frac(c["box"], region) >= photo_inside
+                               for region in scene_regions)
+            if corroborated:
+                c["kept_in_photo"] = True
+                c["meta"]["origin"] = "scene"
+                c["meta"]["role"] = "scene-text"
+                c["meta"]["scene_text_corroborated"] = True
+                continue
+            c["meta"]["scene_text_uncorroborated"] = True
+            c["meta"]["overlay_text"] = True
+            c["meta"]["removal_required"] = True
         if scene_text_role == "wordmark":
             c["meta"]["wordmark"] = True
             c["meta"]["role"] = "logo"

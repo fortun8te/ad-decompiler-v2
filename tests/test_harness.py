@@ -94,11 +94,11 @@ def test_execute_repairs_reruns_mapped_stage_until_qa_ok(tmp_path):
 
     summary = harness.execute_repairs(str(run_dir), {}, max_iterations=3, run_one=fake_run_one)
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert calls[0]["start_from"] == "ocr"
     assert calls[0]["cfg"]["ocr"]["retry_2x"]["enabled"] is True
-    assert summary["stopped"] == "qa_ok"
-    assert summary["qa_ok"] is True
+    assert summary["stopped"] == "all_repairs_failed"
+    assert summary["qa_ok"] is False
     assert (run_dir / "harness.json").exists()
 
 
@@ -121,9 +121,9 @@ def test_execute_repairs_respects_max_iterations(tmp_path):
 
     summary = harness.execute_repairs(str(run_dir), {}, max_iterations=2, run_one=fake_run_one)
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert all(stage == "qwen" for stage in calls)
-    assert summary["stopped"] == "max_iterations"
+    assert summary["stopped"] == "all_repairs_failed"
     assert summary["qa_ok"] is False
 
 
@@ -269,8 +269,8 @@ def test_execute_repairs_reads_max_rounds_from_config(tmp_path):
     cfg = {"runtime": {"harness": {"max_rounds": 2}}}
     summary = harness.execute_repairs(str(run_dir), cfg, run_one=fake_run_one)
 
-    assert len(calls) == 2
-    assert summary["stopped"] == "max_iterations"
+    assert len(calls) == 1
+    assert summary["stopped"] == "all_repairs_failed"
 
 
 def test_execute_repairs_tries_alternative_after_pipeline_exception(tmp_path):
@@ -326,6 +326,35 @@ def test_execute_repairs_tries_alternative_when_runner_leaves_stale_qa(tmp_path)
     assert calls == ["ocr", "qwen"]
     assert summary["qa_ok"] is True
     assert summary["attempts"][0]["qa_fresh"] is False
+
+
+def test_execute_repairs_switches_tactic_when_metrics_stagnate(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    (run_dir / "runtime_report.json").write_text(json.dumps({"input": str(input_path)}))
+    base_qa = {"ok": False, "ssim": 0.48, "visual_score": 0.50, "text_recall": 0.0,
+               "hard_fails": [{"rule": "local-ssim", "detail": "low"}]}
+    (run_dir / "qa.json").write_text(json.dumps(base_qa))
+    (run_dir / "repairs.json").write_text(json.dumps([
+        {"stage": "ocr", "action": "rerun", "severity": "high"},
+        {"stage": "vlm", "action": "boost-stack", "severity": "medium", "params": {"focus": "text"}},
+    ]))
+    calls = []
+
+    def runner(path, rd, cfg, start_from="normalize"):
+        calls.append(start_from)
+        rewritten = dict(base_qa)
+        rewritten["attempt_marker"] = len(calls)  # fresh file, identical quality
+        (run_dir / "qa.json").write_text(json.dumps(rewritten))
+        return {"ok": True}
+
+    summary = harness.execute_repairs(str(run_dir), {}, max_iterations=3, run_one=runner)
+    assert calls == ["ocr", "text"]
+    assert summary["qa_ok"] is False
+    assert summary["stopped"] == "all_repairs_failed"
+    assert all(attempt["qa_improved"] is False for attempt in summary["attempts"])
 
 
 def test_execute_repairs_supports_three_argument_runner(tmp_path):

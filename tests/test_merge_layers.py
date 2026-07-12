@@ -137,6 +137,21 @@ def test_paragraph_block_preserves_wrapping_alignment_line_height_and_baselines(
     assert candidate["meta"]["baseline_last"]["y0"] == 60
 
 
+def test_partial_block_list_cannot_delete_orphan_ocr_lines():
+    lines = [
+        {"id": "L0", "text": "Headline", "conf": .99,
+         "box": {"x": 20, "y": 20, "w": 120, "h": 30}},
+        {"id": "L1", "text": "SHOP NOW", "conf": .98,
+         "box": {"x": 20, "y": 100, "w": 110, "h": 24}, "role": "cta"},
+    ]
+    blocks = [{"id": "B0", "line_ids": ["L0"], "text": "Headline",
+               "box": dict(lines[0]["box"]), "painted_box": dict(lines[0]["box"]),
+               "role": "headline", "meta": {}}]
+    merged = merge_layers.merge({"lines": lines, "blocks": blocks}, [], [], CANVAS, {})
+    texts = {candidate.get("text") for candidate in merged}
+    assert {"Headline", "SHOP NOW"} <= texts
+
+
 def test_low_fidelity_block_meta_survives_the_block_path_into_the_candidate():
     """Regression for the block-path fidelity drop: production OCR always carries a
     non-empty "blocks" array (text_analysis._make_blocks emits >=1 block per line), so

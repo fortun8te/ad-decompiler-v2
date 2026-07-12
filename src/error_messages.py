@@ -51,7 +51,15 @@ _OCR_BLOB = re.compile(
 _CUDNN_BLOB = re.compile(r"cudnn|CUDNN", re.I)
 _CUDA_BLOB = re.compile(r"cuda|CUDA|torch\.cuda|out of memory", re.I)
 _CHARMAP_BLOB = re.compile(r"charmap|codec can't encode|UnicodeEncodeError", re.I)
-_DOCKER_BLOB = re.compile(r"docker|container", re.I)
+# Container is also ordinary layout vocabulary in this project (for example the
+# ``tighten-containers`` repair). Only classify an environment problem when the text
+# contains a real container-runtime signature.
+_DOCKER_BLOB = re.compile(
+    r"\bdocker(?:file)?\b|docker daemon|\bcontainerd\b|/\.dockerenv|"
+    r"(?:inside|within|running in|started in) (?:an? )?(?:docker )?container\b|"
+    r"unsupported container (?:runtime|setup)",
+    re.I,
+)
 _MISSING_DEP_BLOB = re.compile(r"ModuleNotFoundError|No module named", re.I)
 
 

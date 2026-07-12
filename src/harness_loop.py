@@ -29,6 +29,7 @@ def _invoke_run_one(run_one: Callable[..., dict], image_path: str, run_dir: str,
 
 from src.harness import (
     _flag,
+    _qa_progress,
     _qa_accepts,
     execute_repairs,
     harness_enabled,
@@ -89,6 +90,8 @@ def _qa_summary(qa: dict) -> dict:
         "ok": _flag(qa.get("ok")),
         "ssim": qa.get("ssim"),
         "text_recall": qa.get("text_recall"),
+        "visual_score": qa.get("visual_score"),
+        "edge_f1": qa.get("edge_f1"),
         "hard_fails": len(qa.get("hard_fails") or []),
         "repairs": len(qa.get("repairs") or []),
     }
@@ -187,6 +190,7 @@ def _run_round(
 ) -> tuple[dict, dict, bool]:
     """Execute one harness round. Returns (round_record, updated_cfg, should_stop)."""
     round_record: dict[str, Any] = {"round": round_num}
+    qa_before_repairs = _load_json(os.path.join(run_dir, "qa.json"), {})
 
     if not skip_pipeline:
         loop_cfg = _cfg_for_pipeline(working_cfg)
@@ -226,6 +230,7 @@ def _run_round(
             round_record["stopped"] = "qa_ok"
             return round_record, working_cfg, True
 
+    qa_before_repairs = _load_json(os.path.join(run_dir, "qa.json"), {})
     repair_cfg = _cfg_for_pipeline(working_cfg)
     try:
         repair_summary = execute_repairs_fn(
@@ -240,6 +245,11 @@ def _run_round(
         }
     round_record["repairs"] = repair_summary
     qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+    repair_improved, repair_deltas = _qa_progress(qa_before_repairs, qa)
+    round_record["repair_progress"] = {
+        "improved": repair_improved,
+        "metric_deltas": repair_deltas,
+    }
     round_record["qa_after_repairs"] = _qa_summary(qa)
     if _qa_accepts(qa, allow_summary=True):
         round_record["stopped"] = "qa_ok_after_repairs"
@@ -269,9 +279,11 @@ def _run_round(
     round_record["next_resume"] = _resume_after_fixer(run_dir, patched_cfg, critic_output)
 
     no_progress = (
-        repair_summary.get("stopped") == "no_actionable_repairs"
-        and not (fixer_result.get("fixes") or [])
-    )
+        repair_summary.get("stopped") in {
+            "no_actionable_repairs", "all_repairs_failed", "missing_input",
+        }
+        or not repair_improved
+    ) and not (fixer_result.get("fixes") or [])
     if no_progress:
         round_record["stopped"] = "no_progress"
         return round_record, patched_cfg, True

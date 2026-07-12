@@ -61,7 +61,7 @@ if (-not (Test-Path "config.yaml")) {
 }
 
 # Lets the one-click launcher distinguish a complete RTX setup from an old bridge-only venv.
-New-Item -ItemType File -Force -Path ".venv\.rtx-setup-v3" | Out-Null
+New-Item -ItemType File -Force -Path ".venv\.rtx-setup-v4" | Out-Null
 
 if (-not $SkipDoctor) {
   Write-Host ""

@@ -107,6 +107,15 @@ def test_repair_unclean_background_from_design_root_without_hard_fail():
     assert ("inpaint", "rebuild-clean-plate") in _actions(repairs)
 
 
+def test_near_zero_text_recall_has_vlm_alternative_after_ocr():
+    repairs = repair.assess({}, {
+        "text_recall": 0.0, "ssim": 0.48, "visual_score": 0.5,
+        "hard_fails": [], "per_layer": [],
+    }, {"lines": []}, {})
+    assert ("ocr", "rerun") in _actions(repairs)
+    assert ("vlm", "boost-stack") in _actions(repairs)
+
+
 def test_repair_per_layer_element_recall_targets_sam3(tmp_path):
     repairs = repair.assess(
         {},

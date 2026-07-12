@@ -177,10 +177,23 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
                 "stage": "ocr",
                 "action": "rerun",
                 "reason": f"text_recall {text_recall:.2f} < {t['text_recall_min']}",
-                "params": {"upscale": True, "challengers": ["surya"]},
+                # Keep the repair in-process. Surya is intentionally not part of the RTX
+                # install and an external agent previously interpreted it as a Docker job.
+                "params": {"upscale": True, "use_configured_ocr": True,
+                           "vlm_ocr_judge": True},
                 "severity": "high" if text_recall < 0.6 else "medium",
             }
         )
+        if text_recall < 0.25:
+            out.append(
+                {
+                    "stage": "vlm",
+                    "action": "boost-stack",
+                    "reason": f"near-zero text recall {text_recall:.2f}; use scene-text alternative",
+                    "params": {"focus": "text"},
+                    "severity": "medium",
+                }
+            )
 
     editable_text_recall = qa.get("editable_text_recall")
     if editable_text_recall is None:

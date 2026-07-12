@@ -14,7 +14,7 @@ $env:PYTHONIOENCODING = "utf-8"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -Path $Root
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
-$SetupStamp = Join-Path $Root ".venv\.rtx-setup-v3"
+$SetupStamp = Join-Path $Root ".venv\.rtx-setup-v4"
 $BridgeHost = "127.0.0.1"
 
 function Ensure-Venv {

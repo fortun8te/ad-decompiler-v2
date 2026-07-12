@@ -32,8 +32,7 @@ python-pptx>=0.6          # imported by the layered pipeline's PSD/layer export 
 
 # ── vectorize rasterization gate ──
 cairosvg>=2.7             # rasterize traced SVG for the fidelity check
-resvg>=0.2.0              # prebuilt Windows fallback when native Cairo is unavailable
-affine>=2.4                # transform helper used by the resvg Python binding
+resvg_py>=0.3.3            # safe one-call Windows fallback; never shares native Tree objects
 # The official Python VTracer binding is the primary color-vector backend and avoids a
 # separate Windows binary install. The CLI remains supported when present.
 vtracer>=0.6.11
