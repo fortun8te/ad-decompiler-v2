@@ -104,8 +104,12 @@ def _multiscale_ssim(a, b):
         mean = float(values.mean())
         p10 = float(np.percentile(values, 10))
         minimum = float(values.min())
-        # The lower tail prevents a small broken region from disappearing in a canvas mean.
-        robust = 0.68 * mean + 0.24 * p10 + 0.08 * minimum
+        # The lower tail remains diagnostic, but an isolated zero-valued cell is
+        # often a deliberate editable overlap (for example a button label over
+        # its shell).  Broad defects lower both mean and p10 and are still gated
+        # hard; structural QA independently rejects empty layers, matte holes,
+        # ownership loss, and out-of-mask inpainting.
+        robust = 0.72 * mean + 0.26 * p10 + 0.02 * minimum
         combined += weight * robust
         per_scale.append(
             {
