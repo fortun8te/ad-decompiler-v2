@@ -327,6 +327,9 @@ def _candidate_element_lineage(candidate):
     values = [candidate.get("id")]
     meta = candidate.get("meta") or {}
     values.extend((meta.get("source_id"), meta.get("canonical_id"), meta.get("element_id")))
+    # NMS/dedup retains the winning candidate but records canonical ids it
+    # absorbed.  They are survived observations, not dropped elements.
+    values.extend(meta.get("merged_observations") or [])
 
     provenance = meta.get("provenance") or {}
     if isinstance(provenance, list):

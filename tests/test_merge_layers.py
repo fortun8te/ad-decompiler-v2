@@ -107,6 +107,17 @@ def test_unlabelled_overlay_text_receives_a_semantic_figma_role():
     assert layer["meta"]["role"] == "cta"
 
 
+def test_vlm_failure_does_not_flatten_explicit_cta_or_headline():
+    ocr = {"lines": [{"id": "L", "text": "SHOP NOW", "conf": .99,
+                      "role": "cta", "box": {"x": 40, "y": 400, "w": 180, "h": 35},
+                      "meta": {"ownership_decision": {"placement": "artifact", "owner": "none",
+                                                          "action": "raster_keep", "confidence": 0,
+                                                          "reason": "vlm_disagreement"}}}]}
+    layer = _by_id(merge_layers.merge(ocr, [], [], CANVAS, {}))["c_L"]
+    assert layer["target"] == "text"
+    assert layer["meta"]["ownership_recovery"] == "explicit-overlay-role-after-vlm-failure"
+
+
 def test_shape_that_is_pure_text_box_is_deduped():
     """A 'shape' element whose box is essentially an OCR text box is dropped in
     favor of the editable text candidate."""

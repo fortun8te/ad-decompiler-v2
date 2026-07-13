@@ -44,7 +44,7 @@ def test_ambiguous_font_match_uses_exact_raster_fallback_by_default():
         "id": "L11", "text": "Display headline",
         "box": {"x": 120, "y": 120, "w": 620, "h": 100},
         "style": {"confidence": 0.96},
-        "meta": {"origin": "overlay", "fidelity_confidence": 0.80},
+        "meta": {"origin": "overlay", "fidelity_confidence": 0.70},
     }
     result = routing.route(c, CANVAS)
     assert result["target"] == "image"

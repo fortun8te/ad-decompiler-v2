@@ -312,9 +312,16 @@ def _judge_uncertain(
         brandish = want_brand and _looks_like_brand_token(text)
         if low_conf or brandish:
             candidates.append((line, brandish))
-    # Spend the bounded budget on brand/wordmark tokens first (the target of this pass),
-    # then the least-confident remaining lines.
-    candidates.sort(key=lambda pair: (0 if pair[1] else 1, float(pair[0].get("conf", 1.0) or 0.0)))
+    # Spend the bounded budget on brand/wordmark tokens first, then prominent
+    # marketing copy.  A large headline with one bad leading glyph is much more
+    # damaging than a tiny low-confidence ingredient line, especially when the
+    # result will be rebuilt as editable text.
+    def _priority(pair):
+        line, brandish = pair
+        box = line.get("box") or {}
+        visual_area = float(box.get("w", 0) or 0) * float(box.get("h", 0) or 0)
+        return (0 if brandish else 1, -visual_area, float(line.get("conf", 1.0) or 0.0))
+    candidates.sort(key=_priority)
     candidates = candidates[: options["proofread_max_regions"]]
 
     checked = corrected = errors = 0

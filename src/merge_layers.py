@@ -243,6 +243,14 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     text_cands = [_text_candidate(l) for l in ocr_lines]
     for source, candidate in zip(ocr_lines, text_cands):
         meta = candidate["meta"]
+        # OCR commonly reads a single typographic em dash as two separated ASCII
+        # hyphens.  Normalise that unambiguous separator before font fitting so a
+        # CTA remains both readable and editable instead of inheriting a visible
+        # double-hyphen artefact.
+        text_value = str(candidate.get("text") or "")
+        if "- -" in text_value:
+            candidate["text"] = text_value.replace("- -", "—")
+            meta["ocr_normalized"] = "double-hyphen-to-emdash"
         if str(meta.get("role") or "").lower() in {"", "text", "body"}:
             meta["role"] = semantic_text_role(source, canvas)
         meta.setdefault("semantic_role", meta["role"])
@@ -312,6 +320,27 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                 "semantic_role": "platform-logo",
                 "ownership_enforced": True,
                 "preserve_underlay": True,
+            })
+            continue
+        # A failed/disagreeing VLM response deliberately becomes raster_keep so it
+        # can never cause destructive inpainting by itself.  But that uncertainty
+        # must not flatten an otherwise clear high-confidence CTA/headline: OCR
+        # hierarchy already proves it is intentional overlay copy.  Promote only
+        # explicit overlay roles, never generic body/product text.
+        ownership_failed_closed = (
+            ownership_action == "raster_keep"
+            and str(ownership.get("reason") or "") in {
+                "vlm_disagreement", "vlm_error", "vlm_parse_error",
+            }
+            and float(ownership.get("confidence") or 0) <= 0.01
+            and str(c["meta"].get("role") or "").lower() in overlay_text_roles
+        )
+        if ownership_failed_closed:
+            c["meta"].update({
+                "overlay_text": True,
+                "removal_required": True,
+                "ownership_enforced": True,
+                "ownership_recovery": "explicit-overlay-role-after-vlm-failure",
             })
             continue
         if ownership_action != "recreate" and ownership:

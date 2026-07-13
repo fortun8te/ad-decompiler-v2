@@ -29,11 +29,10 @@ PRIMITIVE_SHAPE_ROLES = ("badge", "chip", "button", "divider", "card")
 # reproduced as editable text (glyph too hard to isolate, or the closest font/effect
 # match is a poor fit) — it is routed to a masked-pixel fallback layer instead of
 # emitting a guessed rendering. Overridable via cfg["routing"]["min_text_fidelity"].
-# Local glyph matching scores below the mid-0.80s are often only a plausible
-# category match (sans/serif/bold), not a faithful typeface match.  At that
-# point exact masked pixels are a safer Figma layer than confidently rendering
-# the wrong font.  Callers can still lower this for editability-first jobs.
-MIN_TEXT_FIDELITY = 0.85
+# Scores in the low 0.70s are generally still a solid local glyph match; below
+# that we preserve exact pixels.  A higher cutoff made normal, proofread overlay
+# copy disappear into raster fallbacks, defeating the editable Figma contract.
+MIN_TEXT_FIDELITY = 0.75
 
 # Roles whose rasterized cutout should be delivered as an IMAGE clipped by a swappable
 # shape mask (see _image_mask). The raster is the swappable fill; the mask is the shape.

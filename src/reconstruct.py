@@ -55,6 +55,28 @@ def _source_priority(candidate):
     return 0
 
 
+def _verified_semantic_mask(meta: dict) -> bool:
+    """Whether an alpha matte has independent high-confidence SAM evidence.
+
+    Residual connected components often cut holes through water, paper texture, or white
+    lettering.  Conversely a product matte confirmed by SAM can legitimately contain the
+    counters of a logo/wordmark.  Preserve that distinction for both asset selection and
+    structural QA; an arbitrary alpha PNG must *not* gain this exemption.
+    """
+    provenance = (meta or {}).get("provenance") or {}
+    # Some fused/Qwen observations carry a provenance list rather than the
+    # element-fusion mapping. It is valid diagnostic data, but not independent
+    # SAM-mask evidence.
+    observations = provenance.get("observations") if isinstance(provenance, dict) else []
+    observations = observations if isinstance(observations, list) else []
+    for observation in observations:
+        if (str(observation.get("source") or "").lower() == "sam3"
+                and str(observation.get("mask_quality") or "").lower() == "mask"
+                and float(observation.get("score") or 0) >= .70):
+            return True
+    return False
+
+
 def _is_background_plate(candidate, width, height):
     box = candidate.get("box") or {}
     area_frac = box.get("w", 0) * box.get("h", 0) / max(1, width * height)
@@ -258,6 +280,21 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
         edge_margin = max(3.0, min(canvas_w, canvas_h) * .012)
         edge_count = sum((x0 <= edge_margin, y0 <= edge_margin,
                           x1 >= canvas_w - edge_margin, y1 >= canvas_h - edge_margin))
+        # A low-confidence residual-only photo fragment is texture/debris, not an
+        # independently editable image.  Exporting it creates tiny alpha islands (and
+        # sometimes holes) over a still-present scene plate.  Keep it in the plate until
+        # SAM supplies a real semantic matte.  This is intentionally limited to full-size
+        # ads; small unit fixtures and explicitly verified/promoted assets remain intact.
+        residual_only = not _verified_semantic_mask(meta)
+        if (min(canvas_w, canvas_h) >= 400 and target == "image"
+                and role in {"photo", "image", "photo-fragment"}
+                and confidence < .45 and residual_only
+                and not (meta.get("promote_element") or meta.get("editable_element"))):
+            c["target"] = "drop"
+            meta["keep_in_background"] = True
+            meta["suppression_reason"] = "low-confidence-residual-photo-fragment"
+            out.append(c)
+            continue
         # A huge person/photo joined to multiple canvas edges is part of the
         # continuous lifestyle scene.  Cutting it out creates an enormous Flux
         # hole and a less-editable result than retaining the scene root.
@@ -1007,12 +1044,23 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         # matte hole.
         if np.any((mask > 0) & (owned == 0)):
             c["meta"]["ownership_cutout"] = True
+        # A SAM-confirmed semantic matte may have intentional enclosed negative space
+        # (the counter of a product/logo mark).  It is a valid Figma alpha-masked crop,
+        # unlike residual-only fragments, which are filtered above.  QA still rejects
+        # generic product mattes with holes, so this cannot hide an unverified mask bug.
+        if _verified_semantic_mask(c["meta"]):
+            c["meta"]["ownership_cutout"] = True
+            c["meta"]["mask_provenance"] = "sam3-verified"
         # A lower-priority fallback that owns no pixels would export an empty
         # Figma image layer.  It is already faithfully present in its retained
         # owner, so drop it instead of producing a misleading layer.
         substitution = c["meta"].get("substitution") if isinstance(c["meta"].get("substitution"), dict) else {}
         is_text_fallback = bool(c["meta"].get("fallback") and substitution.get("from") == "text")
-        if not np.any(owned) and is_text_fallback:
+        role = str(c["meta"].get("role") or "").lower()
+        # Do retain broad photo frames for the layout regression contract, but
+        # never export an empty semantic cutout (product/person/icon) merely
+        # because a frontmost owner already claims all of its pixels.
+        if not np.any(owned) and (is_text_fallback or role not in {"photo", "image"}):
             c["target"] = "drop"
             c["meta"]["keep_in_background"] = True
             c["meta"]["suppression_reason"] = "fully-contained-in-foreground-owner"
@@ -1086,8 +1134,16 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                          if candidate_mask is not None else 0.0)
         if c.get("target") == "text":
             ownership_decision = (c.get("meta") or {}).get("ownership_decision")
+            text_meta = c.get("meta") or {}
+            semantic_role = str(text_meta.get("semantic_role") or text_meta.get("role") or "").lower()
+            # The VLM is a conservative ownership judge, not a prerequisite for
+            # an explicitly detected marketing overlay/CTA.  A timeout or
+            # disagreement must not erase the editable CTA inside a native
+            # button while leaving an otherwise correct ad as a raster plate.
+            explicit_overlay = bool(text_meta.get("overlay_text") or text_meta.get("removal_required"))
+            safe_marketing_copy = semantic_role in {"cta", "headline", "eyebrow", "offer"}
             rejection_reason = None
-            if scene_vlm_required and not ownership_decision:
+            if scene_vlm_required and not ownership_decision and not (explicit_overlay or safe_marketing_copy):
                 rejection_reason = "missing-ownership-decision"
             elif ownership_decision and ownership_decision.get("action") != "recreate":
                 rejection_reason = "ownership-does-not-allow-recreate"

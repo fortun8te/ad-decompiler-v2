@@ -194,6 +194,28 @@ def test_photo_heavy_preset_flattens_unverified_fragments_but_keeps_text():
     assert by_id["exact-text"]["target"] == "image"
 
 
+def test_low_confidence_residual_photo_fragment_stays_in_large_scene_plate():
+    candidates = [{
+        "id": "water-speck", "target": "image", "box": {"x": 80, "y": 50, "w": 120, "h": 60},
+        "meta": {"role": "photo", "confidence": .38,
+                 "provenance": {"observations": [{"source": "residual", "score": .38}]}},
+    }]
+    result, _ = reconstruct._flatten_photo_scene(candidates, {"canvas": {"w": 1080, "h": 1080}})
+    assert result[0]["target"] == "drop"
+    assert result[0]["meta"]["suppression_reason"] == "low-confidence-residual-photo-fragment"
+
+
+def test_sam_verified_product_matte_is_retained_even_when_small():
+    candidates = [{
+        "id": "tube", "target": "image", "box": {"x": 80, "y": 50, "w": 120, "h": 300},
+        "meta": {"role": "photo", "confidence": .38, "provenance": {"observations": [
+            {"source": "sam3", "mask_quality": "mask", "score": .91, "role": "product"},
+        ]}},
+    }]
+    result, _ = reconstruct._flatten_photo_scene(candidates, {"canvas": {"w": 1080, "h": 1920}})
+    assert result[0]["target"] == "image"
+
+
 def test_scene_vlm_mode_never_inpaints_text_without_ownership(tmp_path):
     source = tmp_path / "source.png"
     _source(source)
@@ -608,3 +630,7 @@ def test_soft_product_alpha_is_solidified_before_inpaint(tmp_path):
 
     assert set(np.unique(removal)).issubset({0, 255})
     assert removal[40, 40] == 255
+
+
+def test_list_provenance_is_not_treated_as_verified_sam_evidence():
+    assert reconstruct._verified_semantic_mask({"provenance": []}) is False

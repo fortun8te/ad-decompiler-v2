@@ -25,7 +25,7 @@ PRESETS: dict[str, dict[str, Any]] = {
                  "single_line_auto_resize": "WIDTH", "preserve_timestamp_group": True},
         "grouping": {"photo_frame": True, "header_cluster": True},
         "thresholds": {"text_recall_min": 0.90, "editable_text_recall_min": 0.86,
-                       "min_text_fidelity": 0.85},
+                       "min_text_fidelity": 0.75},
     },
     "caption_over_photo": {
         "photo_regions": {"retain_as_single_image": True, "suppress_descendants": True,
@@ -34,7 +34,7 @@ PRESETS: dict[str, dict[str, Any]] = {
                  "single_line_auto_resize": "WIDTH"},
         "grouping": {"pair_text_with_backplate": True, "preserve_line_backplates": True},
         "thresholds": {"text_recall_min": 0.92, "editable_text_recall_min": 0.88,
-                       "min_text_fidelity": 0.85},
+                       "min_text_fidelity": 0.75},
     },
     "comparison_grid": {
         "photo_regions": {"retain_as_single_image": True, "suppress_descendants": True,
@@ -43,7 +43,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "grouping": {"preserve_columns": True, "prevent_cross_column_blocks": True,
                      "preserve_aligned_rows": True, "pair_text_with_backplate": True},
         "thresholds": {"text_recall_min": 0.93, "editable_text_recall_min": 0.88,
-                       "min_text_fidelity": 0.85},
+                       "min_text_fidelity": 0.75},
     },
     "lifestyle_overlay": {
         "photo_regions": {"retain_as_single_image": True, "suppress_descendants": True,
@@ -52,7 +52,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "grouping": {"preserve_callout_leaders": True, "pair_text_with_backplate": True,
                      "circular_insets_use_ellipse_mask": True},
         "thresholds": {"text_recall_min": 0.90, "editable_text_recall_min": 0.85,
-                       "min_text_fidelity": 0.85},
+                       "min_text_fidelity": 0.75},
     },
     "product_on_flat": {
         "photo_regions": {"retain_product_cluster": True, "suppress_product_microtext": True,
@@ -60,7 +60,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "text": {"editable_ui_copy": True, "wordmarks": "artwork"},
         "grouping": {"pair_text_with_backplate": True, "rating_strip_atomic_fallback": True},
         "thresholds": {"text_recall_min": 0.90, "editable_text_recall_min": 0.84,
-                       "min_text_fidelity": 0.85},
+                       "min_text_fidelity": 0.75},
     },
 }
 
