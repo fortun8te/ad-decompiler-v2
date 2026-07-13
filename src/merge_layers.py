@@ -27,6 +27,7 @@ import importlib
 import os
 import copy
 from typing import Optional
+from .wordmark import is_platform_lockup, semantic_text_role
 
 
 def _load_routing():
@@ -88,9 +89,14 @@ def _text_candidate(line):
     meta = dict(line.get("meta") or {})
     if line.get("baseline"):
         meta["baseline"] = dict(line["baseline"])
+    declared_role = line.get("role") or meta.get("role")
+    # OCR normally labels every observation merely "text". Replace only that
+    # placeholder with a semantic role so Figma layers are easy to work with.
+    if not declared_role or str(declared_role).strip().lower() in {"text", "body"}:
+        declared_role = meta.get("semantic_role") or "text"
     meta.update({
         "source": "ocr",
-        "role": line.get("role") or meta.get("role") or "text",
+        "role": declared_role,
         "confidence": round(float(line.get("conf", meta.get("confidence", 1.0))), 4),
         "ocr_id": line["id"],
         "line_ids": line.get("line_ids") or [line["id"]],
@@ -134,6 +140,15 @@ def _text_sources(ocr):
                         "fontStyleCandidates", "confidence"):
                 if key in representative:
                     block_style.setdefault(key, representative[key])
+            # Font judging runs after block construction and updates OCR lines. Carry
+            # its promoted winner into the actual downstream block instead of leaving
+            # the stale pre-judge family on the editable Figma node.
+            judged_member = next((line for line in members if line.get("vlm_font_judged")), None)
+            if judged_member:
+                judged_style = judged_member.get("style") or {}
+                for key in ("fontFamily", "fontStyle", "fontWeight", "fontCandidates"):
+                    if key in judged_style:
+                        block_style[key] = copy.deepcopy(judged_style[key])
         # Blocks are the actual downstream text nodes. Preserve paragraph facts on the
         # block itself rather than relying on the first OCR line's one-line style.
         block_style.setdefault("align", block.get("alignment") or
@@ -197,6 +212,16 @@ def _element_candidate(el):
 # ── public API ───────────────────────────────────────────────────────────────────────
 def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None):
     cfg = cfg or {}
+    # Ownership aggregation is cheap and deterministic. Recompute it at the merge
+    # boundary so a routing-policy refinement can resume from merge without paying for
+    # every VLM call again.
+    if isinstance(ocr, dict) and ocr.get("lines") and ocr.get("blocks"):
+        ocr = copy.deepcopy(ocr)
+        try:
+            from src.vlm_scene_text import _propagate_to_blocks
+            _propagate_to_blocks(ocr["lines"], ocr["blocks"])
+        except Exception:
+            pass
     route, real = _load_routing()
     if run_dir is None:
         run_dir = cfg.get("run_dir")
@@ -216,6 +241,11 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     qwen = qwen or []
 
     text_cands = [_text_candidate(l) for l in ocr_lines]
+    for source, candidate in zip(ocr_lines, text_cands):
+        meta = candidate["meta"]
+        if str(meta.get("role") or "").lower() in {"", "text", "body"}:
+            meta["role"] = semantic_text_role(source, canvas)
+        meta.setdefault("semantic_role", meta["role"])
     elem_cands = [_element_candidate(e) for e in elements]
 
     # ── qwen z-order + alpha: match each qwen layer to overlapping candidates ──────────
@@ -268,6 +298,33 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     # scene text: OCR line inside a photo region -> keep baked in the base.
     # VLM scene_text_role overrides geometry when confident; geometry remains fallback.
     for c in text_cands:
+        ownership = c["meta"].get("ownership_decision") or {}
+        ownership_action = ownership.get("action")
+        # Platform lockups are individual artwork layers even when they sit on a
+        # social-card raster.  The VLM correctly says "raster_keep" (do not
+        # recreate glyphs), but that must mean a cropped/logo asset, not baking
+        # the X.com lockup into the whole screenshot.
+        if is_platform_lockup(c, canvas):
+            c["meta"].update({
+                "wordmark": True,
+                "platform_lockup": True,
+                "role": "platform-logo",
+                "semantic_role": "platform-logo",
+                "ownership_enforced": True,
+                "preserve_underlay": True,
+            })
+            continue
+        if ownership_action != "recreate" and ownership:
+            c["kept_in_photo"] = True
+            c["meta"]["origin"] = "scene"
+            c["meta"]["role"] = "scene-text"
+            c["meta"]["ownership_enforced"] = True
+            continue
+        if ownership_action == "recreate":
+            c["meta"]["overlay_text"] = True
+            c["meta"]["removal_required"] = True
+            c["meta"]["ownership_enforced"] = True
+            continue
         scene_text_role = c["meta"].get("scene_text_role")
         if scene_text_role == "printed_on_product":
             # A VLM crop classification is advisory. It can easily see a product near

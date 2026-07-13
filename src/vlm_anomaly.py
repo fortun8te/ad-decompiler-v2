@@ -9,6 +9,8 @@ other ``vlm_*`` stages) and asks for a STRUCTURED list of visible text anomalies
   - duplicate_text  : the same words appear twice / ghosted / overlapping another layer
   - clipped_text    : text is cut off at a container or image edge (missing letters)
   - wrong_glyphs    : garbled / mojibake / clearly incorrect letters
+  - inpaint_halo    : visible bright/dark rim around a removed element
+  - inpaint_patch   : obvious blurry, repeated, or color-mismatched generated patch
 
 Disabled by default (``vlm.anomaly.enabled: false``) and fails silent: any missing
 file, stopped LM Studio, bad response, or parse error returns ``[]`` so the harness
@@ -31,16 +33,18 @@ _DEFAULT_MAX_TOKENS = 700
 _DEFAULT_PASSES = 1
 _DEFAULT_MAX_CALLS = 1
 
-_TYPES = ("duplicate_text", "clipped_text", "wrong_glyphs")
+_TYPES = ("duplicate_text", "clipped_text", "wrong_glyphs", "inpaint_halo", "inpaint_patch")
 
 _PROMPT = (
     "You are inspecting a rendered advertisement that was reconstructed from detected "
-    "layers. Look ONLY for text rendering defects. Report each defect you actually see:\n"
+    "layers. Look for text defects and visible inpaint seams. Report each defect you actually see:\n"
     "- duplicate_text: the same words appear twice, ghosted, or one text overlaps another\n"
     "- clipped_text: text is cut off at a container or image edge (letters are missing)\n"
     "- wrong_glyphs: garbled/mojibake/incorrect letters (e.g. 'UPERONT' instead of 'UPFRONT')\n\n"
+    "- inpaint_halo: a bright/dark/color rim around an area where content was removed\n"
+    "- inpaint_patch: an obvious blurry, repeated, or color-mismatched generated patch\n\n"
     "Reply with ONLY valid JSON on one line, no markdown, no explanation:\n"
-    '{"anomalies":[{"type":"duplicate_text|clipped_text|wrong_glyphs",'
+    '{"anomalies":[{"type":"duplicate_text|clipped_text|wrong_glyphs|inpaint_halo|inpaint_patch",'
     '"text":"<the exact affected words>","detail":"<short note>"}]}\n'
     "Copy the affected words verbatim into 'text'. If there are no defects, reply "
     '{"anomalies":[]}.'

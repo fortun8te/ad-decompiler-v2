@@ -2,7 +2,7 @@
 import os, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from src import routing, build_design_json, pixel_diff
-from src.wordmark import is_wordmark_candidate, partition_wordmarks
+from src.wordmark import is_wordmark_candidate, is_platform_lockup, partition_wordmarks, semantic_text_role
 
 CANVAS = {"w": 1080, "h": 1350}
 
@@ -39,6 +39,19 @@ def test_confident_text_style_confidence_alone_does_not_trigger_fallback():
     assert routing.route(c, CANVAS)["target"] == "text"
 
 
+def test_ambiguous_font_match_uses_exact_raster_fallback_by_default():
+    c = {
+        "id": "L11", "text": "Display headline",
+        "box": {"x": 120, "y": 120, "w": 620, "h": 100},
+        "style": {"confidence": 0.96},
+        "meta": {"origin": "overlay", "fidelity_confidence": 0.80},
+    }
+    result = routing.route(c, CANVAS)
+    assert result["target"] == "image"
+    assert result["meta"]["fallback"] is True
+    assert result["meta"]["substitution"]["reason"] == "low-confidence font/effect match"
+
+
 def test_wordmark_becomes_artwork_not_text():
     c = {"id": "L3", "text": "grüns", "box": {"x": 460, "y": 40, "w": 160, "h": 70}}
     r = routing.route(c, CANVAS)
@@ -58,6 +71,13 @@ def test_social_ui_labels_and_handles_are_not_wordmarks():
     ]
     assert all(is_wordmark_candidate(line, {"w": 1080, "h": 1080}) is False for line in cases)
     assert all(routing.route(line, {"w": 1080, "h": 1080})["target"] == "text" for line in cases)
+
+
+def test_x_dot_com_platform_lockup_is_wordmark_in_top_right():
+    line = {"id": "x", "text": "X.com", "box": {"x": 900, "y": 100, "w": 140, "h": 35}}
+    assert is_wordmark_candidate(line, {"w": 1080, "h": 1920}) is True
+    assert is_platform_lockup(line, {"w": 1080, "h": 1920}) is True
+    assert semantic_text_role(line, {"w": 1080, "h": 1920}) == "platform-logo"
 
 
 def test_body_copy_is_not_wordmark():

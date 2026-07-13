@@ -1,6 +1,15 @@
 # ad-decompiler config — copy to config.yaml and adjust for your Windows/RTX 5080 box.
 device: cuda                          # cuda | cpu
 
+archetype:
+  # auto | social_screenshot | caption_over_photo | comparison_grid |
+  # lifestyle_overlay | product_on_flat
+  preset: auto
+  # Optional semantic facts supplied by a scene/VLM pass. The classifier never uses
+  # filenames. Examples: photo_coverage, flat_background_fraction, social_header,
+  # text_backplate_count, column_count, center_divider, leader_lines, product_count.
+  observations: {}
+
 # Gemma 4 e4b is part of the RTX quality path: proofread OCR, classify layout context,
 # arbitrate uncertain segments, and propose visual elements before geometric refinement.
 # misreads (stylized ad type, small/dense labels) that OCR confidence alone can't flag as
@@ -10,7 +19,7 @@ vlm:
   enabled: true
   base_url: http://127.0.0.1:1234/v1
   model: google/gemma-4-e4b
-  timeout_s: 120                       # first request can include a local model warm-up
+  timeout_s: 30                        # bounded per request; stages fall back safely on a timeout
   max_tokens: 1024                     # enough room for Gemma reasoning + final structured output
   confidence_threshold: 0.85           # only lines below this OCR confidence get checked
   passes: 2                           # both passes must agree before OCR text is replaced
@@ -51,6 +60,7 @@ vlm:
     context_padding: 24            # crop padding so the model sees surrounding layout
     passes: 2
     max_lines: 32
+    max_total_s: 90                 # cap the whole advisory pass; remaining lines stay raster-owned
   element_propose:                   # optional VLM coarse boxes before SAM box-refine
     enabled: true
     lightweight_grid: false            # harness rerun-detection can enable a cheap grid pass

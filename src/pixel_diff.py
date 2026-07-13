@@ -374,9 +374,36 @@ def _element_survival_audit(run_dir, reconstruction):
     if not proposed_by_id:
         return None
     kept = set()
+    canonical_elements = []
+    protected = []
     for item in reconstruction.get("candidates") or []:
-        if isinstance(item, dict) and item.get("target") != "drop":
-            kept.update(_candidate_element_lineage(item))
+        if not isinstance(item, dict):
+            continue
+        lineage = _candidate_element_lineage(item)
+        if not lineage:
+            continue
+        canonical_elements.append(item)
+        meta = item.get("meta") or {}
+        is_protected = bool(
+            meta.get("keep_in_background") or meta.get("kept_in_photo")
+            or meta.get("raster_fallback") or meta.get("suppression_reason")
+            or meta.get("baked_owner_id") or meta.get("flattened_scene_artwork")
+        )
+        if item.get("target") != "drop" or is_protected:
+            kept.update(lineage)
+        if is_protected:
+            protected.append(item)
+
+    # Flattened/photo-scene presets intentionally account for SAM proposals in the
+    # protected raster plate instead of emitting one Figma layer per segmentation.
+    # In that mode standalone element recall is not applicable; reporting 0/N causes
+    # the repair loop to rerun SAM even though no canonical element was lost.
+    if canonical_elements and len(protected) == len(canonical_elements):
+        return {
+            "proposed": len(proposed_by_id), "kept": len(set(proposed_by_id) & kept),
+            "recall": None, "missing_ids": [], "protected": len(protected),
+            "expected_standalone": 0, "not_applicable": True,
+        }
     survived = set(proposed_by_id) & kept
     missing = sorted(proposed_by_id[item] for item in set(proposed_by_id) - kept)
     return {
@@ -786,7 +813,8 @@ def _structural_audit(
     if duplicate_ownership:
         _add_fail(fails, "duplicate-ownership",
                   f"{len(duplicate_ownership)} observation ownership conflict(s): " + duplicate_ownership[0])
-    if element_survival and element_survival["recall"] < thresholds["element_survival_min"]:
+    if (element_survival and element_survival.get("recall") is not None
+            and element_survival["recall"] < thresholds["element_survival_min"]):
         _add_fail(
             fails,
             "low-element-recall",

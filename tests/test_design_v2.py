@@ -47,6 +47,16 @@ def test_vector_layer_keeps_raster_preview_fallback(tmp_path):
     assert doc.layers[0].src.replace("\\", "/") == "assets/icon_icon.png"
 
 
+def test_semantic_asset_name_survives_design_compile(tmp_path):
+    asset = tmp_path / "avatar.png"
+    Image.new("RGBA", (8, 8), (20, 30, 40, 255)).save(asset)
+    doc = build_design_json.build([{
+        "id": "avatar", "target": "image", "box": {"x": 0, "y": 0, "w": 8, "h": 8},
+        "src": str(asset), "meta": {"role": "avatar", "semantic_name": "Creator avatar"},
+    }], {"w": 8, "h": 8}, str(tmp_path))
+    assert doc.layers[0].name == "Creator avatar"
+
+
 def test_corrupt_raster_is_rejected_before_design_compile(tmp_path):
     asset = tmp_path / "broken.png"
     asset.write_bytes(b"not a png")

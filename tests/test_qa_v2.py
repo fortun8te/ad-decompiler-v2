@@ -315,6 +315,32 @@ def test_element_survival_follows_canonical_ids_and_provenance(tmp_path):
     assert "low-element-recall" in _rules(result)
 
 
+def test_flattened_protected_elements_are_not_expected_as_standalone_layers(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (80, 60), "white").save(source)
+    Image.new("RGB", (80, 60), "white").save(render)
+    (tmp_path / "elements.json").write_text(json.dumps([
+        {"id": "E0", "role": "product"},
+        {"id": "E1", "role": "badge"},
+    ]), encoding="utf-8")
+    (tmp_path / "reconstruction.json").write_text(json.dumps({
+        "candidates": [
+            {"id": "c_E0", "target": "drop", "meta": {"keep_in_background": True}},
+            {"id": "c_E1", "target": "drop", "meta": {"keep_in_background": True}},
+        ],
+        "stats": {"flattened_scene_artwork": 2},
+    }), encoding="utf-8")
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    survival = result["structural"]["element_survival"]
+    assert survival["recall"] is None
+    assert survival["not_applicable"] is True
+    assert survival["expected_standalone"] == 0
+    assert "low-element-recall" not in _rules(result)
+
+
 def test_single_background_without_removal_work_can_legitimately_match_source(tmp_path):
     source = tmp_path / "source.png"
     render = tmp_path / "render.png"

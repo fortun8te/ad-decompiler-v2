@@ -29,7 +29,11 @@ PRIMITIVE_SHAPE_ROLES = ("badge", "chip", "button", "divider", "card")
 # reproduced as editable text (glyph too hard to isolate, or the closest font/effect
 # match is a poor fit) — it is routed to a masked-pixel fallback layer instead of
 # emitting a guessed rendering. Overridable via cfg["routing"]["min_text_fidelity"].
-MIN_TEXT_FIDELITY = 0.30
+# Local glyph matching scores below the mid-0.80s are often only a plausible
+# category match (sans/serif/bold), not a faithful typeface match.  At that
+# point exact masked pixels are a safer Figma layer than confidently rendering
+# the wrong font.  Callers can still lower this for editability-first jobs.
+MIN_TEXT_FIDELITY = 0.85
 
 # Roles whose rasterized cutout should be delivered as an IMAGE clipped by a swappable
 # shape mask (see _image_mask). The raster is the swappable fill; the mask is the shape.
@@ -121,6 +125,11 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
     kind = c.get("kind")            # from element_detect / merge
     meta = c.setdefault("meta", {})
 
+    # Normalize the public overlay vocabulary once. Reconstruction consumes
+    # ``keep_underlay`` when building the canonical removal mask.
+    if meta.get("preserve_underlay") or meta.get("overlay_without_removal"):
+        meta["keep_underlay"] = True
+
     # 1. TEXT candidates (from OCR) --------------------------------------------------
     if c.get("text") is not None and kind in (None, "text"):
         # scene text printed on a product/photo → never a layer
@@ -134,7 +143,11 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
             return c
         # wordmark / brand lettering → artwork, not editable text, never font-matched
         if meta.get("scene_text_role") == "wordmark" or meta.get("wordmark"):
-            c["target"] = "image" if cfg and cfg.get("wordmark_as_raster", True) else "icon"
+            # A platform lockup such as X.com is normally a logo glyph plus domain
+            # lettering. Keep an exact cropped asset rather than risking a lossy
+            # trace or treating the lettering as UI text.
+            force_raster = bool(meta.get("platform_lockup"))
+            c["target"] = "image" if force_raster or (cfg and cfg.get("wordmark_as_raster", True)) else "icon"
             meta["wordmark"] = True
             meta["role"] = meta.get("role") or "logo"
             if c["target"] == "image":

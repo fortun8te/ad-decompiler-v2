@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -27,15 +28,81 @@ VISUAL_FAILURE_RULES = frozenset({
 })
 
 
-def select_images(source_dir: Path, max_images: int | None = None) -> list[Path]:
+def _normalize_fixture_id(value: str) -> str:
+    """Normalize a requested fixture prefix (``26`` and ``026`` both become ``026``)."""
+    value = str(value).strip()
+    if not value:
+        raise ValueError("fixture ID cannot be empty")
+    return value.zfill(3) if value.isdigit() else value.lower()
+
+
+def parse_fixture_ids(values: list[str] | None) -> list[str]:
+    """Parse repeatable/comma-separated CLI values and reject duplicate requests."""
+    requested = [
+        _normalize_fixture_id(item)
+        for value in (values or [])
+        for item in str(value).split(",")
+        if item.strip()
+    ]
+    duplicates = sorted({item for item in requested if requested.count(item) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate fixture IDs requested: {', '.join(duplicates)}")
+    return requested
+
+
+def _file_fixture_id(path: Path) -> str:
+    return _normalize_fixture_id(path.stem.split("_", 1)[0])
+
+
+def select_images(source_dir: Path, max_images: int | None = None,
+                  fixture_ids: list[str] | None = None) -> list[Path]:
     """Return a stable benchmark selection, limited after sorting by filename."""
     images = sorted(path for path in source_dir.iterdir()
                     if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+    requested = parse_fixture_ids(fixture_ids)
+    if requested:
+        if max_images is not None and max_images != len(requested):
+            raise ValueError("--max-images cannot truncate named fixtures; omit it or match the ID count")
+        by_id: dict[str, list[Path]] = {}
+        for path in images:
+            by_id.setdefault(_file_fixture_id(path), []).append(path)
+        missing = [item for item in requested if not by_id.get(item)]
+        ambiguous = {item: by_id[item] for item in requested if len(by_id.get(item, [])) > 1}
+        if missing:
+            raise ValueError(f"missing fixture IDs: {', '.join(missing)}")
+        if ambiguous:
+            detail = "; ".join(
+                f"{item}: {', '.join(path.name for path in paths)}"
+                for item, paths in ambiguous.items()
+            )
+            raise ValueError(f"duplicate files for fixture IDs: {detail}")
+        images = [by_id[item][0] for item in requested]
     if max_images is not None:
         if max_images < 1:
             raise ValueError("max_images must be at least 1")
         images = images[:max_images]
     return images
+
+
+def _source_manifest(images: list[Path], requested_ids: list[str]) -> dict:
+    resolved = []
+    for path in images:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        resolved.append({
+            "id": _file_fixture_id(path),
+            "filename": path.name,
+            "path": str(path.resolve()),
+            "sha256": digest,
+            "size_bytes": path.stat().st_size,
+        })
+    return {"requested_ids": requested_ids, "resolved": resolved}
+
+
+def configure_auto_repair(cfg: dict, enabled: bool) -> None:
+    """Set both repair switches so an explicit CLI disable cannot leave the harness active."""
+    runtime = cfg.setdefault("runtime", {})
+    runtime["auto_repair"] = bool(enabled)
+    runtime.setdefault("harness", {})["enabled"] = bool(enabled)
 
 
 def _read(path: Path, fallback):
@@ -140,6 +207,26 @@ def _entry(run_dir: Path, result: dict) -> dict:
         item.get("rule") for item in merged_hard_fails
         if isinstance(item, dict) and item.get("rule") in VISUAL_FAILURE_RULES
     ]
+    meta = design.get("meta") or {}
+    archetype = (qa.get("archetype") or meta.get("archetype")
+                 or reconstruction.get("archetype") or runtime.get("archetype"))
+    preset = (qa.get("preset") or meta.get("preset")
+              or reconstruction.get("preset") or runtime.get("preset"))
+    inpaint = (reconstruction.get("stats") or {}).get("inpaint") or {}
+    regions = inpaint.get("regions") or reconstruction.get("inpaint_regions") or []
+    route_counts: dict[str, int] = {}
+    fallback_dispositions: list[dict] = []
+    for region in regions if isinstance(regions, list) else []:
+        if not isinstance(region, dict):
+            continue
+        route = str(region.get("route") or region.get("backend") or "unknown")
+        route_counts[route] = route_counts.get(route, 0) + 1
+        if region.get("fallback") or region.get("fallback_reason") or region.get("disposition"):
+            fallback_dispositions.append({
+                key: region.get(key) for key in
+                ("ids", "route", "backend", "fallback", "fallback_reason", "disposition")
+                if region.get(key) is not None
+            })
     return {
         "id": run_dir.name,
         "pipeline_ok": bool(result.get("ok")) and complete,
@@ -156,6 +243,8 @@ def _entry(run_dir: Path, result: dict) -> dict:
         "ssim": qa.get("ssim"),
         "text_recall": qa.get("text_recall"),
         "editable_text_recall": qa.get("editable_text_recall"),
+        "archetype": archetype,
+        "preset": preset,
         "edge_f1": qa.get("edge_f1"),
         "color_similarity": qa.get("color_similarity"),
         "hard_fails": merged_hard_fails,
@@ -163,6 +252,9 @@ def _entry(run_dir: Path, result: dict) -> dict:
         "duplicate_observations_removed": (reconstruction.get("stats") or {}).get("duplicates_removed", 0),
         "vectorized": (reconstruction.get("stats") or {}).get("vectorized", 0),
         "vector_fallback": (reconstruction.get("stats") or {}).get("vector_fallback", 0),
+        "regional_inpaint_backend": inpaint.get("backend"),
+        "regional_inpaint_routes": route_counts,
+        "fallback_dispositions": fallback_dispositions,
         "background_leakage": "background-leakage" in visual_failure_rules,
         "inpaint_outside_mask": "inpaint-outside-mask" in visual_failure_rules,
         "layer_alpha_holes": "layer-alpha-holes" in visual_failure_rules,
@@ -193,8 +285,8 @@ def _markdown(report: dict) -> str:
         "",
         f"Images: {summary['images']}  |  QA passing: {summary['qa_passing']}  |  Runtime accepted: {summary.get('runtime_accepted', '—')}",
         "",
-        "| image | QA | evidence | runtime | seconds | visual | text | edge | element recall | hard fails |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| image | archetype | preset | QA | evidence | runtime | seconds | visual | text | editable text | edge | element recall | regional routes | hard fails |",
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for row in report["runs"]:
         fails = ", ".join(item.get("rule", "unknown") for item in row["hard_fails"]) or "—"
@@ -202,9 +294,15 @@ def _markdown(report: dict) -> str:
             value = row.get(key)
             return "—" if value is None else f"{float(value):.3f}"
         lines.append(
-            f"| {row['id']} | {'pass' if row['qa_ok'] else 'fail'} | {'complete' if row.get('qa_evidence_complete') else 'missing'} | {row.get('runtime_status') or ('ok' if row.get('runtime_ok') else 'unknown')} | {metric('duration_s')} | {metric('visual_score')} | "
-            f"{metric('text_recall')} | {metric('edge_f1')} | {metric('element_recall')} | {fails} |"
+            f"| {row['id']} | {row.get('archetype') or '—'} | {row.get('preset') or '—'} | {'pass' if row['qa_ok'] else 'fail'} | {'complete' if row.get('qa_evidence_complete') else 'missing'} | {row.get('runtime_status') or ('ok' if row.get('runtime_ok') else 'unknown')} | {metric('duration_s')} | {metric('visual_score')} | "
+            f"{metric('text_recall')} | {metric('editable_text_recall')} | {metric('edge_f1')} | {metric('element_recall')} | "
+            f"{', '.join(f'{k}:{v}' for k, v in row.get('regional_inpaint_routes', {}).items()) or '—'} | {fails} |"
         )
+    fixture_manifest = report.get("fixture_manifest") or {}
+    if fixture_manifest.get("resolved"):
+        lines.extend(["", "## Fixture manifest", "", "| id | filename | sha256 |", "| --- | --- | --- |"])
+        for item in fixture_manifest["resolved"]:
+            lines.append(f"| {item['id']} | {item['filename']} | `{item['sha256']}` |")
     lines.extend([
         "",
         "A benchmark is not complete until every hard fail has a deliberate disposition and the"
@@ -227,6 +325,8 @@ def main():
     )
     parser.add_argument("--max-images", type=int, default=None,
                         help="benchmark only the first N images after stable filename sorting (for example, 5)")
+    parser.add_argument("--ids", "--include", action="append", default=[],
+                        help="fixture ID/prefix to include; repeat or comma-separate (for example 26,034)")
     parser.add_argument("--skip-doctor", action="store_true",
                         help="development only; benchmark normally refuses an unready model machine")
     parser.add_argument("--deep-smoke", action="store_true",
@@ -239,10 +339,13 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     cfg = load_cfg(args.config)
     auto_repair = args.auto_repair if args.auto_repair is not None else harness_enabled(cfg)
-    if auto_repair:
-        runtime = cfg.setdefault("runtime", {})
-        runtime["auto_repair"] = True
-        runtime.setdefault("harness", {})["enabled"] = True
+    configure_auto_repair(cfg, auto_repair)
+    from src.runtime_bootstrap import ensure_services
+    startup = ensure_services(cfg)
+    (output / "startup.json").write_text(json.dumps(startup, indent=2), encoding="utf-8")
+    if not startup.get("ok"):
+        print(json.dumps({"benchmark": "blocked", "startup": startup.get("checks")}, indent=2))
+        raise SystemExit(2)
     if not args.skip_doctor:
         preflight = inspect_machine(cfg, Path(__file__).resolve().parent)
         (output / "doctor.json").write_text(json.dumps(preflight, indent=2), encoding="utf-8")
@@ -255,8 +358,17 @@ def main():
         if not smoke.get("ok"):
             print(json.dumps({"benchmark": "blocked", "runtime_smoke": smoke.get("checks")}, indent=2))
             raise SystemExit(2)
+    startup_probes = tuple(((cfg.get("runtime") or {}).get("startup_smoke") or []))
+    if startup_probes and not args.deep_smoke:
+        from runtime_smoke import run_all
+        smoke = run_all(cfg, output / "runtime-smoke", probes=startup_probes,
+                        timeout_s=args.probe_timeout)
+        if not smoke.get("ok"):
+            print(json.dumps({"benchmark": "blocked", "runtime_smoke": smoke.get("checks")}, indent=2))
+            raise SystemExit(2)
     try:
-        images = select_images(source_dir, args.max_images)
+        requested_ids = parse_fixture_ids(args.ids)
+        images = select_images(source_dir, args.max_images, requested_ids)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     if not images:
@@ -273,6 +385,7 @@ def main():
         "version": 1,
         "input_dir": str(source_dir.resolve()),
         "output": str(output.resolve()),
+        "fixture_manifest": _source_manifest(images, requested_ids),
         "runs": runs,
         "summary": {
             "images": len(runs),
@@ -285,6 +398,7 @@ def main():
             "mean_visual_score": _mean(runs, "visual_score"),
             "mean_ssim": _mean(runs, "ssim"),
             "mean_text_recall": _mean(runs, "text_recall"),
+            "mean_editable_text_recall": _mean(runs, "editable_text_recall"),
             "mean_edge_f1": _mean(runs, "edge_f1"),
             "background_leakage_runs": sum(1 for row in runs if row["background_leakage"]),
             "inpaint_outside_mask_runs": sum(1 for row in runs if row["inpaint_outside_mask"]),

@@ -158,3 +158,21 @@ def test_paragraph_lines_with_shared_block_id_form_one_editable_group():
     assert len(tree) == 1
     assert tree[0]["target"] == "group"
     assert [child["id"] for child in tree[0]["children"]] == ["line1", "line2"]
+
+
+def test_semantic_image_owner_keeps_overlay_in_named_asset_group():
+    """Fusion's parent link keeps an avatar/screenshot and its overlay selectable together."""
+    tree = layout.infer([
+        {"id": "avatar", "target": "image", "box": {"x": 40, "y": 50, "w": 120, "h": 120},
+         "meta": {"role": "avatar", "semantic_name": "Creator avatar"}},
+        {"id": "online", "target": "icon", "box": {"x": 132, "y": 142, "w": 22, "h": 22},
+         "meta": {"role": "icon", "parent_id": "avatar"}},
+    ], {"w": 300, "h": 250})
+
+    assert len(tree) == 1
+    group = tree[0]
+    assert group["id"] == "asset-group-avatar"
+    assert group["name"] == "Creator avatar — asset group"
+    assert [child["id"] for child in group["children"]] == ["avatar", "online"]
+    assert group["children"][0]["box"]["x"] == 0
+    assert group["children"][1]["box"]["x"] == 92

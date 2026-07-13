@@ -20,10 +20,52 @@ _SOCIAL_HANDLE = re.compile(r"^@[A-Za-z0-9_.-]+$")
 _PICTOGRAM = re.compile(r"[♡♥❤★☆✦✧]|^[•●◦·]\s*")
 _ALLCAPS_SHORT = re.compile(r"^[A-ZÀ-ÖØ-Þ& ]+$")
 _LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
+_PLATFORM_WORDMARK = re.compile(r"^(?:x\.com|twitter\.com)$", re.I)
+_CTA = re.compile(r"^(?:buy|shop|learn|order|get|try|sign up|subscribe|download)(?:\s+\w+){0,3}$", re.I)
 
 
 def _clean(t) -> str:
     return re.sub(r"\s+", " ", str(t or "")).strip()
+
+
+def is_platform_lockup(line: dict, canvas: dict) -> bool:
+    """True for a platform lockup that must remain a separate artwork asset."""
+    text = _clean(line.get("text"))
+    box = line.get("box") or {}
+    H = float(canvas.get("h") or 1)
+    try:
+        return bool(_PLATFORM_WORDMARK.match(text) and
+                    float(box.get("y", 0)) + float(box.get("h", 0)) <= H * 0.32)
+    except (TypeError, ValueError):
+        return False
+
+
+def semantic_text_role(line: dict, canvas: dict) -> str:
+    """Give editable text a stable human-facing role for Figma naming/grouping.
+
+    Ownership remains VLM-decided. This is deliberately deterministic so reruns
+    do not need more VLM calls just to replace opaque ``Text — ...`` names.
+    """
+    text = _clean(line.get("text"))
+    box = line.get("box") or {}
+    W = float(canvas.get("w") or 1)
+    H = float(canvas.get("h") or 1)
+    try:
+        y, w, h = float(box.get("y", 0)), float(box.get("w", 0)), float(box.get("h", 0))
+    except (TypeError, ValueError):
+        return "text"
+    if is_platform_lockup(line, canvas):
+        return "platform-logo"
+    if _SOCIAL_HANDLE.match(text) or _UI_LABEL.match(text):
+        return "ui-label"
+    if _CTA.match(text) or GENERIC_SHORT_COPY.match(text):
+        return "cta"
+    words = text.split()
+    if y <= H * .62 and h >= max(18.0, H * .028) and len(words) <= 12 and w <= W * .95:
+        return "headline"
+    if len(words) >= 9 or (h <= H * .03 and len(words) >= 4):
+        return "body-copy"
+    return "label"
 
 
 def is_wordmark_candidate(line: dict, canvas: dict, opts: dict | None = None) -> bool:
@@ -39,6 +81,10 @@ def is_wordmark_candidate(line: dict, canvas: dict, opts: dict | None = None) ->
     if line.get("id") in force_text:
         return False
     if line.get("id") in force_wm:
+        return True
+    # Platform lockups combine a custom logo glyph with domain text. They are artwork,
+    # including in the conventional top-right slot, and must not be approximated by a font.
+    if is_platform_lockup(line, canvas):
         return True
     # Short social/UI labels occupy exactly the same header slots as brand marks.  The
     # old positional heuristic consequently rasterized ordinary editable copy such as

@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 
-PROBES = ("ocr", "sam3", "vlm", "big_lama", "vectorization", "figma_staging")
+PROBES = ("ocr", "sam3", "vlm", "big_lama", "flux_comfy", "vectorization", "figma_staging")
 
 
 def _fixture(directory: Path) -> tuple[Path, Path]:
@@ -105,6 +105,38 @@ def _probe_big_lama(cfg: dict, work: Path) -> dict:
             "evidence": {"backend": result.get("backend"), "masked_mae": round(change, 3)}}
 
 
+def _probe_flux_comfy(cfg: dict, work: Path) -> dict:
+    """Submit a real Flux crop; liveness alone does not prove the workflow can run."""
+    import numpy as np
+    from PIL import Image
+    from src import inpaint
+    image, mask = _fixture(work)
+    output = work / "flux-inpainted.png"
+    probe_cfg = copy.deepcopy(cfg)
+    inpaint_cfg = probe_cfg.setdefault("inpaint", {})
+    inpaint_cfg["mode"] = "flux_comfy"
+    inpaint_cfg["allow_fallback"] = False
+    inpaint_cfg.setdefault("comfy", {})["enabled"] = True
+    inpaint_cfg["comfy"]["required"] = True
+    result = inpaint.inpaint_once(str(image), str(mask), str(output), probe_cfg)
+    before = np.asarray(Image.open(image).convert("RGB"))
+    after = np.asarray(Image.open(output).convert("RGB"))
+    region = np.asarray(Image.open(mask).convert("L")) > 0
+    outside_identical = bool(np.array_equal(before[~region], after[~region]))
+    masked_mae = float(np.abs(before.astype(float) - after.astype(float))[region].mean())
+    same_shape = before.shape == after.shape
+    backend = str(result.get("backend") or "")
+    ok = backend == "flux-comfy" and same_shape and outside_identical and masked_mae > 1
+    return {
+        "ok": ok,
+        "detail": (f"backend={backend}; shape_ok={same_shape}; "
+                   f"outside_identical={outside_identical}; masked_mae={masked_mae:.2f}"),
+        "evidence": {"backend": backend, "shape_ok": same_shape,
+                     "outside_identical": outside_identical,
+                     "masked_mae": round(masked_mae, 3)},
+    }
+
+
 def _probe_vectorization(cfg: dict, work: Path) -> dict:
     import numpy as np
     from PIL import Image, ImageDraw
@@ -145,7 +177,8 @@ def _probe_figma_staging(cfg: dict, work: Path) -> dict:
 
 
 _IMPLEMENTATIONS = {"ocr": _probe_ocr, "sam3": _probe_sam3, "vlm": _probe_vlm,
-                    "big_lama": _probe_big_lama, "vectorization": _probe_vectorization,
+                    "big_lama": _probe_big_lama, "flux_comfy": _probe_flux_comfy,
+                    "vectorization": _probe_vectorization,
                     "figma_staging": _probe_figma_staging}
 
 

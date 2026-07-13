@@ -121,6 +121,219 @@ def deduplicate(candidates: list, threshold: float = 0.86):
     return sorted(kept, key=lambda c: order.get(c.get("id"), 10**9))
 
 
+def _box_containment(inner, outer):
+    """Fraction of ``inner`` covered by ``outer`` (boxes are canvas coordinates)."""
+    ix = max(0.0, min(inner.get("x", 0) + inner.get("w", 0),
+                      outer.get("x", 0) + outer.get("w", 0))
+             - max(inner.get("x", 0), outer.get("x", 0)))
+    iy = max(0.0, min(inner.get("y", 0) + inner.get("h", 0),
+                      outer.get("y", 0) + outer.get("h", 0))
+             - max(inner.get("y", 0), outer.get("y", 0)))
+    area = max(0.0, inner.get("w", 0) * inner.get("h", 0))
+    return (ix * iy) / area if area else 0.0
+
+
+def _suppress_baked_raster_text(candidates: list, threshold: float = .90) -> list:
+    """Keep package/scene OCR baked into its canonical raster owner.
+
+    OCR eagerly reads labels on cans, tubes, screenshots and photo cards.  Exporting those
+    observations as editable text both duplicates the pixels in the raster and makes the
+    removal mask damage the asset.  A caller can explicitly promote genuine overlay copy with
+    ``overlay_text``/``promote_text``/``editable_text``.
+    """
+    raster_roles = {
+        "photo", "product", "person", "foreground", "cutout", "avatar",
+        "profile", "profile_photo", "thumbnail", "photo_card", "image",
+    }
+    rasters = []
+    for candidate in candidates:
+        meta = candidate.get("meta") or {}
+        role = str(meta.get("role") or "").lower()
+        if candidate.get("target") == "image" and role in raster_roles:
+            rasters.append(candidate)
+
+    out = []
+    for candidate in candidates:
+        c = dict(candidate)
+        c["meta"] = dict(candidate.get("meta") or {})
+        meta = c["meta"]
+        promoted = bool(meta.get("overlay_text") or meta.get("promote_text")
+                        or meta.get("editable_text") or meta.get("text_promoted"))
+        if c.get("target") == "text" and not promoted:
+            parent_id = meta.get("parent_id") or c.get("parent_id")
+            owner = next((r for r in rasters if r.get("id") == parent_id), None)
+            if owner is None:
+                owner = next((r for r in rasters
+                              if _box_containment(c.get("box") or {}, r.get("box") or {})
+                              >= threshold), None)
+            if owner is not None:
+                c["target"] = "drop"
+                meta["kept_in_photo"] = True
+                meta["baked_owner_id"] = owner.get("id")
+                meta["suppression_reason"] = "text-contained-in-raster-owner"
+        out.append(c)
+    return out
+
+
+def _keeps_underlay(candidate: dict) -> bool:
+    """True for overlay layers whose already-valid underlying plate must not be erased."""
+    meta = candidate.get("meta") or {}
+    return bool(meta.get("keep_underlay") or meta.get("preserve_underlay")
+                or meta.get("overlay_without_removal"))
+
+
+def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
+    """Select independent foreground owners while retaining only scene fragments in the plate.
+
+    This intentionally keeps the historical function name for callers, but no longer
+    implements a flatten-first output.  A product, person, avatar, card, logo, badge,
+    icon, or substantial photo frame is a separate Figma asset; only a full/edge-touching
+    scenic photo and tiny unclassified detector debris remain in the background plate.
+    """
+    scene = cfg.get("scene") or {}
+    photo_policy = (scene.get("preset") or {}).get("photo_regions") or {}
+    out, flattened = [], 0
+    separate_roles = {
+        "product", "person", "foreground", "cutout", "avatar", "profile",
+        "profile_photo", "card", "thumbnail", "photo_card", "logo", "brand",
+        "wordmark", "icon", "badge", "button", "chip", "callout_leader",
+        "text_backplate",
+    }
+    min_photo_fraction = float(photo_policy.get("min_separate_photo_fraction", 0.012))
+    max_photo_fraction = float(photo_policy.get("max_separate_photo_fraction", 0.62))
+    min_shape_fraction = float(photo_policy.get("min_separate_shape_fraction", 0.001))
+    canvas = cfg.get("canvas") or {}
+    canvas_w = float(canvas.get("w") or 0)
+    canvas_h = float(canvas.get("h") or 0)
+    if canvas_w <= 1 or canvas_h <= 1:
+        # ``reconstruct`` owns the true canvas but this compatibility helper is
+        # also unit-tested directly. Infer a conservative canvas from candidates
+        # when a caller did not supply it.
+        boxes = [item.get("visible_box") or item.get("box") or {} for item in candidates]
+        canvas_w = max([1.0] + [float(box.get("x") or 0) + float(box.get("w") or 0) for box in boxes])
+        canvas_h = max([1.0] + [float(box.get("y") or 0) + float(box.get("h") or 0) for box in boxes])
+    canvas_area = max(1.0, canvas_w * canvas_h)
+    # Large photographic frames are the independent replacement unit for a
+    # screenshot/card.  Their internal product pixels are intentionally part of
+    # that one swappable image, not a collection of low-quality SAM cutouts.
+    photo_roots = []
+    for item in candidates:
+        meta = item.get("meta") or {}
+        box = item.get("visible_box") or item.get("box") or {}
+        fraction = (float(box.get("w") or 0) * float(box.get("h") or 0)) / canvas_area
+        if (item.get("target") == "image" and str(meta.get("role") or "").lower() in {"photo", "image"}
+                and fraction >= 0.15 and min(float(box.get("w") or 0), float(box.get("h") or 0)) >= 250):
+            photo_roots.append(item)
+    for candidate in candidates:
+        c = dict(candidate)
+        c["meta"] = dict(candidate.get("meta") or {})
+        meta = c["meta"]
+        text_value = str(c.get("text") or "")
+        box = c.get("visible_box") or c.get("box") or {}
+        confidence = float(meta.get("confidence") or c.get("confidence") or 0.0)
+        compact_text = "".join(ch for ch in text_value if ch.isalnum())
+        invalid_text = c.get("target") == "text" and (
+            "\ufffd" in text_value or not any(ch.isalnum() for ch in text_value)
+            or (len(compact_text) <= 2 and confidence < 0.75)
+            or (float(box.get("h") or 0) > float(box.get("w") or 0) * 1.15)
+        ) and not meta.get("emoji")
+        if invalid_text:
+            c["target"] = "drop"
+            meta["keep_in_background"] = True
+            meta["suppression_reason"] = "invalid-photo-scene-ocr"
+            out.append(c)
+            continue
+        substitution = meta.get("substitution") if isinstance(meta.get("substitution"), dict) else {}
+        exact_text_fallback = bool(
+            meta.get("fallback") and substitution.get("from") == "text"
+        )
+        role = str(meta.get("role") or "").lower()
+        target = str(c.get("target") or "")
+        box = c.get("visible_box") or c.get("box") or {}
+        area_fraction = (float(box.get("w") or 0) * float(box.get("h") or 0)) / canvas_area
+        aspect = float(box.get("w") or 0) / max(1.0, float(box.get("h") or 0))
+        has_explicit_mask = bool(_mask_path(c))
+        x0, y0 = float(box.get("x") or 0), float(box.get("y") or 0)
+        x1, y1 = x0 + float(box.get("w") or 0), y0 + float(box.get("h") or 0)
+        edge_margin = max(3.0, min(canvas_w, canvas_h) * .012)
+        edge_count = sum((x0 <= edge_margin, y0 <= edge_margin,
+                          x1 >= canvas_w - edge_margin, y1 >= canvas_h - edge_margin))
+        # A huge person/photo joined to multiple canvas edges is part of the
+        # continuous lifestyle scene.  Cutting it out creates an enormous Flux
+        # hole and a less-editable result than retaining the scene root.
+        if (min(canvas_w, canvas_h) >= 400 and role in {"photo", "image", "person"}
+                and area_fraction >= .40 and edge_count >= 2):
+            c["target"] = "drop"
+            meta["keep_in_background"] = True
+            meta["background_root"] = True
+            meta["suppression_reason"] = "edge-touching-continuous-scene"
+            out.append(c)
+            continue
+        containing_frame = next((root for root in photo_roots
+                                 if root.get("id") != c.get("id")
+                                 and _box_containment(box, root.get("visible_box") or root.get("box") or {}) >= .96), None)
+        # A continuous edge-to-edge scenic plate is deliberately *not* a
+        # swappable frame.  Its contained product/logo detections must remain
+        # independent layers; otherwise the scene root is dropped and it takes
+        # every meaningful foreground object with it (notably tall product ads).
+        root_is_background_scene = False
+        if containing_frame:
+            root_box = containing_frame.get("visible_box") or containing_frame.get("box") or {}
+            rx0, ry0 = float(root_box.get("x") or 0), float(root_box.get("y") or 0)
+            rx1 = rx0 + float(root_box.get("w") or 0)
+            ry1 = ry0 + float(root_box.get("h") or 0)
+            root_fraction = (float(root_box.get("w") or 0) * float(root_box.get("h") or 0)) / canvas_area
+            root_edges = sum((rx0 <= edge_margin, ry0 <= edge_margin,
+                              rx1 >= canvas_w - edge_margin, ry1 >= canvas_h - edge_margin))
+            root_role = str((containing_frame.get("meta") or {}).get("role") or "").lower()
+            root_is_background_scene = (min(canvas_w, canvas_h) >= 400
+                                        and root_role in {"photo", "image", "person"}
+                                        and root_fraction >= .40 and root_edges >= 2)
+        if (containing_frame and not root_is_background_scene
+                and target not in {"text", "drop"} and role not in {"avatar", "badge", "button"}):
+            c["target"] = "drop"
+            meta["kept_in_owner"] = containing_frame.get("id")
+            meta["suppression_reason"] = "contained-in-swappable-photo-frame"
+            out.append(c)
+            continue
+        promoted = bool(meta.get("promote_element") or meta.get("editable_element")
+                        or meta.get("verified_mask") or exact_text_fallback)
+        is_semantic = role in separate_roles or target == "icon"
+        is_photo_frame = role in {"photo", "image"} and (
+            not box or min_photo_fraction <= area_fraction <= max_photo_fraction
+        )
+        # Generic SAM ``shape`` detections are frequently edge specks (041 produced
+        # dozens).  Preserve only semantically named UI/chrome shapes; meaningful
+        # unlabelled marks should arrive as an icon/vector candidate instead.
+        is_meaningful_shape = target == "shape" and (
+            role in separate_roles or (has_explicit_mask and area_fraction >= .005)
+            or (bool(meta.get("simple_graphic")) and area_fraction >= min_shape_fraction)
+        )
+        if target not in {"text", "drop"} and (promoted or is_semantic or is_photo_frame or is_meaningful_shape):
+            # A substantial rectangular photo is an image frame/card, not an
+            # irregular cutout.  Use a native rounded-rectangle mask and a full
+            # crop so small SAM holes cannot create black seams around a swappable
+            # image.  Small/tall photo detections remain alpha cutouts.
+            if (target == "image" and role in {"photo", "image"} and area_fraction >= 0.15
+                    and min(float(box.get("w") or 0), float(box.get("h") or 0)) >= 250):
+                c["mask"] = {"kind": "rrect"}
+                meta["photo_frame"] = True
+            meta["layer_disposition"] = (
+                "foreground_vector" if target == "icon" else
+                "native_shape" if target == "shape" else "foreground_raster"
+            )
+            meta["z_band"] = "chrome" if target in {"icon", "shape"} else "content"
+            out.append(c)
+            continue
+        if target not in {"text", "drop"}:
+            c["target"] = "drop"
+            meta["keep_in_background"] = True
+            meta["raster_fallback"] = "background-root-or-fragment"
+            flattened += 1
+        out.append(c)
+    return out, flattened
+
+
 def _mask_path(candidate):
     mask = candidate.get("mask")
     if isinstance(mask, dict):
@@ -134,7 +347,12 @@ def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None):
     _, np, _ = _deps()
     h, w = rgb.shape[:2]
     meta = candidate.get("meta") or {}
-    if candidate.get("target") == "text" or (candidate.get("text") and meta.get("wordmark")):
+    substitution = meta.get("substitution") if isinstance(meta.get("substitution"), dict) else {}
+    exact_text_fallback = bool(
+        candidate.get("text") and meta.get("fallback") and substitution.get("from") == "text"
+    )
+    if (candidate.get("target") == "text" or exact_text_fallback
+            or (candidate.get("text") and meta.get("wordmark"))):
         # line_ids are provenance only: merge/reordering can leave them stale or point
         # at an unrelated OCR line. The merged candidate geometry is canonical.
         return inpaint.text_ink_mask(
@@ -669,6 +887,10 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     h, w = rgb.shape[:2]
 
     canonical = deduplicate(candidates, float(rcfg.get("dedup_iou", 0.86)))
+    canonical = _suppress_baked_raster_text(
+        canonical, float(rcfg.get("raster_text_containment", .90)),
+    )
+    canonical, flattened_scene_artwork = _flatten_photo_scene(canonical, cfg)
     ocr_lines = {line.get("id"): line for line in (ocr.get("lines") or [])}
     masks = {}
     for candidate in canonical:
@@ -823,11 +1045,45 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     removal = []
     text_removal = []
     large_removal = []
+    mask_rejected = 0
+    scene_vlm_required = bool((((cfg.get("vlm") or {}).get("scene_text") or {}).get("enabled")))
+    max_text_mask_fraction = float(rcfg.get("max_text_mask_canvas_fraction", 0.035))
     for c in updated:
         if c.get("target") == "drop" and not (c.get("meta") or {}).get("removal_required"):
             continue
+        if _keeps_underlay(c):
+            # Insets, avatars, callout chrome and other true overlays sit above a valid
+            # retained photo/plate. They remain editable owners, but must not punch a
+            # generative-inpaint hole into that underlay.
+            continue
         box = c.get("box", {})
         area_frac = box.get("w", 0) * box.get("h", 0) / max(1, w * h)
+        candidate_mask = masks.get(c.get("id"))
+        mask_fraction = (float(np.count_nonzero(candidate_mask)) / max(1, w * h)
+                         if candidate_mask is not None else 0.0)
+        if c.get("target") == "text":
+            ownership_decision = (c.get("meta") or {}).get("ownership_decision")
+            rejection_reason = None
+            if scene_vlm_required and not ownership_decision:
+                rejection_reason = "missing-ownership-decision"
+            elif ownership_decision and ownership_decision.get("action") != "recreate":
+                rejection_reason = "ownership-does-not-allow-recreate"
+            elif scene_vlm_required and mask_fraction > max_text_mask_fraction:
+                rejection_reason = "text-mask-too-broad"
+            if rejection_reason:
+                c["target"] = "drop"
+                c.setdefault("meta", {})["keep_in_background"] = True
+                c["meta"]["raster_fallback"] = "mask-approval-rejected"
+                c["meta"]["mask_approval"] = {
+                    "accepted": False, "reason": rejection_reason,
+                    "mask_fraction_canvas": round(mask_fraction, 6),
+                }
+                mask_rejected += 1
+                continue
+            c.setdefault("meta", {})["mask_approval"] = {
+                "accepted": True, "reason": "ownership-and-geometry-approved",
+                "mask_fraction_canvas": round(mask_fraction, 6),
+            }
         # A full-canvas raster is the plate itself. Everything else is removed from the plate.
         is_background = bool(c.get("meta", {}).get("role") == "background" or area_frac > 0.92)
         observation = {
@@ -837,7 +1093,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "parent_id": (c.get("meta") or {}).get("parent_id"),
             "meta": c.get("meta") or {},
             "box": box,
-            "mask_array": masks.get(c.get("id")),
+            "mask_array": candidate_mask,
             "is_background": is_background,
             "dilate": inpaint.resolve_mask_dilate(c, cfg),
         }
@@ -890,6 +1146,8 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "duplicates_removed": len(candidates) - len(updated),
             "vectorized": vector_ok,
             "vector_fallback": vector_fallback,
+            "flattened_scene_artwork": flattened_scene_artwork,
+            "mask_rejected": mask_rejected,
             "inpaint": inpaint_result,
         },
     }

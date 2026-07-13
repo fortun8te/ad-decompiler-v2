@@ -96,6 +96,15 @@ def repairs_from_anomalies(anomalies, design=None):
             if layer_ids:
                 item["target_id"] = layer_ids[0]
             out.append(item)
+        elif kind in {"inpaint_halo", "inpaint_patch"}:
+            out.append({
+                "stage": "inpaint",
+                "action": "rebuild-clean-plate",
+                "reason": f"visible {kind.replace('_', ' ')}: {label}",
+                "params": {"score_candidates": True, "color_match": True,
+                           "halo_review": kind == "inpaint_halo"},
+                "severity": "high",
+            })
     return out
 
 

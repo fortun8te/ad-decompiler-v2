@@ -69,6 +69,18 @@ run on the wrong machine.
 
 ## Benchmark gate
 
+Select a frozen subset by fixture prefix instead of relying on directory order:
+
+```bash
+python benchmark.py --input-dir "C:\\path\\to\\IMAGE AD INSPO" --ids 026,034 --ids 103 --output runs/named-benchmark
+```
+
+`--ids` and its alias `--include` are repeatable, normalize numeric IDs to three digits, and
+fail if an ID is missing or resolves to multiple files. `benchmark.json` records the requested
+IDs and each resolved source filename, absolute path, size, and SHA-256; the Markdown report
+also prints the immutable filename/hash manifest. Use `--no-auto-repair` for a baseline run; it
+explicitly disables both the harness and legacy auto-repair switches.
+
 Lock 10-20 representative inputs before tuning. Include ads, UI screenshots, posters, product
 shots, dense paragraphs, multiple fonts, repeated cards, small icons/arrows, gradients, and
 overlaps. Record:

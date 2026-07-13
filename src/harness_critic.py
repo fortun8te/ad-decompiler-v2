@@ -62,6 +62,8 @@ ANOMALY_CATEGORY = {
     "duplicate_text": ("staging", 0.5),
     "clipped_text": ("text", 0.5),
     "wrong_glyphs": ("text", 0.45),
+    "inpaint_halo": ("inpaint", 0.55),
+    "inpaint_patch": ("inpaint", 0.6),
 }
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0}

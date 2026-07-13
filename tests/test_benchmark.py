@@ -1,6 +1,10 @@
 import json
+import pytest
 
-from benchmark import _entry, _harness_telemetry, _markdown, select_images
+from benchmark import (
+    _entry, _harness_telemetry, _markdown, _source_manifest,
+    configure_auto_repair, parse_fixture_ids, select_images,
+)
 from src import harness
 from src.harness import harness_enabled
 
@@ -118,6 +122,14 @@ def test_harness_enabled_defaults_from_config():
     assert harness_enabled({}) is False
 
 
+def test_no_auto_repair_forces_legacy_and_harness_switches_off():
+    cfg = {"runtime": {"auto_repair": True, "harness": {"enabled": True}}}
+    configure_auto_repair(cfg, False)
+    assert cfg["runtime"]["auto_repair"] is False
+    assert cfg["runtime"]["harness"]["enabled"] is False
+    assert harness_enabled(cfg) is False
+
+
 def test_harness_max_rounds_defaults_to_three():
     assert harness.harness_max_rounds({}) == 3
     assert harness.harness_max_rounds({"runtime": {"harness": {"max_rounds": 5}}}) == 5
@@ -130,6 +142,41 @@ def test_benchmark_selection_is_stable_and_supports_five_image_cap(tmp_path):
     assert [p.name for p in select_images(tmp_path, 5)] == [
         "01.png", "02.jpg", "03.webp", "04.png", "05.jpeg"
     ]
+
+
+def test_benchmark_selects_requested_ids_in_request_order_and_normalizes_padding(tmp_path):
+    for name in ("026_first.webp", "034_second.png", "103_third.jpg", "ignored.txt"):
+        (tmp_path / name).write_bytes(name.encode())
+
+    ids = parse_fixture_ids(["103,26", "034"])
+    assert ids == ["103", "026", "034"]
+    assert [p.name for p in select_images(tmp_path, fixture_ids=ids)] == [
+        "103_third.jpg", "026_first.webp", "034_second.png",
+    ]
+
+
+def test_benchmark_named_selection_fails_on_missing_or_ambiguous_ids(tmp_path):
+    (tmp_path / "026_a.webp").write_bytes(b"a")
+    with pytest.raises(ValueError, match="missing fixture IDs: 034"):
+        select_images(tmp_path, fixture_ids=["034"])
+
+    (tmp_path / "026_b.png").write_bytes(b"b")
+    with pytest.raises(ValueError, match="duplicate files for fixture IDs: 026"):
+        select_images(tmp_path, fixture_ids=["26"])
+    with pytest.raises(ValueError, match="duplicate fixture IDs requested: 026"):
+        parse_fixture_ids(["26", "026"])
+    with pytest.raises(ValueError, match="cannot truncate named fixtures"):
+        select_images(tmp_path, max_images=1, fixture_ids=["026", "034"])
+
+
+def test_source_manifest_records_requested_resolution_and_sha256(tmp_path):
+    image = tmp_path / "026_ad.webp"
+    image.write_bytes(b"fixture")
+    manifest = _source_manifest([image], ["026"])
+    assert manifest["requested_ids"] == ["026"]
+    assert manifest["resolved"][0]["id"] == "026"
+    assert manifest["resolved"][0]["filename"] == image.name
+    assert len(manifest["resolved"][0]["sha256"]) == 64
 
 
 def test_benchmark_entry_rejects_partial_run_even_if_result_claims_success(tmp_path):
@@ -169,3 +216,30 @@ def test_benchmark_scorecard_surfaces_each_visual_failure_rule(tmp_path):
     assert row["empty_layer_alpha"] is True
     assert row["low_element_recall"] is True
     assert "inpaint-outside-mask" in _markdown({"summary": {"images": 1, "qa_passing": 0}, "runs": [row]})
+
+
+def test_entry_surfaces_existing_archetype_preset_and_regional_dispositions(tmp_path):
+    run = _fixture_run(tmp_path)
+    design = json.loads((run / "design.json").read_text())
+    design["meta"].update({"archetype": "social_screenshot", "preset": "instagram_caption"})
+    (run / "design.json").write_text(json.dumps(design), encoding="utf-8")
+    reconstruction = json.loads((run / "reconstruction.json").read_text())
+    reconstruction["stats"]["inpaint"] = {
+        "backend": "regional",
+        "regions": [
+            {"ids": ["a"], "route": "flux-comfy"},
+            {"ids": ["b"], "route": "big-lama", "fallback": True,
+             "fallback_reason": "flat-large-hole"},
+        ],
+    }
+    (run / "reconstruction.json").write_text(json.dumps(reconstruction), encoding="utf-8")
+    qa = json.loads((run / "qa.json").read_text())
+    qa["editable_text_recall"] = 0.875
+    (run / "qa.json").write_text(json.dumps(qa), encoding="utf-8")
+
+    row = _entry(run, {"ok": True})
+    assert row["archetype"] == "social_screenshot"
+    assert row["preset"] == "instagram_caption"
+    assert row["editable_text_recall"] == 0.875
+    assert row["regional_inpaint_routes"] == {"flux-comfy": 1, "big-lama": 1}
+    assert row["fallback_dispositions"][0]["fallback_reason"] == "flat-large-hole"

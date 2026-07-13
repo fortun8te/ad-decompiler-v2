@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -52,6 +53,18 @@ def _draw_text(draw, xy, text, font, fill):
     draw.text(xy, text, font=font, fill=fill)
     # OCR boxes usually include some line-box breathing room.
     return (max(0, bbox[0] - 7), max(0, bbox[1] - 6), bbox[2] + 7, bbox[3] + 6)
+
+
+def test_fit_text_box_scales_multiline_line_height_with_font(monkeypatch):
+    monkeypatch.setattr(text_analysis, "_fit_font", lambda style, size: _font(max(1, int(size))))
+    _, resize, patch = text_analysis.fit_text_box(
+        "First long line\nSecond long line\nThird long line",
+        {"fontSize": 40, "lineHeight": 52, "letterSpacing": 0},
+        {"x": 0, "y": 0, "w": 180, "h": 95},
+    )
+    assert resize == "HEIGHT"
+    assert patch["fontSize"] < 40
+    assert patch["lineHeight"] < 52
 
 
 def test_enriches_painted_geometry_colour_baseline_and_style(tmp_path):
@@ -220,6 +233,20 @@ def test_optional_local_font_matching_is_bounded(tmp_path):
     assert candidates[0]["source"] == "local-render"
     assert candidates[0]["score"] > 0.2
     assert result["text_analysis"]["font_matches_attempted"] == 1
+
+
+def test_empty_font_dirs_still_uses_platform_inventory(tmp_path, monkeypatch):
+    font_path = _font_path()
+    if not font_path:
+        pytest.skip("Pillow did not expose a test TrueType font path")
+    staged = tmp_path / "Platform.ttf"
+    staged.write_bytes(Path(font_path).read_bytes())
+    monkeypatch.setattr(text_analysis, "_platform_font_dirs", lambda: [str(tmp_path)])
+    text_analysis._FONT_DISCOVERY_CACHE.clear()
+
+    discovered = text_analysis._discover_fonts({"font_dirs": [], "scan_limit": 4})
+
+    assert any(Path(item["path"]).name == "Platform.ttf" for item in discovered)
 
 
 def test_multicolumn_paragraphs_do_not_cross_merge_by_reading_order(tmp_path):

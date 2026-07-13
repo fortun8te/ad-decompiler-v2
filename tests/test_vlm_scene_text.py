@@ -30,8 +30,8 @@ def test_disabled_returns_ocr_unchanged(tmp_path):
 
 def test_classifies_line_and_sets_meta(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        vlm_client, "multi_pass_answer",
-        lambda *a, **k: ('{"role": "printed_on_product"}', None),
+        vlm_client, "ask_vlm",
+        lambda *a, **k: '{"placement":"printed","owner":"product","action":"raster_keep","confidence":0.9}',
     )
     ocr = _ocr([{"id": "L0", "text": "50ml", "box": {"x": 10, "y": 10, "w": 80, "h": 30}}])
     cfg = {"vlm": {"scene_text": {"enabled": True}}}
@@ -41,21 +41,26 @@ def test_classifies_line_and_sets_meta(tmp_path, monkeypatch):
 
 
 def test_vlm_disagreement_leaves_line_untagged(tmp_path, monkeypatch):
+    answers = iter([
+        '{"placement":"overlay","owner":"background","action":"recreate","confidence":0.9}',
+        '{"placement":"printed","owner":"product","action":"raster_keep","confidence":0.9}',
+    ])
     monkeypatch.setattr(
-        vlm_client, "multi_pass_answer",
-        lambda *a, **k: (None, "vlm_disagreement"),
+        vlm_client, "ask_vlm",
+        lambda *a, **k: next(answers),
     )
     ocr = _ocr([{"id": "L0", "text": "SALE", "box": {"x": 10, "y": 10, "w": 80, "h": 30}}])
     cfg = {"vlm": {"scene_text": {"enabled": True}}}
     out = vlm_scene_text.classify_scene_text(_image(tmp_path), ocr, cfg)
     assert "scene_text_role" not in (out["lines"][0].get("meta") or {})
+    assert out["lines"][0]["meta"]["ownership_decision"]["action"] == "raster_keep"
     assert out["vlm_scene_text"]["lines_disagreed"] == 1
 
 
 def test_propagates_printed_role_to_blocks(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        vlm_client, "multi_pass_answer",
-        lambda *a, **k: ('{"role": "printed_on_product"}', None),
+        vlm_client, "ask_vlm",
+        lambda *a, **k: '{"placement":"printed","owner":"product","action":"raster_keep","confidence":0.9}',
     )
     ocr = {
         "lines": [{"id": "L0", "text": "50ml", "box": {"x": 10, "y": 10, "w": 80, "h": 30}}],
@@ -117,3 +122,54 @@ def test_merge_respects_overlay_copy_over_geometry(tmp_path):
 def test_parse_role_accepts_json_blob():
     assert vlm_scene_text._parse_role('{"role": "wordmark"}') == "wordmark"
     assert vlm_scene_text._parse_role("not json") is None
+
+
+def test_ownership_protects_raster_owner_even_if_model_claims_recreate():
+    decision = vlm_scene_text._parse_ownership(
+        '{"placement":"overlay","owner":"card","action":"recreate","confidence":0.9}'
+    )
+    assert decision["action"] == "raster_keep"
+
+
+def test_merge_enforces_ownership_before_geometry():
+    ocr = {"lines": [{
+        "id": "L0", "text": "Cadence", "conf": .95,
+        "box": {"x": 100, "y": 100, "w": 80, "h": 30},
+        "meta": {"ownership_decision": {
+            "placement": "printed", "owner": "product",
+            "action": "raster_keep", "confidence": .95,
+        }},
+    }]}
+    text = next(c for c in merge_layers.merge(ocr, [], [], {"w": 600, "h": 600}, {})
+                if c["id"] == "c_L0")
+    assert text["target"] == "drop"
+    assert text["meta"]["ownership_enforced"] is True
+
+
+def test_two_views_may_disagree_on_placement_when_safe_action_agrees(tmp_path, monkeypatch):
+    answers = iter([
+        '{"placement":"printed","owner":"none","action":"recreate","confidence":0.9}',
+        '{"placement":"overlay","owner":"background","action":"recreate","confidence":1.0}',
+    ])
+    monkeypatch.setattr(vlm_client, "ask_vlm", lambda *a, **k: next(answers))
+    ocr = _ocr([{"id": "L0", "text": "Post body",
+                 "box": {"x": 10, "y": 10, "w": 80, "h": 30}}])
+    out = vlm_scene_text.classify_scene_text(
+        _image(tmp_path), ocr, {"vlm": {"scene_text": {"enabled": True, "passes": 2}}},
+    )
+    decision = out["lines"][0]["meta"]["ownership_decision"]
+    assert decision["action"] == "recreate"
+    assert decision["confidence"] == 0.9
+
+
+def test_block_two_thirds_consensus_recreates_without_protected_owner():
+    lines = []
+    for index, action in enumerate(("recreate", "recreate", "raster_keep")):
+        lines.append({"id": f"L{index}", "meta": {"ownership_decision": {
+            "placement": "overlay", "owner": "none", "action": action,
+            "confidence": .8 if action == "recreate" else 0,
+        }}})
+    blocks = [{"id": "B0", "line_ids": ["L0", "L1", "L2"]}]
+    vlm_scene_text._propagate_to_blocks(lines, blocks)
+    assert blocks[0]["meta"]["ownership_decision"]["action"] == "recreate"
+    assert blocks[0]["meta"]["ownership_decision"]["block_consensus"] == "2/3"

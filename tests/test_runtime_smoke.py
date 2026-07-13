@@ -37,6 +37,22 @@ def test_ocr_probe_rejects_silent_fallback_engine(monkeypatch, tmp_path):
     assert "engine=tesseract" in result["detail"]
 
 
+def test_flux_probe_requires_real_backend_and_outside_identity(monkeypatch, tmp_path):
+    import numpy as np
+
+    def fake_once(image_path, mask_path, output_path, cfg):
+        before = np.asarray(Image.open(image_path).convert("RGB")).copy()
+        mask = np.asarray(Image.open(mask_path).convert("L")) > 0
+        before[mask] = (12, 34, 56)
+        Image.fromarray(before).save(output_path)
+        return {"backend": "flux-comfy"}
+
+    monkeypatch.setattr("src.inpaint.inpaint_once", fake_once)
+    result = runtime_smoke._probe_flux_comfy({}, tmp_path)
+    assert result["ok"] is True
+    assert result["evidence"]["outside_identical"] is True
+
+
 def test_worker_turns_probe_exception_into_evidence(monkeypatch, tmp_path):
     monkeypatch.setitem(runtime_smoke._IMPLEMENTATIONS, "ocr",
                         lambda cfg, work: (_ for _ in ()).throw(RuntimeError("boom")))

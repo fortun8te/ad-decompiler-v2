@@ -19,6 +19,7 @@ from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  build_design_json, figma_import, pixel_diff, repair, render_preview,
                  vlm_proofread, vlm_ocr_judge, vlm_font_judge, vlm_scene_text,
                  vlm_segment_filter, vlm_element_propose, vram)
+from src import archetype
 from src.run_report import RunReport, qwen_degradation
 from src.schema import dump, load, validate_design
 from src.harness import harness_enabled, harness_max_rounds, recommended_resume
@@ -218,6 +219,10 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         dump({"w": canvas["w"], "h": canvas["h"]}, A("canvas.json"))
         norm_path = A("normalized.png")
 
+        # Cheap initial scene contract. OCR/VLM observations refine this below before
+        # text analysis and decomposition consume the preset.
+        configured_archetype = str((cfg.get("archetype") or {}).get("preset", "auto"))
+
         # 2 OCR facts, followed by painted-text/style/hierarchy analysis.
         if stage("ocr") or dirty or not exists("ocr_raw.json"):
             current_stage = "ocr"
@@ -247,6 +252,19 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                     vp_note += f", ensemble-proofread {vp['ensemble_disagreement_checked']}"
             _log(run_dir, f"ocr[{raw_ocr.get('engine')}] → {len(raw_ocr.get('lines', []))} lines{oj_note}{vp_note}")
         raw_ocr = load(A("ocr_raw.json")) if exists("ocr_raw.json") else load(A("ocr.json"))
+        # Persist a filename-independent scene decision and make its preset visible to
+        # every remaining stage. Optional semantic observations can come from an
+        # upstream/VLM caller; OCR and canvas facts are always available locally.
+        archetype_cfg = cfg.get("archetype") or {}
+        facts = archetype.scene_facts(
+            canvas, raw_ocr, observations=archetype_cfg.get("observations") or {},
+        )
+        facts.update(archetype.image_facts(norm_path))
+        scene_decision = archetype.classify(facts, configured=configured_archetype)
+        scene_decision["facts"] = facts
+        dump(scene_decision, A("archetype.json"))
+        cfg = archetype.apply_preset(cfg, scene_decision)
+        _log(run_dir, f"archetype → {scene_decision['archetype']}")
         if stage("text") or dirty or not exists("ocr.json"):
             current_stage = "text"
             dirty = True
@@ -370,14 +388,22 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                  f"{reconstruction['stats']['canonical_entities']} entities, "
                  f"background={reconstruction['stats']['inpaint']['backend']}")
         reconstruction = load(A("reconstruction.json"))
-        inpaint_backend = str((reconstruction.get("stats") or {}).get("inpaint", {}).get("backend") or "")
-        inpaint_diag = (reconstruction.get("stats") or {}).get("inpaint", {}).get("diagnostics") or {}
+        inpaint_stats = (reconstruction.get("stats") or {}).get("inpaint", {}) or {}
+        inpaint_backend = str(inpaint_stats.get("backend") or "")
+        inpaint_class = str(inpaint_stats.get("backend_class") or "").lower()
+        backend_counts = inpaint_stats.get("backend_counts") or {}
+        inpaint_diag = inpaint_stats.get("diagnostics") or {}
         comfy_note = ""
         if inpaint_diag.get("comfyui_healthy") is True:
             comfy_note = "; comfyui=ok"
         elif inpaint_diag.get("comfyui_healthy") is False:
             comfy_note = "; comfyui=down"
-        if inpaint_backend and inpaint_backend != "big-lama":
+        fallback_backend = (
+            inpaint_class in {"fallback", "degraded", "unavailable"}
+            or inpaint_backend.lower().startswith("opencv")
+            or any(str(name).lower().startswith("opencv") for name in backend_counts)
+        )
+        if inpaint_backend and fallback_backend:
             report.stage("inpaint", "fallback", detail=f"backend={inpaint_backend}{comfy_note}")
             skip = inpaint_diag.get("auto_skip_reason")
             reason = f"Big-LaMa unavailable; used {inpaint_backend} fallback for background plate"
@@ -387,7 +413,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         elif inpaint_backend:
             passes = inpaint_diag.get("inpaint_passes")
             pass_note = f"; passes={passes}" if passes else ""
-            report.stage("inpaint", "ok", detail=f"backend={inpaint_backend}{comfy_note}{pass_note}")
+            routes = ",".join(f"{name}:{count}" for name, count in sorted(backend_counts.items()))
+            route_note = f"; routes={routes}" if routes else ""
+            report.stage("inpaint", "ok", detail=f"backend={inpaint_backend}{route_note}{comfy_note}{pass_note}")
 
         if stage("layout") or dirty or not exists("layout.json"):
             current_stage = "layout"

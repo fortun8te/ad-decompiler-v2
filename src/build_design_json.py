@@ -27,16 +27,26 @@ def _truncate(value, length=28):
 
 def _name(candidate):
     meta = candidate.get("meta") or {}
+    # Names are part of the deliverable, not cosmetic metadata.  When the scene/VLM
+    # knows an asset's identity, preserve it verbatim so a designer sees e.g. "X logo"
+    # rather than a pile of anonymous `Image — cutout` layers.  Fall back only when no
+    # semantic label survived detection.
+    explicit = (candidate.get("name") or meta.get("semantic_name") or
+                meta.get("layer_name") or meta.get("vlm_name") or meta.get("label"))
+    if explicit:
+        return _truncate(explicit, 56)
     role = str(meta.get("role") or "").strip()
     target = candidate.get("target")
     if target == "text":
         return f'{(role or "Text").title()} — "{_truncate(candidate.get("text"))}"'
     if target == "image":
         if meta.get("wordmark"):
-            return f'Logo — {_truncate(candidate.get("text") or "wordmark")}'
+            return f'Logo — {_truncate(candidate.get("text") or "wordmark")} (raster crop)'
         if meta.get("substitution") or meta.get("low_fidelity"):
             return f'Text (fallback) — "{_truncate(candidate.get("text"))}"'
-        return f'{(role or "Image").title()} — cutout'
+        # These are deliberately image-filled native nodes, so they remain trivially
+        # swappable in Figma even when a complex asset cannot safely be vectorized.
+        return f'{(role or "Image").title()} — swappable crop'
     if target == "icon":
         return f'{(role or "Icon").title()} — vector'
     if target == "group":

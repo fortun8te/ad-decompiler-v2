@@ -206,7 +206,11 @@ def _resolve_options(cfg: dict) -> dict:
         "ocr_read_max_regions": int(read.get("max_regions") or _DEFAULT_MAX_OCR_READ_REGIONS),
         "ocr_read_passes": int(read.get("passes") or passes),
         "proofread_enabled": bool(proof.get("enabled", False)),
-        "proofread_max_conf": float(proof.get("max_conf", 0.80)),
+        # Single-engine OCR can be confidently wrong on high-impact ad copy.  A
+        # 0.90 ceiling spends the bounded VLM budget on those near-misses (for
+        # example one substituted word in a headline) before destructive text
+        # removal is approved.
+        "proofread_max_conf": float(proof.get("max_conf", 0.90)),
         "proofread_brand_tokens": bool(proof.get("brand_tokens", True)),
         "proofread_max_regions": int(proof.get("max_regions") or 8),
         "proofread_passes": int(proof.get("passes") or passes),

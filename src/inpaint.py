@@ -632,6 +632,24 @@ def _seam_energy(candidate, mask):
     return float(gradient[band].mean()) + .20 * chroma
 
 
+def _boundary_color_match(source, generated, mask, radius: int = 5, max_shift: float = 24.0):
+    """Align generated boundary colour to retained context without touching source pixels."""
+    cv2, np, _ = _deps()
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if not binary.any():
+        return np.asarray(generated, dtype=np.uint8), [0.0, 0.0, 0.0]
+    kernel = np.ones((3, 3), np.uint8)
+    ring = (cv2.dilate(binary, kernel, iterations=max(1, int(radius))) > 0) & (binary == 0)
+    if int(np.count_nonzero(ring)) < 16:
+        return np.asarray(generated, dtype=np.uint8), [0.0, 0.0, 0.0]
+    src = np.asarray(source, dtype=np.float32)
+    gen = np.asarray(generated, dtype=np.float32)
+    delta = np.median(src[ring], axis=0) - np.median(gen[ring], axis=0)
+    delta = np.clip(delta, -float(max_shift), float(max_shift))
+    matched = np.clip(gen + delta.reshape(1, 1, 3), 0, 255).astype(np.uint8)
+    return matched, [round(float(value), 3) for value in delta]
+
+
 def _opencv_auto(rgb, mask, radius):
     """Pick the less seam-prone deterministic OpenCV fill for the fallback path."""
     telea = _opencv_inpaint(rgb, mask, radius, "telea")
@@ -944,10 +962,46 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             region_cfg["inpaint"]["mode"] = requested
             # A regional crop is already the coarse context window. Calling the global
             # coarse-to-fine wrapper would run Flux twice and invite a second hallucination.
-            generated, used, backend_diagnostics = _inpaint_single_pass(
-                crop_rgb, crop_mask, region_cfg,
+            attempts = (max(1, int(comfy.get("attempts", 1)))
+                        if requested == "flux-comfy" else 1)
+            candidates = []
+            base_seed = int(comfy.get("seed", 0))
+            for attempt in range(attempts):
+                attempt_cfg = dict(region_cfg)
+                attempt_cfg["inpaint"] = dict(region_cfg["inpaint"])
+                attempt_cfg["inpaint"]["comfy"] = dict(comfy)
+                attempt_cfg["inpaint"]["comfy"]["seed"] = base_seed + attempt
+                candidate, candidate_backend, candidate_diag = _inpaint_single_pass(
+                    crop_rgb, crop_mask, attempt_cfg,
+                )
+                candidate = np.asarray(candidate, dtype=np.uint8)
+                if candidate.shape[:2] != crop_rgb.shape[:2]:
+                    candidate = cv2.resize(candidate, (crop_rgb.shape[1], crop_rgb.shape[0]),
+                                           interpolation=cv2.INTER_LINEAR)
+                if bool(regional_cfg.get("color_match_enabled", False)):
+                    matched, shift = _boundary_color_match(
+                        crop_rgb, candidate, crop_mask,
+                        radius=int(regional_cfg.get("color_match_ring", 5)),
+                        max_shift=float(regional_cfg.get("color_match_max_shift", 24)),
+                    )
+                else:
+                    matched, shift = candidate, [0.0, 0.0, 0.0]
+                preview_candidate = crop_rgb.copy()
+                preview_candidate[crop_mask > 0] = matched[crop_mask > 0]
+                seam_score = _seam_energy(preview_candidate, crop_mask)
+                candidates.append((seam_score, matched, candidate_backend, candidate_diag,
+                                   shift, base_seed + attempt))
+            seam_score, generated, used, backend_diagnostics, shift, chosen_seed = min(
+                candidates, key=lambda row: row[0]
             )
-            generated = np.asarray(generated, dtype=np.uint8)
+            backend_diagnostics = dict(backend_diagnostics)
+            backend_diagnostics.update({
+                "attempts": attempts,
+                "chosen_seed": chosen_seed,
+                "seam_score": round(float(seam_score), 4),
+                "candidate_seam_scores": [round(float(row[0]), 4) for row in candidates],
+                "boundary_color_shift": shift,
+            })
             if generated.shape[:2] != crop_rgb.shape[:2]:
                 backend_diagnostics["resized_from"] = f"{generated.shape[1]}x{generated.shape[0]}"
                 generated = cv2.resize(generated, (crop_rgb.shape[1], crop_rgb.shape[0]), interpolation=cv2.INTER_LINEAR)

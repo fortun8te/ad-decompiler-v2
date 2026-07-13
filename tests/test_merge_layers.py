@@ -82,6 +82,31 @@ def test_headline_text_survives_and_is_editable():
     assert m["c_L0"]["meta"]["removal_required"] is True
 
 
+def test_platform_lockup_is_a_separate_cropped_logo_not_baked_into_card():
+    ocr = {"lines": [{
+        "id": "X", "text": "X.com", "conf": .99,
+        "box": {"x": 450, "y": 42, "w": 90, "h": 24},
+        "meta": {"ownership_decision": {"placement": "ui_metadata", "owner": "card",
+                                         "action": "raster_keep", "confidence": .99}},
+    }]}
+    merged = _by_id(merge_layers.merge(ocr, [], [], CANVAS, {}))
+    x = merged["c_X"]
+    assert x["target"] == "image"
+    assert x["meta"]["platform_lockup"] is True
+    assert x["meta"]["role"] == "platform-logo"
+    assert not x["meta"].get("kept_in_photo")
+
+
+def test_unlabelled_overlay_text_receives_a_semantic_figma_role():
+    ocr = {"lines": [{"id": "L", "text": "SHOP NOW", "conf": .99,
+                      "box": {"x": 40, "y": 400, "w": 180, "h": 35},
+                      "meta": {"ownership_decision": {"placement": "overlay", "owner": "none",
+                                                          "action": "recreate", "confidence": .99}}}]}
+    layer = _by_id(merge_layers.merge(ocr, [], [], CANVAS, {}))["c_L"]
+    assert layer["target"] == "text"
+    assert layer["meta"]["role"] == "cta"
+
+
 def test_shape_that_is_pure_text_box_is_deduped():
     """A 'shape' element whose box is essentially an OCR text box is dropped in
     favor of the editable text candidate."""
@@ -198,3 +223,20 @@ def test_low_fidelity_block_meta_survives_the_block_path_into_the_candidate():
     # "else" branch that loses the actual pixels.
     assert m["c_B0"]["target"] == "image"
     assert m["c_B0"].get("src") == "fallback_crops/L0.png"
+
+
+def test_vlm_font_winner_on_line_overrides_stale_block_font():
+    line = {
+        "id": "L0", "text": "Post body", "conf": .9,
+        "box": {"x": 10, "y": 20, "w": 200, "h": 30},
+        "vlm_font_judged": True,
+        "style": {"fontFamily": "Arial", "fontStyle": "Regular", "fontWeight": 400,
+                  "fontCandidates": [{"family": "Arial", "vlm_score": 9}]},
+    }
+    block = {
+        "id": "B0", "text": "Post body", "line_ids": ["L0"],
+        "box": dict(line["box"]), "style": {"fontFamily": "Comic Sans MS"},
+    }
+    merged = merge_layers.merge({"lines": [line], "blocks": [block]}, [], [], CANVAS, {})
+    text = next(item for item in merged if item["id"] == "c_B0")
+    assert text["style"]["fontFamily"] == "Arial"

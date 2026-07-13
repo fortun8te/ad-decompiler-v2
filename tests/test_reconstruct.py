@@ -79,7 +79,8 @@ def test_reconstruct_wires_enriched_canonical_observations_to_regional_inpaint(t
         {"id": "label", "target": "text", "text": "SALE",
          "box": {"x": 45, "y": 40, "w": 30, "h": 12},
          "visible_box": {"x": 45, "y": 40, "w": 30, "h": 12},
-         "meta": {"role": "offer", "parent_id": "product"}},
+         # Explicit promotion distinguishes editable ad copy from packaging OCR.
+         "meta": {"role": "offer", "parent_id": "product", "overlay_text": True}},
     ]
     captured = {}
 
@@ -102,6 +103,112 @@ def test_reconstruct_wires_enriched_canonical_observations_to_regional_inpaint(t
     assert by_id["product"]["role"] == "product"
     assert by_id["label"]["parent_id"] == "product"
     assert np.any(captured["union"])
+
+
+def test_inset_overlay_keeps_valid_photo_underlay_out_of_removal_mask(tmp_path):
+    source = tmp_path / "inset.png"
+    Image.new("RGB", (120, 90), (40, 110, 150)).save(source)
+    Image.new("L", (30, 30), 255).save(tmp_path / "inset-mask.png")
+    candidates = [{
+        "id": "inset", "target": "image", "box": {"x": 78, "y": 8, "w": 30, "h": 30},
+        "mask": {"src": "inset-mask.png"},
+        "meta": {"role": "photo", "keep_underlay": True, "circular": True},
+    }]
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates, str(tmp_path),
+                                     {"inpaint": {"mode": "opencv"}})
+    removal = np.asarray(Image.open(tmp_path / result["removal_mask"]).convert("L"))
+    assert not removal.any()
+    assert result["candidates"][0]["target"] == "image"
+
+
+def test_photo_card_suppresses_contained_scene_ocr_but_preserves_overlay_copy(tmp_path):
+    source = tmp_path / "card.png"
+    Image.new("RGB", (140, 100), (80, 90, 100)).save(source)
+    Image.new("L", (100, 70), 255).save(tmp_path / "card-mask.png")
+    candidates = [
+        {"id": "card", "target": "image", "box": {"x": 20, "y": 20, "w": 100, "h": 70},
+         "mask": {"src": "card-mask.png"}, "meta": {"role": "photo_card"}},
+        {"id": "label", "target": "text", "text": "CANDLE",
+         "box": {"x": 50, "y": 55, "w": 35, "h": 10}, "meta": {"source": "ocr"}},
+        {"id": "caption", "target": "text", "text": "Real overlay",
+         "box": {"x": 30, "y": 28, "w": 60, "h": 12},
+         "meta": {"source": "ocr", "overlay_text": True}},
+    ]
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates, str(tmp_path),
+                                     {"inpaint": {"mode": "opencv", "mask_dilate": 0}})
+    by_id = {c["id"]: c for c in result["candidates"]}
+    assert by_id["label"]["target"] == "drop"
+    assert by_id["label"]["meta"]["baked_owner_id"] == "card"
+    assert by_id["caption"]["target"] == "text"
+
+
+def test_product_label_ocr_is_baked_unless_explicitly_promoted(tmp_path):
+    source = tmp_path / "product.png"
+    Image.new("RGB", (100, 100), "white").save(source)
+    Image.new("L", (50, 70), 255).save(tmp_path / "product-mask.png")
+    candidates = [
+        {"id": "can", "target": "image", "box": {"x": 25, "y": 15, "w": 50, "h": 70},
+         "mask": {"src": "product-mask.png"}, "meta": {"role": "product"}},
+        {"id": "brand", "target": "text", "text": "BRAND",
+         "box": {"x": 35, "y": 40, "w": 30, "h": 10}, "meta": {"source": "ocr"}},
+    ]
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates, str(tmp_path),
+                                     {"inpaint": {"mode": "opencv"}})
+    brand = next(c for c in result["candidates"] if c["id"] == "brand")
+    assert brand["target"] == "drop"
+    assert brand["meta"]["kept_in_photo"] is True
+
+
+def test_photo_heavy_preset_flattens_unverified_fragments_but_keeps_text():
+    candidates = [
+        {"id": "person", "target": "image", "meta": {"role": "person"}},
+        {"id": "inset", "target": "image", "meta": {"role": "photo"}},
+        {"id": "headline", "target": "text", "text": "Beach ready", "meta": {}},
+        {"id": "noise", "target": "text", "text": "\ufffd ", "meta": {}},
+        {"id": "tiny-noise", "target": "text", "text": "cm", "box": {"w": 40, "h": 12},
+         "meta": {"confidence": 0.45}},
+        {"id": "vertical-package", "target": "text", "text": "Cadence",
+         "box": {"w": 30, "h": 90}, "meta": {"confidence": 0.95}},
+        {"id": "verified", "target": "image", "meta": {"verified_mask": True}},
+        {"id": "exact-text", "target": "image", "text": "Display headline", "meta": {
+            "fallback": True,
+            "substitution": {"from": "text", "to": "image"},
+        }},
+    ]
+    result, count = reconstruct._flatten_photo_scene(
+        candidates, {"scene": {"archetype": "lifestyle_overlay", "preset": {
+            "photo_regions": {"flatten_scene_artwork": True},
+        }}},
+    )
+    by_id = {item["id"]: item for item in result}
+
+    assert count == 0
+    assert by_id["person"]["target"] == "image"
+    assert by_id["inset"]["target"] == "image"
+    assert by_id["headline"]["target"] == "text"
+    assert by_id["noise"]["target"] == "drop"
+    assert by_id["noise"]["meta"]["suppression_reason"] == "invalid-photo-scene-ocr"
+    assert by_id["tiny-noise"]["target"] == "drop"
+    assert by_id["vertical-package"]["target"] == "drop"
+    assert by_id["verified"]["target"] == "image"
+    assert by_id["exact-text"]["target"] == "image"
+
+
+def test_scene_vlm_mode_never_inpaints_text_without_ownership(tmp_path):
+    source = tmp_path / "source.png"
+    _source(source)
+    candidates = [{
+        "id": "headline", "target": "text", "text": "SALE",
+        "box": {"x": 10, "y": 10, "w": 45, "h": 18}, "meta": {},
+    }]
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, candidates, str(tmp_path),
+        {"vlm": {"scene_text": {"enabled": True}}, "inpaint": {"mode": "opencv"}},
+    )
+    headline = next(c for c in result["candidates"] if c["id"] == "headline")
+    assert headline["target"] == "drop"
+    assert headline["meta"]["mask_approval"]["reason"] == "missing-ownership-decision"
+    assert result["stats"]["mask_rejected"] == 1
 
 
 def test_duplicate_observations_collapse_before_asset_work(tmp_path):

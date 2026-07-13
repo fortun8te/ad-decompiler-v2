@@ -328,6 +328,9 @@ def _dominant_axis_gradient(crop, mask) -> Optional[dict]:
     larger colour split. Returns None for ordinary flat-fill text."""
     import numpy as np
 
+    core = _erode_mask(mask)
+    if int(core.sum()) >= max(24, int(np.asarray(mask).sum() * .35)):
+        mask = core
     ys, xs = np.nonzero(mask)
     if ys.size < 24:
         return None
@@ -451,6 +454,19 @@ def _stroke_from_mask(crop, mask) -> Optional[tuple[dict, str]]:
     rim_pixels = crop[rim_sample].astype(np.float32)
     rim_rgb = np.median(rim_pixels, axis=0)
     interior_rgb = np.median(crop[interior].astype(np.float32), axis=0)
+    outside = ~mask
+    if outside.any():
+        background_rgb = np.median(crop[outside].astype(np.float32), axis=0)
+        axis = interior_rgb - background_rgb
+        norm = float(np.dot(axis, axis))
+        if norm > 1:
+            blend = float(np.dot(rim_rgb - background_rgb, axis) / norm)
+            predicted = background_rgb + max(0.0, min(1.0, blend)) * axis
+            # A normal anti-aliased edge is simply a blend between the glyph fill and
+            # its background. It is not an authored outline and must not become a Figma
+            # stroke that visibly fattens the reconstructed text.
+            if 0.03 < blend < 0.97 and float(np.linalg.norm(rim_rgb - predicted)) < 18.0:
+                return None
     # Median absolute deviation, not stddev: thin-stroke regions (e.g. an 'F' stem)
     # can leak a minority of interior-coloured pixels into the rim sample, which
     # would blow up a plain stddev even though the rim colour itself is clean.
@@ -775,6 +791,11 @@ def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
         fit_tracking = bounded_tracking * target_scale
         patch["fontSize"] = round(new_size, 2)
         patch["letterSpacing"] = round(fit_tracking, 3)
+        # Multiline OCR boxes carry a measured line height for the original font.
+        # Keeping that absolute value after shrinking a substitute font is a common
+        # source of clipped final lines in both the preview and Figma.
+        if line_count > 1:
+            patch["lineHeight"] = round(max(new_size, line_height * target_scale), 2)
     elif abs(bounded_tracking - tracking) > 0.001:
         patch["letterSpacing"] = round(bounded_tracking, 3)
 
@@ -998,7 +1019,8 @@ def _discover_fonts(options: dict) -> list[dict]:
     explicit = options.get("font_files") or []
     if isinstance(explicit, str):
         explicit = [explicit]
-    dirs = options.get("font_dirs") if "font_dirs" in options else _platform_font_dirs()
+    # Empty means "no extra directories", not "disable every installed system font".
+    dirs = options.get("font_dirs") or _platform_font_dirs()
     if isinstance(dirs, str):
         dirs = [dirs]
     family_filter = options.get("families") or []

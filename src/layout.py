@@ -528,6 +528,74 @@ def _semantic_text_stacks(roots):
     return out
 
 
+def _semantic_asset_groups(roots):
+    """Keep an explicit asset owner and its overlays together in the Figma tree.
+
+    Element fusion already records ``parent_id`` when, for example, an avatar owns an
+    online badge or a screenshot/card owns its UI chrome.  Geometry-only grouping used
+    to discard that evidence unless the owner happened to be a flat shape.  That produced
+    a flat layer list where a designer could not select a whole swappable photo/card.
+
+    Only image/vector-like owners are wrapped here: native shape containers are handled
+    by the card/button pass below.  We also require meaningful spatial overlap so a stale
+    parent hint cannot accidentally pull a distant caption into an asset group.
+    """
+    by_id = {node.get("id"): node for node in roots if node.get("id")}
+    children_by_parent = {}
+    for node in roots:
+        parent_id = (node.get("meta") or {}).get("parent_id")
+        if parent_id and parent_id in by_id and parent_id != node.get("id"):
+            children_by_parent.setdefault(parent_id, []).append(node)
+
+    consumed = set()
+    wrappers = []
+    for parent_id, children in children_by_parent.items():
+        owner = by_id[parent_id]
+        if owner.get("target") not in {"image", "icon"}:
+            continue
+        owner_box = owner.get("box") or {}
+        accepted = []
+        for child in children:
+            child_box = child.get("box") or {}
+            confidence = float((child.get("meta") or {}).get("parent_confidence", 0) or 0)
+            if _inside(child_box, owner_box) >= .55 or confidence >= .85:
+                accepted.append(child)
+        if not accepted:
+            continue
+        # A semantic owner may itself already be nested in a native card frame.  Do
+        # not manufacture a second root around it; the existing frame is the correct
+        # designer-facing group in that case.
+        if owner.get("id") in consumed or any(child.get("id") in consumed for child in accepted):
+            continue
+        role = str((owner.get("meta") or {}).get("role") or owner.get("target") or "asset")
+        label = ((owner.get("meta") or {}).get("semantic_name") or
+                 (owner.get("meta") or {}).get("label") or role.replace("-", " ").title())
+        wrappers.append({
+            "id": f"asset-group-{owner.get('id')}",
+            "target": "group",
+            "name": f"{label} — asset group",
+            "box": dict(owner_box),
+            "z": min([_node_z(owner)] + [_node_z(child) for child in accepted]),
+            "children": [owner] + sorted(accepted, key=lambda node: (_node_z(node), node.get("id", ""))),
+            "layout": {"mode": "NONE", "confidence": 1.0},
+            "meta": {
+                "role": "asset-group",
+                "semantic_owner": owner.get("id"),
+                "semantic_label": label,
+                "layout_confidence": 1.0,
+            },
+        })
+        consumed.add(owner.get("id"))
+        consumed.update(child.get("id") for child in accepted)
+
+    if not wrappers:
+        return roots
+    out = [node for node in roots if node.get("id") not in consumed]
+    out.extend(wrappers)
+    out.sort(key=lambda node: (_node_z(node), node.get("id", "")))
+    return out
+
+
 def _merge_card_shells(nodes, containers):
     """Fold a full-bleed painted backdrop into an otherwise empty card shell."""
     dropped = set()
@@ -629,6 +697,10 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
             _passthrough_corner_radius(host)
 
     roots = [n for n in nodes if n.get("id") not in parent and n.get("id") not in dropped]
+    # Preserve fusion's semantic image ownership before heuristic text-stack grouping.
+    # This stops a UI label over a screenshot/avatar from being split back into a
+    # distant top-level layer merely because its owner is an IMAGE rather than a RECT.
+    roots = _semantic_asset_groups(roots)
     roots = _semantic_text_stacks(roots)
     for node in nodes:
         if node.get("children"):
