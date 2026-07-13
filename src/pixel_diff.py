@@ -679,7 +679,7 @@ def _layer_alpha_audit(layers, run_dir, thresholds):
         rows.append(row)
         if opaque == 0:
             failures.append(("empty-layer-alpha", f"layer {lid} has no visible pixels"))
-        elif (role in hole_roles and hole_pixels >= 16
+        elif (role in hole_roles and not meta.get("ownership_cutout") and hole_pixels >= 16
               and hole_fraction > thresholds["layer_internal_hole_fraction_max"]):
             failures.append((
                 "layer-alpha-holes",

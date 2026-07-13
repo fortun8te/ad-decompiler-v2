@@ -364,6 +364,12 @@ def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None):
     mask = inpaint.mask_on_canvas(_mask_path(candidate), candidate.get("box", {}), (w, h), run_dir)
     if candidate.get("target") in ("shape", "icon", "image"):
         mask = inpaint.solidify_mask(mask)
+    # For tangible foreground subjects an enclosed transparent island is almost
+    # always an accidental segmentation void, not a design feature.  Fill it
+    # before ownership/inpainting so the product stays a clean swappable asset.
+    role = str(meta.get("role") or "").lower()
+    if candidate.get("target") == "image" and role in {"product", "person", "people", "portrait", "cutout"}:
+        mask = inpaint.fill_enclosed_mask_holes(mask)
     return mask
 
 
@@ -994,8 +1000,25 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             target = c["target"] = "image"
             # fall through to the image materialization below
 
-        image = _source_rgba(c, rgb, mask, run_dir)
         owned = (ownership == owner_number.get(cid, 0)).astype(np.uint8) * 255
+        # Holes introduced by front-to-back ownership are intentional: a child
+        # logo/badge sits in that exact region and is rendered independently.
+        # Preserve this provenance so QA can distinguish it from a broken SAM
+        # matte hole.
+        if np.any((mask > 0) & (owned == 0)):
+            c["meta"]["ownership_cutout"] = True
+        # A lower-priority fallback that owns no pixels would export an empty
+        # Figma image layer.  It is already faithfully present in its retained
+        # owner, so drop it instead of producing a misleading layer.
+        substitution = c["meta"].get("substitution") if isinstance(c["meta"].get("substitution"), dict) else {}
+        is_text_fallback = bool(c["meta"].get("fallback") and substitution.get("from") == "text")
+        if not np.any(owned) and is_text_fallback:
+            c["target"] = "drop"
+            c["meta"]["keep_in_background"] = True
+            c["meta"]["suppression_reason"] = "fully-contained-in-foreground-owner"
+            updated.append(c)
+            continue
+        image = _source_rgba(c, rgb, mask, run_dir)
         image = _apply_owned_alpha(image, owned, c.get("box", {}))
         # Keep the exact reconstructed crop even when the editable vector passes
         # the fidelity gate.  It is the deterministic preview fallback for SVGs

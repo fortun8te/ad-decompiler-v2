@@ -182,6 +182,25 @@ def solidify_mask(mask, threshold: int = 16):
     return np.where(np.asarray(mask) > threshold, 255, 0).astype(np.uint8)
 
 
+def fill_enclosed_mask_holes(mask, threshold: int = 16):
+    """Fill only transparent islands enclosed by a segmentation matte.
+
+    This keeps the exterior transparent while preventing a SAM void from
+    punching a visible hole through a product/person raster layer.  It is
+    intentionally opt-in at the reconstruction callsite; icons may have
+    legitimate counters.
+    """
+    cv2, np, _ = _deps()
+    binary = solidify_mask(mask, threshold)
+    padded = np.pad(binary, 1, mode="constant")
+    flood = padded.copy()
+    flood_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
+    cv2.floodFill(flood, flood_mask, (0, 0), 255)
+    enclosed = (padded == 0) & (flood == 0)
+    padded[enclosed] = 255
+    return padded[1:-1, 1:-1].astype(np.uint8)
+
+
 def feather_mask_edges(mask, radius: int = 1):
     """Soften only the outer rim of a binary mask — helps LaMa blend without widening the hole."""
     cv2, np, _ = _deps()
