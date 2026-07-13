@@ -25,7 +25,8 @@ PRESETS: dict[str, dict[str, Any]] = {
                  "single_line_auto_resize": "WIDTH", "preserve_timestamp_group": True},
         "grouping": {"photo_frame": True, "header_cluster": True},
         "thresholds": {"text_recall_min": 0.90, "editable_text_recall_min": 0.86,
-                       "min_text_fidelity": 0.75},
+                       "min_text_fidelity": 0.75, "visual_pass_ssim_min": 0.55,
+                       "edge_f1_min": 0.35},
     },
     "caption_over_photo": {
         "photo_regions": {"retain_as_single_image": True, "suppress_descendants": True,
@@ -43,7 +44,8 @@ PRESETS: dict[str, dict[str, Any]] = {
         "grouping": {"preserve_columns": True, "prevent_cross_column_blocks": True,
                      "preserve_aligned_rows": True, "pair_text_with_backplate": True},
         "thresholds": {"text_recall_min": 0.93, "editable_text_recall_min": 0.88,
-                       "min_text_fidelity": 0.75},
+                       "min_text_fidelity": 0.75, "visual_pass_ssim_min": 0.65,
+                       "edge_f1_min": 0.45},
     },
     "lifestyle_overlay": {
         "photo_regions": {"retain_as_single_image": True, "suppress_descendants": True,

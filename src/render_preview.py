@@ -453,10 +453,59 @@ def _render_tile(layer, run_dir):
     return padded, (effect_offset[0] + text_offset[0], effect_offset[1] + text_offset[1])
 
 
-def _blend(canvas, tile, point, mode):
+def _layer_paint_clip(layer, offset=(0, 0)):
+    box = layer.get("box") or {}
+    vis = layer.get("visible_box") or {}
+    ox, oy = _number(offset[0]), _number(offset[1])
+    top_bound = oy + min(_number(box.get("y", 0)), _number(vis.get("y", box.get("y", 0))))
+    bottom_bound = oy + max(
+        _number(box.get("y", 0)) + _number(box.get("h", 0)),
+        _number(vis.get("y", 0)) + _number(vis.get("h", 0)),
+    )
+    if layer.get("type") == "text":
+        style = layer.get("style") or {}
+        font_size = _number(style.get("fontSize", box.get("h", 12)), max(12, _number(box.get("h", 12))))
+        pad = max(2, int(math.ceil(font_size * 0.20)))
+        top_bound -= pad
+        bottom_bound += pad
+        return (-1_000_000, int(math.floor(top_bound - 1)), 1_000_000, int(math.ceil(bottom_bound)))
+    left = ox + min(_number(box.get("x", 0)), _number(vis.get("x", box.get("x", 0))))
+    right = ox + max(
+        _number(box.get("x", 0)) + _number(box.get("w", 0)),
+        _number(vis.get("x", 0)) + _number(vis.get("w", 0)),
+    )
+    return (
+        int(math.floor(left - 1)),
+        int(math.floor(top_bound - 1)),
+        int(math.ceil(right + 1)),
+        int(math.ceil(bottom_bound + 1)),
+    )
+
+
+def _clip_tile_to_rect(tile, dest_x, dest_y, clip_rect):
+    """Zero alpha outside the layer's declared paint bounds on the canvas."""
+    from PIL import Image, ImageDraw
+    cx0, cy0, cx1, cy1 = clip_rect
+    tx0, ty0 = dest_x, dest_y
+    tx1, ty1 = dest_x + tile.width, dest_y + tile.height
+    ix0, iy0 = max(cx0, tx0), max(cy0, ty0)
+    ix1, iy1 = min(cx1, tx1), min(cy1, ty1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return Image.new("RGBA", tile.size, (0, 0, 0, 0))
+    mask = Image.new("L", tile.size, 0)
+    ImageDraw.Draw(mask).rectangle(
+        (ix0 - tx0, iy0 - ty0, ix1 - tx0 - 1, iy1 - ty0 - 1),
+        fill=255,
+    )
+    return _multiply_alpha(tile, mask)
+
+
+def _blend(canvas, tile, point, mode, clip_rect=None):
     """Composite tile onto an opaque preview, including common non-normal Figma blends."""
     from PIL import ImageChops
     x, y = point
+    if clip_rect is not None:
+        tile = _clip_tile_to_rect(tile, x, y, clip_rect)
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(canvas.width, x + tile.width), min(canvas.height, y + tile.height)
     if x1 <= x0 or y1 <= y0:
@@ -500,7 +549,8 @@ def _draw_layer(canvas, layer, run_dir, offset=(0, 0)):
     if opacity < 1:
         alpha = tile.getchannel("A").point(lambda value: round(value * opacity))
         tile.putalpha(alpha)
-    _blend(canvas, tile, (x, y), layer.get("blend_mode", layer.get("blendMode", "NORMAL")))
+    _blend(canvas, tile, (x, y), layer.get("blend_mode", layer.get("blendMode", "NORMAL")),
+           _layer_paint_clip(layer, offset))
 
 
 def render(design_or_path, run_dir, out_name="preview.png"):

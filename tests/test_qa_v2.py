@@ -391,6 +391,12 @@ def test_visual_pass_ssim_unifies_pixel_diff_repair_and_pipeline_gate():
     assert pixel_diff_thresholds(cfg)["local_ssim_min"] == 0.9
     assert pixel_diff.DEFAULT_THRESHOLDS["local_ssim_min"] == DEFAULT_VISUAL_PASS_SSIM
 
+    archetype_cfg = {
+        "qa": {"visual_pass_ssim": 0.9, "archetype_thresholds": {"visual_pass_ssim_min": 0.65}},
+    }
+    assert visual_pass_ssim(archetype_cfg) == 0.65
+    assert pixel_diff_thresholds(archetype_cfg)["local_ssim_min"] == 0.65
+
     below = repair.assess({}, {"ssim": 0.88, "visual_score": 0.88}, {}, cfg)
     assert any("ssim 0.88 < 0.9" in item["reason"] for item in below)
     assert any("visual score 0.88 < 0.90" in item["reason"] for item in below)

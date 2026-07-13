@@ -122,7 +122,11 @@ class RunReport:
 
     @property
     def acceptable(self) -> bool:
-        return not self.data.get("violations") and self.data.get("status") != "failed"
+        if self.data.get("violations") or self.data.get("status") == "failed":
+            return False
+        if self.data.get("qa_ok") is False:
+            return False
+        return True
 
     def finish(self, *, error: str | None = None, qa_ok: bool | None = None) -> None:
         qa_path = os.path.join(os.path.dirname(self.path), "qa.json")

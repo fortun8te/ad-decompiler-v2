@@ -51,6 +51,22 @@ _DEFAULT_CALIBRATION = {
     "tesseract": 0.82,
 }
 
+def _parse_langs(cfg: dict) -> list[str]:
+    """Return OCR language preference list from config.
+
+    Supports strings like "en", "en+nl", "en,nl" (order matters).
+    """
+    ocr_cfg = cfg.get("ocr") or {}
+    raw = str(ocr_cfg.get("lang", "en") or "en").strip().lower()
+    if raw in {"auto", "multi", "*"}:
+        return ["en", "nl"]
+    parts = [p.strip() for p in re.split(r"[+,]", raw) if p.strip()]
+    return parts or ["en"]
+
+
+def _primary_lang(cfg: dict) -> str:
+    return _parse_langs(cfg)[0]
+
 
 def _load_schema():
     for name in ("src.schema", "schema"):
@@ -519,7 +535,7 @@ def _parse_paddle_result(result: Any) -> list:
 
 def _paddle_engine(cfg: dict, *, device_override: Optional[str] = None):
     ocr_cfg = cfg.get("ocr") or {}
-    lang = ocr_cfg.get("lang", "en")
+    lang = _primary_lang(cfg)
     device_key = device_override if device_override is not None else str(cfg.get("device", "cpu"))
     device = "gpu" if device_key.startswith("cuda") else "cpu"
     key = (
@@ -858,10 +874,9 @@ def _parse_easyocr_results(results: Any) -> list:
 
 
 def _easyocr_engine(cfg: dict):
-    ocr_cfg = cfg.get("ocr") or {}
-    lang = str(ocr_cfg.get("lang", "en"))
+    langs = _parse_langs(cfg)
     gpu = str(cfg.get("device", "cpu")).lower().startswith("cuda")
-    key = (lang, gpu)
+    key = (tuple(langs), gpu)
     reader = _EASYOCR_ENGINES.get(key)
     if reader is not None:
         return reader
@@ -869,7 +884,7 @@ def _easyocr_engine(cfg: dict):
         import easyocr
     except ImportError as error:  # pragma: no cover
         raise ImportError("EasyOCR backend requires easyocr.  pip install easyocr") from error
-    reader = easyocr.Reader([lang], gpu=gpu)
+    reader = easyocr.Reader(langs, gpu=gpu)
     _EASYOCR_ENGINES[key] = reader
     return reader
 
@@ -892,7 +907,7 @@ def _tesseract(img_path, cfg):
             "Tesseract backend requires pytesseract and the tesseract binary.\n"
             "  pip install pytesseract"
         ) from error
-    language = (cfg.get("ocr") or {}).get("lang", "en")
+    language = _primary_lang(cfg)
     data = pytesseract.image_to_data(
         Image.open(img_path), lang=language, output_type=pytesseract.Output.DICT
     )

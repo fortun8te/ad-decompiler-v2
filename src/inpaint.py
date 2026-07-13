@@ -107,6 +107,20 @@ def mask_on_canvas(mask_path: Optional[str], box: dict, canvas: tuple[int, int],
     return out
 
 
+def box_fill_mask(canvas: tuple[int, int], box: dict, pad: int = 2):
+    """Solid rectangle mask for a layer box, used to complete sparse text ink masks."""
+    _, np, _ = _deps()
+    height, width = canvas
+    out = np.zeros((height, width), dtype=np.uint8)
+    x0 = max(0, int(round(box.get("x", 0))) - pad)
+    y0 = max(0, int(round(box.get("y", 0))) - pad)
+    x1 = min(width, int(round(box.get("x", 0) + box.get("w", 0))) + pad)
+    y1 = min(height, int(round(box.get("y", 0) + box.get("h", 0))) + pad)
+    if x1 > x0 and y1 > y0:
+        out[y0:y1, x0:x1] = 255
+    return out
+
+
 def text_ink_mask(rgb, box: dict, quad: Optional[list] = None,
                   allow_box_fallback: bool = True):
     """Estimate painted glyph pixels, avoiding a destructive whole OCR rectangle.
@@ -740,6 +754,14 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
             diagnostics["flux_comfy"] = "ok"
         else:
             diagnostics["flux_comfy"] = "unavailable"
+            worker = _load_qwen_worker()
+            last_error = ""
+            try:
+                last_error = str(getattr(getattr(worker, "flux_inpaint", None), "__dict__", {}).get("last_error", "") or "")
+            except Exception:
+                last_error = ""
+            if last_error:
+                diagnostics["flux_comfy_last_error"] = last_error
             flux_required = bool(comfy_inpaint.get("required"))
             require_active = bool((cfg.get("runtime") or {}).get("require_active_models"))
             if (mode in flux_modes and (flux_required or require_active)
@@ -912,6 +934,8 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
     flux_residual = float(regional_cfg.get("flux_residual_p90", 18.0))
     flux_gradient = float(regional_cfg.get("flux_gradient_p90", 18.0))
     flux_max_fraction = float(regional_cfg.get("flux_max_canvas_fraction", 0.025))
+    analytic_max_fraction = float(regional_cfg.get("analytic_max_canvas_fraction", 0.12))
+    force_active_for_large = float(regional_cfg.get("force_active_above_fraction", 1.0))
     base_mode = str((cfg.get("inpaint") or {}).get("mode", "auto")).lower()
     comfy = (cfg.get("inpaint") or {}).get("comfy") or {}
     flux_allowed = base_mode in ("flux", "flux-comfy", "flux_comfy") or (
@@ -923,6 +947,12 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
     for number, region in enumerate(regions, start=1):
         mask = solidify_mask(region["mask"])
         region_fraction = float(np.count_nonzero(mask)) / max(1, mask.size)
+        region_roles = {str(role).lower() for role in (region.get("roles") or []) if role}
+        region_targets = {str(target).lower() for target in (region.get("targets") or []) if target}
+        photo_hole = bool(
+            region_targets & {"image"}
+            or region_roles & {"photo", "product", "person", "cutout"}
+        )
         crop_spec = _regional_crop(mask, cfg)
         if crop_spec is None:
             continue
@@ -948,15 +978,28 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
         if (coeff is not None and complexity.get("model") == "dominant-flat-rgb"
                 and complexity["residual_p90"] <= flat_residual):
             analytic = True
+        # Analytic plates are safe (non-hallucinating) but can wipe subtle photographic
+        # texture inside a removed product/person/photo region even when the exterior ring
+        # looks flat. Prefer an active inpaint model for those holes unless the plate is
+        # overwhelmingly uniform.
+        if analytic and photo_hole and complexity.get("model") != "dominant-flat-rgb":
+            analytic = False
+        # Guardrail: analytic fills are great for small UI cutouts, but they destroy large
+        # regions (e.g. a photo that was masked) by collapsing them to a single plate.
+        if region_fraction >= analytic_max_fraction:
+            analytic = False
         complex_background = bool(
             coeff is not None and (
                 complexity["residual_p90"] >= flux_residual
                 or complexity["gradient_p90"] >= flux_gradient
             )
         )
-        requested = "analytic-affine" if analytic else "big-lama"
-        if not analytic:
-            if base_mode == "opencv":
+        force_flux = bool(regional_cfg.get("force_flux", False))
+        requested = "analytic-affine" if analytic and not force_flux else "big-lama"
+        if not analytic or force_flux:
+            if force_flux and flux_allowed and "text" not in set(region["targets"]):
+                requested = "flux-comfy"
+            elif base_mode == "opencv":
                 requested = "opencv"
             elif base_mode in ("lama", "big-lama", "simple-lama"):
                 requested = "big-lama"
@@ -969,6 +1012,13 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             elif (flux_allowed and complex_background
                   and region_fraction <= flux_max_fraction
                   and "text" not in set(region["targets"])):
+                requested = "flux-comfy"
+            # If we removed a huge fraction of the canvas, avoid analytic and prefer an
+            # active model when possible; otherwise the plate will flatten/hallucinate.
+            if (region_fraction >= force_active_for_large
+                    and requested == "big-lama"
+                    and flux_allowed
+                    and "text" not in set(region["targets"])):
                 requested = "flux-comfy"
 
         started = time.monotonic()
@@ -992,6 +1042,18 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
                 attempt_cfg["inpaint"] = dict(region_cfg["inpaint"])
                 attempt_cfg["inpaint"]["comfy"] = dict(comfy)
                 attempt_cfg["inpaint"]["comfy"]["seed"] = base_seed + attempt
+                if requested == "flux-comfy":
+                    if photo_hole:
+                        attempt_cfg["inpaint"]["comfy"]["prompt"] = str(
+                            regional_cfg.get("photo_prompt", "")
+                        )
+                    else:
+                        attempt_cfg["inpaint"]["comfy"]["prompt"] = str(
+                            regional_cfg.get(
+                                "plate_prompt",
+                                comfy.get("prompt", ""),
+                            )
+                        )
                 candidate, candidate_backend, candidate_diag = _inpaint_single_pass(
                     crop_rgb, crop_mask, attempt_cfg,
                 )

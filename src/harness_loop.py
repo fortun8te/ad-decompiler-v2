@@ -37,6 +37,7 @@ from src.harness import (
     harness_max_rounds,
     is_actionable,
     load_repairs,
+    load_repair_candidates,
     recommended_resume,
     _load_json,
     _write_json,
@@ -79,12 +80,16 @@ def _qa_score(qa: Optional[dict]) -> Optional[float]:
     qa = qa or {}
     if _qa_accepts(qa, allow_summary=True):
         return 1.0
-    values = [float(qa[key]) for key in _SCORE_KEYS if isinstance(qa.get(key), (int, float))]
-    if not values:
-        return None
-    base = sum(values) / len(values)
+    composite = qa.get("composite")
+    if isinstance(composite, (int, float)):
+        base = float(composite) / 100.0
+    else:
+        values = [float(qa[key]) for key in _SCORE_KEYS if isinstance(qa.get(key), (int, float))]
+        if not values:
+            return None
+        base = sum(values) / len(values)
     hard_fails = qa.get("hard_fails")
-    penalty = 0.05 * len(hard_fails) if isinstance(hard_fails, list) else 0.0
+    penalty = 0.12 * len(hard_fails) if isinstance(hard_fails, list) else 0.0
     return round(max(0.0, base - penalty), 6)
 
 
@@ -146,7 +151,7 @@ def _round_repair_signatures(repair_summary: dict) -> tuple[list, set]:
 def _actionable_signatures(run_dir: str, cfg: dict, blocked: set) -> list:
     """Signatures of currently actionable repairs not already blocked."""
     out: list = []
-    for repair in load_repairs(run_dir, cfg) or []:
+    for repair in load_repair_candidates(run_dir, cfg) or []:
         if not is_actionable(repair):
             continue
         signature = _repair_id(repair)
@@ -339,13 +344,20 @@ def _run_round(
         round_record["qa"] = _qa_summary(qa)
         production_result = "qa_ok" in pipeline_result or "runtime_ok" in pipeline_result
         if not qa_fresh and production_result:
-            round_record["stopped"] = "qa_not_refreshed"
-            return round_record, working_cfg, True
-        if _qa_accepts(qa, allow_summary=True):
+            round_record["pipeline"]["qa_stale"] = True
+        elif _qa_accepts(qa, allow_summary=True) and qa_fresh:
             round_record["stopped"] = "qa_ok"
             return round_record, working_cfg, True
 
     qa_before_repairs = _load_json(os.path.join(run_dir, "qa.json"), {})
+    # Run critic before repairs so execute_repairs can use filtered_repairs this round.
+    critic_output = _run_critic_pass(run_dir, working_cfg)
+    _write_json(os.path.join(run_dir, "critic.json"), critic_output)
+    round_record["critic"] = {
+        "issues": len(critic_output.get("prioritized_issues") or critic_output.get("issues") or []),
+        "suggested_fix_ids": critic_output.get("suggested_fix_ids") or [],
+        "blockers": len(critic_output.get("blockers") or []),
+    }
     repair_cfg = _cfg_for_pipeline(working_cfg)
     try:
         repair_summary = _invoke_execute_repairs(
@@ -368,17 +380,10 @@ def _run_round(
         "metric_deltas": repair_deltas,
     }
     round_record["qa_after_repairs"] = _qa_summary(qa)
-    if _qa_accepts(qa, allow_summary=True):
+    pipeline_stale = bool((round_record.get("pipeline") or {}).get("qa_stale"))
+    if _qa_accepts(qa, allow_summary=True) and not pipeline_stale:
         round_record["stopped"] = "qa_ok_after_repairs"
         return round_record, working_cfg, True
-
-    critic_output = _run_critic_pass(run_dir, working_cfg)
-    _write_json(os.path.join(run_dir, "critic.json"), critic_output)
-    round_record["critic"] = {
-        "issues": len(critic_output.get("prioritized_issues") or critic_output.get("issues") or []),
-        "suggested_fix_ids": critic_output.get("suggested_fix_ids") or [],
-        "blockers": len(critic_output.get("blockers") or []),
-    }
 
     fixer_result = _run_fixer_pass(run_dir, working_cfg, critic_output)
     _write_json(os.path.join(run_dir, "fixer.json"), {
@@ -448,8 +453,12 @@ def run_until_acceptable(
     rolled_back_rounds = 0
 
     next_resume = start_from
+    last_repair_refreshed_qa = False
     for round_num in range(1, max_rounds + 1):
-        skip_pipeline = pipeline_already_ran and round_num == 1
+        skip_pipeline = (
+            (pipeline_already_ran and round_num == 1)
+            or (round_num > 1 and last_repair_refreshed_qa)
+        )
         resume = next_resume
 
         round_record, working_cfg, should_stop = _run_round(
@@ -467,6 +476,8 @@ def run_until_acceptable(
         )
         next_resume = round_record.get("next_resume") or next_resume
         round_stopped = round_record.get("stopped")
+        attempts = (round_record.get("repairs") or {}).get("attempts") or []
+        last_repair_refreshed_qa = any(attempt.get("qa_fresh") for attempt in attempts)
 
         # ── convergence bookkeeping ────────────────────────────────────────────────
         after_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
@@ -559,7 +570,7 @@ def run_until_acceptable(
         "rounds": rounds,
         "rounds_completed": len(rounds),
         "max_rounds": max_rounds,
-        "qa_ok": success_stop and _qa_accepts(final_qa, allow_summary=True),
+        "qa_ok": _qa_accepts(final_qa, allow_summary=True),
         "stopped": stopped,
         "thresholds": threshold_snapshot,
         "convergence": {

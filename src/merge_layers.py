@@ -59,6 +59,57 @@ def _inside_frac(a, b):
     return (ix * iy) / max(1.0, a["w"] * a["h"])
 
 
+def _normalize_text_key(value):
+    return " ".join(str(value or "").strip().upper().split())
+
+
+def _dedup_text_candidates(candidates, merge_cfg: dict, dedup_iou: float):
+    """Collapse ghosted/duplicate OCR text layers flagged by the harness or VLM critic."""
+    if not merge_cfg.get("dedup_text"):
+        return candidates
+    drop_ids = set()
+    layer_ids = [str(layer_id) for layer_id in (merge_cfg.get("layer_ids") or []) if layer_id]
+    if layer_ids:
+        drop_ids.update(layer_ids[1:])
+    duplicate_texts = {
+        _normalize_text_key(text)
+        for text in (merge_cfg.get("duplicate_text") or [])
+        if _normalize_text_key(text)
+    }
+    if duplicate_texts:
+        texts = [
+            c for c in candidates
+            if c.get("target") == "text" and c.get("id") not in drop_ids
+        ]
+        by_text = {}
+        for candidate in texts:
+            key = _normalize_text_key(candidate.get("text"))
+            if key not in duplicate_texts:
+                continue
+            by_text.setdefault(key, []).append(candidate)
+        for group in by_text.values():
+            if len(group) < 2:
+                continue
+            group.sort(
+                key=lambda c: (
+                    float((c.get("meta") or {}).get("confidence", 0) or 0),
+                    -_inside_frac(c.get("box", {}), c.get("box", {})),
+                    str(c.get("id", "")),
+                ),
+                reverse=True,
+            )
+            keeper = group[0]
+            for duplicate in group[1:]:
+                if _iou(keeper.get("box", {}), duplicate.get("box", {})) >= dedup_iou:
+                    drop_ids.add(duplicate.get("id"))
+                    keeper.setdefault("meta", {}).setdefault("deduped_text_ids", []).append(
+                        duplicate.get("id")
+                    )
+    if not drop_ids:
+        return candidates
+    return [c for c in candidates if c.get("id") not in drop_ids]
+
+
 # ── conservative inline router (fallback only) ───────────────────────────────────────
 def _fallback_route(candidate: dict, canvas: dict, cfg: dict) -> dict:
     """Minimal port of routing intent, used ONLY if src.routing is unimportable.
@@ -435,6 +486,8 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                 kept.append(c)
                 continue
         kept.append(c)
+
+    kept = _dedup_text_candidates(kept, cfg.get("merge") or {}, dedup_iou)
 
     # stable z: keep qwen-derived z, then order remaining by area (large=back)
     def _area(c):

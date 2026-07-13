@@ -73,6 +73,8 @@ class BaseNode {
   resize(width, height) {
     this.width = width;
     this.height = height;
+    if ("primaryAxisSizingMode" in this) this.primaryAxisSizingMode = "FIXED";
+    if ("counterAxisSizingMode" in this) this.counterAxisSizingMode = "FIXED";
   }
 
   setPluginData(key, value) {
@@ -263,6 +265,13 @@ const figma = {
   },
   createText() { return autoParent(new TextNode()); },
   createFrame() { return autoParent(new BaseNode("FRAME")); },
+  createAutoLayout(mode) {
+    const frame = autoParent(new BaseNode("FRAME"));
+    frame.layoutMode = mode === "VERTICAL" ? "VERTICAL" : "HORIZONTAL";
+    frame.primaryAxisSizingMode = "AUTO";
+    frame.counterAxisSizingMode = "AUTO";
+    return frame;
+  },
   createComponent() { return autoParent(new ComponentNode()); },
   createRectangle() { return autoParent(new BaseNode("RECTANGLE")); },
   createEllipse() { return autoParent(new BaseNode("ELLIPSE")); },
@@ -610,7 +619,7 @@ assert.ok(page.findAll((node) => node.type === "COMPONENT").length >= 1);
 assert.ok(page.findAll((node) => node.type === "INSTANCE").length >= 1);
 const firstRoot = roots(sceneV2.id)[0];
 assert.equal(nodeForLayer(firstRoot, "copy-stack").x, 40, "v2 top-level boxes stay root-local");
-assert.equal(nodeForLayer(firstRoot, "headline").x, 16, "v2 nested boxes stay parent-relative");
+assert.equal(nodeForLayer(firstRoot, "headline").x, 0, "autolayout flow children use flow origin, not absolute box coords");
 assert.equal(nodeForLayer(firstRoot, "headline").leadingTrim, "CAP_HEIGHT");
 assert.deepEqual(nodeForLayer(firstRoot, "headline").fontName, { family: "Inter", style: "Bold" });
 assert.equal(first.fonts.selections.find((selection) => selection.label === "Headline").rank, 2);
@@ -621,6 +630,8 @@ const badge = nodeForLayer(firstRoot, "badge");
 assert.equal(badge.layoutMode, "HORIZONTAL");
 assert.equal(badge.primaryAxisAlignItems, "CENTER");
 assert.equal(badge.counterAxisAlignItems, "CENTER");
+assert.equal(badge.primaryAxisSizingMode, "AUTO", "buttons hug content on the main axis");
+assert.equal(badge.counterAxisSizingMode, "AUTO", "buttons hug content on the cross axis");
 assert.equal(badge.paddingTop, 14);
 assert.equal(badge.paddingLeft, 20);
 assert.equal(badge.cornerRadius, 30);
@@ -629,6 +640,7 @@ const badgeLabel = nodeForLayer(firstRoot, "label");
 assert.equal(badgeLabel.layoutAlign, "CENTER");
 assert.equal(badgeLabel.layoutGrow, 0);
 assert.equal(badgeLabel.layoutSizingHorizontal, "HUG");
+assert.equal(badgeLabel.textAlignVertical, "CENTER", "button labels vertically center in autolayout frames");
 assert.equal(badgeLabel.x, 0, "CTA labels in autolayout frames skip absolute x positioning");
 assert.equal(badgeLabel.y, 0, "CTA labels in autolayout frames skip absolute y positioning");
 const ctaButton = nodeForLayer(firstRoot, "cta-button");
@@ -636,6 +648,7 @@ assert.equal(ctaButton.type, "FRAME");
 assert.equal(ctaButton.layoutMode, "HORIZONTAL");
 assert.equal(ctaButton.primaryAxisAlignItems, "CENTER");
 assert.equal(ctaButton.counterAxisAlignItems, "CENTER");
+assert.equal(ctaButton.primaryAxisSizingMode, "AUTO");
 assert.equal(ctaButton.paddingTop, 16);
 assert.equal(ctaButton.paddingLeft, 16);
 assert.equal(ctaButton.cornerRadius, 14, "corner radius can come from layer.style");
@@ -651,10 +664,13 @@ assert.deepEqual(styledCard.dashPattern, [4, 2]);
 assert.equal(styledCard.effects[0].type, "DROP_SHADOW");
 assert.equal(styledCard.topLeftRadius, 12);
 const masked = nodeForLayer(firstRoot, "masked-photo");
-assert.equal(masked.type, "RECTANGLE", "rounded image mask compiles to one native image-filled rectangle");
-assert.equal(masked.width, 140, "mask geometry does not inherit full image width");
-assert.equal(masked.height, 70, "mask geometry does not inherit full image height");
-assert.equal(masked.cornerRadius, 14);
+assert.equal(masked.type, "FRAME", "rounded image mask compiles to a clipped frame wrapper");
+const maskedImage = masked.children[0];
+assert.equal(maskedImage.type, "RECTANGLE", "rounded masked image lives inside the frame");
+assert.equal(maskedImage.width, 140, "mask geometry does not inherit full image width");
+assert.equal(maskedImage.height, 70, "mask geometry does not inherit full image height");
+assert.equal(maskedImage.cornerRadius, 14);
+assert.equal(masked.clipsContent, true);
 const generated = nodeForLayer(firstRoot, "generated-vector");
 assert.match(generated.svg, /stroke-linecap="round"/);
 assert.match(generated.svg, /stroke-linejoin="bevel"/);
@@ -665,11 +681,14 @@ assert.equal(first.fidelity.unsupported_paint, 0);
 // (index 0, i.e. "first child" in Figma's own isMask contract) so it masks the
 // content sibling that follows it, not the other way around.
 const pathMasked = nodeForLayer(firstRoot, "path-masked-photo");
-assert.equal(pathMasked.type, "GROUP", "a path/SVG mask compiles to a mask+content group");
-assert.equal(pathMasked.children.length, 2, "the mask group holds exactly the mask and the masked content");
-assert.equal(pathMasked.children[0].isMask, true, "the mask must be the first (bottom) sibling so it masks the content above it");
-assert.equal(pathMasked.children[1].isMask, false, "the content is the masked (subsequent) sibling, not itself a mask");
-assert.equal(pathMasked.children[1].fills[0].type, "IMAGE", "the masked sibling still carries the photo's image fill");
+assert.equal(pathMasked.type, "FRAME", "path/SVG masks compile to a clipped frame wrapper");
+assert.equal(pathMasked.clipsContent, true);
+const pathGroup = pathMasked.children[0];
+assert.equal(pathGroup.type, "GROUP", "masked content is grouped inside the frame");
+assert.equal(pathGroup.children.length, 2, "the mask group holds exactly the mask and the masked content");
+assert.equal(pathGroup.children[0].isMask, true, "the mask must be the first (bottom) sibling so it masks the content above it");
+assert.equal(pathGroup.children[1].isMask, false, "the content is the masked (subsequent) sibling, not itself a mask");
+assert.equal(pathGroup.children[1].fills[0].type, "IMAGE", "the masked sibling still carries the photo's image fill");
 
 // Z-order: children must be appended back-to-front in the design JSON's declared
 // stack (z_index / array order), not incidentally sorted by x/y position. This frame
@@ -686,6 +705,11 @@ const cardPanel = nodeForLayer(firstRoot, "card-panel");
 assert.equal(cardPanel.type, "FRAME", "card panels with background fills promote groups to frames");
 assert.equal(cardPanel.fills[0].type, "SOLID");
 assert.equal(cardPanel.cornerRadius, 12);
+assert.equal(cardPanel.clipsContent, true, "rounded card panels clip overflowing content");
+
+const stretchStack = nodeForLayer(firstRoot, "stretch-stack");
+assert.equal(stretchStack.primaryAxisSizingMode, "FIXED", "vertical stacks keep a fixed width for FILL children");
+assert.equal(stretchStack.counterAxisSizingMode, "FIXED");
 
 const stretchLine = nodeForLayer(firstRoot, "stretch-line");
 assert.equal(stretchLine.fontName.style, "Bold", "fontWeightCandidates steer installed style selection");
@@ -803,8 +827,9 @@ assert.equal(roots(sceneV2.id).length, 2);
 }
 
 const failed = await build(sceneV2, "replace", {});
-assert.equal(failed.ok, false);
+assert.equal(failed.ok, true, "partial import succeeds when some layers compile despite missing assets");
 assert.ok(failed.errors.some((error) => error.detail.includes("Missing image asset")));
+assert.ok(failed.skipped >= 1);
 assert.equal(roots(sceneV2.id).length, 2, "failed replace keeps existing imports intact");
 
 const legacy = {

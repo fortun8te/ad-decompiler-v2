@@ -337,7 +337,7 @@ def inspect(cfg, root: Path) -> dict:
         comfy_dir = comfy_inpaint.get("comfy_dir")
         model_names = comfy_inpaint.get("models") or {}
         flux_defaults = {
-            "unet_gguf": "flux1-fill-dev-Q4_K_M.gguf",
+            "unet_gguf": "flux1-fill-dev-Q6_K.gguf",
             "t5xxl": "t5xxl_fp8_e4m3fn.safetensors",
             "clip_l": "clip_l.safetensors",
             "vae": "ae.safetensors",

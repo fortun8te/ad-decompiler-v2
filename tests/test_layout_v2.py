@@ -141,6 +141,30 @@ def test_card_panel_hoists_inner_background_fill():
     assert frame["radius"] == 12
 
 
+def test_group_hoist_drops_inner_button_shell():
+  candidates = [
+      {"id": "cta", "target": "group", "box": {"x": 20, "y": 30, "w": 160, "h": 52},
+       "meta": {"role": "button"}, "children": []},
+      {"id": "pill", "target": "shape", "box": {"x": 20, "y": 30, "w": 160, "h": 52},
+       "fill": {"kind": "flat", "color": "#111111"}, "style": {"radius": 24}, "z": 0},
+      {"id": "label", "target": "text", "box": {"x": 60, "y": 44, "w": 80, "h": 24},
+       "text": "Buy now", "meta": {"role": "cta"}, "z": 1},
+  ]
+  # Re-run infer on flat list — group must be built by container detection or passed in.
+  tree = layout.infer([
+      {"id": "shell", "target": "shape", "box": {"x": 20, "y": 30, "w": 160, "h": 52},
+       "meta": {"role": "button"}},
+      {"id": "pill", "target": "shape", "box": {"x": 20, "y": 30, "w": 160, "h": 52},
+       "fill": {"kind": "flat", "color": "#111111"}, "style": {"radius": 24}, "z": 0},
+      {"id": "label", "target": "text", "box": {"x": 60, "y": 44, "w": 80, "h": 24},
+       "text": "Buy now", "meta": {"role": "cta"}, "z": 1},
+  ], {"w": 400, "h": 300}, {})
+  frame = tree[0]
+  assert frame["fill"]["color"] == "#111111"
+  assert all(child["id"] != "pill" for child in frame.get("children") or [])
+  assert frame["children"][0]["id"] == "label"
+
+
 def test_zero_placeholder_z_keeps_text_above_plate_and_cutout():
     tree = layout.infer([
         {"id": "plate", "target": "shape", "box": {"x": 0, "y": 0, "w": 100, "h": 100}, "z": 0},

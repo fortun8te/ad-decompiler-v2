@@ -179,8 +179,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--comfy-dir", default=os.environ.get("COMFYUI_DIR", ""),
                     help="Path to the ComfyUI install (contains a models/ folder).")
-    ap.add_argument("--quant", default="Q4_K_M",
-                    help="GGUF quant of Flux Fill (Q4_K_M default; Q5_K_M for a bit more quality on 16GB).")
+    ap.add_argument("--quant", default="Q6_K",
+                    help="GGUF quant of Flux Fill (Q6_K best quality; Q5_K_S/Q4_K_S for tighter VRAM).")
     ap.add_argument("--list", action="store_true", help="Print the download plan and exit.")
     args = ap.parse_args()
 

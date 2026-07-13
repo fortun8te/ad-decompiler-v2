@@ -37,7 +37,10 @@ def test_run_until_acceptable_stops_when_qa_ok(tmp_path):
 
     def fake_run_one(path, rd, cfg, start_from="normalize"):
         calls["pipeline"] += 1
-        return {"ok": True, "run_dir": rd}
+        (tmp_path / "run" / "qa.json").write_text(
+            json.dumps({"ok": True, "repairs": [], "hard_fails": [], "ssim": 0.95}),
+            encoding="utf-8")
+        return {"ok": True, "run_dir": rd, "qa_ok": True, "runtime_ok": True}
 
     def fake_repairs(rd, cfg, max_iterations=2, run_one=None):
         calls["repairs"] += 1
@@ -49,7 +52,7 @@ def test_run_until_acceptable_stops_when_qa_ok(tmp_path):
     )
 
     assert summary["qa_ok"] is True
-    assert summary["stopped"] == "qa_ok"
+    assert summary["stopped"] in {"qa_ok", "qa_ok_after_repairs"}
     assert summary["rounds_completed"] == 1
     assert calls["pipeline"] == 1
     assert calls["repairs"] == 0
@@ -201,17 +204,32 @@ def test_pipeline_exception_is_reported_and_summary_is_written(tmp_path):
     assert json.loads((tmp_path / "run" / "harness_loop.json").read_text())["qa_ok"] is False
 
 
-def test_production_runner_cannot_reuse_stale_passing_qa(tmp_path):
+def test_stale_passing_qa_still_runs_repairs(tmp_path, monkeypatch):
+    """Production runners that skip rewriting qa.json must not short-circuit the harness."""
     input_path, run_dir = _seed_run(tmp_path, qa_ok=True)
+    calls = {"repairs": 0}
 
     def stale_runner(path, rd, cfg, start_from="normalize"):
         return {"ok": True, "qa_ok": True, "runtime_ok": True}
 
+    def fake_repairs(rd, cfg, max_iterations=2, run_one=None, blocked_repairs=None):
+        calls["repairs"] += 1
+        return {"stopped": "no_actionable_repairs", "qa_ok": True, "iterations": 0, "attempts": []}
+
+    monkeypatch.setattr(harness_loop, "_run_critic_pass",
+                        lambda rd, cfg: {"prioritized_issues": [], "suggested_fix_ids": [],
+                                         "blockers": [], "filtered_repairs": []})
+    monkeypatch.setattr(harness_loop, "_run_fixer_pass",
+                        lambda rd, cfg, c: {"cfg": cfg, "fixes": []})
+
     summary = harness_loop.run_until_acceptable(
-        input_path, run_dir, {}, max_rounds=2, run_one=stale_runner)
-    assert summary["qa_ok"] is False
-    assert summary["stopped"] == "qa_not_refreshed"
+        input_path, run_dir, {}, max_rounds=2, run_one=stale_runner,
+        execute_repairs_fn=fake_repairs,
+    )
     assert summary["rounds"][0]["pipeline"]["qa_fresh"] is False
+    assert summary["rounds"][0]["pipeline"].get("qa_stale") is True
+    assert calls["repairs"] >= 1
+    assert summary["stopped"] != "qa_not_refreshed"
 
 
 def test_malformed_critic_falls_back_with_visible_error(tmp_path, monkeypatch):

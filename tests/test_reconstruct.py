@@ -211,6 +211,38 @@ def test_product_label_ocr_is_baked_unless_explicitly_promoted(tmp_path):
     assert brand["meta"]["kept_in_photo"] is True
 
 
+def test_comparison_grid_drops_standalone_before_after_labels(tmp_path):
+    source = tmp_path / "comparison-labels.png"
+    Image.new("RGB", (240, 160), (98, 127, 102)).save(source)
+    Image.new("L", (90, 120), 255).save(tmp_path / "before-mask.png")
+    Image.new("L", (90, 120), 255).save(tmp_path / "after-mask.png")
+    candidates = [
+        {"id": "before-photo", "target": "image",
+         "box": {"x": 20, "y": 30, "w": 90, "h": 120},
+         "mask": {"src": "before-mask.png"},
+         "meta": {"role": "photo", "semantic_name": "Before image", "comparison_side": "before"}},
+        {"id": "after-photo", "target": "image",
+         "box": {"x": 130, "y": 30, "w": 90, "h": 120},
+         "mask": {"src": "after-mask.png"},
+         "meta": {"role": "photo", "semantic_name": "After image", "comparison_side": "after"}},
+        {"id": "before-label", "target": "text", "text": "Before",
+         "box": {"x": 40, "y": 36, "w": 70, "h": 24}, "meta": {"role": "headline"}},
+        {"id": "after-label", "target": "text", "text": "After",
+         "box": {"x": 150, "y": 36, "w": 60, "h": 24}, "meta": {"role": "headline"}},
+        {"id": "headline", "target": "text", "text": "Perfect curls",
+         "box": {"x": 30, "y": 8, "w": 180, "h": 18}, "meta": {"role": "headline"}},
+    ]
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, candidates, str(tmp_path),
+        {"scene": {"archetype": "comparison_grid", "facts": {"before_after_pair": True}},
+         "inpaint": {"mode": "opencv"}},
+    )
+    by_id = {item["id"]: item for item in result["candidates"]}
+    assert by_id["before-label"]["target"] == "drop"
+    assert by_id["after-label"]["target"] == "drop"
+    assert by_id["headline"]["target"] == "text"
+
+
 def test_photo_heavy_preset_flattens_unverified_fragments_but_keeps_text():
     candidates = [
         {"id": "person", "target": "image", "meta": {"role": "person"}},

@@ -17,6 +17,8 @@ Endpoints:
                                    re-stages /inbox.json + /design.json when done. Returns
                                    {job_id, status:"queued"} immediately — poll with:
     GET  /process?job_id=x     -> {status:"running"|"done"|"failed", ...}
+    GET  /process/input?job_id=x -> original uploaded image bytes (for live plugin preview)
+    GET  /process/snapshot?job_id=x -> preview.png / normalized.png when available, else input
     GET  /run-summary?job_id=x -> manifest + staging fields for a finished job (no inbox race)
                                    Requires the pipeline's own deps (torch, paddleocr, sam3,
                                    ...) to be importable in this interpreter; the /process
@@ -44,6 +46,52 @@ def _safe_name(name, fallback="upload"):
     base = os.path.basename(str(name or "").strip().replace("\\", "/"))
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "-", base).strip(".-") or fallback
     return cleaned[:120]
+
+
+def _image_content_type(path: str) -> str:
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    return {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+    }.get(ext, "application/octet-stream")
+
+
+def _job_input_path(job: dict | None) -> str | None:
+    """Original upload bytes saved for a /process job."""
+    job = job or {}
+    path = job.get("image_path")
+    if path and os.path.isfile(path):
+        return path
+    return None
+
+
+def _job_snapshot_path(run_dir: str | None) -> str | None:
+    """Best live preview for an in-flight run: reconstruction preview, then normalized."""
+    if not run_dir:
+        return None
+    for name in ("preview.png", "figma_export.png", "normalized.png"):
+        path = os.path.join(run_dir, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _job_preview_urls(job_id: str, job: dict | None) -> dict[str, str]:
+    """Relative URLs the plugin can fetch while a job is queued/running/done."""
+    job_id = str(job_id or "")
+    if not job_id:
+        return {}
+    urls = {"input_url": f"/process/input?job_id={job_id}"}
+    run_dir = (job or {}).get("run_dir")
+    if _job_snapshot_path(run_dir) or _job_input_path(job):
+        urls["snapshot_url"] = f"/process/snapshot?job_id={job_id}"
+    return urls
 
 
 def _load_cfg(path):
@@ -528,6 +576,7 @@ def _upload_cfg(base_cfg, inbox):
     bridge_inbox = _bridge_inbox_path(inbox)
     cfg = copy.deepcopy(base_cfg or {})
     cfg["figma"] = {**cfg.get("figma", {}), "enabled": True, "mode": "plugin", "inbox": bridge_inbox}
+    cfg.setdefault("runtime", {}).setdefault("harness", {})["enabled"] = True
     return cfg
 
 
@@ -612,6 +661,39 @@ def _stage_job_output(inbox, run_dir, cfg):
         "design_url": "/design.json",
         "manifest": manifest,
     }
+
+
+def _rerun_qa_for_run(run_dir, config_path=None):
+    """Re-score QA after the Figma plugin posts export/report."""
+    run_dir = os.path.abspath(str(run_dir or ""))
+    if not run_dir or not os.path.isdir(run_dir):
+        return {"ok": False, "error": "invalid run_dir"}
+    manifest_path = os.path.join(run_dir, "input_manifest.json")
+    if not os.path.exists(manifest_path):
+        return {"ok": False, "error": "missing input_manifest.json"}
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError, TypeError) as exc:
+        return {"ok": False, "error": f"cannot read input manifest: {exc}"}
+    input_path = manifest.get("source_path")
+    if not input_path or not os.path.exists(input_path):
+        return {"ok": False, "error": "source image path missing from manifest"}
+    export_path = os.path.join(run_dir, "figma_export.png")
+    if not os.path.exists(export_path):
+        return {"ok": False, "error": "figma_export.png not written yet"}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from run_pipeline import load_cfg, run_one
+    except ImportError as exc:
+        return {"ok": False, "error": f"cannot import run_pipeline: {exc}"}
+    cfg = load_cfg(config_path) if config_path else _load_cfg(os.path.join(root, "config.yaml"))
+    cfg = dict(cfg or {})
+    cfg.setdefault("figma", {})["enabled"] = True
+    result = run_one(input_path, run_dir, cfg, start_from="qa")
+    return {"ok": bool(result.get("qa_ok")), "qa_ok": result.get("qa_ok"), "run_dir": run_dir}
 
 
 def make_handler(inbox, config_path=None):
@@ -715,13 +797,12 @@ def make_handler(inbox, config_path=None):
                         "_bridge_summary": True,
                     }
                     should_repair, repair_reason = harness_should_repair(
-                        result, qa=qa, staging=staging,
+                        result, qa=qa, staging=staging, run_dir=run_dir, cfg=cfg,
                     )
                     already_ran_harness = _run_one_already_ran_harness(result, run_dir)
                     skip_harness = already_ran_harness and repair_reason != "staging_failed"
                     repair_opted_in = (
-                        harness_enabled(cfg)
-                        or qa is not None
+                        (harness_enabled(cfg) and should_repair)
                         or repair_reason == "staging_failed"
                     )
                     if repair_opted_in and should_repair and not skip_harness:
@@ -968,6 +1049,7 @@ def make_handler(inbox, config_path=None):
                         "eta_s": eta_s,
                         "eta_sample_size": sample_size,
                         "progress_pct": progress_pct,
+                        **_job_preview_urls(active_id, active),
                     }
                 else:
                     payload["active_job"] = None
@@ -1062,6 +1144,22 @@ def make_handler(inbox, config_path=None):
                     "runtime_violations": (runtime or {}).get("violations") or [],
                 }
                 return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
+            if u.path == "/process/input":
+                job_id = parse_qs(u.query).get("job_id", [""])[0]
+                with jobs_lock:
+                    job = jobs.get(job_id)
+                path = _job_input_path(job)
+                if not path:
+                    return self._send(404, b'{"ok":false,"error":"input image not found"}', "application/json")
+                return self._send(200, open(path, "rb").read(), _image_content_type(path))
+            if u.path == "/process/snapshot":
+                job_id = parse_qs(u.query).get("job_id", [""])[0]
+                with jobs_lock:
+                    job = dict(jobs.get(job_id) or {})
+                path = _job_snapshot_path(job.get("run_dir")) or _job_input_path(job)
+                if not path:
+                    return self._send(404, b'{"ok":false,"error":"snapshot not found"}', "application/json")
+                return self._send(200, open(path, "rb").read(), _image_content_type(path))
             if u.path == "/process":
                 job_id = parse_qs(u.query).get("job_id", [""])[0]
                 with jobs_lock:
@@ -1113,6 +1211,7 @@ def make_handler(inbox, config_path=None):
                             snapshot["eta_sample_size"] = sample_size
                         if progress_pct is not None:
                             snapshot["progress_pct"] = progress_pct
+                    snapshot.update(_job_preview_urls(job_id, snapshot))
                     if status == "done":
                         snapshot.setdefault("design_url", "/design.json")
                         if snapshot.get("staged") is None:
@@ -1147,7 +1246,18 @@ def make_handler(inbox, config_path=None):
                 with os.fdopen(fd, "wb") as f:
                     f.write(data)
                 os.replace(temp_path, out)
-                return self._send(200, b'{"ok":true}', "application/json")
+                qa_result = None
+                run_dir = man.get("run_dir")
+                report_path = os.path.join(run_dir, "figma_report.json") if run_dir else ""
+                if run_dir and os.path.exists(report_path):
+                    try:
+                        qa_result = _rerun_qa_for_run(run_dir, config_path)
+                    except Exception as exc:
+                        qa_result = {"ok": False, "error": str(exc)}
+                payload = {"ok": True}
+                if qa_result is not None:
+                    payload["qa_rerun"] = qa_result
+                return self._send(200, json.dumps(payload).encode(), "application/json")
             if route == "/report":
                 n = self._content_length(max_bytes=2 * 1024 * 1024)
                 if n is None:
@@ -1175,7 +1285,18 @@ def make_handler(inbox, config_path=None):
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         json.dump(report, fh, ensure_ascii=False, indent=2)
                     os.replace(temp_path, out)
-                return self._send(200, b'{"ok":true}', "application/json")
+                qa_result = None
+                if run_dir:
+                    export_path = os.path.join(run_dir, "figma_export.png")
+                    if os.path.exists(export_path):
+                        try:
+                            qa_result = _rerun_qa_for_run(run_dir, config_path)
+                        except Exception as exc:
+                            qa_result = {"ok": False, "error": str(exc)}
+                payload = {"ok": True}
+                if qa_result is not None:
+                    payload["qa_rerun"] = qa_result
+                return self._send(200, json.dumps(payload).encode(), "application/json")
             if route == "/log":
                 n = self._content_length(max_bytes=2 * 1024 * 1024)
                 if n is None:
@@ -1263,6 +1384,7 @@ def make_handler(inbox, config_path=None):
                 }], self._manifest())
                 threading.Thread(target=run_job, args=(job_id, image_path, run_dir), daemon=True).start()
                 payload = {"ok": True, "job_id": job_id, "status": "queued", "filename": filename}
+                payload.update(_job_preview_urls(job_id, {"image_path": image_path}))
                 return self._send(202, json.dumps(payload).encode(), "application/json")
             return self._send(404)
 

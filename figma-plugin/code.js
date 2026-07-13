@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.0.0","build":44,"commit":"4234906","dirty":true,"built_at":"2026-07-13T17:24:45Z","label":"v2.0.0+b44.4234906-dirty","source":"git"};
+const PLUGIN_BUILD = {"version":"2.0.0","build":45,"commit":"f872719","dirty":true,"built_at":"2026-07-13T17:29:12Z","label":"v2.0.0+b45.f872719-dirty","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,
@@ -441,6 +441,12 @@ function applyRadius(node, layer, context) {
 
 function applyConstraints(node, layer, context) {
   if (!("constraints" in node)) return;
+  // Constraints conflict with in-flow auto layout children; only absolute overlays use them.
+  if (context.inAutoLayout) {
+    const childLayout = layer.layout || {};
+    const positioning = normalizedToken(pick(childLayout, "positioning", "position", "layoutPositioning", "layout_positioning"));
+    if (positioning !== "ABSOLUTE" && childLayout.absolute !== true) return;
+  }
   const source = layer.constraints;
   if (!source) return;
   let horizontal = normalizedToken(pick(source, "horizontal", "x")) || "LEFT";
@@ -471,10 +477,18 @@ function applyCommon(node, layer, context) {
   applyEffects(node, layer, context);
 }
 
+function isFlowAutoLayoutChild(layer, context) {
+  if (!context.inAutoLayout) return false;
+  const childLayout = layer.layout || {};
+  const positioning = normalizedToken(pick(childLayout, "positioning", "position", "layoutPositioning", "layout_positioning"));
+  return positioning !== "ABSOLUTE" && childLayout.absolute !== true;
+}
+
 function setGeometry(node, layer, context, useVisible) {
   const b = localBox(layer, context, useVisible);
-  safeSet(node, "x", b.x, context);
-  safeSet(node, "y", b.y, context);
+  const flowChild = isFlowAutoLayoutChild(layer, context);
+  safeSet(node, "x", flowChild ? 0 : b.x, context);
+  safeSet(node, "y", flowChild ? 0 : b.y, context);
   try {
     node.resize(Math.max(0.01, b.w), Math.max(0.01, b.h));
   } catch (error) {
@@ -802,6 +816,10 @@ async function fitTextWithCandidates(node, layer, style, context, hasRuns) {
     }
     return { rank: 0, overflow: Math.max(0, dimensions.width - target.w) + Math.max(0, dimensions.height - target.h), fontName: node.fontName, fontSize: node.fontSize };
   }
+  if (style.preFitted === true || style.pre_fitted === true || style.fit === false) {
+    await fitTextToVisibleBox(node, layer, style, context, false);
+    return { rank: 0, overflow: 0, fontName: node.fontName, fontSize: node.fontSize };
+  }
   const requests = rankedFontRequests(style);
   const target = localBox(layer, context, true);
   let best = { rank: 0, overflow: Number.POSITIVE_INFINITY, fontName: node.fontName, fontSize: node.fontSize };
@@ -896,39 +914,46 @@ async function fitTextToVisibleBox(node, layer, style, context, hasRuns) {
   const explicitFit = pick(style, "fit", "fitText", "fit_text", "fitMode", "fit_mode") !== undefined
     ? pick(style, "fit", "fitText", "fit_text", "fitMode", "fit_mode")
     : pick(layer, "fit_text", "fitText");
+  const preFitted = style.preFitted === true || style.pre_fitted === true;
+  const autoResizeHint = normalizedToken(pick(style, "autoResize", "auto_resize"));
   const hasExplicitSize = Number.isFinite(Number(pick(style, "fontSize", "font_size", "size")));
   const hasVisibleBox = Boolean(pick(layer, "visible_box", "visibleBox"));
-  if (multiline) {
+  if (autoResizeHint === "HEIGHT") {
+    node.textAutoResize = "HEIGHT";
+    node.resize(Math.max(1, target.w), Math.max(1, target.h));
+  } else if (autoResizeHint === "WIDTH" || autoResizeHint === "WIDTH_AND_HEIGHT") {
+    node.textAutoResize = multiline ? "HEIGHT" : "WIDTH_AND_HEIGHT";
+  } else if (multiline) {
     node.textAutoResize = "HEIGHT";
     node.resize(Math.max(1, target.w), Math.max(1, target.h));
   } else {
     node.textAutoResize = "WIDTH_AND_HEIGHT";
   }
-  const overflows = node.width > target.w * 1.015 || node.height > target.h * 1.015;
-  const shouldFit = explicitFit !== false && normalizedToken(explicitFit) !== "NONE" && (!hasExplicitSize || explicitFit === true || hasVisibleBox || overflows);
   const role = layerRole(layer);
   const buttonText = context.inAutoLayout && (isButtonLikeRole(role) || role === "LABEL");
   if (buttonText) {
-    if (!multiline) node.textAutoResize = "WIDTH_AND_HEIGHT";
-    if (shouldFit && !hasRuns && content.length) {
-      if (hasVisibleBox) {
-        await binaryFitFontSize(node, target, multiline);
-        if (multiline && normalizedToken(pick(style, "lockLineHeight", "lock_line_height")) !== "TRUE") {
-          await binaryFitMultilineLineHeight(node, target);
-        }
-      } else {
-        const dimensions = await renderedTextDimensions(node);
-        const widthRatio = multiline ? 1 : target.w / Math.max(0.01, dimensions.width);
-        const heightRatio = target.h / Math.max(0.01, dimensions.height);
-        const ratio = clamp(Math.min(widthRatio, heightRatio), 0.35, 2.5);
-        node.fontSize = clamp(finite(node.fontSize, 12) * ratio * 0.995, 1, 1000);
-        if (multiline) node.resize(Math.max(1, target.w), Math.max(1, node.height));
-      }
-    }
+    node.textAutoResize = multiline ? "HEIGHT" : "WIDTH_AND_HEIGHT";
+    if ("textAlignVertical" in node) node.textAlignVertical = "CENTER";
     node.x = 0;
     node.y = 0;
     return;
   }
+  if (preFitted || explicitFit === false || normalizedToken(explicitFit) === "NONE") {
+    const horizontal = alignmentValue(pick(style, "align", "textAlign", "text_align"), "LEFT");
+    const vertical = verticalAlignmentValue(pick(style, "verticalAlign", "vertical_align"), "TOP");
+    if (isFlowAutoLayoutChild(layer, context)) {
+      node.x = 0;
+      node.y = 0;
+      return;
+    }
+    const xFactor = horizontal === "CENTER" ? 0.5 : horizontal === "RIGHT" ? 1 : 0;
+    const yFactor = vertical === "TOP" ? 0 : vertical === "BOTTOM" ? 1 : 0.5;
+    node.x = target.x + (target.w - node.width) * xFactor;
+    node.y = target.y + (target.h - node.height) * yFactor;
+    return;
+  }
+  const overflows = node.width > target.w * 1.015 || node.height > target.h * 1.015;
+  const shouldFit = explicitFit !== false && normalizedToken(explicitFit) !== "NONE" && (!hasExplicitSize || explicitFit === true || hasVisibleBox || overflows);
   if (shouldFit && !hasRuns && content.length) {
     if (hasVisibleBox) {
       await binaryFitFontSize(node, target, multiline);
@@ -944,7 +969,9 @@ async function fitTextToVisibleBox(node, layer, style, context, hasRuns) {
       if (multiline) node.resize(Math.max(1, target.w), Math.max(1, node.height));
     }
     const explicitSpacing = pick(style, "letterSpacing", "letter_spacing", "tracking") !== undefined;
-    if (!multiline && !explicitSpacing && content.length > 1) {
+    const hasPunct = /[.:/\\-]/.test(content);
+    const shortToken = content.trim().length <= 4;
+    if (!multiline && !explicitSpacing && content.length > 1 && !hasPunct && !shortToken) {
       const dimensions = await renderedTextDimensions(node);
       const adjustment = (target.w - dimensions.width) / (content.length - 1);
       if (Math.abs(adjustment) <= finite(node.fontSize, 12) * 0.22) {
@@ -953,7 +980,12 @@ async function fitTextToVisibleBox(node, layer, style, context, hasRuns) {
     }
   }
   const horizontal = alignmentValue(pick(style, "align", "textAlign", "text_align"), "LEFT");
-  const vertical = verticalAlignmentValue(pick(style, "verticalAlign", "vertical_align"), "CENTER");
+  const vertical = verticalAlignmentValue(pick(style, "verticalAlign", "vertical_align"), "TOP");
+  if (isFlowAutoLayoutChild(layer, context)) {
+    node.x = 0;
+    node.y = 0;
+    return;
+  }
   const xFactor = horizontal === "CENTER" ? 0.5 : horizontal === "RIGHT" ? 1 : 0;
   const yFactor = vertical === "TOP" ? 0 : vertical === "BOTTOM" ? 1 : 0.5;
   node.x = target.x + (target.w - node.width) * xFactor;
@@ -1225,29 +1257,40 @@ async function createImageLayer(layer, parent, context) {
   context.report.assets.loaded += 1;
   const mask = layer.mask || {};
   const maskKind = normalizedToken(pick(mask, "kind", "type"));
-  let node;
-  if (maskKind === "ELLIPSE" || maskKind === "CIRCLE") node = figma.createEllipse();
-  else node = figma.createRectangle();
-  parent.appendChild(node);
-  // Ellipse/rounded-rect clips are representable as one native image-filled node.
-  // Honour a detector-supplied mask box instead of stretching it back to the
-  // original raster box.
   const directMaskGeometry = (maskKind === "ELLIPSE" || maskKind === "CIRCLE" || maskKind === "RRECT" || maskKind === "ROUNDED_RECT") &&
     (pick(mask, "box", "bounds") || ["x", "y", "w", "h", "width", "height", "left", "top"].some(function (key) { return mask[key] !== undefined; }));
-  setGeometry(node, directMaskGeometry ? maskLayerFor(mask, layer) : layer, context, false);
   const shapeClipped = maskKind === "ELLIPSE" || maskKind === "CIRCLE" || maskKind === "RRECT" || maskKind === "ROUNDED_RECT";
-  const paint = imagePaint(image, layer);
-  // A shape-masked cutout is meant to be swapped in Figma: force FILL so any replacement
-  // image always covers the ellipse/rounded-rect with no transparent gaps (unless an
-  // explicit CROP transform was supplied).
-  if (shapeClipped && !paint.imageTransform) paint.scaleMode = "FILL";
-  node.fills = [paint];
-  if (maskKind === "RRECT" || maskKind === "ROUNDED_RECT") node.cornerRadius = Math.max(0, finite(pick(mask, "radius", "corner_radius", "cornerRadius"), finite(pick(layer, "radius"), 16)));
-  applyStrokes(node, layer, context);
-  applyEffects(node, layer, context);
-
   const needsMaskGroup = maskKind === "PATH" || mask.path || mask.svg || (maskKind === "ALPHA" && pick(mask, "src", "source", "asset"));
+  const innerContext = Object.assign({}, context, {
+    sourceOrigin: childSourceOrigin(layer, context),
+    localOffset: { x: 0, y: 0 },
+  });
+
+  function buildImageShape(targetParent) {
+    let node;
+    if (maskKind === "ELLIPSE" || maskKind === "CIRCLE") node = figma.createEllipse();
+    else node = figma.createRectangle();
+    targetParent.appendChild(node);
+    setGeometry(node, directMaskGeometry ? maskLayerFor(mask, layer) : layer, innerContext, false);
+    const paint = imagePaint(image, layer);
+    if (shapeClipped && !paint.imageTransform) paint.scaleMode = "FILL";
+    node.fills = [paint];
+    if (maskKind === "RRECT" || maskKind === "ROUNDED_RECT") {
+      node.cornerRadius = Math.max(0, finite(pick(mask, "radius", "corner_radius", "cornerRadius"), finite(pick(layer, "radius"), 16)));
+    }
+    applyStrokes(node, layer, context);
+    applyEffects(node, layer, context);
+    node.name = (layer.name || layerId(layer)) + " — image";
+    return node;
+  }
+
   if (needsMaskGroup) {
+    const frame = figma.createFrame();
+    parent.appendChild(frame);
+    setGeometry(frame, layer, context, false);
+    safeSet(frame, "clipsContent", true, context);
+    applyRadius(frame, layer, context);
+    const imageNode = buildImageShape(frame);
     let maskNode = null;
     const maskSource = pick(mask, "src", "source", "asset", "asset_path", "assetPath");
     if (maskKind === "ALPHA" && maskSource) {
@@ -1255,8 +1298,8 @@ async function createImageLayer(layer, parent, context) {
       if (maskBytes) {
         const maskImage = figma.createImage(maskBytes);
         maskNode = figma.createRectangle();
-        parent.appendChild(maskNode);
-        setGeometry(maskNode, maskLayerFor(mask, layer), context, false);
+        frame.appendChild(maskNode);
+        setGeometry(maskNode, maskLayerFor(mask, layer), innerContext, false);
         maskNode.fills = [{ type: "IMAGE", scaleMode: "FILL", imageHash: maskImage.hash }];
         context.report.assets.loaded += 1;
       } else {
@@ -1264,20 +1307,40 @@ async function createImageLayer(layer, parent, context) {
         context.warn("Alpha mask missing", String(maskSource) + "; the image's own transparency was used.");
       }
     } else {
-      maskNode = createMaskGeometry(mask, layer, parent, context);
+      maskNode = createMaskGeometry(mask, layer, frame, innerContext);
     }
     if (maskNode) {
-      // A Figma mask only affects following siblings. Mark it before grouping to
-      // keep the import native in both the desktop app and plugin test harness.
       safeSet(maskNode, "isMask", true, context, "Mask could not be enabled");
-      const group = figma.group([maskNode, node], parent);
+      const group = figma.group([maskNode, imageNode], frame);
       safeSet(maskNode, "isMask", true, context, "Mask could not be enabled");
       maskNode.name = (layer.name || layerId(layer)) + " — mask";
-      node.name = (layer.name || layerId(layer)) + " — image";
-      applyCommon(group, layer, context);
-      return group;
+      imageNode.name = (layer.name || layerId(layer)) + " — image";
+      group.name = (layer.name || layerId(layer)) + " — masked";
+      applyCommon(frame, layer, context);
+      return frame;
     }
+    applyCommon(imageNode, layer, context);
+    return imageNode;
   }
+
+  if (shapeClipped) {
+    const frame = figma.createFrame();
+    parent.appendChild(frame);
+    setGeometry(frame, layer, context, false);
+    safeSet(frame, "clipsContent", true, context);
+    applyRadius(frame, layer, context);
+    const node = buildImageShape(frame);
+    node.x = 0;
+    node.y = 0;
+    if ("layoutSizingHorizontal" in node) {
+      safeSet(node, "layoutSizingHorizontal", "FILL", context);
+      safeSet(node, "layoutSizingVertical", "FILL", context);
+    }
+    applyCommon(frame, layer, context);
+    return frame;
+  }
+
+  const node = buildImageShape(parent);
   applyCommon(node, layer, context);
   return node;
 }
@@ -1298,6 +1361,18 @@ function componentIntent(layer) {
   };
 }
 
+function layoutModeOf(layer) {
+  const rawMode = normalizedToken(pick(layer.layout || {}, "mode", "direction", "layoutMode", "layout_mode"));
+  if (rawMode === "ROW") return "HORIZONTAL";
+  if (rawMode === "COLUMN") return "VERTICAL";
+  return rawMode;
+}
+
+function hasAutoLayoutIntent(layer) {
+  const mode = layoutModeOf(layer);
+  return ["HORIZONTAL", "VERTICAL", "GRID"].indexOf(mode) >= 0;
+}
+
 function createContainerNode(layer, context) {
   const intent = componentIntent(layer);
   if (intent && intent.kind === "instance") {
@@ -1306,7 +1381,33 @@ function createContainerNode(layer, context) {
     context.warn("Component instance expanded", (layer.name || layerId(layer)) + ": source " + intent.ref + " was not available yet.");
   }
   if (intent && intent.kind === "component" && typeof figma.createComponent === "function") return figma.createComponent();
+  const mode = layoutModeOf(layer);
+  if (typeof figma.createAutoLayout === "function" && (mode === "HORIZONTAL" || mode === "VERTICAL")) {
+    return figma.createAutoLayout(mode);
+  }
   return figma.createFrame();
+}
+
+function axisSizingMode(layout, axis, fallback) {
+  const keys = axis === "primary"
+    ? ["primarySizing", "primary_sizing", "primaryAxisSizingMode", "primary_axis_sizing"]
+    : ["counterSizing", "counter_sizing", "counterAxisSizingMode", "counter_axis_sizing"];
+  const token = normalizedToken(pick(layout, keys[0], keys[1], keys[2], keys[3]));
+  if (token === "HUG" || token === "AUTO") return "AUTO";
+  if (token === "FIXED") return "FIXED";
+  return fallback;
+}
+
+function shouldClipContent(layer) {
+  const explicit = pick(layer, "clips_content", "clipsContent", "clip");
+  if (explicit === false) return false;
+  if (explicit === true) return true;
+  const role = layerRole(layer);
+  if (["CARD", "MODAL", "BUTTON", "BADGE", "CHIP", "PANEL"].indexOf(role) >= 0) return true;
+  if (pick(layer, "radius", "corner_radius", "cornerRadius") !== undefined) return true;
+  if (pick(layer.style || {}, "radius", "corner_radius", "cornerRadius") !== undefined) return true;
+  if (pick(layer.meta || {}, "radius", "corner_radius", "cornerRadius") !== undefined) return true;
+  return false;
 }
 
 function paddingValues(layout) {
@@ -1441,6 +1542,8 @@ function inferButtonLayout(layer) {
     padding: padding,
     align: "CENTER",
     counterAlign: "CENTER",
+    primarySizing: "HUG",
+    counterSizing: "HUG",
   };
 }
 
@@ -1464,8 +1567,10 @@ function groupHasSurface(layer) {
 }
 
 function shouldPromoteGroupToFrame(layer) {
-  const layoutMode = normalizedToken(pick(layer.layout || {}, "mode", "direction", "layoutMode", "layout_mode"));
-  if (["HORIZONTAL", "VERTICAL", "GRID", "ROW", "COLUMN"].indexOf(layoutMode) >= 0) return true;
+  const children = childrenOf(layer);
+  if (!children.length) return false;
+  const layoutMode = layoutModeOf(layer);
+  if (["HORIZONTAL", "VERTICAL", "GRID"].indexOf(layoutMode) >= 0) return true;
   if (componentIntent(layer)) return true;
   if (groupHasSurface(layer)) return true;
   if (isButtonLikeRole(layerRole(layer))) return true;
@@ -1491,6 +1596,8 @@ function applyButtonTextLayout(node, layer, context) {
   safeSet(node, "layoutGrow", 0, context);
   safeSet(node, "layoutSizingHorizontal", "HUG", context);
   safeSet(node, "layoutSizingVertical", "HUG", context);
+  if ("textAlignVertical" in node) node.textAlignVertical = "CENTER";
+  if ("textAlignHorizontal" in node) node.textAlignHorizontal = "CENTER";
 }
 
 function applyChildLayout(node, layer, context) {
@@ -1514,39 +1621,49 @@ function applyChildLayout(node, layer, context) {
 
 function applyAutoLayout(node, layer, childResults, context) {
   const layout = layer.layout || {};
-  const rawMode = normalizedToken(pick(layout, "mode", "direction", "layoutMode", "layout_mode"));
-  const mode = rawMode === "ROW" ? "HORIZONTAL" : rawMode === "COLUMN" ? "VERTICAL" : rawMode;
+  const mode = layoutModeOf(layer);
   if (["HORIZONTAL", "VERTICAL", "GRID"].indexOf(mode) < 0) return;
   if (!("layoutMode" in node)) {
     context.warn("Auto Layout skipped", (layer.name || layerId(layer)) + " is not a frame-like node.");
     return;
   }
   const original = localBox(layer, context, false);
+  const buttonFrame = isButtonFrame(layer);
   try {
-    node.layoutMode = mode;
-    if ("primaryAxisSizingMode" in node) node.primaryAxisSizingMode = "FIXED";
-    if ("counterAxisSizingMode" in node) node.counterAxisSizingMode = "FIXED";
+    if (node.layoutMode !== mode) node.layoutMode = mode;
+    childResults.forEach(function (entry) {
+      applyChildLayout(entry.node, entry.layer, context);
+      if (buttonFrame && canonicalType(entry.layer) === "text") applyButtonTextLayout(entry.node, entry.layer, context);
+    });
     const padding = paddingValues(layout);
     node.paddingTop = padding.top;
     node.paddingRight = padding.right;
     node.paddingBottom = padding.bottom;
     node.paddingLeft = padding.left;
     node.itemSpacing = finite(pick(layout, "gap", "spacing", "itemSpacing", "item_spacing"), 0);
-    const buttonFrame = isButtonFrame(layer);
     const primaryDefault = buttonFrame ? "CENTER" : "MIN";
     const counterDefault = buttonFrame ? "CENTER" : "MIN";
     const primary = axisAlignment(pick(layout, "primary_align", "primaryAlign", "justify", "primaryAxisAlignItems", "align"), primaryDefault);
-    const counter = axisAlignment(pick(layout, "counter_align", "counterAlign", "counterAxisAlignItems", buttonFrame ? "align" : "align"), counterDefault);
+    const counter = axisAlignment(pick(layout, "counter_align", "counterAlign", "counterAxisAlignItems"), counterDefault);
     safeSet(node, "primaryAxisAlignItems", primary, context);
     safeSet(node, "counterAxisAlignItems", counter, context);
     const wrap = normalizedToken(pick(layout, "wrap", "layoutWrap", "layout_wrap"));
     if (wrap) safeSet(node, "layoutWrap", wrap === "TRUE" || wrap === "WRAP" ? "WRAP" : "NO_WRAP", context);
     if (layout.strokes_included === true || layout.strokesIncluded === true) safeSet(node, "strokesIncludedInLayout", true, context);
-    childResults.forEach(function (entry) {
-      applyChildLayout(entry.node, entry.layer, context);
-      if (buttonFrame && canonicalType(entry.layer) === "text") applyButtonTextLayout(entry.node, entry.layer, context);
-    });
-    node.resize(Math.max(0.01, original.w), Math.max(0.01, original.h));
+    const primarySizing = axisSizingMode(layout, "primary", buttonFrame ? "AUTO" : "FIXED");
+    const counterSizing = axisSizingMode(layout, "counter", buttonFrame ? "AUTO" : "FIXED");
+    if ("primaryAxisSizingMode" in node) node.primaryAxisSizingMode = primarySizing;
+    if ("counterAxisSizingMode" in node) node.counterAxisSizingMode = counterSizing;
+    // resize() resets sizing modes to FIXED — only pin explicit dimensions when both axes are fixed.
+    if (primarySizing === "FIXED" && counterSizing === "FIXED") {
+      node.resize(Math.max(0.01, original.w), Math.max(0.01, original.h));
+    } else if (primarySizing === "FIXED" && counterSizing === "AUTO") {
+      node.resize(Math.max(0.01, original.w), Math.max(0.01, node.height || original.h));
+      if ("counterAxisSizingMode" in node) node.counterAxisSizingMode = "AUTO";
+    } else if (primarySizing === "AUTO" && counterSizing === "FIXED") {
+      node.resize(Math.max(0.01, node.width || original.w), Math.max(0.01, original.h));
+      if ("primaryAxisSizingMode" in node) node.primaryAxisSizingMode = "AUTO";
+    }
   } catch (error) {
     context.warn("Auto Layout partially applied", (layer.name || layerId(layer)) + ": " + String(error && error.message || error));
   }
@@ -1560,15 +1677,15 @@ async function createFrameLayer(layer, parent, context) {
     applyCommon(node, layer, context);
     return node;
   }
-  safeSet(node, "clipsContent", pick(layer, "clips_content", "clipsContent", "clip") === true, context);
+  safeSet(node, "clipsContent", shouldClipContent(layer), context);
   applyFills(node, layer, context, true);
   applyStrokes(node, layer, context);
   applyRadius(node, layer, context);
   applyCommon(node, layer, context);
   const intent = componentIntent(layer);
   if (intent && intent.kind === "component") context.components.set(intent.ref, node);
-  const layoutMode = normalizedToken(pick(layer.layout || {}, "mode", "direction", "layoutMode", "layout_mode"));
-  const hasAutoLayout = ["HORIZONTAL", "VERTICAL", "GRID", "ROW", "COLUMN"].indexOf(layoutMode) >= 0;
+  const layoutMode = layoutModeOf(layer);
+  const hasAutoLayout = hasAutoLayoutIntent(layer);
   const childContext = Object.assign({}, context, {
     sourceOrigin: childSourceOrigin(layer, context),
     localOffset: { x: 0, y: 0 },
@@ -1587,7 +1704,6 @@ async function createFrameLayer(layer, parent, context) {
 
 async function createGroupLayer(layer, parent, context) {
   if (shouldPromoteGroupToFrame(layer)) {
-    context.warn("Group promoted to frame", (layer.name || layerId(layer)) + " carries layout or component intent.");
     const prepared = isShapeTextGroup(layer) || isButtonLikeRole(layerRole(layer))
       ? prepareButtonFrame(layer)
       : Object.assign({}, layer, { type: "frame" });
@@ -1599,17 +1715,24 @@ async function createGroupLayer(layer, parent, context) {
     return createFrameLayer(Object.assign({}, layer, { type: "frame" }), parent, context);
   }
   const groupBox = localBox(layer, context, false);
+  const staging = figma.createFrame();
+  staging.name = (layer.name || layerId(layer)) + " — staging";
+  staging.visible = false;
+  parent.appendChild(staging);
   const childContext = Object.assign({}, context, {
-    localOffset: { x: groupBox.x, y: groupBox.y },
+    localOffset: { x: 0, y: 0 },
+    sourceOrigin: childSourceOrigin(layer, context),
     depth: context.depth + 1,
   });
   const nodes = [];
   for (let i = 0; i < children.length; i += 1) {
-    const result = await compileLayer(children[i], parent, childContext);
+    const result = await compileLayer(children[i], staging, childContext);
     if (result) nodes.push(result);
   }
+  staging.remove();
   if (!nodes.length) throw new Error("Group has no compilable children");
   const group = figma.group(nodes, parent);
+  setGeometry(group, layer, context, false);
   applyCommon(group, layer, context);
   return group;
 }
@@ -1817,7 +1940,17 @@ async function buildDocument(message) {
       cancelled.code = "CANCELLED";
       throw cancelled;
     }
-    if (context.report.errors.length) throw new Error(context.report.errors.length + " layer" + (context.report.errors.length === 1 ? "" : "s") + " could not be compiled");
+    if (context.report.errors.length) {
+      const created = context.report.created || 0;
+      const skipped = context.report.skipped || 0;
+      if (created === 0) {
+        throw new Error(context.report.errors.length + " layer" + (context.report.errors.length === 1 ? "" : "s") + " could not be compiled");
+      }
+      context.warn(
+        "Partial import",
+        created + " layer(s) compiled; " + skipped + " skipped due to " + context.report.errors.length + " error(s)"
+      );
+    }
     post("progress", { phase: "export", current: context.total, total: context.total, message: "Checking the finished frame…" });
     const png = await root.exportAsync({ format: "PNG" });
     // Point of no return: once the previous import is removed, a later failure

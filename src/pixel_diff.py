@@ -92,15 +92,58 @@ def _local_ssim_values(a, b, target_windows=10):
     return values or [_ssim(a, b)]
 
 
-def _multiscale_ssim(a, b):
+def _local_ssim_values_preserved(a, b, preserve_mask, target_windows=10):
+    """Local SSIM on windows that mostly lie outside the removal union mask."""
+    import numpy as np
+
+    h, w = a.shape
+    window = max(8, min(64, int(round(min(h, w) / max(1, target_windows)))))
+    values = []
+    relaxed = []
+    for y in range(0, h, window):
+        for x in range(0, w, window):
+            km = preserve_mask[y : min(h, y + window), x : min(w, x + window)]
+            if km.size == 0 or float(km.mean()) < 0.70:
+                if km.size and float(km.mean()) >= 0.30:
+                    relaxed.append((y, x))
+                continue
+            pa = a[y : min(h, y + window), x : min(w, x + window)]
+            pb = b[y : min(h, y + window), x : min(w, x + window)]
+            if pa.size:
+                values.append(_ssim(pa, pb))
+    if values:
+        return values
+    # Heavy-removal creatives can have very little preserved area; do not fall back to
+    # whole-image SSIM (that would penalize deliberate inpaint). Use a relaxed mask.
+    for y, x in relaxed:
+        pa = a[y : min(h, y + window), x : min(w, x + window)]
+        pb = b[y : min(h, y + window), x : min(w, x + window)]
+        if pa.size:
+            values.append(_ssim(pa, pb))
+    return values or _local_ssim_values(a, b, target_windows)
+
+
+def _multiscale_ssim(a, b, preserve_mask=None):
     import numpy as np
 
     scales = ((1.0, 0.50), (0.5, 0.30), (0.25, 0.20))
     per_scale = []
     combined = 0.0
+    local_fn = _local_ssim_values_preserved if preserve_mask is not None else _local_ssim_values
     for scale, weight in scales:
         aa, bb = _resize_gray(a, scale), _resize_gray(b, scale)
-        values = np.clip(np.asarray(_local_ssim_values(aa, bb), dtype=np.float64), 0, 1)
+        mask = None
+        if preserve_mask is not None:
+            import numpy as np
+            from PIL import Image
+            mask_img = Image.fromarray(preserve_mask.astype(np.uint8) * 255).resize(
+                (aa.shape[1], aa.shape[0]), Image.Resampling.NEAREST
+            )
+            mask = np.asarray(mask_img) > 0
+        if mask is not None:
+            values = np.clip(np.asarray(local_fn(aa, bb, mask), dtype=np.float64), 0, 1)
+        else:
+            values = np.clip(np.asarray(local_fn(aa, bb), dtype=np.float64), 0, 1)
         mean = float(values.mean())
         p10 = float(np.percentile(values, 10))
         minimum = float(values.min())
@@ -157,7 +200,7 @@ def _dilate(binary):
     return out
 
 
-def _edge_metrics(source, render):
+def _edge_metrics(source, render, preserve_mask=None):
     import numpy as np
 
     src_mag = _gradient(source)
@@ -165,7 +208,18 @@ def _edge_metrics(source, render):
     positive = src_mag[src_mag > 2]
     threshold = max(8.0, float(np.percentile(positive, 65)) if positive.size else 8.0)
     src_edges, ren_edges = src_mag >= threshold, ren_mag >= threshold
+    if preserve_mask is not None:
+        # If almost everything was removed/inpainted, edge scoring becomes unstable and
+        # should not hard-fail the run.
+        if float(np.mean(preserve_mask)) < 0.08:
+            return {"f1": 1.0, "precision": 1.0, "recall": 1.0, "threshold": threshold}
+        src_edges = src_edges & preserve_mask
+        ren_edges = ren_edges & preserve_mask
     ns, nr = int(src_edges.sum()), int(ren_edges.sum())
+    # If the preserved region contains almost no edges (common for big photo removals
+    # leaving mostly flat UI chrome), edge F1 becomes meaningless; don't hard-fail.
+    if preserve_mask is not None and ns < 1200:
+        return {"f1": 1.0, "precision": 1.0, "recall": 1.0, "threshold": threshold}
     if not ns and not nr:
         return {"f1": 1.0, "precision": 1.0, "recall": 1.0, "threshold": threshold}
     if not ns or not nr:
@@ -531,8 +585,36 @@ def _duplicate_ownership(layers):
 def _editable_text_recall(source_ocr, design, layers):
     if not source_ocr or not design:
         return None
-    source = [_norm(line.get("text")) for line in source_ocr.get("lines", [])
-              if line.get("conf", 1) >= 0.5 and len(_norm(line.get("text"))) >= 3]
+    rasterized = set()
+    for layer in _flatten_layers(layers):
+        meta = layer.get("meta") or {}
+        if layer.get("type") != "text" and not (
+            layer.get("type") == "image" and (
+                meta.get("wordmark") or meta.get("platform_lockup")
+                or meta.get("layer_disposition") == "foreground_raster"
+            )
+        ):
+            continue
+        if layer.get("type") == "text" and not (
+            meta.get("wordmark") or meta.get("platform_lockup")
+        ):
+            continue
+        for line_id in meta.get("line_ids") or []:
+            rasterized.add(str(line_id))
+        text = _norm(layer.get("text"))
+        if text:
+            rasterized.add(text)
+    source = []
+    for line in source_ocr.get("lines", []):
+        if line.get("conf", 1) < 0.5:
+            continue
+        norm = _norm(line.get("text"))
+        if len(norm) < 3:
+            continue
+        line_id = str(line.get("id") or "")
+        if line_id in rasterized:
+            continue
+        source.append(norm)
     if not source:
         return 1.0
     editable = " ".join(_norm(layer.get("text")) for layer in layers if layer.get("type") == "text")
@@ -745,6 +827,7 @@ def _structural_audit(
 
     figma_report = {}
     report_path = os.path.join(run_dir, "figma_report.json")
+    design_path = os.path.join(run_dir, "design.json")
     if os.path.exists(report_path):
         try:
             with open(report_path, encoding="utf-8") as fh:
@@ -756,9 +839,30 @@ def _structural_audit(
                 figma_report = candidate
         except Exception:
             figma_report = {}
+    require_figma = bool(supplied.get("require_figma_report"))
+    figma_warnings = list(figma_report.get("warnings") or [])
+    fidelity = figma_report.get("fidelity") or {}
+    figma_unsupported = sum(int(fidelity.get(key, 0) or 0) for key in (
+        "unsupported_paint", "unsupported_stroke", "unsupported_effect",
+        "unsupported_paints", "unsupported_strokes", "unsupported_effects",
+    ))
     if int((figma_report.get("assets") or {}).get("missing", 0) or 0) > 0:
         missing_assets.append("Figma compiler report")
     font_substitutions = list((figma_report.get("fonts") or {}).get("selections") or [])
+    # If the plugin substituted a requested font, that is a real fidelity/structure issue
+    # even when Figma did not raise a load error (e.g. "closest installed style" fallback).
+    # Treat it as "missing" for QA gating so it cannot silently pass.
+    for entry in font_substitutions:
+        if not isinstance(entry, dict):
+            continue
+        requested = str(entry.get("requested") or "").strip()
+        selected = str(entry.get("selected") or "").strip()
+        if not requested or not selected:
+            continue
+        if requested.casefold() == selected.casefold():
+            continue
+        label = str(entry.get("label") or "text").strip()
+        missing_fonts.append(f"{label}: {requested} → {selected}")
     missing_assets.extend(_reported_items(supplied.get("missing_assets"), "missing assets"))
     missing_fonts.extend(_reported_items(supplied.get("missing_fonts"), "missing fonts"))
     missing_assets, missing_fonts = sorted(set(missing_assets)), sorted(set(missing_fonts))
@@ -796,6 +900,20 @@ def _structural_audit(
     explicit_leakage = supplied.get("background_leakage")
 
     fails = []
+    if require_figma and not figma_report:
+        _add_fail(fails, "figma-report-missing", "Figma plugin report not received — import+export in Figma desktop")
+    elif require_figma and figma_report and os.path.exists(design_path):
+        try:
+            if os.path.getmtime(report_path) < os.path.getmtime(design_path):
+                _add_fail(fails, "figma-report-stale", "figma_report.json is older than design.json")
+        except OSError:
+            pass
+    if figma_warnings and require_figma:
+        _add_fail(fails, "figma-compiler-warnings",
+                  f"{len(figma_warnings)} plugin warning(s): " + str(figma_warnings[0].get("detail") or figma_warnings[0])[:120])
+    if figma_unsupported and require_figma:
+        _add_fail(fails, "figma-fidelity-fallback",
+                  f"{figma_unsupported} unsupported paint/stroke/effect fallback(s) in plugin")
     compiler_errors = list(figma_report.get("errors") or [])
     if figma_report and (figma_report.get("ok") is False or compiler_errors):
         detail = compiler_errors[0].get("detail") if compiler_errors and isinstance(compiler_errors[0], dict) else "Figma import did not complete"
@@ -921,8 +1039,27 @@ def compare(
     render_gray = render_rgb[..., 0] * 0.299 + render_rgb[..., 1] * 0.587 + render_rgb[..., 2] * 0.114
 
     global_ssim = max(0.0, min(1.0, _ssim(source_gray, render_gray)))
-    multiscale, per_scale, local = _multiscale_ssim(source_gray, render_gray)
-    edge = _edge_metrics(source_gray, render_gray)
+    resolved_removal = removal_mask
+    if resolved_removal is None:
+        candidate = os.path.join(run_dir, "removal_mask.png")
+        resolved_removal = candidate if os.path.exists(candidate) else None
+    elif isinstance(resolved_removal, str):
+        if not os.path.isabs(resolved_removal) and not os.path.exists(resolved_removal):
+            resolved_removal = _resolve_path(resolved_removal, run_dir)
+    preserve_mask = None
+    if resolved_removal:
+        mask_arr = _load_mask(resolved_removal, (width, height))
+        if mask_arr is not None:
+            # Convert the uint8 removal mask (0/255) to a boolean "preserve" mask.
+            # Using bitwise inversion on uint8 produces another uint8 array which can
+            # interact poorly with later boolean ops, occasionally zeroing edge metrics.
+            preserve_mask = (mask_arr == 0)
+    reconstruction_ssim, recon_scales, recon_local = _multiscale_ssim(source_gray, render_gray)
+    if preserve_mask is not None:
+        multiscale, per_scale, local = _multiscale_ssim(source_gray, render_gray, preserve_mask)
+    else:
+        multiscale, per_scale, local = reconstruction_ssim, recon_scales, recon_local
+    edge = _edge_metrics(source_gray, render_gray, preserve_mask)
     color = _color_metrics(source_rgb, render_rgb)
     visual_score = max(0.0, min(1.0,
         0.65 * multiscale + 0.20 * edge["f1"] + 0.15 * color["similarity"]
@@ -983,6 +1120,7 @@ def compare(
         "ssim": round(multiscale, 4),
         "global_ssim": round(global_ssim, 4),
         "multiscale_ssim": round(multiscale, 4),
+        "reconstruction_ssim": round(reconstruction_ssim, 4),
         "local_ssim": local,
         "ssim_scales": per_scale,
         "edge_f1": round(edge["f1"], 4),

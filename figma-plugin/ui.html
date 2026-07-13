@@ -686,6 +686,9 @@
       border-style: solid;
       border-color: var(--border-strong);
       background: var(--bg-secondary);
+      padding: 12px 12px 16px;
+      min-height: 300px;
+      justify-content: flex-start;
     }
 
     .upload-idle, .upload-busy {
@@ -696,6 +699,93 @@
       width: 100%;
       min-width: 0;
       max-width: 320px;
+    }
+
+    .upload-zone[data-busy="true"] .upload-busy {
+      max-width: none;
+      gap: 12px;
+    }
+
+    .work-preview-frame {
+      position: relative;
+      width: 100%;
+      flex: 0 0 auto;
+      min-height: 120px;
+      max-height: min(44vh, 300px);
+      aspect-ratio: 4 / 5;
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      border: 1px solid var(--border);
+      background-color: #0a0a0a;
+      background-image:
+        linear-gradient(45deg, color-mix(in srgb, var(--text) 4%, transparent) 25%, transparent 25%),
+        linear-gradient(-45deg, color-mix(in srgb, var(--text) 4%, transparent) 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, color-mix(in srgb, var(--text) 4%, transparent) 75%),
+        linear-gradient(-45deg, transparent 75%, color-mix(in srgb, var(--text) 4%, transparent) 75%);
+      background-size: 14px 14px;
+      background-position: 0 0, 0 7px, 7px -7px, -7px 0;
+      box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 4%, transparent);
+    }
+
+    .work-preview-frame img {
+      display: none;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #0a0a0a;
+    }
+
+    .work-preview-frame.has-image img { display: block; }
+
+    .work-preview-meta {
+      position: absolute;
+      inset: auto 0 0 0;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 36px 10px 9px;
+      background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, #000 78%, transparent) 55%, color-mix(in srgb, #000 92%, transparent) 100%);
+      pointer-events: none;
+    }
+
+    .work-preview-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 10px;
+      font-weight: 600;
+      color: color-mix(in srgb, var(--text) 92%, transparent);
+      letter-spacing: -0.01em;
+    }
+
+    .work-preview-stage {
+      flex: 0 0 auto;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid color-mix(in srgb, var(--brand) 35%, transparent);
+      background: color-mix(in srgb, var(--brand) 22%, #000);
+      color: var(--text);
+      font-size: 9px;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+    }
+
+    .work-progress-block {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      min-width: 0;
+      max-width: 360px;
+      margin: 0 auto;
+    }
+
+    .upload-zone[data-busy="true"] .work-progress-block {
+      max-width: none;
     }
 
     .scan-percent {
@@ -955,24 +1045,33 @@
             </div>
           </div>
           <div class="upload-busy hidden" id="uploadBusy">
-            <div class="scan-header">
-              <div class="scan-percent" id="processPercent" aria-hidden="true">0%</div>
-              <div class="scan-step-count" id="processStepCount">Step 1 / 15</div>
-            </div>
-            <div class="scan-stage upload-title" id="uploadBusyTitle">Scanning…</div>
-            <div class="scan-track-wrap">
-              <div class="scan-segments" id="processSegments" aria-hidden="true"></div>
-              <div class="scan-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="processTrack" aria-labelledby="uploadBusyTitle">
-                <div class="scan-bar" id="processBar"></div>
+            <div class="work-preview-frame" id="workPreviewFrame">
+              <img id="workPreviewImage" alt="Ad being processed" />
+              <div class="work-preview-meta">
+                <span class="work-preview-name" id="workPreviewName">—</span>
+                <span class="work-preview-stage" id="workPreviewStage">Processing</span>
               </div>
             </div>
-            <div class="scan-timing" id="uploadBusyTiming">
-              <span class="timing-elapsed" id="processElapsed">—</span>
-              <span class="timing-remaining" id="processRemaining">—</span>
-              <span class="timing-total hidden" id="processTotal">—</span>
+            <div class="work-progress-block">
+              <div class="scan-header">
+                <div class="scan-percent" id="processPercent" aria-hidden="true">0%</div>
+                <div class="scan-step-count" id="processStepCount">Step 1 / 15</div>
+              </div>
+              <div class="scan-stage upload-title" id="uploadBusyTitle">Scanning…</div>
+              <div class="scan-track-wrap">
+                <div class="scan-segments" id="processSegments" aria-hidden="true"></div>
+                <div class="scan-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="processTrack" aria-labelledby="uploadBusyTitle">
+                  <div class="scan-bar" id="processBar"></div>
+                </div>
+              </div>
+              <div class="scan-timing" id="uploadBusyTiming">
+                <span class="timing-elapsed" id="processElapsed">—</span>
+                <span class="timing-remaining" id="processRemaining">—</span>
+                <span class="timing-total hidden" id="processTotal">—</span>
+              </div>
+              <div class="scan-meta upload-copy" id="uploadBusyCopy">Starting pipeline…</div>
+              <button class="cancel-button" id="cancelProcess" type="button">Cancel</button>
             </div>
-            <div class="scan-meta upload-copy" id="uploadBusyCopy">Starting pipeline…</div>
-            <button class="cancel-button" id="cancelProcess" type="button">Cancel</button>
           </div>
         </div>
       </section>
@@ -1084,7 +1183,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.0.0","build":44,"commit":"4234906","dirty":true,"built_at":"2026-07-13T17:24:45Z","label":"v2.0.0+b44.4234906-dirty","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.0.0","build":45,"commit":"f872719","dirty":true,"built_at":"2026-07-13T17:29:12Z","label":"v2.0.0+b45.f872719-dirty","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -1096,6 +1195,7 @@
       processJobId: null,
       processCancelled: false,
       previewUrl: null,
+      workPreview: { blobUrl: null, filename: null, snapshotKey: null },
       log: [],
       logFlushTimer: null,
       pluginBuild: PLUGIN_BUILD,
@@ -1297,6 +1397,80 @@
       return candidate;
     }
 
+    function releaseWorkPreview() {
+      if (state.workPreview.blobUrl) {
+        URL.revokeObjectURL(state.workPreview.blobUrl);
+      }
+      state.workPreview = { blobUrl: null, filename: null, snapshotKey: null };
+      const frame = $("workPreviewFrame");
+      const img = $("workPreviewImage");
+      if (frame) frame.classList.remove("has-image");
+      if (img) img.removeAttribute("src");
+      if ($("workPreviewName")) $("workPreviewName").textContent = "—";
+      if ($("workPreviewStage")) $("workPreviewStage").textContent = "Processing";
+    }
+
+    function setWorkPreviewFilename(name) {
+      if ($("workPreviewName")) $("workPreviewName").textContent = name || "image";
+    }
+
+    function setWorkPreviewImage(url) {
+      const frame = $("workPreviewFrame");
+      const img = $("workPreviewImage");
+      if (!url || !frame || !img) return;
+      img.onload = function () { frame.classList.add("has-image"); };
+      img.onerror = function () { frame.classList.remove("has-image"); };
+      img.src = url;
+    }
+
+    function setWorkPreviewFromBlob(file) {
+      releaseWorkPreview();
+      state.workPreview.blobUrl = URL.createObjectURL(file);
+      state.workPreview.filename = file.name;
+      setWorkPreviewFilename(file.name);
+      setWorkPreviewImage(state.workPreview.blobUrl);
+    }
+
+    function workPreviewUrl(base, status) {
+      if (!status || !status.job_id) return null;
+      if (status.snapshot_url) return base + status.snapshot_url;
+      if (status.input_url) return base + status.input_url;
+      return base + "/process/input?job_id=" + encodeURIComponent(status.job_id);
+    }
+
+    function refreshWorkPreviewFromBridge(base, status, filename) {
+      const url = workPreviewUrl(base, status);
+      if (!url) return;
+      setWorkPreviewFilename(filename || status.filename || state.workPreview.filename || "image");
+      if (!state.workPreview.blobUrl) setWorkPreviewImage(url);
+      const snapshotKey = String(status.stage || "") + "|" + String(status.status || "");
+      if (state.workPreview.snapshotKey === snapshotKey) return;
+      state.workPreview.snapshotKey = snapshotKey;
+      const snapshotBase = status.snapshot_url
+        ? base + status.snapshot_url
+        : base + "/process/snapshot?job_id=" + encodeURIComponent(status.job_id);
+      const probe = new Image();
+      probe.onload = function () {
+        setWorkPreviewImage(snapshotBase + "&t=" + Date.now());
+      };
+      probe.src = snapshotBase + "&t=" + Date.now();
+    }
+
+    function updateWorkPreviewStage(status) {
+      const stage = $("workPreviewStage");
+      if (!stage) return;
+      const label = status.harness_running
+        ? "Auto-fixing"
+        : status.phase === "upload"
+          ? "Uploading"
+          : status.status === "queued"
+            ? "Queued"
+            : status.status === "done"
+              ? "Done"
+              : (STAGE_LABELS[status.stage] || "Processing");
+      stage.textContent = label;
+    }
+
     function releasePreview() {
       if (state.previewUrl && state.previewUrl.indexOf("blob:") === 0) URL.revokeObjectURL(state.previewUrl);
       state.previewUrl = null;
@@ -1424,6 +1598,7 @@
       state.lastProcessStatus = active;
       const startedAt = active.started_at ? Number(active.started_at) * 1000
         : Date.now() - Number(active.elapsed_s || 0) * 1000;
+      refreshWorkPreviewFromBridge(base, active, active.filename);
       setUploadBusy(true, active);
       pollProcessJob(base, active.job_id, active.filename || "image", startedAt);
     }
@@ -1539,7 +1714,12 @@
       $("uploadIdle").classList.toggle("hidden", Boolean(busy));
       $("uploadBusy").classList.toggle("hidden", !busy);
       if (busy) $("progressSection").classList.add("hidden");
-      if (busy && status) renderProcessStatus(status);
+      if (!busy) releaseWorkPreview();
+      if (busy && status) {
+        const base = cleanBase();
+        if (status.job_id && validBridge(base)) refreshWorkPreviewFromBridge(base, status, status.filename);
+        renderProcessStatus(status);
+      }
       // #region agent log
       agentDebugLog("ui.html:setUploadBusy", "upload busy state", progressVisibilitySnapshot("setUploadBusy:" + Boolean(busy)), "H6");
       // #endregion
@@ -1714,6 +1894,7 @@
       $("processTrack").setAttribute("aria-valuenow", String(percent));
       $("processPercent").setAttribute("aria-hidden", "false");
       updateProcessSegments(status);
+      updateWorkPreviewStage(status);
       timingRows(status);
       setFooter(stageLabel + " · " + percent + "%");
       // #region agent log
@@ -1949,6 +2130,7 @@
         return;
       }
       setUploadBusy(true, status);
+      refreshWorkPreviewFromBridge(base, status, filename);
       if (status.agent_debug) forwardAgentDebug(status.agent_debug);
       const stageKey = String(status.status || "") + "|" + String(status.stage || "") + "|" + String(status.phase || "");
       if (pollProcessJob._lastKey !== stageKey) {
@@ -1970,7 +2152,8 @@
         return;
       }
       state.uploading = true;
-      setUploadBusy(true, { phase: "upload" });
+      setWorkPreviewFromBlob(file);
+      setUploadBusy(true, { phase: "upload", filename: file.name });
       hideIssues();
       recordLog("info", "Upload started", file.name);
       try {
@@ -1998,6 +2181,7 @@
         state.processCancelled = false;
         state.processJobId = payload.job_id;
         pollProcessJob._lastKey = null;
+        refreshWorkPreviewFromBridge(base, payload, file.name);
         pollProcessJob(base, payload.job_id, file.name, Date.now());
       } catch (error) {
         state.uploading = false;

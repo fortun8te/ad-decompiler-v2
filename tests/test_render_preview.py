@@ -123,6 +123,16 @@ def test_preview_honors_text_horizontal_and_vertical_alignment(tmp_path):
     assert second_ink[:, 0].mean() > first_ink[:, 0].mean() + 10
 
 
+def test_preview_never_clips_text_ascenders_at_top(tmp_path):
+    preview = np.asarray(_render(tmp_path, [{
+        "id": "headline", "type": "text", "box": {"x": 10, "y": 0, "w": 200, "h": 28},
+        "text": "LAATSTE SALE", "style": {"fontSize": 24, "align": "left", "verticalAlign": "top"},
+    }], size=(240, 50)))
+    ink_rows = np.where(np.any(preview < 200, axis=(1, 2)))[0]
+    assert ink_rows.size
+    assert ink_rows.min() <= 8
+
+
 def test_preview_never_clips_text_wider_than_its_box(tmp_path):
     # The box is deliberately far too narrow for the run; the renderer must grow the
     # drawn region instead of cutting the last words off at the right edge (ad9 defect).

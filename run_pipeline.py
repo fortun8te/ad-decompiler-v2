@@ -22,7 +22,7 @@ from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
 from src import archetype
 from src.run_report import RunReport, qwen_degradation
 from src.schema import dump, load, validate_design
-from src.harness import harness_enabled, harness_max_rounds, recommended_resume
+from src.harness import harness_enabled, harness_max_rounds, has_actionable_repairs, load_repairs, recommended_resume
 from src.harness_loop import in_harness_loop, run_harness_after_pipeline
 from src.qa_config import pixel_diff_thresholds, visual_pass_ssim
 
@@ -520,7 +520,12 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             try:
                 qa_partial = pixel_diff.compare(norm_path, qa_render, run_dir,
                                                 source_ocr=ocr_res, render_ocr=ren_ocr,
-                                                thresholds=pixel_diff_thresholds(cfg))
+                                                thresholds=pixel_diff_thresholds(cfg),
+                                                structural={
+                                                    "require_figma_report": bool(
+                                                        use_figma_export and cfg.get("figma", {}).get("enabled")
+                                                    ),
+                                                })
             except Exception as exc:
                 # A minimal independent pixel judge keeps the run inspectable, but can never
                 # turn a primary QA crash into success.
@@ -597,7 +602,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         if not in_harness_loop(cfg) and harness_enabled(cfg):
             needs_repair = False
             if os.path.exists(A("qa.json")):
-                needs_repair = not load(A("qa.json")).get("ok")
+                qa_data = load(A("qa.json"))
+                repairs = qa_data.get("repairs") or load_repairs(run_dir, cfg)
+                needs_repair = not qa_data.get("ok") or has_actionable_repairs(repairs)
             elif not report.acceptable:
                 needs_repair = True
             if needs_repair:

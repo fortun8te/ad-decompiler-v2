@@ -292,6 +292,26 @@ def is_actionable(repair: dict) -> bool:
     return bool(stage and action and (stage, action) in ACTIONABLE and resume_stage_for(repair))
 
 
+def has_actionable_repairs(repairs: list) -> bool:
+    """True when QA still has medium/high severity actionable repairs."""
+    for repair in repairs or []:
+        if not is_actionable(repair):
+            continue
+        if str(repair.get("severity") or "").lower() in {"high", "medium"}:
+            return True
+    return False
+
+
+def load_repair_candidates(run_dir: str, cfg: Optional[dict] = None) -> list:
+    """Prefer critic-filtered repairs; fall back to QA/repair assess list."""
+    run_dir = os.path.abspath(run_dir)
+    critic = _load_json(os.path.join(run_dir, "critic.json"), {})
+    filtered = critic.get("filtered_repairs")
+    if isinstance(filtered, list) and filtered:
+        return filtered
+    return load_repairs(run_dir, cfg)
+
+
 def recommended_resume(repairs: list) -> Optional[dict]:
     """Pick the highest-priority actionable repair and expose resume metadata."""
     for repair in repairs or []:
@@ -347,13 +367,15 @@ def _qa_progress(before: dict, after: dict) -> tuple[bool, dict]:
         "editable_text_recall": 0.01, "edge_f1": 0.005,
         "color_similarity": 0.005,
     }
-    improved = _qa_accepts(after, allow_summary=True)
+    improved = False
+    if _qa_accepts(after, allow_summary=True) and not _qa_accepts(before, allow_summary=True):
+        improved = True
     for key, minimum in tolerances.items():
         old, new = before.get(key), after.get(key)
         if isinstance(new, (int, float)):
             delta = None if not isinstance(old, (int, float)) else float(new) - float(old)
             deltas[key] = None if delta is None else round(delta, 6)
-            if old is None or delta >= minimum:
+            if isinstance(old, (int, float)) and delta >= minimum:
                 improved = True
     before_fails = before.get("hard_fails") or []
     after_fails = after.get("hard_fails") or []
@@ -474,6 +496,8 @@ def harness_should_repair(
     *,
     qa: Optional[dict] = None,
     staging: Optional[dict] = None,
+    run_dir: Optional[str] = None,
+    cfg: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Decide whether to run repairs before reporting a job done to the plugin."""
     result = pipeline_result or {}
@@ -483,8 +507,15 @@ def harness_should_repair(
     if staging is not None and not _flag(staging.get("staged")):
         return True, "staging_failed"
 
+    repairs = list((qa or {}).get("repairs") or [])
+    if run_dir and not repairs:
+        repairs = load_repairs(run_dir, cfg)
+
     if qa is not None and not _qa_accepts(qa, allow_summary=True):
         return True, "qa_failed"
+
+    if qa is not None and has_actionable_repairs(repairs):
+        return True, "actionable_repairs"
 
     if "runtime_ok" in result and not _flag(result.get("runtime_ok")):
         return True, "runtime_degraded"
@@ -574,7 +605,8 @@ def execute_repairs(
         run_one = run_pipeline.run_one
 
     qa = _load_json(os.path.join(run_dir, "qa.json"), {})
-    if _qa_accepts(qa, allow_summary=True):
+    repairs = load_repair_candidates(run_dir, cfg)
+    if _qa_accepts(qa, allow_summary=True) and not has_actionable_repairs(repairs):
         return _save_harness_summary(run_dir, {
             "run_dir": run_dir,
             "iterations": 0,
@@ -600,7 +632,7 @@ def execute_repairs(
     working_cfg.setdefault("runtime", {})["auto_repair"] = False
 
     for iteration in range(1, max(0, int(max_iterations)) + 1):
-        repairs = load_repairs(run_dir, working_cfg)
+        repairs = load_repair_candidates(run_dir, working_cfg)
         candidates = [repair for repair in repairs if _repair_id(repair) not in exhausted]
         choice = recommended_resume(candidates)
         if not choice:
@@ -655,7 +687,8 @@ def execute_repairs(
             "qa_ok": qa_fresh and _qa_accepts(qa, allow_summary=True),
         }
         attempts.append(attempt)
-        working_cfg = iter_cfg
+        if qa_improved or (qa_fresh and _qa_accepts(qa, allow_summary=True)):
+            working_cfg = iter_cfg
 
         # A failed stage or a run that produced no new QA cannot prove progress.
         # Exhaust that exact tactic and let the next repair act as the fallback.
@@ -663,14 +696,20 @@ def execute_repairs(
             exhausted.add((choice.get("stage"), choice.get("action"), choice.get("target_id")))
 
         if qa_fresh and _qa_accepts(qa, allow_summary=True):
-            summary = {
-                "run_dir": run_dir,
-                "iterations": iteration,
-                "qa_ok": True,
-                "stopped": "qa_ok",
-                "attempts": attempts,
-            }
-            return _save_harness_summary(run_dir, summary)
+            explicit_repairs = qa.get("repairs")
+            if explicit_repairs is None:
+                remaining: list = []
+            else:
+                remaining = explicit_repairs
+            if not has_actionable_repairs(remaining):
+                summary = {
+                    "run_dir": run_dir,
+                    "iterations": iteration,
+                    "qa_ok": True,
+                    "stopped": "qa_ok",
+                    "attempts": attempts,
+                }
+                return _save_harness_summary(run_dir, summary)
 
     final_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
     summary = {

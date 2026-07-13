@@ -380,3 +380,49 @@ def test_execute_repairs_supports_three_argument_runner(tmp_path):
 
     assert len(calls) == 1
     assert summary["qa_ok"] is True
+
+
+def test_qa_progress_ignores_missing_baseline_metrics():
+    before = {"ok": False, "ssim": 0.5}
+    after = {"ok": False, "ssim": 0.5, "text_recall": 0.4}
+    improved, deltas = harness._qa_progress(before, after)
+    assert improved is False
+    assert deltas.get("text_recall") is None
+
+
+def test_harness_should_repair_on_actionable_repairs_when_qa_ok():
+    ok_result = {"ok": True, "runtime_ok": True}
+    qa = {
+        "ok": True,
+        "repairs": [{"stage": "ocr", "action": "rerun", "severity": "high"}],
+    }
+    assert harness.harness_should_repair(ok_result, qa=qa, staging={"staged": True}) == (
+        True, "actionable_repairs",
+    )
+
+
+def test_execute_repairs_continues_when_qa_ok_but_repairs_remain(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    (run_dir / "runtime_report.json").write_text(json.dumps({"input": str(input_path)}))
+    (run_dir / "qa.json").write_text(json.dumps({
+        "ok": True, "text_recall": 0.5,
+        "repairs": [
+            {"stage": "ocr", "action": "rerun", "severity": "high"},
+            {"stage": "text-analysis", "action": "resolve-fonts", "severity": "medium"},
+        ],
+    }), encoding="utf-8")
+    calls = []
+
+    def runner(path, rd, cfg, start_from="normalize"):
+        calls.append(start_from)
+        (run_dir / "qa.json").write_text(json.dumps({
+            "ok": True, "text_recall": 0.95, "repairs": [],
+        }), encoding="utf-8")
+        return {"ok": True}
+
+    summary = harness.execute_repairs(str(run_dir), {}, max_iterations=2, run_one=runner)
+    assert calls == ["ocr"]
+    assert summary["stopped"] == "qa_ok"

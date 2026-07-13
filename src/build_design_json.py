@@ -203,12 +203,17 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         fill = candidate.get("fill") or style.pop("fill", None)
         stroke = candidate.get("stroke") or style.pop("stroke", None)
         text_value = str(candidate.get("text") or "")
-        # Grow/shrink the box so the rendered glyph run cannot clip, and record the
-        # matching Figma auto-resize intent (WIDTH label / HEIGHT paragraph / NONE).
-        fitted_box, auto_resize, style_patch = fit_text_box(text_value, style, common["box"])
+        # Fit against ink/painted bounds when available so Python preview and the Figma
+        # plugin agree on the same target box (plugin uses visible_box in fitTextToVisibleBox).
+        fit_box = dict(
+            candidate.get("visible_box") or candidate.get("ink_box") or common["box"]
+        )
+        fitted_box, auto_resize, style_patch = fit_text_box(text_value, style, fit_box)
         common["box"] = fitted_box
         style.update(style_patch)
         style.setdefault("autoResize", auto_resize)
+        style["preFitted"] = True
+        style["fit"] = False
         return Layer(
             type="text",
             text=text_value,

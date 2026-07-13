@@ -251,3 +251,24 @@ def test_vlm_font_winner_on_line_overrides_stale_block_font():
     merged = merge_layers.merge({"lines": [line], "blocks": [block]}, [], [], CANVAS, {})
     text = next(item for item in merged if item["id"] == "c_B0")
     assert text["style"]["fontFamily"] == "Arial"
+
+
+def test_dedup_text_collapses_explicit_layer_ids():
+    ocr = {
+        "lines": [
+            {"id": "B3", "text": "UPFRONT", "conf": 0.99,
+             "box": {"x": 40, "y": 30, "w": 120, "h": 24}, "role": "headline"},
+            {"id": "B19", "text": "UPFRONT", "conf": 0.62,
+             "box": {"x": 42, "y": 32, "w": 116, "h": 22}, "role": "headline"},
+        ]
+    }
+    cfg = {"merge": {
+        "dedup_text": True,
+        "duplicate_text": ["UPFRONT"],
+        "layer_ids": ["c_B3", "c_B19"],
+        "dedup_iou": 0.72,
+    }}
+    merged = merge_layers.merge(ocr, [], [], CANVAS, cfg)
+    ids = {item["id"] for item in merged}
+    assert "c_B3" in ids
+    assert "c_B19" not in ids

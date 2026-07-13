@@ -240,6 +240,8 @@ inpaint:
     flux_residual_p90: 18
     flux_gradient_p90: 18
     flux_max_canvas_fraction: 0.025     # never ask Flux to invent a large product/text hole
+    photo_prompt: ""                    # photo holes: let Fill dev inpaint from context
+    plate_prompt: "clean plain seamless background, empty, no text, no objects"
     nested_containment: 0.88
     duplicate_overlap: 0.65
   # Flux Fill is used only for crop-local regions whose exterior is genuinely complex.
@@ -251,13 +253,14 @@ inpaint:
     base_url: http://127.0.0.1:8188
     api_key_env: COMFY_CLOUD_API_KEY
     workflow: workflows/flux_fill_inpaint_api.json
-    steps: 20
+    steps: 8                            # native Flux Fill dev (no turbo LoRA)
     cfg: 1.0
-    guidance: 3.5
+    guidance: 30.0
     denoise: 1.0
     seed: 0
-    prompt: "clean seamless background, empty, no text, no objects"
-    negative_prompt: "text, logo, object, product, person"
+    attempts: 2                         # pick lowest seam score across seeds
+    prompt: ""
+    negative_prompt: ""
     required: false
   # Per-target removal-mask dilation (pixels). Buttons need more bleed so anti-aliased
   # shells and re-edits do not leave halos; photos stay tight to protect surroundings.

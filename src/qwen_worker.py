@@ -357,6 +357,8 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
     base = str(comfy.get("base_url") or cfg.get("backend_url") or _FLUX_DEFAULTS["base_url"]).rstrip("/")
     headers = _comfy_auth_headers(comfy)
 
+    # Expose last backend failure to src/inpaint.py without raising.
+    flux_inpaint.__dict__["last_error"] = ""
     try:
         # Fail fast when the separately hosted ComfyUI service is not running.
         try:
@@ -364,12 +366,16 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
                                  timeout=float(params["probe_timeout_s"]))
             probe.raise_for_status()
         except Exception as exc:
-            print(f"[flux-inpaint] ComfyUI offline at {base} ({exc}); caller will fall back")
+            msg = f"ComfyUI offline at {base} ({exc})"
+            flux_inpaint.__dict__["last_error"] = msg
+            print(f"[flux-inpaint] {msg}; caller will fall back")
             return None
 
         wf_path = _resolve_workflow_path(str(params["workflow"]))
         if not wf_path:
-            print(f"[flux-inpaint] workflow not found: {params['workflow']}; caller will fall back")
+            msg = f"workflow not found: {params['workflow']}"
+            flux_inpaint.__dict__["last_error"] = msg
+            print(f"[flux-inpaint] {msg}; caller will fall back")
             return None
         with open(wf_path, encoding="utf-8") as fh:
             workflow = json.load(fh)
@@ -399,7 +405,9 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
             src_name = _upload(src_png)
             mask_name = _upload(mask_png)
         except Exception as exc:
-            print(f"[flux-inpaint] image/mask upload failed ({exc}); caller will fall back")
+            msg = f"image/mask upload failed ({exc})"
+            flux_inpaint.__dict__["last_error"] = msg
+            print(f"[flux-inpaint] {msg}; caller will fall back")
             return None
 
         # Patch the graph. Match by _meta.title first (robust to node-id changes), then by
@@ -449,7 +457,11 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
             resp.raise_for_status()
             prompt_id = resp.json()["prompt_id"]
         except Exception as exc:
-            print(f"[flux-inpaint] /prompt failed ({exc}); caller will fall back")
+            detail = _http_error_detail(resp) if "resp" in locals() else ""
+            suffix = f"; validation={detail}" if detail else ""
+            msg = f"/prompt failed ({exc}){suffix}"
+            flux_inpaint.__dict__["last_error"] = msg
+            print(f"[flux-inpaint] {msg}; caller will fall back")
             return None
 
         deadline = time.time() + int(params["timeout_s"])
@@ -465,7 +477,9 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
                 break
             time.sleep(1.5)
         if history is None:
-            print(f"[flux-inpaint] timed out waiting for {prompt_id}; caller will fall back")
+            msg = f"timed out waiting for {prompt_id}"
+            flux_inpaint.__dict__["last_error"] = msg
+            print(f"[flux-inpaint] {msg}; caller will fall back")
             return None
 
         outputs = history.get("outputs", {})
@@ -487,14 +501,20 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
                     view.raise_for_status()
                     arr = np.asarray(Image.open(io.BytesIO(view.content)).convert("RGB"), dtype=np.uint8)
                 except Exception as exc:
-                    print(f"[flux-inpaint] output download/decode failed ({exc})")
+                    msg = f"output download/decode failed ({exc})"
+                    flux_inpaint.__dict__["last_error"] = msg
+                    print(f"[flux-inpaint] {msg}")
                     continue
                 print(f"[flux-inpaint] produced {arr.shape[1]}x{arr.shape[0]} plate")
                 return arr
-        print("[flux-inpaint] run completed but produced no images; caller will fall back")
+        msg = "run completed but produced no images"
+        flux_inpaint.__dict__["last_error"] = msg
+        print(f"[flux-inpaint] {msg}; caller will fall back")
         return None
     except Exception as exc:  # pragma: no cover - last-ditch guard, must never crash the run
-        print(f"[flux-inpaint] unexpected error ({exc}); caller will fall back")
+        msg = f"unexpected error ({exc})"
+        flux_inpaint.__dict__["last_error"] = msg
+        print(f"[flux-inpaint] {msg}; caller will fall back")
         return None
 
 

@@ -441,6 +441,36 @@ def test_process_rejects_concurrent_uploads(tmp_path, monkeypatch):
         server.server_close()
 
 
+def test_process_preview_endpoints_serve_upload_and_snapshot(tmp_path, monkeypatch):
+    """Plugin live preview can fetch the uploaded ad while the pipeline runs."""
+    _allow_machine_ready(monkeypatch)
+    _install_fake_run_pipeline(monkeypatch, sleep_s=0.4)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = _write_passing_config(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    png = b"\x89PNG\r\n\x1a\n" + b"preview-test-bytes"
+    try:
+        queued = json.loads(urlopen(
+            Request(base + "/process?filename=ad.png", data=png, method="POST"), timeout=2,
+        ).read())
+        assert queued["input_url"] == f"/process/input?job_id={queued['job_id']}"
+        assert queued["snapshot_url"] == f"/process/snapshot?job_id={queued['job_id']}"
+        input_bytes = urlopen(base + queued["input_url"], timeout=2).read()
+        assert input_bytes == png
+        snapshot_bytes = urlopen(base + queued["snapshot_url"], timeout=2).read()
+        assert snapshot_bytes == png
+        status = json.loads(urlopen(base + "/process?job_id=" + queued["job_id"], timeout=2).read())
+        assert status["input_url"] == queued["input_url"]
+        assert status["snapshot_url"] == queued["snapshot_url"]
+        _poll_job(base, queued["job_id"])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_process_cancel_endpoint_marks_job_cancelled(tmp_path, monkeypatch):
     _allow_machine_ready(monkeypatch)
     _install_fake_run_pipeline(monkeypatch, sleep_s=0.5)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from typing import Optional
 
 from . import inpaint, vectorize
@@ -193,6 +194,43 @@ def _suppress_baked_raster_text(candidates: list, threshold: float = .90) -> lis
                 meta["kept_in_photo"] = True
                 meta["baked_owner_id"] = owner.get("id")
                 meta["suppression_reason"] = "text-contained-in-raster-owner"
+        out.append(c)
+    return out
+
+
+def _suppress_comparison_column_labels(candidates: list, cfg: dict) -> list:
+    """Drop standalone Before/After OCR when labels are baked into column photos."""
+    scene = cfg.get("scene") or {}
+    if scene.get("archetype") != "comparison_grid":
+        return candidates
+    facts = scene.get("facts") or {}
+    photo_columns = [
+        item for item in candidates
+        if item.get("target") == "image"
+        and ((item.get("meta") or {}).get("comparison_side")
+             or str((item.get("meta") or {}).get("semantic_name") or "").lower().endswith("image"))
+    ]
+    if not facts.get("before_after_pair") and len(photo_columns) < 2:
+        return candidates
+    label_re = re.compile(r"^\s*(before|after)\s*$", re.I)
+    out = []
+    for candidate in candidates:
+        c = dict(candidate)
+        c["meta"] = dict(candidate.get("meta") or {})
+        meta = c["meta"]
+        if c.get("target") == "text" and label_re.match(str(c.get("text") or "")):
+            box = c.get("visible_box") or c.get("box") or {}
+            owner = next(
+                (col for col in photo_columns
+                 if _box_containment(box, col.get("visible_box") or col.get("box") or {}) >= 0.35
+                 or _iou(box, col.get("visible_box") or col.get("box") or {}) >= 0.08),
+                None,
+            )
+            if owner is not None or facts.get("before_after_pair"):
+                c["target"] = "drop"
+                meta["kept_in_photo"] = True
+                meta["baked_owner_id"] = (owner or {}).get("id")
+                meta["suppression_reason"] = "comparison-column-label-baked"
         out.append(c)
     return out
 
@@ -409,12 +447,24 @@ def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None):
             or (candidate.get("text") and meta.get("wordmark"))):
         # line_ids are provenance only: merge/reordering can leave them stale or point
         # at an unrelated OCR line. The merged candidate geometry is canonical.
-        return inpaint.text_ink_mask(
+        box = candidate.get("visible_box") or candidate.get("ink_box") or candidate.get("box", {})
+        mask = inpaint.text_ink_mask(
             rgb,
-            candidate.get("visible_box") or candidate.get("ink_box") or candidate.get("box", {}),
+            box,
             candidate.get("quad") or meta.get("quad"),
             allow_box_fallback=not bool(meta.get("overlay_text")),
         )
+        if candidate.get("target") == "text":
+            solid = inpaint.box_fill_mask((h, w), box, pad=5)
+            coverage = float(np.count_nonzero(mask & solid)) / max(1, np.count_nonzero(solid))
+            # Most normal text is sparse ink, so "coverage" is usually low. Unioning the
+            # full box for large paragraphs creates huge removal rectangles and damages
+            # plates (notably photo ads like 041). Only promote to the full box when the
+            # box is small enough that this can't become a destructive slab.
+            solid_fraction = float(np.count_nonzero(solid)) / max(1, h * w)
+            if coverage < 0.92 and solid_fraction <= 0.02:
+                mask = np.maximum(mask, solid)
+        return mask
     mask = inpaint.mask_on_canvas(_mask_path(candidate), candidate.get("box", {}), (w, h), run_dir)
     if candidate.get("target") in ("shape", "icon", "image"):
         mask = inpaint.solidify_mask(mask)
@@ -517,12 +567,32 @@ def _split_comparison_frame(candidate, image, assets_dir, cfg):
             "w": float(right - left),
         }
         child["meta"] = dict(meta)
+        side = "before" if index == 0 else "after"
         child["meta"].update({
             "role": "comparison-column",
             "comparison_side": label.lower(),
             "semantic_name": f"{label} image",
             "parent_id": candidate.get("id"),
         })
+        prov = child["meta"].get("provenance") or {}
+        if isinstance(prov, dict):
+            observations = list(prov.get("observations") or child["meta"].get("observations") or [])
+            remapped = []
+            for observation in observations:
+                if not isinstance(observation, dict):
+                    remapped.append(observation)
+                    continue
+                entry = dict(observation)
+                if entry.get("key"):
+                    entry["key"] = f"{entry['key']}-{side}"
+                elif entry.get("id") is not None:
+                    entry["id"] = f"{entry['id']}-{side}"
+                remapped.append(entry)
+            if remapped:
+                prov = dict(prov)
+                prov["observations"] = remapped
+                child["meta"]["provenance"] = prov
+                child["meta"]["observations"] = remapped
         child["mask"] = {"kind": "rrect", "radius": 0.0}
         child["src"] = _write_asset(part, assets_dir, child["id"])
         out.append(child)
@@ -1042,6 +1112,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         canonical = _suppress_baked_raster_text(
             canonical, float(rcfg.get("raster_text_containment", .90)),
         )
+    canonical = _suppress_comparison_column_labels(canonical, cfg)
     canonical, flattened_scene_artwork = _flatten_photo_scene(canonical, cfg)
     ocr_lines = {line.get("id"): line for line in (ocr.get("lines") or [])}
     masks = {}
@@ -1306,6 +1377,9 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                 and ((cfg.get("scene") or {}).get("facts") or {}).get("before_after_pair")
                 and c.get("target") == "text"):
             dilate = max(dilate, int(rcfg.get("comparison_text_dilate", 5)))
+        if ((cfg.get("scene") or {}).get("archetype") == "social_screenshot"
+                and c.get("target") == "text"):
+            dilate = max(dilate, int(rcfg.get("social_text_dilate", 6)))
         observation = {
             "id": c.get("id"),
             "target": c.get("target"),

@@ -149,7 +149,7 @@ def infer_auto_layout(container, children):
     pb = container["box"]
     if not children:
         return {"mode": "NONE", "confidence": 0.0}
-    boxes = [c["box"] for c in children]
+    boxes = [_paint_box(c) for c in children]
     padding = _layout_padding(pb, children)
     if len(children) == 1:
         paint = _paint_box(children[0])
@@ -164,7 +164,7 @@ def infer_auto_layout(container, children):
                 "mode": mode, "confidence": 0.92, "gap": 0, "itemSpacing": 0,
                 "padding": padding, "align": "CENTER", "counterAlign": "CENTER",
                 "primaryAxisAlignItems": "CENTER", "counterAxisAlignItems": "CENTER",
-                "primarySizing": "FIXED", "counterSizing": "FIXED",
+                "primarySizing": "HUG", "counterSizing": "HUG",
             })
         return {"mode": "NONE", "confidence": 0.3}
 
@@ -261,6 +261,9 @@ def _hoist_background_surface(group):
         group["radius"] = best.get("radius") or (best.get("style") or {}).get("radius")
     if group.get("stroke") is None and best.get("stroke") is not None:
         group["stroke"] = best.get("stroke")
+    shell_id = best.get("id")
+    if shell_id:
+        group["children"] = [child for child in children if child.get("id") != shell_id]
 
 
 def _annotate_stack_children(parent, children):
@@ -268,6 +271,16 @@ def _annotate_stack_children(parent, children):
     layout = parent.get("layout") or {}
     mode = layout.get("mode")
     if mode not in ("HORIZONTAL", "VERTICAL") or not children:
+        return
+    role = (parent.get("meta") or {}).get("role")
+    if role in ("button", "badge", "chip") or _is_button_pattern(parent, children):
+        for child in children:
+            hints = dict(child.get("layout") or {})
+            hints["layoutAlign"] = "CENTER"
+            hints["layoutSizingHorizontal"] = "HUG"
+            hints["layoutSizingVertical"] = "HUG"
+            hints.pop("layoutPositioning", None)
+            child["layout"] = hints
         return
     parent_box = parent.get("box") or {}
     boxes = [child.get("box") or {} for child in children]
@@ -376,8 +389,13 @@ def _finalize_layout(nodes):
         if children:
             _finalize_layout(children)
         _normalize_group_surface(node)
+        children_before = list(node.get("children") or [])
         _hoist_background_surface(node)
+        children = node.get("children") or []
         _passthrough_corner_radius(node)
+        if node.get("target") == "group" and children and len(children) != len(children_before):
+            node["layout"] = infer_auto_layout(node, children)
+            node.setdefault("meta", {})["layout_confidence"] = node["layout"].get("confidence")
         layout = node.get("layout") or {}
         if layout.get("mode") in ("HORIZONTAL", "VERTICAL"):
             role = (node.get("meta") or {}).get("role")
@@ -451,9 +469,12 @@ def _text_alignment(a, b):
 
 def _node_z(node):
     raw = node.get("z_index", node.get("z"))
+    target = node.get("target")
+    # Fusion assigns OCR z=1 to distinguish shell vs label — not final paint order.
+    if target == "text" and raw in (None, 0, 1, "0", "0.0", "1", "1.0"):
+        return 40.0
     if raw not in (None, 0, "0", "0.0"):
         return float(raw)
-    target = node.get("target")
     role = str((node.get("meta") or {}).get("role") or node.get("role") or "").lower()
     if role in {"background", "plate", "clean plate"}:
         return -1_000_000.0
@@ -508,7 +529,7 @@ def _semantic_text_stacks(roots):
             "id": group_id,
             "target": "group",
             "box": box,
-            "z": min(_node_z(node) for node in group),
+            "z": max(_node_z(node) for node in group),
             "children": group,
             "layout": {
                 "mode": "VERTICAL", "confidence": 0.9,
@@ -604,7 +625,7 @@ def _merge_card_shells(nodes, containers):
         if _has_surface(host):
             continue
         role = (host.get("meta") or {}).get("role")
-        if role not in (None, "card", "container"):
+        if role not in (None, "card", "container", "button", "badge", "chip"):
             continue
         host_box = host.get("box") or {}
         backdrops = [node for node in nodes if node is not host and node.get("target") == "shape"
