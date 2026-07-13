@@ -170,6 +170,16 @@ def _artifact_ready(path: str) -> bool:
         return False
 
 
+def _artifact_at_least_as_fresh(path: str, reference: str) -> bool:
+    """True only when a render was produced for the current design checkpoint."""
+    if not (_artifact_ready(path) and _artifact_ready(reference)):
+        return False
+    try:
+        return os.path.getmtime(path) >= os.path.getmtime(reference)
+    except OSError:
+        return False
+
+
 def run_one(input_path, run_dir, cfg, start_from="normalize"):
     os.makedirs(run_dir, exist_ok=True)
     cfg = copy.deepcopy(cfg or {})
@@ -481,7 +491,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         # 11 diff + 12 qa — QA against the Figma render if present, else the local preview
         # A stale Figma export must not judge a newly rebuilt design. Until this run exports
         # again, the freshly generated local preview is the only matching render.
-        use_figma_export = exists("figma_export.png") and (not design_updated or stage("export"))
+        use_figma_export = _artifact_at_least_as_fresh(
+            A("figma_export.png"), A("design.json")
+        )
         qa_render = A("figma_export.png") if use_figma_export else \
             (A("preview.png") if exists("preview.png") else None)
         if (stage("diff") or stage("qa")) and qa_render:

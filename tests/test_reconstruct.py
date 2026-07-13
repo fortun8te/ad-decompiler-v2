@@ -121,6 +121,34 @@ def test_inset_overlay_keeps_valid_photo_underlay_out_of_removal_mask(tmp_path):
     assert result["candidates"][0]["target"] == "image"
 
 
+def test_explicit_z_band_keeps_chrome_above_smaller_content_overlap(tmp_path):
+    """A large UI/header cluster must own its overlap before a smaller photo fragment.
+
+    Area-only ownership used to let the small content crop punch a transparent hole through
+    a bigger verified chrome/header asset.  The VLM/SAM z contract is authoritative.
+    """
+    source = tmp_path / "z-band.png"
+    Image.new("RGB", (100, 100), (230, 230, 230)).save(source)
+    Image.new("L", (60, 60), 255).save(tmp_path / "chrome-mask.png")
+    Image.new("L", (20, 20), 255).save(tmp_path / "content-mask.png")
+    candidates = [
+        {"id": "chrome", "target": "image", "box": {"x": 20, "y": 20, "w": 60, "h": 60},
+         "mask": {"src": "chrome-mask.png"},
+         "meta": {"role": "icon", "layer_disposition": "foreground_raster", "z_band": "chrome"}},
+        {"id": "content", "target": "image", "box": {"x": 40, "y": 40, "w": 20, "h": 20},
+         "mask": {"src": "content-mask.png"},
+         "meta": {"role": "photo", "layer_disposition": "foreground_raster", "z_band": "content"}},
+    ]
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates, str(tmp_path),
+                                     {"inpaint": {"mode": "opencv", "mask_dilate": 0}})
+    by_id = {item["id"]: item for item in result["candidates"]}
+    chrome = Image.open(tmp_path / by_id["chrome"]["src"]).convert("RGBA")
+    content = Image.open(tmp_path / by_id["content"]["src"]).convert("RGBA")
+    # Global (50,50) corresponds to local (30,30) / (10,10) respectively.
+    assert chrome.getpixel((30, 30))[3] == 255
+    assert content.getpixel((10, 10))[3] == 0
+
+
 def test_photo_card_suppresses_contained_scene_ocr_but_preserves_overlay_copy(tmp_path):
     source = tmp_path / "card.png"
     Image.new("RGB", (140, 100), (80, 90, 100)).save(source)
@@ -140,6 +168,30 @@ def test_photo_card_suppresses_contained_scene_ocr_but_preserves_overlay_copy(tm
     assert by_id["label"]["target"] == "drop"
     assert by_id["label"]["meta"]["baked_owner_id"] == "card"
     assert by_id["caption"]["target"] == "text"
+
+
+def test_comparison_policy_keeps_contained_column_copy_editable(tmp_path):
+    source = tmp_path / "comparison-text.png"
+    Image.new("RGB", (200, 120), (80, 90, 100)).save(source)
+    Image.new("L", (100, 120), 255).save(tmp_path / "right-mask.png")
+    candidates = [
+        {"id": "right-photo", "target": "image",
+         "box": {"x": 100, "y": 0, "w": 100, "h": 120},
+         "mask": {"src": "right-mask.png"}, "meta": {"role": "person"}},
+        {"id": "after-copy", "target": "text", "text": "AFTER\nClear conversations",
+         "box": {"x": 115, "y": 55, "w": 75, "h": 35},
+         "meta": {"role": "body-copy"}},
+    ]
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, candidates, str(tmp_path),
+        {"scene": {"archetype": "comparison_grid", "facts": {"before_after_pair": True},
+                   "preset": {"photo_regions": {
+            "suppress_descendants": False,
+        }}}, "inpaint": {"mode": "opencv"}},
+    )
+    by_id = {item["id"]: item for item in result["candidates"]}
+    assert by_id["after-copy"]["target"] == "text"
+    assert by_id["after-copy"]["meta"].get("suppression_reason") is None
 
 
 def test_product_label_ocr_is_baked_unless_explicitly_promoted(tmp_path):
@@ -211,6 +263,67 @@ def test_sam_verified_product_matte_is_retained_even_when_small():
         "meta": {"role": "photo", "confidence": .38, "provenance": {"observations": [
             {"source": "sam3", "mask_quality": "mask", "score": .91, "role": "product"},
         ]}},
+    }]
+    result, _ = reconstruct._flatten_photo_scene(candidates, {"canvas": {"w": 1080, "h": 1920}})
+    assert result[0]["target"] == "image"
+
+
+def test_comparison_grid_photo_exports_before_and_after_as_separate_crops(tmp_path):
+    source = tmp_path / "comparison.png"
+    image = Image.new("RGB", (200, 160), "white")
+    ImageDraw.Draw(image).rectangle((20, 30, 99, 129), fill=(180, 50, 40))
+    ImageDraw.Draw(image).rectangle((100, 30, 179, 129), fill=(40, 160, 90))
+    image.save(source)
+    masks = tmp_path / "masks"; masks.mkdir()
+    Image.new("L", (160, 100), 255).save(masks / "comparison.png")
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, [{
+            "id": "comparison", "target": "image", "box": {"x": 20, "y": 30, "w": 160, "h": 100},
+            "mask": {"kind": "alpha", "src": "masks/comparison.png"},
+            "meta": {"role": "photo", "confidence": .95},
+        }], str(tmp_path), {
+            "canvas": {"w": 200, "h": 160},
+            "scene": {"archetype": "comparison_grid", "facts": {"before_after_pair": True}},
+            "inpaint": {"mode": "opencv"},
+        })
+    by_id = {item["id"]: item for item in result["candidates"]}
+    assert by_id["comparison"]["target"] == "drop"
+    assert by_id["comparison"]["meta"]["removal_required"] is True
+    assert by_id["comparison-before"]["meta"]["comparison_side"] == "before"
+    assert by_id["comparison-after"]["meta"]["comparison_side"] == "after"
+    assert by_id["comparison-before"]["box"]["w"] == 80
+    assert Image.open(tmp_path / by_id["comparison-before"]["src"]).size == (80, 100)
+
+
+def test_full_bleed_comparison_plate_exports_two_swappable_clean_bases(tmp_path):
+    source = tmp_path / "full-comparison.png"
+    image = Image.new("RGB", (200, 120), (30, 40, 50))
+    ImageDraw.Draw(image).rectangle((100, 0, 199, 119), fill=(70, 80, 90))
+    image.save(source)
+    Image.new("L", (200, 120), 255).save(tmp_path / "full-mask.png")
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, [{
+            "id": "plate", "target": "image", "box": {"x": 0, "y": 0, "w": 200, "h": 120},
+            "mask": {"src": "full-mask.png"}, "meta": {"role": "photo"},
+        }], str(tmp_path), {
+            "scene": {"archetype": "comparison_grid", "facts": {"before_after_pair": True},
+                      "preset": {"photo_regions": {
+                "suppress_descendants": False,
+            }}}, "inpaint": {"mode": "opencv"},
+        },
+    )
+    by_id = {item["id"]: item for item in result["candidates"]}
+    before = by_id["comparison-plate-before"]
+    after = by_id["comparison-plate-after"]
+    assert before["meta"]["swappable"] is True
+    assert after["box"] == {"x": 100, "y": 0, "w": 100, "h": 120}
+    assert Image.open(tmp_path / before["src"]).size == (100, 120)
+
+
+def test_platform_lockup_is_kept_as_a_separate_raster_asset():
+    candidates = [{
+        "id": "x-lockup", "target": "image", "box": {"x": 820, "y": 40, "w": 130, "h": 32},
+        "meta": {"role": "platform-logo", "wordmark": True, "confidence": .9},
     }]
     result, _ = reconstruct._flatten_photo_scene(candidates, {"canvas": {"w": 1080, "h": 1920}})
     assert result[0]["target"] == "image"

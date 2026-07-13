@@ -218,7 +218,7 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
     separate_roles = {
         "product", "person", "foreground", "cutout", "avatar", "profile",
         "profile_photo", "card", "thumbnail", "photo_card", "logo", "brand",
-        "wordmark", "icon", "badge", "button", "chip", "callout_leader",
+        "wordmark", "platform-logo", "icon", "badge", "button", "chip", "callout_leader",
         "text_backplate",
     }
     min_photo_fraction = float(photo_policy.get("min_separate_photo_fraction", 0.012))
@@ -370,7 +370,13 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
                 "foreground_vector" if target == "icon" else
                 "native_shape" if target == "shape" else "foreground_raster"
             )
-            meta["z_band"] = "chrome" if target in {"icon", "shape"} else "content"
+            # A VLM segment review may have supplied a stronger semantic z-band
+            # (for example, a rasterized UI header is still chrome even though its
+            # routed target is ``image``).  Never overwrite that contract while
+            # assigning the deterministic fallback for unclassified detections.
+            meta["z_band"] = meta.get("z_band") or (
+                "chrome" if target in {"icon", "shape"} else "content"
+            )
             out.append(c)
             continue
         if target not in {"text", "drop"}:
@@ -469,6 +475,96 @@ def _apply_owned_alpha(image, owned_mask, box):
     rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
     rgba[:, :, 3] = np.minimum(rgba[:, :, 3], local)
     return Image.fromarray(rgba)
+
+
+def _split_comparison_frame(candidate, image, assets_dir, cfg):
+    """Turn a verified wide before/after raster into independently swappable columns.
+
+    The comparison preset is explicit evidence that the two halves have semantic value.
+    Splitting only its broad photographic frame avoids guessing at arbitrary two-column
+    layouts while making the common before/after creative genuinely editable in Figma.
+    The original owner is retained as a removal-only observation by the caller, so the
+    clean plate is still rebuilt exactly once.
+    """
+    scene = cfg.get("scene") or {}
+    if scene.get("archetype") != "comparison_grid":
+        return []
+    if not (scene.get("facts") or {}).get("before_after_pair"):
+        return []
+    if candidate.get("target") != "image":
+        return []
+    meta = candidate.get("meta") or {}
+    if str(meta.get("role") or "").lower() not in {"photo", "image", "photo-card"}:
+        return []
+    box = candidate.get("box") or {}
+    width, height = image.size
+    if width < 80 or height < 60 or width / max(1, height) < 1.25:
+        return []
+    # A near 50/50 split is deliberately used only after archetype evidence (the OCR
+    # has already supplied BEFORE/AFTER labels).  Odd pixels stay with the right side.
+    cut = width // 2
+    if cut < 32 or width - cut < 32:
+        return []
+    out = []
+    for index, (label, left, right) in enumerate((("Before", 0, cut), ("After", cut, width))):
+        part = image.crop((left, 0, right, height))
+        child = dict(candidate)
+        child["id"] = f"{candidate.get('id')}-{'before' if index == 0 else 'after'}"
+        child["name"] = f"{label} image — swappable crop"
+        child["box"] = {
+            **box,
+            "x": float(box.get("x") or 0) + float(left),
+            "w": float(right - left),
+        }
+        child["meta"] = dict(meta)
+        child["meta"].update({
+            "role": "comparison-column",
+            "comparison_side": label.lower(),
+            "semantic_name": f"{label} image",
+            "parent_id": candidate.get("id"),
+        })
+        child["mask"] = {"kind": "rrect", "radius": 0.0}
+        child["src"] = _write_asset(part, assets_dir, child["id"])
+        out.append(child)
+    return out
+
+
+def _comparison_plate_columns(background_path, assets_dir, width, height, cfg, candidates):
+    """Expose a full-bleed comparison plate as two swappable base-image layers."""
+    if (cfg.get("scene") or {}).get("archetype") != "comparison_grid":
+        return []
+    if not ((cfg.get("scene") or {}).get("facts") or {}).get("before_after_pair"):
+        return []
+    if any((item.get("meta") or {}).get("comparison_side") for item in candidates):
+        return []
+    _, _, Image = _deps()
+    plate = Image.open(background_path).convert("RGBA")
+    if plate.size != (width, height) or width < 80:
+        return []
+    cut = width // 2
+    out = []
+    for side, left, right in (("before", 0, cut), ("after", cut, width)):
+        label = side.title()
+        candidate = {
+            "id": f"comparison-plate-{side}",
+            "target": "image",
+            "name": f"{label} image — swappable base",
+            "box": {"x": left, "y": 0, "w": right - left, "h": height},
+            "z_index": -999_999,
+            "mask": {"kind": "rect"},
+            "meta": {
+                "role": "comparison-column",
+                "comparison_side": side,
+                "semantic_name": f"{label} image",
+                "swappable": True,
+                "source": "clean-plate-column",
+            },
+        }
+        candidate["src"] = _write_asset(
+            plate.crop((left, 0, right, height)), assets_dir, candidate["id"]
+        )
+        out.append(candidate)
+    return out
 
 
 def _dominant_fill(rgb, mask, box):
@@ -941,9 +1037,11 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     h, w = rgb.shape[:2]
 
     canonical = deduplicate(candidates, float(rcfg.get("dedup_iou", 0.86)))
-    canonical = _suppress_baked_raster_text(
-        canonical, float(rcfg.get("raster_text_containment", .90)),
-    )
+    photo_policy = (((cfg.get("scene") or {}).get("preset") or {}).get("photo_regions") or {})
+    if photo_policy.get("suppress_descendants", True):
+        canonical = _suppress_baked_raster_text(
+            canonical, float(rcfg.get("raster_text_containment", .90)),
+        )
     canonical, flattened_scene_artwork = _flatten_photo_scene(canonical, cfg)
     ocr_lines = {line.get("id"): line for line in (ocr.get("lines") or [])}
     masks = {}
@@ -958,7 +1056,21 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     # and leave the real product/icon cutout with an empty alpha channel.
     def _ownership_priority(candidate):
         target = candidate.get("target")
-        role = str((candidate.get("meta") or {}).get("role") or "").lower()
+        meta = candidate.get("meta") or {}
+        role = str(meta.get("role") or "").lower()
+        # VLM/SAM may have classified an element as UI chrome, an overlay, or scene
+        # content.  Keep that explicit top-down contract ahead of the generic target
+        # heuristic so a verified badge/callout leader cannot be swallowed by the
+        # photo/card it sits on.  Unknown candidates retain the old conservative order.
+        band = str(meta.get("z_band") or "").lower()
+        band_priority = {
+            "chrome": 40, "ui": 40,
+            "overlay": 30, "foreground": 30,
+            "content": 20, "scene": 20,
+            "background": 0, "plate": 0,
+        }.get(band)
+        if band_priority is not None:
+            return band_priority
         # Semantic foreground cutouts must claim their pixels before a broad
         # scene/photo region.  z is often unavailable for SAM/residual-only
         # runs, so relying on z alone silently reverses ownership.
@@ -1079,6 +1191,16 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             continue
         image = _source_rgba(c, rgb, mask, run_dir)
         image = _apply_owned_alpha(image, owned, c.get("box", {}))
+        comparison_columns = _split_comparison_frame(c, image, assets_dir, cfg)
+        if comparison_columns:
+            # Keep the broad source owner only as the inpaint/removal observation.  The
+            # two children above are the actual Figma layers, each with its own crop.
+            c["target"] = "drop"
+            c["meta"]["removal_required"] = True
+            c["meta"]["suppression_reason"] = "split-into-before-after-columns"
+            updated.append(c)
+            updated.extend(comparison_columns)
+            continue
         # Keep the exact reconstructed crop even when the editable vector passes
         # the fidelity gate.  It is the deterministic preview fallback for SVGs
         # that CairoSVG cannot paint (or paints fully transparent).
@@ -1176,6 +1298,14 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             }
         # A full-canvas raster is the plate itself. Everything else is removed from the plate.
         is_background = bool(c.get("meta", {}).get("role") == "background" or area_frac > 0.92)
+        dilate = inpaint.resolve_mask_dilate(c, cfg)
+        # Comparison cards place bright editable copy over textured/translucent photo
+        # surfaces. OCR ink masks are slightly tighter than the antialiased glyph fringe;
+        # a two-pixel default leaves readable duplicate halos after reconstruction.
+        if ((cfg.get("scene") or {}).get("archetype") == "comparison_grid"
+                and ((cfg.get("scene") or {}).get("facts") or {}).get("before_after_pair")
+                and c.get("target") == "text"):
+            dilate = max(dilate, int(rcfg.get("comparison_text_dilate", 5)))
         observation = {
             "id": c.get("id"),
             "target": c.get("target"),
@@ -1185,7 +1315,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "box": box,
             "mask_array": candidate_mask,
             "is_background": is_background,
-            "dilate": inpaint.resolve_mask_dilate(c, cfg),
+            "dilate": dilate,
         }
         removal.append(observation)
         if c.get("target") == "text" or (c.get("target") == "drop" and (c.get("meta") or {}).get("removal_required")):
@@ -1218,6 +1348,10 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             )
         else:
             inpaint_result = inpaint.inpaint_once(image_path, union, background_path, cfg)
+
+    updated.extend(_comparison_plate_columns(
+        background_path, assets_dir, w, h, cfg, updated,
+    ))
 
     # Visual ownership map plus a machine-readable legend.
     ownership_path = os.path.join(run_dir, "ownership.png")

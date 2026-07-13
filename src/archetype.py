@@ -94,10 +94,13 @@ def scene_facts(canvas: dict, ocr: dict | None = None, observations: dict | None
     texts = [str(x.get("text") or "").strip() for x in lines]
     joined = " ".join(texts).lower()
     w, h = max(1, int(canvas.get("w", 1))), max(1, int(canvas.get("h", 1)))
+    has_before = bool(re.search(r"\bbefore\b", joined))
+    has_after = bool(re.search(r"\bafter\b", joined))
     facts = {
         "aspect_ratio": w / h,
         "text_line_count": len([x for x in texts if x]),
         "before_after_labels": bool(re.search(r"\b(before|after|others|versus|vs)\b", joined)),
+        "before_after_pair": has_before and has_after,
         "social_metadata": bool(re.search(r"\b(views?|reposts?|likes?|reply|am|pm)\b", joined)),
         "caption_language": bool(re.search(r"\b(my|i\s|finally|why|started|wish)\b", joined)),
         "emoji_present": any(ord(ch) > 0xFFFF for text in texts for ch in text),
@@ -129,7 +132,11 @@ def classify(facts: dict, configured: str = "auto") -> dict:
     if photo >= .55 and backplates >= 2: add("caption_over_photo", 5, "photo with repeated text backplates")
     if f.get("caption_language") and photo >= .5: add("caption_over_photo", 5, "testimonial/caption language")
     if columns >= 2: add("comparison_grid", 4, "multiple columns")
-    if f.get("before_after_labels"): add("comparison_grid", 4, "comparison labels")
+    # Explicit comparison labels are a stronger structural signal than generic caption
+    # words such as "why".  The latter often appears in the headline of a before/after
+    # creative and previously won 5:4, which flattened one comparison column into the
+    # photo plate and defeated the independently-swappable column contract.
+    if f.get("before_after_labels"): add("comparison_grid", 7, "comparison labels")
     if f.get("center_divider"): add("comparison_grid", 2, "center divider")
     if photo >= .65: add("lifestyle_overlay", 3, "dominant lifestyle photo")
     if f.get("leader_lines") or f.get("circular_inset"): add("lifestyle_overlay", 3, "annotation overlay")
@@ -141,7 +148,9 @@ def classify(facts: dict, configured: str = "auto") -> dict:
     if not score[chosen]:
         chosen = "product_on_flat" if flat >= .5 else "lifestyle_overlay"
         why[chosen].append("conservative visual default")
-    return decision(chosen, score, why[chosen])
+    result = decision(chosen, score, why[chosen])
+    result["facts"] = copy.deepcopy(f)
+    return result
 
 
 def decision(name: str, scores: dict, reasons: list[str]) -> dict:
@@ -153,7 +162,13 @@ def apply_preset(cfg: dict, result: dict) -> dict:
     """Expose the contract through real downstream config namespaces."""
     out = copy.deepcopy(cfg or {})
     preset = copy.deepcopy(result["preset"])
-    out["scene"] = {"archetype": result["archetype"], "preset": preset}
+    facts = copy.deepcopy(result.get("facts") or {})
+    # Only a literal BEFORE+AFTER pair authorizes rebuilding all contained column copy
+    # and exposing two swappable photo bases. Generic "VS" comparison tables keep their
+    # existing raster ownership policy.
+    if result["archetype"] == "comparison_grid" and facts.get("before_after_pair"):
+        preset["photo_regions"]["suppress_descendants"] = False
+    out["scene"] = {"archetype": result["archetype"], "preset": preset, "facts": facts}
     routing = out.setdefault("routing", {})
     routing.setdefault("min_text_fidelity", preset["thresholds"]["min_text_fidelity"])
     routing["photo_regions"] = preset["photo_regions"]

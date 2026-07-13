@@ -575,3 +575,34 @@ def test_regional_large_complex_hole_routes_to_lama_not_flux(tmp_path, monkeypat
 
     assert calls == ["big-lama"]
     assert result["backend_counts"] == {"big-lama": 1}
+
+
+def test_regional_mixed_text_and_icon_routes_to_lama_not_flux(tmp_path, monkeypatch):
+    from PIL import Image
+    source = np.zeros((100, 120, 3), dtype=np.uint8)
+    source[:, ::2] = 255
+    text = np.zeros((100, 120), dtype=np.uint8); text[35:55, 30:85] = 255
+    icon = np.zeros_like(text); icon[37:53, 35:47] = 255
+    union = np.maximum(text, icon)
+    Image.fromarray(source).save(tmp_path / "source.png")
+    calls = []
+
+    def fake_single(rgb, inner_mask, cfg):
+        calls.append(cfg["inpaint"]["mode"])
+        return np.full_like(rgb, 127), "big-lama", {"backend_choice": "big-lama"}
+
+    monkeypatch.setattr(inpaint, "_inpaint_single_pass", fake_single)
+    cfg = {"inpaint": {"mode": "auto", "comfy": {"enabled": True}, "regional": {
+        "enabled": True, "min_context": 4, "max_context": 8, "min_crop": 32,
+        "flat_residual_p90": -1, "flat_gradient_p90": -1,
+        "flux_residual_p90": -1, "flux_gradient_p90": -1,
+        "flux_max_canvas_fraction": 0.10,
+    }}}
+    result = inpaint.inpaint_regional(
+        str(tmp_path / "source.png"), [
+            {"id": "copy", "target": "text", "role": "body", "mask_array": text},
+            {"id": "bullet", "target": "icon", "role": "icon", "mask_array": icon},
+        ], union, str(tmp_path / "out.png"), cfg,
+    )
+    assert calls == ["big-lama"]
+    assert result["regions"][0]["route"] == "big-lama"

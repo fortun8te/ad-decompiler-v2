@@ -228,7 +228,12 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
     if qwen_enabled and run_dir:
         try:
             note = open(os.path.join(run_dir, "qwen.note.txt"), encoding="utf-8").read().lower()
-            if any(marker in note for marker in ("backend offline", "backend likely down", "connection refused")):
+            if any(marker in note for marker in (
+                "backend offline", "backend likely down", "connection refused",
+                # Validation failures are deterministic until the workflow/models change.
+                # Repeating the same upload and rejected prompt cannot improve the scene.
+                "/prompt failed", "prompt_outputs_failed_validation", "validation=",
+            )):
                 qwen_enabled = False
         except OSError:
             pass

@@ -130,6 +130,16 @@ def test_offline_qwen_note_blocks_repeat_retry(tmp_path):
     assert ("qwen", "retry") not in _actions(repairs)
 
 
+def test_invalid_qwen_workflow_note_blocks_repeat_retry(tmp_path):
+    (tmp_path / "qwen.note.txt").write_text(
+        "qwen(comfyui): /prompt failed (400); validation=prompt_outputs_failed_validation",
+        encoding="utf-8",
+    )
+    repairs = repair.assess({}, {"ssim": 0.48, "hard_fails": []}, {"lines": []},
+                            {"run_dir": str(tmp_path), "qwen": {"enabled": True}})
+    assert ("qwen", "retry") not in _actions(repairs)
+
+
 def test_repair_per_layer_element_recall_targets_sam3(tmp_path):
     repairs = repair.assess(
         {},

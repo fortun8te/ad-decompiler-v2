@@ -27,6 +27,24 @@ def test_comparison_grid_from_columns_divider_or_labels():
     assert chosen(photo_coverage=.50, before_after_labels=True) == "comparison_grid"
 
 
+def test_comparison_labels_beat_generic_caption_language_on_photo():
+    result = classify({
+        "photo_coverage": .59,
+        "before_after_labels": True,
+        "before_after_pair": True,
+        "caption_language": True,
+    })
+    assert result["archetype"] == "comparison_grid"
+    cfg = apply_preset({}, result)
+    assert cfg["scene"]["preset"]["photo_regions"]["suppress_descendants"] is False
+
+
+def test_vs_table_does_not_enable_before_after_photo_rebuild():
+    result = classify({"before_after_labels": True, "before_after_pair": False})
+    cfg = apply_preset({}, result)
+    assert cfg["scene"]["preset"]["photo_regions"]["suppress_descendants"] is True
+
+
 def test_lifestyle_overlay_for_photo_annotations():
     assert chosen(photo_coverage=.91, leader_lines=True, circular_inset=True) == "lifestyle_overlay"
 

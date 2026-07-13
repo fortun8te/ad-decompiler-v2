@@ -105,6 +105,23 @@ def _last_note(run_dir: str) -> str:
         return ""
 
 
+def _recent_deterministic_failure(run_dir: str, qcfg: dict) -> str:
+    """Return a cached non-transient failure during the harness cooldown window."""
+    if qcfg.get("force_retry"):
+        return ""
+    path = os.path.join(run_dir, "qwen.note.txt")
+    note = _last_note(run_dir)
+    markers = ("/prompt failed", "prompt_outputs_failed_validation", "validation=")
+    if not note or not any(marker in note.lower() for marker in markers):
+        return ""
+    try:
+        age = max(0.0, time.time() - os.path.getmtime(path))
+    except OSError:
+        return ""
+    cooldown = max(0.0, float(qcfg.get("failure_cooldown_s", 900)))
+    return note if age < cooldown else ""
+
+
 def _http_error_detail(response, limit: int = 1800) -> str:
     """Return bounded ComfyUI validation detail for an unsuccessful request.
 
@@ -125,6 +142,21 @@ def _http_error_detail(response, limit: int = 1800) -> str:
     return detail[: max(0, int(limit))]
 
 
+def _comfy_auth_headers(section: Optional[dict] = None) -> dict[str, str]:
+    """Return Comfy Cloud authentication headers without persisting secrets.
+
+    Local ComfyUI ignores the empty header set. Remote providers compatible with the
+    official Comfy Cloud API can opt in with ``api_key`` or, preferably,
+    ``api_key_env`` (default ``COMFY_CLOUD_API_KEY``).
+    """
+    section = section or {}
+    key = str(section.get("api_key") or "").strip()
+    if not key:
+        env_name = str(section.get("api_key_env") or "COMFY_CLOUD_API_KEY").strip()
+        key = str(os.environ.get(env_name, "") or "").strip()
+    return {"X-API-Key": key} if key else {}
+
+
 # ── ComfyUI backend ──────────────────────────────────────────────────────────────────
 def _run_comfyui(img_path, run_dir, cfg, schema):
     try:
@@ -133,14 +165,16 @@ def _run_comfyui(img_path, run_dir, cfg, schema):
         raise ImportError("comfyui backend requires requests.  pip install requests") from e
 
     qcfg = cfg.get("qwen") or {}
-    base = cfg.get("backend_url", "http://127.0.0.1:8188").rstrip("/")
+    base = str(qcfg.get("base_url") or cfg.get("backend_url", "http://127.0.0.1:8188")).rstrip("/")
+    headers = _comfy_auth_headers(qcfg)
     wf_path = qcfg.get("workflow", "workflows/qwen_layered_8_api.json")
     layers_n = int(qcfg.get("layers", 8))
 
     # Fail fast when the separately hosted ComfyUI service is not running. The old
     # upload-first path could waste thirty seconds on every harness round.
     try:
-        probe = requests.get(f"{base}/system_stats", timeout=float(qcfg.get("probe_timeout_s", 2)))
+        probe = requests.get(f"{base}/system_stats", headers=headers,
+                             timeout=float(qcfg.get("probe_timeout_s", 2)))
         probe.raise_for_status()
     except Exception as e:
         note = f"qwen(comfyui): backend offline ({e})"
@@ -163,6 +197,7 @@ def _run_comfyui(img_path, run_dir, cfg, schema):
         with open(img_path, "rb") as fh:
             up = requests.post(
                 f"{base}/upload/image",
+                headers=headers,
                 files={"image": (os.path.basename(img_path), fh, "image/png")},
                 data={"overwrite": "true"},
                 timeout=30,
@@ -188,6 +223,7 @@ def _run_comfyui(img_path, run_dir, cfg, schema):
     try:
         resp = requests.post(
             f"{base}/prompt",
+            headers=headers,
             json={"prompt": workflow, "client_id": client_id},
             timeout=30,
         )
@@ -207,7 +243,7 @@ def _run_comfyui(img_path, run_dir, cfg, schema):
     history = None
     while time.time() < deadline:
         try:
-            h = requests.get(f"{base}/history/{prompt_id}", timeout=15).json()
+            h = requests.get(f"{base}/history/{prompt_id}", headers=headers, timeout=15).json()
         except Exception:
             time.sleep(2)
             continue
@@ -234,7 +270,7 @@ def _run_comfyui(img_path, run_dir, cfg, schema):
                 "type": img.get("type", "output"),
             }
             try:
-                r = requests.get(f"{base}/view", params=params, timeout=30)
+                r = requests.get(f"{base}/view", headers=headers, params=params, timeout=30)
                 r.raise_for_status()
             except Exception as e:
                 print(f"[qwen] download failed for {img['filename']}: {e}")
@@ -319,11 +355,13 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
     params = dict(_FLUX_DEFAULTS)
     params.update({k: v for k, v in comfy.items() if k in _FLUX_DEFAULTS})
     base = str(comfy.get("base_url") or cfg.get("backend_url") or _FLUX_DEFAULTS["base_url"]).rstrip("/")
+    headers = _comfy_auth_headers(comfy)
 
     try:
         # Fail fast when the separately hosted ComfyUI service is not running.
         try:
-            probe = requests.get(f"{base}/system_stats", timeout=float(params["probe_timeout_s"]))
+            probe = requests.get(f"{base}/system_stats", headers=headers,
+                                 timeout=float(params["probe_timeout_s"]))
             probe.raise_for_status()
         except Exception as exc:
             print(f"[flux-inpaint] ComfyUI offline at {base} ({exc}); caller will fall back")
@@ -349,6 +387,7 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
             with open(path, "rb") as handle:
                 resp = requests.post(
                     f"{base}/upload/image",
+                    headers=headers,
                     files={"image": (os.path.basename(path), handle, "image/png")},
                     data={"overwrite": "true"},
                     timeout=30,
@@ -403,6 +442,7 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
         try:
             resp = requests.post(
                 f"{base}/prompt",
+                headers=headers,
                 json={"prompt": workflow, "client_id": client_id},
                 timeout=30,
             )
@@ -416,7 +456,7 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
         history = None
         while time.time() < deadline:
             try:
-                h = requests.get(f"{base}/history/{prompt_id}", timeout=15).json()
+                h = requests.get(f"{base}/history/{prompt_id}", headers=headers, timeout=15).json()
             except Exception:
                 time.sleep(1.5)
                 continue
@@ -436,6 +476,7 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
                 try:
                     view = requests.get(
                         f"{base}/view",
+                        headers=headers,
                         params={
                             "filename": img["filename"],
                             "subfolder": img.get("subfolder", ""),
@@ -534,6 +575,11 @@ def propose_layers(img_path: str, run_dir: str, cfg: Optional[dict] = None):
     if qcfg.get("enabled", False) is False:
         note = "qwen: disabled (SAM/residual pipeline remains active)"
         _write_manifest(schema, [], run_dir, note)
+        return []
+    cached_failure = _recent_deterministic_failure(run_dir, qcfg)
+    if cached_failure:
+        print("[qwen] skipping cached deterministic workflow failure during cooldown")
+        _write_manifest(schema, [], run_dir, cached_failure)
         return []
     primary_mode = str(qcfg.get("mode", "comfyui"))
     configured_fallbacks = qcfg.get("fallback_modes") or []

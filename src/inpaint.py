@@ -963,10 +963,12 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             # A high residual around a large product/text mask often means the mask is
             # incomplete and the ring still sees foreground pixels. Flux interprets that
             # as photographic context and regenerates the product. Reserve it for genuinely
-            # local complex holes; large regions and text-only regions use conservative LaMa.
+            # local complex holes; any region containing editable text uses conservative
+            # LaMa. Flux can otherwise regenerate glyph-like residue around an adjacent
+            # icon, creating a duplicate behind the new native Figma text.
             elif (flux_allowed and complex_background
                   and region_fraction <= flux_max_fraction
-                  and set(region["targets"]) != {"text"}):
+                  and "text" not in set(region["targets"])):
                 requested = "flux-comfy"
 
         started = time.monotonic()

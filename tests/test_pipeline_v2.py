@@ -238,3 +238,17 @@ def test_resume_rebuilds_a_truncated_json_checkpoint(monkeypatch, tmp_path):
     assert resumed["ok"]
     assert json.loads((run_dir / "ocr_raw.json").read_text(encoding="utf-8"))["engine"] == "fixture"
     assert calls["ocr"] >= 2
+
+
+def test_stale_figma_export_is_not_fresh_for_new_design(tmp_path):
+    from PIL import Image
+    import os
+
+    export = tmp_path / "figma_export.png"
+    design = tmp_path / "design.json"
+    Image.new("RGB", (4, 4), "white").save(export)
+    design.write_text('{"schema_version": 2, "canvas": {"w": 4, "h": 4}, "layers": []}',
+                      encoding="utf-8")
+    old = design.stat().st_mtime - 10
+    os.utime(export, (old, old))
+    assert run_pipeline._artifact_at_least_as_fresh(str(export), str(design)) is False

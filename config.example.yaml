@@ -162,6 +162,11 @@ qwen:
   enabled: false                       # opt in only after the separate local ComfyUI service is online
   required: false                      # set true only for an experiment that depends on its alpha layers
   mode: comfyui                       # comfyui | direct-diffusers
+  # For a rented/remote GPU use https://cloud.comfy.org and set COMFY_CLOUD_API_KEY.
+  # Keep secrets in the environment; api_key_env names the variable to read.
+  base_url: http://127.0.0.1:8188
+  api_key_env: COMFY_CLOUD_API_KEY
+  failure_cooldown_s: 900              # do not repeat a deterministic 400 in harness rounds
   workflow: workflows/qwen_layered_8_api.json
   layers: 8
 backend_url: http://127.0.0.1:8188    # ComfyUI, only used when qwen.mode=comfyui
@@ -241,7 +246,10 @@ inpaint:
   # Plain/gradient plates route to analytic fill or Big-LaMa to avoid invented objects.
   comfy:
     enabled: false                     # enable on the RTX/ComfyUI workstation
+    # Comfy Cloud is API-compatible: set this to https://cloud.comfy.org and export
+    # COMFY_CLOUD_API_KEY to run the same crop-local Flux workflow on a virtual GPU.
     base_url: http://127.0.0.1:8188
+    api_key_env: COMFY_CLOUD_API_KEY
     workflow: workflows/flux_fill_inpaint_api.json
     steps: 20
     cfg: 1.0

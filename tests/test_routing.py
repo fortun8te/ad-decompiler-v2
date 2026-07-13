@@ -116,3 +116,35 @@ def test_explicit_upstream_mask_shape_is_not_downgraded():
         CANVAS,
     )
     assert out["mask"]["kind"] == "ellipse"
+
+
+def test_foreground_raster_disposition_overrides_generic_detector_shape():
+    out = routing.route(
+        {"id": "header", "kind": "shape", "box": {"x": 10, "y": 10, "w": 220, "h": 80},
+         "mask": {"src": "sam3_masks/header.png"},
+         "meta": {"role": "shape", "layer_disposition": "foreground_raster",
+                  "z_band": "chrome"}},
+        CANVAS,
+    )
+    assert out["target"] == "image"
+    assert out["mask"]["src"] == "sam3_masks/header.png"
+
+
+def test_foreground_vector_disposition_reaches_vector_fidelity_gate():
+    out = routing.route(
+        {"id": "leader", "kind": "photo-fragment", "box": {"x": 10, "y": 10, "w": 90, "h": 12},
+         "meta": {"role": "photo", "layer_disposition": "foreground_vector",
+                  "z_band": "overlay"}},
+        CANVAS,
+    )
+    assert out["target"] == "icon"
+
+
+def test_plate_disposition_is_never_materialized_as_an_independent_layer():
+    out = routing.route(
+        {"id": "scene", "kind": "photo-fragment", "box": {"x": 0, "y": 0, "w": 1000, "h": 1000},
+         "meta": {"role": "photo", "layer_disposition": "plate"}},
+        CANVAS,
+    )
+    assert out["target"] == "drop"
+    assert out["meta"]["keep_in_background"] is True

@@ -174,6 +174,27 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
         c["target"] = "text"
         return c
 
+    # A VLM/SAM ownership pass may already have made the materialization decision.
+    # Honor that contract before applying the broad role heuristics below: otherwise a
+    # confirmed card/avatar/logo can be silently re-routed as a plate fragment simply
+    # because a detector called it a generic ``shape``.  Text is deliberately handled
+    # above -- its ownership contract is the stricter scene-text path.
+    disposition = str(meta.get("layer_disposition") or meta.get("disposition") or "").lower()
+    if disposition in {"plate", "background", "keep_in_background"}:
+        c["target"] = "drop"
+        meta["keep_in_background"] = True
+        return c
+    if disposition in {"foreground_raster", "raster", "image"}:
+        c["target"] = "image"
+        c["mask"] = _image_mask(c, canvas)
+        return c
+    if disposition in {"foreground_vector", "vector", "icon"}:
+        c["target"] = "icon"
+        return c
+    if disposition in {"native_shape", "shape", "primitive"}:
+        c["target"] = "shape"
+        return c
+
     # 2. Explicit emoji candidate ----------------------------------------------------
     if meta.get("emoji") or c.get("codepoint"):
         c["target"] = "text"; meta["emoji"] = True

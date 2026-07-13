@@ -51,6 +51,26 @@ def test_successful_retry_clears_stale_failure_note(tmp_path, monkeypatch):
     assert not (tmp_path / "qwen.note.txt").exists()
 
 
+def test_deterministic_comfy_failure_is_not_retried_during_cooldown(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    Image.new("RGB", (20, 20), "white").save(source)
+    (tmp_path / "qwen.note.txt").write_text(
+        "qwen(comfyui): /prompt failed (400); validation=prompt_outputs_failed_validation",
+        encoding="utf-8",
+    )
+    called = []
+    monkeypatch.setattr(qwen_worker, "_load_schema", lambda: _Schema)
+    monkeypatch.setattr(qwen_worker, "_run_comfyui", lambda *args: called.append(args))
+
+    result = qwen_worker.propose_layers(
+        str(source), str(tmp_path),
+        {"qwen": {"enabled": True, "mode": "comfyui", "failure_cooldown_s": 900}},
+    )
+
+    assert result == []
+    assert called == []
+
+
 def test_finalize_rejects_fully_transparent_fake_layers(tmp_path):
     transparent = tmp_path / "transparent.png"
     Image.fromarray(np.zeros((16, 16, 4), dtype=np.uint8), "RGBA").save(transparent)
@@ -70,6 +90,14 @@ def test_http_error_detail_preserves_comfy_validation_reason_and_is_bounded():
 
     assert "node_errors" in detail
     assert len(detail) <= 48
+
+
+def test_comfy_cloud_auth_reads_key_from_configured_environment(monkeypatch):
+    monkeypatch.setenv("TEST_COMFY_KEY", "cloud-secret")
+    assert qwen_worker._comfy_auth_headers({"api_key_env": "TEST_COMFY_KEY"}) == {
+        "X-API-Key": "cloud-secret"
+    }
+    assert qwen_worker._comfy_auth_headers({"api_key_env": "MISSING_COMFY_KEY"}) == {}
 
 
 # ── Flux Fill inpaint backend ─────────────────────────────────────────────────────────
