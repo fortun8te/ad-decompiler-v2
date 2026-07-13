@@ -35,6 +35,25 @@ def test_svg_z_and_nested_frame_survive_design_compile(tmp_path):
     assert doc.layers[1].children[0].z_index == 7
 
 
+def test_text_with_fusion_z_one_paints_above_its_native_button_shell(tmp_path):
+    background = tmp_path / "background_clean.png"
+    Image.new("RGB", (100, 100), "white").save(background)
+    tree = [{
+        "id": "button", "target": "group", "box": {"x": 0, "y": 0, "w": 90, "h": 40},
+        "children": [
+            {"id": "label", "target": "text", "z": 1, "text": "SHOP NOW",
+             "box": {"x": 10, "y": 10, "w": 60, "h": 15}, "style": {"fontSize": 12}},
+            {"id": "shell", "target": "shape", "z": 0,
+             "box": {"x": 0, "y": 0, "w": 90, "h": 40}},
+        ],
+    }]
+    doc = build_design_json.build(tree, {"w": 100, "h": 100}, str(tmp_path),
+                                   base_src=str(background))
+    children = doc.layers[1].children
+    assert children[-1].id == "label"
+    assert children[-1].z_index > children[0].z_index
+
+
 def test_vector_layer_keeps_raster_preview_fallback(tmp_path):
     from PIL import Image
     asset = tmp_path / "icon.png"

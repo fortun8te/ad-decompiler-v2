@@ -148,9 +148,13 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         z_raw = meta.get("z")
     else:
         z_raw = default_z.get(target, 10)
-    # Fusion/layout currently use zero as an unset placeholder. Treat only that
-    # placeholder as absent; explicit positive/negative ordering remains intact.
-    z_index = float(_semantic_z(candidate, target) if z_raw in (None, 0, "0", "0.0") else z_raw)
+    # Fusion assigns OCR a small ``z=1`` merely to distinguish it from its
+    # detected shell.  It is not a final paint order: native button/card shapes
+    # receive semantic z=20 and would otherwise cover their own CTA. Preserve
+    # genuinely explicit text z-orders (>1), but promote the fusion placeholder
+    # to the normal front text band.
+    text_placeholder_z = target == "text" and z_raw in (None, 0, 1, "0", "0.0", "1", "1.0")
+    z_index = float(_semantic_z(candidate, target) if text_placeholder_z or z_raw in (None, 0, "0", "0.0") else z_raw)
     if meta.get("substitution"):
         warnings.append({"code": "text-fidelity-fallback", "layer_id": layer_id, **meta["substitution"]})
     common = {

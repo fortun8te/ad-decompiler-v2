@@ -95,6 +95,12 @@ def _text_fidelity_fallback(c: dict, meta: dict, cfg: dict | None) -> dict | Non
     """If this text candidate's ink/font-match confidence is below the fidelity gate,
     return a routed masked-pixel-fallback candidate; otherwise None (route as text)."""
     threshold = _num((cfg or {}).get("routing", {}).get("min_text_fidelity"), MIN_TEXT_FIDELITY)
+    # Long social/body copy amplifies a small font mismatch across a large area.
+    # Keep the ordinary overlay threshold permissive for CTA/headline editing,
+    # but require a stronger render match before rebuilding a paragraph.
+    semantic_role = str(meta.get("semantic_role") or meta.get("role") or "").lower()
+    if semantic_role in {"body-copy", "body", "caption"}:
+        threshold = max(threshold, 0.85)
     style = c.get("style") or {}
     fidelity_conf = meta.get("fidelity_confidence")
     if fidelity_conf is None:

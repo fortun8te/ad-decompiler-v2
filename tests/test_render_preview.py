@@ -97,6 +97,17 @@ def test_preview_text_uses_layer_fill_when_style_color_is_absent(tmp_path):
     assert any(pixel[0] > pixel[1] * 2 for pixel in preview.getdata())
 
 
+def test_preview_prefers_selected_font_family_over_stale_candidate_order():
+    font = render_preview._text_font({
+        "fontFamily": "Arial",
+        "fontCandidates": [
+            {"family": "Comic Sans MS", "path": "C:\\Windows\\Fonts\\comic.ttf"},
+            {"family": "Arial", "path": "C:\\Windows\\Fonts\\arial.ttf"},
+        ],
+    }, 20)
+    assert "arial" in " ".join(font.getname()).lower()
+
+
 def test_preview_honors_text_horizontal_and_vertical_alignment(tmp_path):
     left_top = np.asarray(_render(tmp_path / "a", [{
         "id": "copy", "type": "text", "box": {"x": 0, "y": 0, "w": 70, "h": 40},

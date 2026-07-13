@@ -236,8 +236,23 @@ def _normalize_align(value, default="left"):
 def _text_font(style, font_size):
     from PIL import ImageFont
     candidates = style.get("fontCandidates") or []
-    paths = [candidate.get("path") for candidate in candidates
-             if isinstance(candidate, dict) and candidate.get("path") and os.path.exists(candidate["path"])]
+    family = str(style.get("fontFamily") or "").strip().casefold()
+    usable = [candidate for candidate in candidates if isinstance(candidate, dict)
+              and candidate.get("path") and os.path.exists(candidate["path"])]
+    # A VLM/font-arbitration pass can promote ``fontFamily`` while retaining the
+    # original candidates for provenance. Preview must render the selected family
+    # first; otherwise it may draw Comic Sans even though the exported Figma node
+    # correctly says Arial.
+    usable.sort(key=lambda candidate: 0 if str(candidate.get("family") or "").strip().casefold() == family else 1)
+    selected_paths = []
+    # The font matcher intentionally stores only the top few candidates. A
+    # later semantic/font decision can select a common family not present in
+    # that shortlist; resolve Windows' canonical Arial directly before falling
+    # back to a visually unrelated candidate.
+    if family in {"arial", "arial mt"}:
+        windir = os.environ.get("WINDIR", r"C:\\Windows")
+        selected_paths.append(os.path.join(windir, "Fonts", "arial.ttf"))
+    paths = selected_paths + [candidate["path"] for candidate in usable]
     paths += ["arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
     for path in paths:
         try:

@@ -346,6 +346,17 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
             role in separate_roles or (has_explicit_mask and area_fraction >= .005)
             or (bool(meta.get("simple_graphic")) and area_fraction >= min_shape_fraction)
         )
+        # A very thin unparented SAM shape is frequently only the rim/highlight
+        # of a badge or button.  Rebuilding that fragment creates visible clipped
+        # arcs; retain it in the plate unless it is part of an explicitly-owned
+        # control group.
+        if (target == "shape" and not meta.get("parent_id") and role in {"", "shape"}
+                and aspect >= 6 and area_fraction < .01):
+            c["target"] = "drop"
+            meta["keep_in_background"] = True
+            meta["suppression_reason"] = "thin-unparented-ui-fragment"
+            out.append(c)
+            continue
         if target not in {"text", "drop"} and (promoted or is_semantic or is_photo_frame or is_meaningful_shape):
             # A substantial rectangular photo is an image frame/card, not an
             # irregular cutout.  Use a native rounded-rectangle mask and a full
