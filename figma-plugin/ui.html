@@ -199,6 +199,28 @@
       min-height: 0;
     }
 
+    .hero-copy { padding: 2px 2px 12px; }
+    .hero-eyebrow {
+      color: var(--brand-hover);
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    .hero-heading {
+      margin: 4px 0 3px;
+      font-size: 20px;
+      line-height: 1.12;
+      letter-spacing: -0.04em;
+    }
+    .hero-subcopy {
+      max-width: 290px;
+      margin: 0;
+      color: var(--text-secondary);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
     .section + .section { margin-top: 0; }
 
     .section-header {
@@ -699,6 +721,22 @@
       letter-spacing: 0.01em;
     }
 
+    /* Calm visual layer: keep diagnostics available without making the plugin feel like a console. */
+    .readiness-strip { margin: 0 14px; border: 0; border-radius: 8px; background: transparent; color: var(--text-tertiary); }
+    .readiness-strip[data-state="ok"] { color: var(--text-secondary); }
+    .connection { border-color: transparent; background: transparent; }
+    .build-badge { border-color: transparent; background: transparent; }
+    .source-card, .history-panel, .progress-panel, .result-panel, .issue-panel { box-shadow: 0 8px 24px rgba(0,0,0,.16); }
+    .source-info, .history-detail, .history-time, .import-identity-value, .import-identity-detail { font-family: inherit; }
+    .upload-zone { min-height: 230px; border-style: solid; border-color: var(--border-strong); background: linear-gradient(180deg, #171b22, #101217); }
+    .upload-zone:hover { border-color: color-mix(in srgb, var(--brand) 55%, var(--border-strong)); }
+    .upload-zone[data-dragover="true"] { box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 18%, transparent); }
+    .upload-title { font-size: 14px; }
+    .upload-copy { color: var(--text-secondary); }
+    .settings { border-top-color: transparent; }
+    .settings summary { color: var(--text-secondary); }
+    .primary-button { min-height: 42px; border-radius: 11px; }
+
     .hidden { display: none !important; }
 
     .skeleton {
@@ -1134,6 +1172,11 @@
 
     <main>
       <section class="hero">
+        <div class="hero-copy">
+          <div class="hero-eyebrow">Image → editable Figma</div>
+          <h1 class="hero-heading">Bring your ad to life.</h1>
+          <p class="hero-subcopy">Upload a screenshot and we’ll turn the parts we can prove into clean, editable layers.</p>
+        </div>
         <div class="upload-zone" id="uploadZone" tabindex="0" role="button" aria-label="Upload an image to process">
           <input type="file" id="uploadInput" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" hidden />
           <div class="upload-idle" id="uploadIdle">
@@ -1231,7 +1274,7 @@
         </div>
       </section>
 
-      <details class="settings" open>
+      <details class="settings">
         <summary>Import details &amp; settings</summary>
         <div class="settings-body">
           <div>
@@ -1308,7 +1351,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.1.0","build":49,"commit":"917a8ad","dirty":false,"built_at":"2026-07-15T14:37:00Z","label":"v2.1.0+b49.917a8ad","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.1.0","build":50,"commit":"7b0a0c4","dirty":false,"built_at":"2026-07-15T14:39:33Z","label":"v2.1.0+b50.7b0a0c4","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
