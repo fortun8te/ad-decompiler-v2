@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.1.0","build":55,"commit":"60f28f2","dirty":true,"built_at":"2026-07-15T22:23:13Z","label":"v2.1.0+b55.60f28f2-dirty","source":"git"};
+const PLUGIN_BUILD = {"version":"2.1.0","build":56,"commit":"ba5b0cc","dirty":false,"built_at":"2026-07-15T23:20:16Z","label":"v2.1.0+b56.ba5b0cc","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,
@@ -1335,8 +1335,8 @@ function svgForLayer(layer) {
       (capSvg ? ' stroke-linecap="' + capSvg + '"' : "") + (joinSvg ? ' stroke-linejoin="' + joinSvg + '"' : "") +
       (dashSvg ? ' stroke-dasharray="' + dashSvg + '"' : "") + (pathOpacity < 1 ? ' opacity="' + pathOpacity + '"' : "") + '/>';
   }).join("");
-  // Explicit width/height matter: createNodeFromSvg is "equivalent to the SVG import
-  // feature in the editor", and FrameNode.resize afterwards would NOT scale the
+  // Explicit width/height matter: createNodeFromSvg behaves like the editor's SVG
+  // placement feature, and FrameNode.resize afterwards would NOT scale the
   // imported vector children — only the browser-style width/height↔viewBox mapping
   // scales the actual geometry to the layer box.
   return '<svg xmlns="http://www.w3.org/2000/svg" width="' + box.w + '" height="' + box.h +
@@ -1381,7 +1381,8 @@ async function createVectorLayer(layer, parent, context) {
   }
   if (svg.length > SVG_IMPORT_CHAR_LIMIT) {
     if (hasRasterFallback) return rasterFallback("SVG too large to import safely (" + svg.length + " chars)");
-    throw new Error("SVG too large to import (" + svg.length + " chars, limit " + SVG_IMPORT_CHAR_LIMIT + ")");
+    // Keep the loader-safe wording here; Figma can misread certain error text as code.
+    throw new Error("SVG too large for Figma: " + svg.length + " chars (limit " + SVG_IMPORT_CHAR_LIMIT + ")");
   }
   let node;
   try {
