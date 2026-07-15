@@ -35,6 +35,46 @@ def test_svg_z_and_nested_frame_survive_design_compile(tmp_path):
     assert doc.layers[1].children[0].z_index == 7
 
 
+def test_f1_promoted_image_host_preserves_its_raster_as_background_child(tmp_path):
+    # A pixel-carrying candidate (the 002 product panel) that reconstruction promoted to
+    # a container GROUP must not lose its raster: the compiler re-emits it as a background
+    # image child behind the group's other children, so the products survive.
+    background = tmp_path / "background_clean.png"
+    Image.new("RGB", (200, 300), "white").save(background)
+    panel = tmp_path / "panel.png"
+    Image.new("RGBA", (150, 250), (10, 20, 30, 255)).save(panel)
+    product = tmp_path / "product.png"
+    Image.new("RGBA", (60, 80), (200, 50, 50, 255)).save(product)
+    tree = [{
+        "id": "c_E003", "target": "group", "box": {"x": 20, "y": 30, "w": 150, "h": 250},
+        # dangling raster material left on the promoted container by reconstruction
+        "src": str(panel), "meta": {"role": "shape"},
+        "children": [
+            {"id": "c_E006", "target": "image", "z": 30,
+             "box": {"x": 5, "y": 100, "w": 60, "h": 80},
+             "src": str(product), "meta": {"role": "product"}},
+            {"id": "label", "target": "text", "z": 40, "text": "PRE PRO",
+             "box": {"x": 10, "y": 10, "w": 80, "h": 20}, "style": {"fontSize": 14}},
+        ],
+    }]
+    doc = build_design_json.build(tree, {"w": 200, "h": 300}, str(tmp_path),
+                                   base_src=str(background))
+    group = next(layer for layer in doc.layers if layer.id == "c_E003")
+    assert group.type == "group"
+    host = [c for c in group.children if c.meta.get("preserved_host_raster")]
+    assert len(host) == 1, "promoted image host must re-emit its raster as a child"
+    host = host[0]
+    assert host.type == "image" and host.src is not None
+    # It fills the frame in local coords and sits behind every real child.
+    assert host.box == {"x": 0.0, "y": 0.0, "w": 150, "h": 250}
+    assert host.z_index < min(c.z_index for c in group.children if c.id != host.id)
+    # The staged asset exists and matches the panel raster dimensions (pixels survived).
+    staged = tmp_path / host.src
+    assert staged.exists()
+    with Image.open(staged) as im:
+        assert im.size == (150, 250)
+
+
 def test_text_with_fusion_z_one_paints_above_its_native_button_shell(tmp_path):
     background = tmp_path / "background_clean.png"
     Image.new("RGB", (100, 100), "white").save(background)
@@ -221,3 +261,29 @@ def test_leaf_accounting_flags_only_unexplained_generic_fallbacks(tmp_path):
     assert accounting["fallback_raster_count"] == 2
     assert accounting["unexplained_raster_count"] == 1
     assert accounting["unexplained_raster_ids"] == ["unknown"]
+
+
+def test_f11_fidelity_image_with_substitution_is_explained_not_unexplained(tmp_path):
+    # A documented text->image substitution (052 c_B0) carries WHY it gave up. It is
+    # explained-but-non-native: it must NOT be counted as an "unexplained" quiet
+    # give-up, but it still costs native_leaf_ratio. A bare give-up with no evidence
+    # stays unexplained (F4 anti-laundering, preserved).
+    asset = tmp_path / "asset.png"
+    Image.new("RGBA", (10, 10), "red").save(asset)
+    doc = build_design_json.build([
+        {"id": "headline", "target": "image", "src": str(asset),
+         "box": {"x": 0, "y": 0, "w": 10, "h": 10},
+         "meta": {"role": "headline", "fallback": True,
+                  "substitution": {"from": "text", "reason": "low-fidelity-font"}}},
+        {"id": "bare", "target": "image", "src": str(asset),
+         "box": {"x": 12, "y": 0, "w": 10, "h": 10},
+         "meta": {"role": "unknown", "fallback": True}},
+    ], {"w": 30, "h": 10}, str(tmp_path))
+
+    accounting = doc.meta["leaf_accounting"]
+    assert accounting["fallback_raster_count"] == 2
+    # Only the bare, evidence-free give-up is unexplained.
+    assert accounting["unexplained_raster_count"] == 1
+    assert accounting["unexplained_raster_ids"] == ["bare"]
+    # Both are still non-native (the substitution image did not launder into native).
+    assert accounting["native_leaf_count"] == 0

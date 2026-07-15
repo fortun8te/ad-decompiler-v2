@@ -1,0 +1,64 @@
+{
+  "id": "empty-text",
+  "name": "empty-text",
+  "canvas": {
+    "w": 1000,
+    "h": 800
+  },
+  "schema_version": 2,
+  "meta": {
+    "coordinate_space": "local"
+  },
+  "layers": [
+    {
+      "id": "bg",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "bg",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "w": 1000,
+        "h": 800
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#ffffff"
+      }
+    },
+    {
+      "id": "t-empty",
+      "type": "text",
+      "name": "t-empty",
+      "box": {
+        "x": 100,
+        "y": 100,
+        "w": 200,
+        "h": 40
+      },
+      "text": "",
+      "style": {
+        "fontFamily": "Arial",
+        "fontSize": 18,
+        "color": "#111111"
+      }
+    },
+    {
+      "id": "t-normal",
+      "type": "text",
+      "name": "t-normal",
+      "box": {
+        "x": 100,
+        "y": 200,
+        "w": 300,
+        "h": 40
+      },
+      "text": "I have content",
+      "style": {
+        "fontFamily": "Arial",
+        "fontSize": 18,
+        "color": "#111111"
+      }
+    }
+  ]
+}

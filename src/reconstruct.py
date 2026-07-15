@@ -13,7 +13,9 @@ import re
 from typing import Optional
 
 from . import inpaint, vectorize
-from .schema import dump
+from .schema import (
+    dump, load, raster_slice_failures, raster_slice_thresholds, is_raster_slice,
+)
 from .raster_clusters import INTENTIONAL_RASTER_CLUSTER_ROLES, is_intentional_raster_cluster
 
 
@@ -252,13 +254,32 @@ def _suppress_comparison_column_labels(candidates: list, cfg: dict) -> list:
                  or _iou(box, col.get("visible_box") or col.get("box") or {}) >= 0.08),
                 None,
             )
-            if owner is not None or facts.get("before_after_pair"):
+            # F7: only bake a Before/After label into a column photo when it is actually
+            # CONTAINED in that photo (its pixels are part of the raster). The mere
+            # existence of a before_after_pair used to force every such label uneditable
+            # even when it sits in the gutter/below the photos, contradicting the
+            # comparison-grid archetype's "rebuild column copy as editable" contract
+            # (benchmark 052 pills baked with no overlap). A non-overlapping label stays a
+            # real, swappable TEXT layer.
+            if owner is not None:
                 c["target"] = "drop"
                 meta["kept_in_photo"] = True
-                meta["baked_owner_id"] = (owner or {}).get("id")
+                meta["baked_owner_id"] = owner.get("id")
                 meta["suppression_reason"] = "comparison-column-label-baked"
         out.append(c)
     return out
+
+
+# Semantic foreground/asset roles that legitimately get a clean plate behind them even
+# when large: removing them keeps a genuinely-swappable Figma asset. The per-candidate
+# removal cap (which stops a spurious backdrop blob from inpainting most of the canvas)
+# never fires on these — it targets big, LOW-confidence, generic-role rasters only.
+_CAP_EXEMPT_ROLES = frozenset({
+    "product", "person", "people", "portrait", "foreground", "cutout", "subject",
+    "hero", "avatar", "profile", "profile_photo", "logo", "brand", "wordmark",
+    "platform-logo", "badge", "icon", "card", "thumbnail", "photo_card", "photo-card",
+    "panel", "image-panel", "photo-panel", "comparison-column", "comparison-panel",
+})
 
 
 def _keeps_underlay(candidate: dict) -> bool:
@@ -536,6 +557,203 @@ def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None, cfg: Optional[dict]
     return mask
 
 
+def _is_text_removal(item):
+    """Text removals: emitted editable text and drop-observations that erase text."""
+    return item.get("target") == "text" or (
+        item.get("target") == "drop" and (item.get("meta") or {}).get("removal_required")
+    )
+
+
+def _ensure_text_removal_coverage(candidate, mask, rgb, cfg):
+    """Every EMITTED text layer must have its source pixels in the removal mask.
+
+    Ghost/duplicate text (009 timestamp row) happens exactly when the ink mask misses
+    low-contrast or tiny glyphs: the original stays in the plate AND the editable text
+    is re-rendered on top.  When the estimated ink under-covers the candidate box,
+    force the OCR polygon (or, failing that, the box) so removal is guaranteed.  The
+    repair is recorded in meta for QA/harness visibility.  Config-gated, default ON
+    (``reconstruct.force_text_removal_coverage``).
+    """
+    _, np, _ = _deps()
+    rcfg = (cfg or {}).get("reconstruct") or {}
+    if not bool(rcfg.get("force_text_removal_coverage", True)):
+        return mask
+    if _keeps_underlay(candidate):
+        return mask
+    box = candidate.get("visible_box") or candidate.get("ink_box") or candidate.get("box", {})
+    area = max(1.0, float(box.get("w", 0) or 0) * float(box.get("h", 0) or 0))
+    required = max(12, int(area * float(rcfg.get("min_text_mask_area_fraction", 0.015))))
+    covered = int(np.count_nonzero(mask))
+    if covered >= required:
+        return mask
+    height, width = rgb.shape[:2]
+    meta = candidate.setdefault("meta", {})
+    forced = inpaint.text_ink_mask(
+        rgb, box, candidate.get("quad") or meta.get("quad"), allow_box_fallback=True,
+    )
+    if int(np.count_nonzero(forced)) < required:
+        forced = np.maximum(forced, inpaint.box_fill_mask((height, width), box, pad=1))
+    merged = np.maximum(np.asarray(mask, dtype=np.uint8), np.asarray(forced, dtype=np.uint8))
+    meta["removal_coverage_forced"] = {
+        "reason": "text-ink-mask-under-coverage",
+        "mask_px_before": covered,
+        "mask_px_after": int(np.count_nonzero(merged)),
+        "required_px": required,
+    }
+    return merged
+
+
+def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
+                                ledger, cfg):
+    """Ghost-text guard: detect glyph residue left on the clean plate under removed text.
+
+    A glyph-ink plate pixel is leftover ghost when it either (a) still matches the
+    SOURCE (|plate - source| <= tolerance — the inpaint skipped it), OR (b) still sits
+    near the glyph's OWN colour (|plate - ink_colour| <= ink_tolerance — a *smeared*
+    inpaint that blurred the value out of source-match range but is visibly still inky).
+    The old audit used only (a); a smear (067 "WE'RE SAYING GOODBYE" stayed red, 021
+    sticky-note copy) dropped the source-match count and falsely read as "resolved".
+
+    Flagged regions expand the removal mask/ledger in place (single-union contract) and
+    get up to ``reinpaint_max_passes`` targeted text-backend re-inpaint passes with a
+    growing dilation, so thin residue that only needs cleaner context resolves.
+    "Resolved" is an ABSOLUTE bar (remaining px / ratio), not a fraction of the original
+    residue — a catastrophic ghost can no longer pass just because it shrank 30%.  Any
+    EMITTED native-text layer still ghosting after the passes is handed to the
+    raster-slice floor via ``force_raster_ids`` (apply_raster_slice_fallback reads it),
+    so a double-render is never shipped.  This module only *calls* inpaint; it does not
+    modify the backends.  Config-gated, default ON (``reconstruct.text_residual``).
+    """
+    cv2, np, Image = _deps()
+    rcfg = (cfg or {}).get("reconstruct") or {}
+    audit_cfg = rcfg.get("text_residual") if isinstance(rcfg.get("text_residual"), dict) else {}
+    if not bool(audit_cfg.get("enabled", True)):
+        return {"enabled": False, "checked": 0, "flagged": []}
+    text_records = [item for item in records if _is_text_removal(item)]
+    if not text_records or not os.path.exists(background_path):
+        return {"enabled": True, "checked": 0, "flagged": []}
+    plate = np.asarray(Image.open(background_path).convert("RGB"), dtype=np.int16)
+    if plate.shape != rgb.shape:
+        return {"enabled": True, "checked": 0, "flagged": [], "note": "plate-shape-mismatch"}
+    source = rgb.astype(np.int16)
+    tolerance = float(audit_cfg.get("tolerance", 12.0))
+    ink_tolerance = float(audit_cfg.get("ink_tolerance", 40.0))
+    min_px = int(audit_cfg.get("min_px", 24))
+    min_ratio = float(audit_cfg.get("min_ratio", 0.30))
+    grow = max(1, int(audit_cfg.get("reinpaint_dilate", 3)))
+    max_passes = max(1, int(audit_cfg.get("reinpaint_max_passes", 3)))
+    resolved_ratio = float(audit_cfg.get("resolved_ratio", 0.15))
+    # Residue below the raster-slice minimum region size is considered resolved: it is
+    # both visually negligible and too small for the looks-right floor to even act on
+    # (schema.RASTER_SLICE_FALLBACK_DEFAULTS["min_region_px"] == 120). A genuine ghost
+    # (009 c_B1 ~1729px, 067, 101 c_B0 ~5146px) sits far above this and still fails.
+    resolved_abs_px = int(audit_cfg.get("resolved_abs_px", 120))
+    force_raster = bool(audit_cfg.get("force_raster", True))
+
+    def _residue(plate_arr, ink, ink_color):
+        d_src = np.abs(plate_arr - source).mean(axis=2)
+        res = ink & (d_src <= tolerance)
+        if ink_color is not None:
+            d_ink = np.abs(plate_arr.astype(np.float32) - ink_color).mean(axis=2)
+            res = res | (ink & (d_ink <= ink_tolerance))
+        return res
+
+    checked = 0
+    tracked = []
+    for item in text_records:
+        # Use the pre-dilation glyph-ink mask: the ledger's dilated halo is plate-
+        # coloured on both sides and would count as false "residue".
+        ink_mask = ink_masks.get(item.get("id"))
+        if ink_mask is None:
+            continue
+        ink = np.asarray(ink_mask) > 0
+        total = int(ink.sum())
+        if total < 8:
+            continue
+        checked += 1
+        ink_color = np.median(source[ink].astype(np.float32), axis=0).reshape(1, 1, 3)
+        residue = _residue(plate, ink, ink_color)
+        count = int(residue.sum())
+        ratio = count / total
+        if count < min_px or ratio < min_ratio:
+            continue
+        tracked.append({
+            "item": item, "ink": ink, "ink_color": ink_color, "total": total,
+            "residue": residue,
+            "flag": {
+                "id": item.get("id"), "box": item.get("box"),
+                "residual_px": count, "residual_ratio": round(ratio, 4),
+                "resolved": False,
+            },
+            "resolved": False,
+        })
+
+    expand_total = np.zeros(union.shape, dtype=np.uint8)
+    report = {
+        "enabled": True, "checked": checked,
+        "flagged": [t["flag"] for t in tracked],
+        "expanded_px": 0, "reinpainted": False, "passes": 0,
+    }
+    if not tracked or not bool(audit_cfg.get("reinpaint", True)):
+        report["expanded_px"] = int(np.count_nonzero(expand_total))
+        return report
+
+    passes_done = 0
+    backend = None
+    for pass_index in range(max_passes):
+        pending = [t for t in tracked if not t["resolved"]]
+        if not pending:
+            break
+        dilate_px = grow * (pass_index + 1)
+        kernel = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), np.uint8)
+        expand = np.zeros(union.shape, dtype=np.uint8)
+        for t in pending:
+            grown = cv2.dilate(t["residue"].astype(np.uint8) * 255, kernel)
+            owner = int(t["item"].get("removal_owner") or 0)
+            if owner:
+                ledger[(grown > 0) & (ledger == 0)] = owner
+            np.maximum(union, grown, out=union)
+            np.maximum(expand, grown, out=expand)
+            np.maximum(expand_total, grown, out=expand_total)
+        if not np.any(expand):
+            break
+        try:
+            second = inpaint.inpaint_role_aware(
+                background_path, {"text": expand}, background_path, cfg,
+            )
+            report["reinpainted"] = bool(second.get("ok", True))
+            backend = second.get("backend")
+        except Exception as exc:  # a failed repair pass is evidence, never a crash
+            report["reinpaint_error"] = str(exc)
+            break
+        passes_done = pass_index + 1
+        plate_after = np.asarray(Image.open(background_path).convert("RGB"), dtype=np.int16)
+        for t in pending:
+            residue = _residue(plate_after, t["ink"], t["ink_color"])
+            remaining = int(residue.sum())
+            t["residue"] = residue
+            t["flag"]["residual_px_after"] = remaining
+            rem_ratio = remaining / max(1, t["total"])
+            if remaining < resolved_abs_px or rem_ratio < resolved_ratio:
+                t["resolved"] = True
+                t["flag"]["resolved"] = True
+    report["passes"] = passes_done
+    report["reinpaint_backend"] = backend
+    report["expanded_px"] = int(np.count_nonzero(expand_total))
+    # Genuine residue that survived every pass under an EMITTED native-text layer would
+    # double-render (native text stamped over leftover ink). Hand those ids to the
+    # raster-slice floor so the layer ships as a pixel-exact slice of the ORIGINAL text.
+    unresolved = [t for t in tracked if not t["resolved"]]
+    for t in unresolved:
+        t["flag"]["hard_fail"] = True
+    if force_raster:
+        report["force_raster_ids"] = sorted({
+            str(t["item"].get("id")) for t in unresolved
+            if t["item"].get("target") == "text"
+        })
+    return report
+
+
 def _build_removal_ledger(observations: list, canvas: tuple[int, int]):
     """Assign every final removal pixel to exactly one accepted observation.
 
@@ -749,6 +967,75 @@ def _comparison_plate_columns(background_path, assets_dir, width, height, cfg, c
     return out
 
 
+_PLATE_SHELL_ROLES = {"button", "badge", "chip", "pill"}
+
+
+def _suppress_plate_boundary_fragments(candidates, cfg=None):
+    """Fold sliver debris on a button/badge/chip rim back into its plate.
+
+    Segmentation frequently peels a rounded plate's anti-aliased end caps into
+    separate icon/shape fragments (009 "Volgend": both pill caps became tiny
+    "icons").  Rendered on top of the restored native plate they re-draw the
+    original's background ring — the "bitten edge" artifact.  A real glyph or
+    icon inside a button sits clear of the rim, so only small fragments that
+    cross the plate's boundary ring are suppressed; their source pixels remain
+    covered by the plate's own removal footprint.  Config-gated, default ON
+    (``reconstruct.suppress_plate_fragments``).
+    """
+    rcfg = (cfg or {}).get("reconstruct") or {}
+    if rcfg.get("suppress_plate_fragments", True) is False:
+        return candidates, 0
+    plates = []
+    for item in candidates:
+        meta = item.get("meta") or {}
+        role = str(meta.get("role") or "").lower()
+        box = item.get("box") or {}
+        if (item.get("target") == "shape"
+                and (role in _PLATE_SHELL_ROLES or meta.get("button_shell"))
+                and float(box.get("w") or 0) > 0 and float(box.get("h") or 0) > 0):
+            plates.append(item)
+    if not plates:
+        return candidates, 0
+    suppressed = 0
+    for item in candidates:
+        if item.get("target") not in {"icon", "shape", "image"} or item.get("text"):
+            continue
+        if any(plate is item for plate in plates):
+            continue
+        box = item.get("box") or {}
+        fw, fh = float(box.get("w") or 0), float(box.get("h") or 0)
+        if fw <= 0 or fh <= 0:
+            continue
+        x0, y0 = float(box.get("x") or 0), float(box.get("y") or 0)
+        x1, y1 = x0 + fw, y0 + fh
+        for plate in plates:
+            pbox = plate.get("box") or {}
+            pw, ph = float(pbox.get("w") or 0), float(pbox.get("h") or 0)
+            if fw * fh > 0.08 * pw * ph:
+                continue
+            px0, py0 = float(pbox.get("x") or 0), float(pbox.get("y") or 0)
+            px1, py1 = px0 + pw, py0 + ph
+            # The fragment must live on the plate (a small anti-alias overhang
+            # past the true edge is exactly the failure signature, so allow it).
+            reach = max(4.0, 0.06 * min(pw, ph))
+            if x0 < px0 - reach or y0 < py0 - reach or x1 > px1 + reach or y1 > py1 + reach:
+                continue
+            # Content that sits clear of the rim (a chevron/glyph icon) is real.
+            ring = max(4.0, 0.08 * min(pw, ph))
+            if (x0 >= px0 + ring and y0 >= py0 + ring
+                    and x1 <= px1 - ring and y1 <= py1 - ring):
+                continue
+            meta = item.setdefault("meta", {})
+            item["target"] = "drop"
+            meta["keep_in_background"] = True
+            meta["removal_required"] = True
+            meta["suppression_reason"] = "plate-boundary-fragment"
+            meta["plate_id"] = plate.get("id")
+            suppressed += 1
+            break
+    return candidates, suppressed
+
+
 def _dominant_fill(rgb, mask, box):
     _, np, _ = _deps()
     x0, y0 = max(0, int(box.get("x", 0))), max(0, int(box.get("y", 0)))
@@ -784,11 +1071,50 @@ def _local_shape_pixels(rgb, mask, box):
     return rgb[y0:y1, x0:x1], mask[y0:y1, x0:x1] > 16
 
 
+CORNER_FIT_MIN_MATCH = 0.94
+
+
+def _fit_quarter_radius(quadrant):
+    """Best-fit rounded-corner radius for a square quadrant oriented corner-at-(0, 0).
+
+    A one-parameter model fit over the whole quadrant instead of a first-occupied
+    edge scan: debris elsewhere on the silhouette (009's "Volgend" pill carried a
+    one-row residual ledge welded mid-bottom, which made the old row/column scan
+    bail) cannot corrupt the estimate, and a full pill cap measures its true
+    radius instead of the anti-aliased chord shortfall.  Returns
+    ``(radius, match_fraction)`` where match is the fraction of quadrant pixels
+    the fitted model explains.
+    """
+    cv2, np, _ = _deps()
+    actual = quadrant > 0
+    size = actual.shape[0]
+    scale = 1.0
+    # Large plates carry no extra corner information; cap the search resolution.
+    if size > 64:
+        scale = size / 64.0
+        actual = cv2.resize(actual.astype(np.uint8), (64, 64), interpolation=cv2.INTER_NEAREST) > 0
+        size = 64
+    yy, xx = np.mgrid[0:size, 0:size]
+    best_radius, best_match = 0.0, -1.0
+    for radius in range(size + 1):
+        inside = (xx >= radius) | (yy >= radius) | (
+            (xx - radius) ** 2 + (yy - radius) ** 2 <= radius * radius
+        )
+        match = float((inside == actual).mean())
+        if match > best_match:
+            best_radius, best_match = float(radius), match
+    return best_radius * scale, best_match
+
+
 def _corner_radius(local_mask):
     """Infer an axis-aligned rounded-rectangle radius from its four clipped corners.
 
-    This intentionally returns ``None`` for a noisy/partial mask.  A wrong native radius
-    is worse than a rectangular fallback because it visibly bends otherwise straight art.
+    Each corner quadrant is fitted against the one-parameter rounded-corner model
+    and must explain its pixels almost perfectly; a noisy/partial mask still
+    returns ``None`` because a wrong native radius is worse than a rectangular
+    fallback.  A cap that rounds through the whole half-height is a pill end
+    (radius == min(h, w) / 2 — the single most common ad button) and snaps to the
+    exact pill radius instead of being clamped to a smaller value.
     """
     _, np, _ = _deps()
     if local_mask.size == 0 or min(local_mask.shape) < 8:
@@ -796,28 +1122,25 @@ def _corner_radius(local_mask):
     h, w = local_mask.shape
     if float(local_mask.mean()) < .62:
         return None
-
-    def first_true(values):
-        hit = np.flatnonzero(values)
-        return int(hit[0]) if hit.size else None
-
-    pairs = [
-        (first_true(local_mask[0, :]), first_true(local_mask[:, 0])),
-        (first_true(local_mask[0, ::-1]), first_true(local_mask[:, -1])),
-        (first_true(local_mask[-1, ::-1]), first_true(local_mask[::-1, -1])),
-        (first_true(local_mask[-1, :]), first_true(local_mask[::-1, 0])),
-    ]
+    quadrant = min(h, w) // 2
+    if quadrant < 4:
+        return None
+    quadrants = (
+        local_mask[:quadrant, :quadrant],
+        local_mask[:quadrant, ::-1][:, :quadrant],
+        local_mask[::-1, ::-1][:quadrant, :quadrant],
+        local_mask[::-1, :][:quadrant, :quadrant],
+    )
+    fits = [_fit_quarter_radius(piece) for piece in quadrants]
+    if any(match < CORNER_FIT_MIN_MATCH for _, match in fits):
+        return None
+    pill_gate = quadrant - max(2.0, quadrant * .12)
     radii = []
-    max_radius = min(h, w) * .48
-    for horizontal, vertical in pairs:
-        if horizontal is None or vertical is None:
-            return None
-        # A real quarter-circle has the same first occupied distance on both edges.
-        if abs(horizontal - vertical) > max(2, min(h, w) * .08):
-            return None
-        radius = (horizontal + vertical) / 2
-        if radius < 1.25 or radius > max_radius:
+    for radius, _ in fits:
+        if radius < 1.25:
             radii.append(0.0)
+        elif radius >= pill_gate:
+            radii.append(min(h, w) / 2)
         else:
             radii.append(radius)
     if not any(radii):
@@ -961,6 +1284,205 @@ def _radial_gradient_fill(local_rgb, interior, min_range=18.0, min_r2=.91):
     }
 
 
+def _hex_to_rgb(value):
+    """Parse a ``#rrggbb`` design colour into an (r, g, b) float triplet."""
+    s = str(value or "").strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6:
+        return (0.0, 0.0, 0.0)
+    try:
+        return tuple(float(int(s[i:i + 2], 16)) for i in (0, 2, 4))
+    except ValueError:
+        return (0.0, 0.0, 0.0)
+
+
+def _multistop_linear_gradient_fill(local_rgb, interior, min_range=18.0, min_r2=.90,
+                                    margin=.03, max_stops=5):
+    """Fit a >2-stop linear paint when a 2-stop ramp leaves clear residual.
+
+    A 2-stop linear gradient is a straight colour ramp; metallic / multi-hue ad plates bend
+    along the axis (blue→white→orange glows, brushed-metal sweeps), and a bent ramp is
+    non-monotonic per channel, so a single colour-plane regression cannot recover the axis.
+    Instead this searches candidate axis angles, and for each samples the median colour at
+    equally spaced positions along that axis, prunes any collinear middle stop, and scores a
+    piecewise-linear fit. It only returns when the best axis's piecewise fit is BOTH good on
+    its own AND materially better than the 2-stop endpoint fit — otherwise None, so the
+    established 2-stop/flat path keeps handling it.
+    """
+    import math
+    _, np, _ = _deps()
+    ys, xs = np.nonzero(interior)
+    if len(xs) < 200:
+        return None
+    h, w = interior.shape
+    x = (xs.astype(np.float32) - (w - 1) / 2) / max(1.0, (w - 1) / 2)
+    y = (ys.astype(np.float32) - (h - 1) / 2) / max(1.0, (h - 1) / 2)
+    colors = local_rgb[ys, xs].astype(np.float32)
+    if len(colors) > 12000:
+        pick = np.linspace(0, len(colors) - 1, 12000).astype(int)
+        x, y, colors = x[pick], y[pick], colors[pick]
+    spread = np.percentile(colors, 95, axis=0) - np.percentile(colors, 5, axis=0)
+    range_norm = float(np.linalg.norm(spread))
+    if range_norm < min_range:
+        return None
+    total = float(np.square(colors - colors.mean(axis=0)).sum())
+    if total <= 1e-6:
+        return None
+
+    def fit_axis(angle_deg):
+        dx, dy = math.cos(math.radians(angle_deg)), math.sin(math.radians(angle_deg))
+        t = x * dx + y * dy
+        lo, hi = np.percentile(t, (2, 98))
+        if hi - lo < .25:
+            return None
+        tn = np.clip((t - lo) / (hi - lo), 0.0, 1.0)
+
+        def sample(pos, halfwin):
+            sel = np.abs(tn - pos) <= halfwin
+            if int(sel.sum()) < 12:
+                sel = np.abs(tn - pos) <= halfwin * 2
+            if int(sel.sum()) < 6:
+                return None
+            return np.median(colors[sel], axis=0)
+
+        stops = []
+        for i in range(max_stops):
+            pos = i / float(max_stops - 1)
+            colour = sample(pos, 0.2 if pos in (0.0, 1.0) else 0.12)
+            if colour is not None:
+                stops.append((pos, colour))
+        if len(stops) < 3 or stops[0][0] > 0.001 or stops[-1][0] < 0.999:
+            return None
+        pruned = [stops[0]]
+        for i in range(1, len(stops) - 1):
+            p0, c0 = pruned[-1]
+            p1, c1 = stops[i]
+            p2, c2 = stops[i + 1]
+            span = max(1e-6, p2 - p0)
+            interp = c0 + (c2 - c0) * ((p1 - p0) / span)
+            if float(np.linalg.norm(c1 - interp)) > 10.0:
+                pruned.append(stops[i])
+        pruned.append(stops[-1])
+        if len(pruned) < 3:
+            return None
+
+        def piecewise(model):
+            ps = np.array([p for p, _ in model], dtype=np.float32)
+            cs = np.array([c for _, c in model], dtype=np.float32)
+            out = np.empty((len(tn), 3), dtype=np.float32)
+            for ch in range(3):
+                out[:, ch] = np.interp(tn, ps, cs[:, ch])
+            return out
+
+        r2_multi = 1 - float(np.square(colors - piecewise(pruned)).sum()) / total
+        r2_two = 1 - float(np.square(colors - piecewise([pruned[0], pruned[-1]])).sum()) / total
+        return {"angle": float(angle_deg), "stops": pruned, "r2": r2_multi, "r2_two": r2_two}
+
+    best = None
+    for angle_deg in range(0, 180, 15):
+        fit = fit_axis(angle_deg)
+        if fit and (best is None or fit["r2"] > best["r2"]):
+            best = fit
+    if best is None or best["r2"] < min_r2 or best["r2"] < best["r2_two"] + margin:
+        return None
+    return {
+        "kind": "linear",
+        "angle": round(best["angle"], 2),
+        "stops": [{"position": round(float(p), 4), "color": _hex(c)} for p, c in best["stops"]],
+        "meta": {"r2": round(best["r2"], 4), "r2_two_stop": round(best["r2_two"], 4),
+                 "stops": len(best["stops"]), "multistop": True,
+                 "range": round(range_norm, 2)},
+    }
+
+
+def _gradient_reconstruction_error(rgb, gradient):
+    """Mean absolute per-pixel error of an analytic linear/radial gradient vs an image.
+
+    Used to VERIFY a fitted background gradient really explains the plate before it replaces
+    a raster: a textured or photographic plate that a plane numerically half-explains still
+    fails this render-back check, so the honest fidelity gate holds.
+    """
+    _, np, _ = _deps()
+    h, w = rgb.shape[:2]
+    stops = gradient.get("stops") or []
+    if len(stops) < 2:
+        return None
+    ps = np.array([float(s.get("position", i)) for i, s in enumerate(stops)], dtype=np.float32)
+    cols = np.array([_hex_to_rgb(s.get("color")) for s in stops], dtype=np.float32)
+    order = np.argsort(ps)
+    ps, cols = ps[order], cols[order]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    if gradient.get("kind") == "radial":
+        cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+        t = np.hypot(xx - cx, yy - cy) / max(1.0, float(np.hypot(cx, cy)))
+    else:
+        import math
+        angle = math.radians(float(gradient.get("angle", 0)))
+        proj = (xx / max(1, w - 1)) * math.cos(angle) + (yy / max(1, h - 1)) * math.sin(angle)
+        low, high = float(proj.min()), float(proj.max())
+        t = (proj - low) / max(1e-6, high - low)
+    t = np.clip(t, 0.0, 1.0)
+    pred = np.empty((h, w, 3), dtype=np.float32)
+    flat_t = t.ravel()
+    for ch in range(3):
+        pred[:, :, ch] = np.interp(flat_t, ps, cols[:, ch]).reshape(h, w)
+    return float(np.abs(rgb.astype(np.float32) - pred).mean())
+
+
+def extract_background_gradient(image_path, cfg=None):
+    """Fit an editable native radial / multi-stop-linear gradient over a full clean plate.
+
+    Radial-glow and smooth-gradient ad backgrounds are flattened to a raster today (item 2
+    in the recreatability audit). When the WHOLE clean plate is explained by a single
+    analytic gradient to very high fidelity, this returns a design.json ``fill`` dict so the
+    background can be emitted as an editable gradient instead. Two gates keep it honest: a
+    high R² analytic fit AND a render-back mean-absolute-error check on the reconstructed
+    gradient. Anything textured/photographic fails and stays raster. Returns None otherwise.
+    Config: ``reconstruct.background_gradient`` (defaults ON).
+    """
+    cv2, np, Image = _deps()
+    bg = ((cfg or {}).get("reconstruct") or {}).get("background_gradient")
+    bg = bg if isinstance(bg, dict) else {}
+    if bg.get("enabled", True) is False:
+        return None
+    try:
+        rgb_full = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+    except Exception:
+        return None
+    height, width = rgb_full.shape[:2]
+    if min(height, width) < int(bg.get("min_canvas_dim", 256)):
+        return None
+    scale = 256.0 / float(max(height, width))
+    if scale < 1.0:
+        small = cv2.resize(rgb_full, (max(1, int(width * scale)), max(1, int(height * scale))),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = rgb_full
+    interior = np.ones(small.shape[:2], dtype=bool)
+    min_range = float(bg.get("min_range", 24.0))
+    radial = _radial_gradient_fill(small, interior, min_range, float(bg.get("radial_min_r2", .95)))
+    linear = _gradient_fill(small, interior, min_range, float(bg.get("linear_min_r2", .95)))
+    if linear:
+        multi = _multistop_linear_gradient_fill(
+            small, interior, min_range, float(bg.get("multistop_min_r2", .95)),
+        )
+        if multi:
+            linear = multi
+    r_radial = float(((radial or {}).get("meta") or {}).get("r2", -1))
+    r_linear = float(((linear or {}).get("meta") or {}).get("r2", -1))
+    gradient = radial if radial and r_radial >= r_linear + float(bg.get("radial_margin", 0.0)) else linear
+    if not gradient:
+        return None
+    error = _gradient_reconstruction_error(small, gradient)
+    if error is None or error > float(bg.get("max_mean_abs_error", 6.0)):
+        return None
+    gradient = dict(gradient)
+    gradient["meta"] = dict(gradient.get("meta") or {}, background=True,
+                            reconstruction_mae=round(error, 3))
+    return gradient
+
+
 def _stroke_and_interior(local_rgb, local_mask, max_width=8):
     """Detect a coherent inset stroke and return (stroke, safe_fill_pixels_mask).
 
@@ -1061,14 +1583,44 @@ def _shadow_effect(rgb, mask, box, geometry):
     }
 
 
-def _extract_shape_style(rgb, mask, box, cfg):
+_PLATE_RESTORE_ROLES = {"button", "badge", "chip", "pill", "cta"}
+
+
+def _fill_plate_holes(local_mask):
+    """Restore a shape-role plate whose label was carved out of its mask.
+
+    Ownership gives glyph pixels to the editable text layer, which can leave
+    text-shaped holes inside a button/badge/chip mask.  The label renders on top
+    of the native plate, so the plate must be fitted (geometry, radius, fill) as
+    the full primitive — a pill with a text hole is still a pill, never a donut.
+    Only enclosed islands are filled; the outer silhouette is untouched, and a
+    mostly-hollow ring (an outline-only ghost button) is left alone because
+    filling it would invent a solid fill that is not in the source.
+    Returns ``(mask, filled_pixel_count)``.
+    """
+    _, np, _ = _deps()
+    if local_mask.size == 0 or not local_mask.any():
+        return local_mask, 0
+    original = int(np.count_nonzero(local_mask))
+    filled = inpaint.fill_enclosed_mask_holes(local_mask.astype(np.uint8) * 255) > 0
+    restored = int(np.count_nonzero(filled))
+    if restored <= original or restored > original * 1.6:
+        return local_mask, 0
+    return filled, restored - original
+
+
+def _extract_shape_style(rgb, mask, box, cfg, role=None):
     """Conservative native-style extraction for semantic primitive candidates."""
     _, np, _ = _deps()
     local_rgb, local_mask = _local_shape_pixels(rgb, mask, box)
+    style_cfg = ((cfg.get("reconstruct") or {}).get("style_extraction") or {})
+    plate_holes = 0
+    if (str(role or "").lower() in _PLATE_RESTORE_ROLES
+            and style_cfg.get("restore_plate_mask", True) is not False):
+        local_mask, plate_holes = _fill_plate_holes(local_mask)
     geometry = _simple_shape_geometry(local_mask)
     if geometry is None:
         return None
-    style_cfg = ((cfg.get("reconstruct") or {}).get("style_extraction") or {})
     stroke, interior = _stroke_and_interior(
         local_rgb, local_mask, int(style_cfg.get("max_stroke_width", 8))
     )
@@ -1089,6 +1641,20 @@ def _extract_shape_style(rgb, mask, box, cfg):
     linear_r2 = float(((linear or {}).get("meta") or {}).get("r2", -1))
     radial_r2 = float(((radial or {}).get("meta") or {}).get("r2", -1))
     gradient = radial if radial and radial_r2 >= linear_r2 + radial_margin else linear
+    # A multi-hue / metallic sweep bends along its axis, so a 2-stop plane fit either leaves
+    # clear residual OR fails outright (non-monotonic per channel). Attempt the >2-stop fit
+    # whenever the winner is not radial — including when the 2-stop linear was rejected — and
+    # keep it only when its piecewise fit is clean and materially better than 2 stops.
+    if (style_cfg.get("multistop_gradients", True) is not False
+            and (gradient is None or gradient.get("kind") == "linear")):
+        multi = _multistop_linear_gradient_fill(
+            local_rgb, interior,
+            float(style_cfg.get("gradient_min_range", 18)),
+            float(style_cfg.get("multistop_gradient_min_r2", .90)),
+            float(style_cfg.get("multistop_gradient_margin", .03)),
+        )
+        if multi:
+            gradient = multi
     fill_color = _robust_color(local_rgb[interior])
     fill = gradient or {"kind": "flat", "color": _hex(fill_color)}
     radius = _corner_radius(local_mask) if geometry == "rect" else None
@@ -1104,6 +1670,7 @@ def _extract_shape_style(rgb, mask, box, cfg):
             "gradient": gradient.get("meta") if gradient else None,
             "stroke_detected": bool(stroke),
             "shadow_detected": bool(effect),
+            **({"plate_holes_filled_px": plate_holes} if plate_holes else {}),
         },
     }
 
@@ -1305,14 +1872,18 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         )
     canonical = _suppress_comparison_column_labels(canonical, cfg)
     canonical, flattened_scene_artwork = _flatten_photo_scene(canonical, cfg)
+    canonical, plate_fragments_suppressed = _suppress_plate_boundary_fragments(canonical, cfg)
     ocr_lines = {line.get("id"): line for line in (ocr.get("lines") or [])}
     masks = {}
     for candidate in canonical:
         if (candidate.get("target") != "drop"
                 or (candidate.get("meta") or {}).get("removal_required")):
-            masks[candidate.get("id")] = _candidate_mask(
-                candidate, rgb, run_dir, ocr_lines, cfg,
-            )
+            mask = _candidate_mask(candidate, rgb, run_dir, ocr_lines, cfg)
+            if candidate.get("target") == "text":
+                # Ghost-text invariant: an emitted editable text layer whose source
+                # pixels stay in the plate produces double text in the render.
+                mask = _ensure_text_removal_coverage(candidate, mask, rgb, cfg)
+            masks[candidate.get("id")] = mask
 
     # Front-to-back ownership is diagnostic and makes overlapping raster assets exclusive.
     # Text/icons are frontmost; smaller nested layers win over broad photo regions.
@@ -1391,7 +1962,9 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         if target == "shape":
             # Do not overwrite upstream paint facts.  This fills only the gaps left by
             # segmentation/Qwen and tags every inference for later QA/debugging.
-            extracted = _extract_shape_style(rgb, mask, c.get("box", {}), cfg)
+            extracted = _extract_shape_style(
+                rgb, mask, c.get("box", {}), cfg, role=(c.get("meta") or {}).get("role")
+            )
             photo_mask = _photo_shape_override(rgb, mask, c.get("box", {}), extracted, c)
             if photo_mask is None:
                 if extracted:
@@ -1447,6 +2020,25 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         substitution = c["meta"].get("substitution") if isinstance(c["meta"].get("substitution"), dict) else {}
         is_text_fallback = bool(c["meta"].get("fallback") and substitution.get("from") == "text")
         role = str(c["meta"].get("role") or "").lower()
+        # F1: a DISTINCT, independently-verified semantic cutout (a product/person/logo
+        # with its own high-confidence SAM matte) must not be dropped merely because a
+        # DIFFERENT entity's owner box was ranked ahead of it and claimed all its pixels
+        # first. A product sitting on a panel is not "part of" the panel: when the panel
+        # carries e.g. z_band="chrome" it out-ranks the product in ownership and steals
+        # its pixels, and the product then vanishes (benchmark 002: whey bag + jars
+        # erased). Re-claim the cutout's own matte so it survives as an editable/swappable
+        # image; the front owner keeps its raster too (identical pixels, same position ->
+        # no visible double), so this only ever adds a layer, never a hole.
+        _DISTINCT_CUTOUT_ROLES = {
+            "product", "person", "foreground", "cutout", "avatar", "profile",
+            "profile_photo", "logo", "brand", "wordmark",
+        }
+        if (not np.any(owned) and not is_text_fallback
+                and role in _DISTINCT_CUTOUT_ROLES
+                and _verified_semantic_mask(c["meta"])):
+            owned = (mask > 0).astype(np.uint8) * 255
+            c["meta"]["ownership_rescued"] = "distinct-verified-cutout"
+            c["meta"]["ownership_cutout"] = True
         # Do retain broad photo frames for the layout regression contract, but
         # never export an empty semantic cutout (product/person/icon) merely
         # because a frontmost owner already claims all of its pixels.
@@ -1490,7 +2082,25 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                 c["paths"] = traced["paths"]
                 c["svg"] = traced.get("svg") or _paths_to_svg(traced["paths"], image.width, image.height)
                 c["src"] = raster_src
-                c["fill"] = {"kind": "flat", "color": traced["paths"][0].get("fill", "#000000")}
+                first_path = traced["paths"][0] if traced["paths"] else {}
+                fill_value = first_path.get("fill", "#000000")
+                # A hand-drawn annotation (marker underline / strikethrough / connector /
+                # arrow shaft) traces to a stroke-only path (fill="none"). Keep it as an
+                # editable, recolorable Figma stroke rather than stamping a bogus flat fill;
+                # propagate its stroke style (colour + approx width) so the vector is
+                # movable AND recolorable in Figma. Filled marks (badge/arrow head) behave
+                # exactly as before.
+                if isinstance(fill_value, str) and fill_value.strip().lower() == "none":
+                    c.pop("fill", None)
+                else:
+                    c["fill"] = {"kind": "flat", "color": fill_value}
+                stroke_spec = first_path.get("stroke") if isinstance(first_path, dict) else None
+                if stroke_spec and not c.get("stroke"):
+                    c["stroke"] = dict(stroke_spec)
+                    c["meta"]["annotation_stroke"] = {
+                        "color": stroke_spec.get("color"),
+                        "width": stroke_spec.get("width"),
+                    }
                 vector_ok += 1
                 updated.append(c)
                 continue
@@ -1523,8 +2133,17 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
 
     removal = []
     mask_rejected = 0
+    removal_capped = 0
     scene_vlm_required = bool((((cfg.get("vlm") or {}).get("scene_text") or {}).get("enabled")))
     max_text_mask_fraction = float(rcfg.get("max_text_mask_canvas_fraction", 0.035))
+    # Bound how much of the canvas any single OPAQUE raster may claim as a removal hole.
+    # A photo/image layer re-renders over its own footprint, so inpainting the plate
+    # underneath it is invisible work; admitting a quarter-plus of the canvas as one
+    # removal element instead nukes the plate (002 c_E003 — a low-confidence residual-CC
+    # "shape->image" — claimed 34.5% and destroyed the background). Keep those original
+    # pixels; the opaque raster still ships on top and shows the same pixels.
+    max_candidate_removal_fraction = float(rcfg.get("max_candidate_removal_fraction", 0.25))
+    max_candidate_removal_confidence = float(rcfg.get("max_candidate_removal_confidence", 0.55))
     for c in updated:
         if c.get("target") == "drop" and not (c.get("meta") or {}).get("removal_required"):
             continue
@@ -1571,7 +2190,40 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             }
         # A full-canvas raster is the plate itself. Everything else is removed from the plate.
         is_background = bool(c.get("meta", {}).get("role") == "background" or area_frac > 0.92)
+        # Per-candidate removal cap: one bad element must not claim most of the canvas.
+        # Only opaque rasters qualify — a photo/image layer re-renders over its own
+        # footprint, so the plate underneath it never shows and need not be inpainted.
+        # A genuine large foreground (product/person/photo) still gets a clean plate so
+        # it stays a swappable asset; the cap targets the spurious-blob signature that
+        # actually destroys the plate: a big generic-role raster with LOW detector
+        # confidence (002 c_E003 — a residual-CC "shape->image" at conf 0.405 claimed
+        # 34.5%). Explicit removal_required overlays and background plates are exempt.
+        _cap_meta = c.get("meta") or {}
+        _cap_role = str(_cap_meta.get("role") or "").lower()
+        _cap_conf = _cap_meta.get("confidence")
+        if (c.get("target") == "image" and not is_background
+                and mask_fraction > max_candidate_removal_fraction
+                and not _cap_meta.get("removal_required")
+                and _cap_role not in _CAP_EXEMPT_ROLES
+                and isinstance(_cap_conf, (int, float))
+                and float(_cap_conf) < max_candidate_removal_confidence):
+            c.setdefault("meta", {})["keep_in_background"] = True
+            c["meta"]["removal_capped"] = {
+                "mask_fraction_canvas": round(mask_fraction, 6),
+                "cap": max_candidate_removal_fraction,
+                "confidence": float(_cap_conf),
+                "reason": "low-confidence-opaque-raster-exceeds-removal-cap",
+            }
+            removal_capped += 1
+            continue
         dilate = inpaint.resolve_mask_dilate(c, cfg)
+        # Anti-aliased glyph fringes extend past the Otsu ink mask; the global 2px
+        # default (reconstruct.mask_dilate) demonstrably leaves readable halos (009
+        # timestamp, 052 "125ML"). Text removals get their own wider floor.
+        if c.get("target") == "text" or (
+                c.get("target") == "drop" and c.get("text")
+                and (c.get("meta") or {}).get("removal_required")):
+            dilate = max(dilate, int(rcfg.get("text_removal_dilate", 4)))
         # Comparison cards place bright editable copy over textured/translucent photo
         # surfaces. OCR ink masks are slightly tighter than the antialiased glyph fringe;
         # a two-pixel default leaves readable duplicate halos after reconstruction.
@@ -1598,19 +2250,8 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     removal, union, removal_ownership, removal_owner_index = _build_removal_ledger(
         removal, (w, h),
     )
-    def _is_text_removal(item):
-        return item.get("target") == "text" or (
-            item.get("target") == "drop" and (item.get("meta") or {}).get("removal_required")
-        )
     text_removal = [item for item in removal if _is_text_removal(item)]
     large_removal = [item for item in removal if not _is_text_removal(item)]
-    mask_path = os.path.join(run_dir, "removal_mask.png")
-    Image.fromarray(union).save(mask_path)
-    removal_ownership_path = os.path.join(run_dir, "removal_ownership.png")
-    removal_scale = max(1, 65535 // max(1, len(removal_owner_index)))
-    Image.fromarray((removal_ownership * removal_scale).astype(np.uint16)).save(
-        removal_ownership_path
-    )
     background_path = os.path.join(run_dir, "background_clean.png")
     regional_enabled = bool(((cfg.get("inpaint") or {}).get("regional") or {}).get("enabled", False))
     if regional_enabled:
@@ -1632,6 +2273,20 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             )
         else:
             inpaint_result = inpaint.inpaint_once(image_path, union, background_path, cfg)
+
+    # Post-inpaint ghost-text audit: residue under removed text expands the masks
+    # in-place (union + ledger) and triggers one targeted text-backend repair pass,
+    # so the artifacts written below always describe the final plate.
+    text_residual = _post_inpaint_text_residual(
+        rgb, background_path, removal, masks, union, removal_ownership, cfg,
+    )
+    mask_path = os.path.join(run_dir, "removal_mask.png")
+    Image.fromarray(union).save(mask_path)
+    removal_ownership_path = os.path.join(run_dir, "removal_ownership.png")
+    removal_scale = max(1, 65535 // max(1, len(removal_owner_index)))
+    Image.fromarray((removal_ownership * removal_scale).astype(np.uint16)).save(
+        removal_ownership_path
+    )
 
     updated.extend(_comparison_plate_columns(
         background_path, assets_dir, w, h, cfg, updated,
@@ -1657,7 +2312,12 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "vectorized": vector_ok,
             "vector_fallback": vector_fallback,
             "flattened_scene_artwork": flattened_scene_artwork,
+            "plate_fragments_suppressed": plate_fragments_suppressed,
             "mask_rejected": mask_rejected,
+            "removal_capped": removal_capped,
+            # Ghost-text audit evidence: repair.assess turns unresolved residue into a
+            # rebuild-clean-plate repair instead of letting duplicate text ship.
+            "text_residual": text_residual,
             # Surface the low-quality OpenCV fallback at the top level so acceptance QA
             # (pixel_diff._structural_audit) can hard-fail on it. The producer emits it
             # nested (per-region backend_counts, or single-pass diagnostics.backend_route),
@@ -1668,3 +2328,366 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     }
     dump(result, os.path.join(run_dir, "reconstruction.json"))
     return result
+
+
+# ── Codia-style confidence-gated raster-slice fallback ─────────────────────────────
+#
+# Any emitted layer whose preview region no longer matches the source (per-layer crop
+# SSIM, plus ink-IoU/ghost gates for text — see pixel_diff._layer_region_rows and
+# schema.raster_slice_failures) is replaced by a pixel-exact slice of the ORIGINAL
+# source pixels.  The slice's alpha is exactly the set of pixels the removal ledger
+# inpainted out on behalf of that layer, so:
+#   * the slice covers the inpainted hole and nothing else (no background leakage),
+#   * a pixel never renders twice (ledger pixels are exclusive by construction),
+#   * remaining editable layers keep their own ledger pixels untouched.
+# A failing layer whose pixels were never removed (keep_underlay overlays) is simply
+# dropped — the plate already shows the original pixels.  The failed editable attempt
+# is preserved in meta["fallback_editable"] so a later repair can restore it.
+
+
+def _find_layer_node(nodes, layer_id, offset=(0.0, 0.0)):
+    """Locate a node by id in a (possibly nested) candidate/layer tree.
+
+    Returns (container_list, index, node, parent_offset).  Children of groups carry
+    parent-relative coordinates; ``parent_offset`` converts them to canvas space.
+    """
+    for index, node in enumerate(nodes or []):
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("id")) == str(layer_id):
+            return nodes, index, node, offset
+        children = node.get("children") or []
+        if children:
+            box = node.get("box") or {}
+            child_offset = (
+                offset[0] + float(box.get("x") or 0),
+                offset[1] + float(box.get("y") or 0),
+            )
+            found = _find_layer_node(children, layer_id, child_offset)
+            if found:
+                return found
+    return None
+
+
+_SLICE_EDITABLE_KEYS = (
+    "text", "style", "text_runs", "fill", "stroke", "shape_kind", "radius",
+    "path", "svg", "paths", "src", "mask",
+)
+
+
+def _apply_slice_mutation(node, local_box, src_rel, scores, reasons):
+    """Turn a failed editable node into a positioned raster slice, keeping provenance."""
+    meta = dict(node.get("meta") or {})
+    editable = {key: node.get(key) for key in _SLICE_EDITABLE_KEYS
+                if node.get(key) not in (None, [], {})}
+    editable["kind"] = node.get("target") or node.get("type")
+    if node.get("text"):
+        meta["source_text"] = str(node.get("text"))
+    label = str(node.get("name") or meta.get("semantic_name")
+                or node.get("text") or node.get("id") or "layer").strip()
+    label = " ".join(label.split())
+    if len(label) > 40:
+        label = label[:39] + "…"
+    meta.update({
+        "fallback": "raster-slice",
+        "fallback_reasons": list(reasons),
+        "fallback_scores": scores,
+        "fallback_editable": editable,
+        "layer_disposition": "foreground_raster",
+        # The alpha is a ledger cutout by construction, not a broken matte.
+        "ownership_cutout": True,
+    })
+    if "target" in node:
+        node["target"] = "image"
+    if "type" in node:
+        node["type"] = "image"
+    node["name"] = f"{label} — raster slice (low confidence)"
+    node["box"] = dict(local_box)
+    node["src"] = src_rel
+    node["rotation"] = 0.0
+    node["opacity"] = 1.0
+    node["blend_mode"] = "NORMAL"
+    node["effects"] = []
+    node["style"] = {}
+    for key in ("fill", "stroke", "shape_kind", "radius", "path", "svg", "paths",
+                "text_runs", "visible_box", "ink_box", "mask", "text"):
+        node.pop(key, None)
+    node["meta"] = meta
+    return node
+
+
+def _apply_drop_mutation(node, scores, reasons):
+    """Retire a failed layer whose source pixels still live in the plate."""
+    meta = dict(node.get("meta") or {})
+    meta.update({
+        "fallback": "plate-passthrough",
+        "fallback_reasons": list(reasons),
+        "fallback_scores": scores,
+        "keep_in_background": True,
+        "suppression_reason": "confidence-fallback-plate-already-correct",
+    })
+    if "target" in node:
+        node["target"] = "drop"
+    node["meta"] = meta
+    return node
+
+
+def _removal_ledger_numbers(run_dir, reconstruction, shape):
+    """Load the removal-ownership ledger as owner numbers plus id → numbers map."""
+    _, np, Image = _deps()
+    index = reconstruction.get("removal_owner_index") or {}
+    rel = reconstruction.get("removal_ownership") or "removal_ownership.png"
+    path = os.path.join(run_dir, rel)
+    if not index or not os.path.exists(path):
+        return None, {}
+    arr = np.asarray(Image.open(path), dtype=np.uint32)
+    if arr.shape != shape[:2]:
+        return None, {}
+    scale = max(1, 65535 // max(1, len(index)))
+    numbers = arr // scale
+    id_to_numbers: dict = {}
+    for number, owner in index.items():
+        try:
+            id_to_numbers.setdefault(str(owner), []).append(int(number))
+        except (TypeError, ValueError):
+            continue
+    return numbers, id_to_numbers
+
+
+def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[dict] = None) -> dict:
+    """Replace low-confidence regions of design.json with pixel-exact source slices.
+
+    Runs after the local preview render (and again on every harness round that reaches
+    the preview stage, so a repair can force specific layers via
+    ``reconstruct.focus_regions``/``fallback.force_slice_ids``).  Mutates
+    reconstruction.json + layout.json, rebuilds design.json through the normal
+    compiler, re-renders the preview, and writes an auditable ``fallback.json``.
+    Config-gated with defaults ON (``fallback.enabled``).
+    """
+    cfg = cfg or {}
+    thresholds = raster_slice_thresholds(cfg)
+    report: dict = {
+        "enabled": bool(thresholds.get("enabled", True)),
+        "thresholds": {k: v for k, v in thresholds.items() if k != "enabled"},
+        "scored": 0, "slices": [], "dropped": [], "skipped": [],
+    }
+    out_path = os.path.join(run_dir, "fallback.json")
+    if not report["enabled"]:
+        dump(report, out_path)
+        return report
+    design_path = os.path.join(run_dir, "design.json")
+    preview_path = os.path.join(run_dir, "preview.png")
+    recon_path = os.path.join(run_dir, "reconstruction.json")
+    for required in (design_path, preview_path, recon_path, source_path):
+        if not required or not os.path.exists(required):
+            report["note"] = f"missing artifact: {os.path.basename(str(required))}"
+            dump(report, out_path)
+            return report
+    from . import pixel_diff  # lazy: keeps reconstruct importable without QA deps
+
+    _, np, Image = _deps()
+    design = load(design_path)
+    rows = pixel_diff.score_layer_regions(source_path, preview_path, design, run_dir)
+    report["scored"] = len(rows)
+
+    forced = {str(value) for value in (thresholds.get("force_slice_ids") or [])}
+    for entry in ((cfg.get("reconstruct") or {}).get("focus_regions") or []):
+        if isinstance(entry, dict) and entry.get("layer_id"):
+            forced.add(str(entry["layer_id"]))
+    # Ghost-text layers the post-inpaint residual audit could not clean (glyph residue
+    # survived every re-inpaint pass) would otherwise stamp native text over leftover
+    # ink. Force them to a pixel-exact source slice here (the looks-right floor).
+    audit_forced = set()
+    try:
+        _audit = ((load(recon_path).get("stats") or {}).get("text_residual") or {})
+        audit_forced = {str(i) for i in (_audit.get("force_raster_ids") or [])}
+    except Exception:
+        audit_forced = set()
+    forced |= audit_forced
+
+    canvas = design.get("canvas") or {}
+    canvas_area = max(1.0, float(canvas.get("w") or 1) * float(canvas.get("h") or 1))
+    failing = []
+    for row in rows:
+        rid = str(row.get("id"))
+        if is_raster_slice({"fallback": row.get("fallback")}):
+            continue  # our own slice output — never re-gate it (F11 canonical read)
+        # Upstream fidelity fallbacks (meta.fallback == True, e.g. the masked-pixel
+        # text path) stay gated on purpose: a fallback whose ink mask is broken
+        # renders garbage and must still be replaceable by a source slice
+        # (benchmark 009 c_B6: masked-pixel render shipped at region_ssim 0.33).
+        reasons = raster_slice_failures(row, thresholds)
+        if rid in forced and not reasons:
+            reasons = ["forced by repair (reconstruct.focus_regions)"]
+        if not reasons:
+            continue
+        if int(row.get("region_px") or 0) < int(thresholds["min_region_px"]):
+            report["skipped"].append({"id": rid, "reason": "region-too-small"})
+            continue
+        if float(row.get("region_px") or 0) / canvas_area > float(thresholds["max_layer_canvas_fraction"]):
+            # A slice this big would approach an untouched source copy — the exact
+            # failure mode the architecture forbids. Leave it to stage-level repairs.
+            report["skipped"].append({"id": rid, "reason": "region-too-large-for-slice"})
+            continue
+        failing.append((row, reasons))
+    # Worst (lowest region_ssim) first, so a slice budget spends on the most-broken regions.
+    failing.sort(key=lambda item: float(item[0].get("region_ssim") or 0.0))
+    slice_budget = int(thresholds.get("max_slices", 8))
+    if len(failing) > slice_budget:
+        # F10: the excess used to be dropped silently, which made "every sub-threshold
+        # region resolved" unauditable. Record the un-sliced failing regions honestly so
+        # QA/Gate 3 can see the budget was exhausted rather than the regions being clean.
+        truncated = failing[slice_budget:]
+        report["truncated"] = {
+            "reason": "slice-budget-exhausted",
+            "max_slices": slice_budget,
+            "un_sliced_count": len(truncated),
+            "un_sliced_ids": [str(item[0].get("id")) for item in truncated],
+        }
+        for item in truncated:
+            report["skipped"].append({
+                "id": str(item[0].get("id")),
+                "reason": "slice-budget-exhausted",
+                "failing_reasons": list(item[1]),
+            })
+        failing = failing[:slice_budget]
+    if not failing:
+        dump(report, out_path)
+        return report
+
+    reconstruction = load(recon_path)
+    rgb = np.asarray(Image.open(source_path).convert("RGB"), dtype=np.uint8)
+    removal_mask_path = os.path.join(
+        run_dir, reconstruction.get("removal_mask") or "removal_mask.png")
+    removal_union = None
+    if os.path.exists(removal_mask_path):
+        removal_union = np.asarray(Image.open(removal_mask_path).convert("L")) > 0
+    numbers, id_to_numbers = _removal_ledger_numbers(run_dir, reconstruction, rgb.shape)
+    assets_dir = os.path.join(run_dir, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    layout_path = os.path.join(run_dir, "layout.json")
+    tree = load(layout_path) if os.path.exists(layout_path) else None
+    candidates = [c for c in reconstruction.get("candidates") or [] if isinstance(c, dict)]
+    candidates_by_id = {str(c.get("id")): c for c in candidates}
+
+    changed = False
+    for row, reasons in failing:
+        rid = str(row.get("id"))
+        scores = {key: row.get(key)
+                  for key in ("region_ssim", "region_color", "ink_iou", "ink_excess")
+                  if row.get(key) is not None}
+        alpha = None
+        wanted = id_to_numbers.get(rid)
+        if numbers is not None and wanted:
+            alpha = np.isin(numbers, np.asarray(wanted, dtype=numbers.dtype))
+            if not alpha.any():
+                alpha = None
+        targets = []
+        if tree is not None:
+            found = _find_layer_node(tree, rid)
+            if found:
+                targets.append(found)
+        design_hit = _find_layer_node(design.get("layers") or [], rid)
+        if design_hit:
+            targets.append(design_hit)
+        candidate = candidates_by_id.get(rid)
+        if not targets and candidate is None:
+            report["skipped"].append({"id": rid, "reason": "layer-not-found"})
+            continue
+
+        if alpha is None:
+            # This layer's pixels were never inpainted out of the plate (e.g. a
+            # keep_underlay overlay): the plate already shows the original, so
+            # dropping the wrong reconstruction is the pixel-exact fallback.
+            for container, index, node, _offset in targets:
+                if "target" in node:
+                    _apply_drop_mutation(node, scores, reasons)
+                else:
+                    container.pop(index)
+            if candidate is not None:
+                _apply_drop_mutation(candidate, scores, reasons)
+            report["dropped"].append({
+                "id": rid, "reasons": reasons, "scores": scores,
+                "note": "plate-already-holds-source-pixels",
+            })
+            changed = True
+            continue
+
+        ys, xs = np.nonzero(alpha)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        tile = np.dstack([
+            rgb[y0:y1, x0:x1],
+            (alpha[y0:y1, x0:x1].astype(np.uint8) * 255),
+        ])
+        src_rel = _write_asset(Image.fromarray(tile), assets_dir, f"{rid}_slice")
+        abs_box = {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+        for _container, _index, node, offset in targets:
+            local_box = {"x": abs_box["x"] - offset[0], "y": abs_box["y"] - offset[1],
+                         "w": abs_box["w"], "h": abs_box["h"]}
+            _apply_slice_mutation(node, local_box, src_rel, scores, reasons)
+        if candidate is not None and not any(node is candidate for _c, _i, node, _o in targets):
+            _apply_slice_mutation(candidate, abs_box, src_rel, scores, reasons)
+        covered = True
+        if removal_union is not None:
+            outside = int(np.count_nonzero(alpha & ~removal_union))
+            covered = outside == 0
+        report["slices"].append({
+            "id": rid, "reasons": reasons, "scores": scores, "box": abs_box,
+            "src": src_rel, "alpha_px": int(alpha.sum()),
+            "covered_by_removal_mask": covered,
+        })
+        changed = True
+
+    if changed:
+        # A ghost-text layer the residual audit flagged and we just replaced with a
+        # pixel-exact slice (or dropped to plate-passthrough) no longer double-renders:
+        # the slice IS the resolution. Mark those audit flags resolved so QA's
+        # glyph-residue gate and repair's rebuild-clean-plate don't re-fire on a region
+        # the looks-right floor already handled.
+        handled_ids = {str(s.get("id")) for s in report["slices"]} | {
+            str(d.get("id")) for d in report["dropped"]}
+        resolved_by_slice = audit_forced & handled_ids
+        if resolved_by_slice:
+            audit_stats = (reconstruction.get("stats") or {}).get("text_residual") or {}
+            for entry in audit_stats.get("flagged") or []:
+                if isinstance(entry, dict) and str(entry.get("id")) in resolved_by_slice:
+                    entry["resolved"] = True
+                    entry["resolved_by"] = "raster-slice"
+            report["residue_resolved_by_slice"] = sorted(resolved_by_slice)
+        dump(reconstruction, recon_path)
+        if tree is not None:
+            dump(tree, layout_path)
+            from . import build_design_json  # lazy import; heavy transitive deps
+            base_rel = reconstruction.get("background") or "background_clean.png"
+            build_design_json.build(
+                tree,
+                {"w": canvas.get("w"), "h": canvas.get("h")},
+                run_dir,
+                base_src=os.path.join(run_dir, base_rel),
+                doc_id=str(design.get("id") or os.path.basename(run_dir)),
+                name=str(design.get("name") or os.path.basename(run_dir)),
+                kept_in_photo=list(design.get("kept_in_photo") or []),
+            )
+        else:
+            # Minimal path for fixtures without layout.json: patch design.json in
+            # place and keep its honest editable accounting roughly current.
+            layers = design.get("layers") or []
+            flat = []
+            def _visit(items):
+                for item in items:
+                    flat.append(item)
+                    _visit(item.get("children") or [])
+            _visit(layers)
+            editable = sum(1 for item in flat if item.get("type") in ("text", "shape", "group"))
+            meta = design.setdefault("meta", {})
+            meta["editable_ratio"] = round(editable / max(1, len(flat)), 4)
+            dump(design, design_path)
+        try:
+            from . import render_preview  # lazy: PIL-only, but keep import cost off the hot path
+            preview_result = render_preview.render(design_path, run_dir)
+            report["preview"] = {"rerendered": True, "errors": preview_result.get("errors") or []}
+        except Exception as exc:
+            report["preview"] = {"rerendered": False, "error": str(exc)}
+    dump(report, out_path)
+    return report

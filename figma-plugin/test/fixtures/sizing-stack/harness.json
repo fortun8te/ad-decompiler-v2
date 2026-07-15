@@ -1,0 +1,14 @@
+{
+  "installedFonts": "auto",
+  "expect": {
+    "ok": true,
+    "mustBuild": [
+      "card",
+      "headline",
+      "body",
+      "divider",
+      "cta",
+      "cta-label"
+    ]
+  }
+}

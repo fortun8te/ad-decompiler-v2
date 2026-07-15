@@ -253,13 +253,28 @@ def _text_font(style, font_size):
     from PIL import ImageFont
     candidates = style.get("fontCandidates") or []
     family = str(style.get("fontFamily") or "").strip().casefold()
+    try:
+        target_weight = float(style.get("fontWeight") or 400)
+    except (TypeError, ValueError):
+        target_weight = 400.0
     usable = [candidate for candidate in candidates if isinstance(candidate, dict)
               and candidate.get("path") and os.path.exists(candidate["path"])]
+
+    def _candidate_weight(candidate):
+        try:
+            return float(candidate.get("weight") or 400)
+        except (TypeError, ValueError):
+            return 400.0
+
     # A VLM/font-arbitration pass can promote ``fontFamily`` while retaining the
     # original candidates for provenance. Preview must render the selected family
     # first; otherwise it may draw Comic Sans even though the exported Figma node
-    # correctly says Arial.
-    usable.sort(key=lambda candidate: 0 if str(candidate.get("family") or "").strip().casefold() == family else 1)
+    # correctly says Arial.  Within a family, the candidate closest to the node's
+    # fontWeight wins: Codia-style weight-split runs (121K bold / weergaven light)
+    # only read correctly when Bold text is drawn with the Bold file.
+    usable.sort(key=lambda candidate: (
+        0 if str(candidate.get("family") or "").strip().casefold() == family else 1,
+        abs(_candidate_weight(candidate) - target_weight)))
     selected_paths = []
     # The font matcher intentionally stores only the top few candidates. A
     # later semantic/font decision can select a common family not present in
@@ -267,8 +282,12 @@ def _text_font(style, font_size):
     # back to a visually unrelated candidate.
     if family in {"arial", "arial mt"}:
         windir = os.environ.get("WINDIR", r"C:\\Windows")
-        selected_paths.append(os.path.join(windir, "Fonts", "arial.ttf"))
+        selected_paths.append(os.path.join(windir, "Fonts",
+                                           "arialbd.ttf" if target_weight >= 600 else "arial.ttf"))
     paths = selected_paths + [candidate["path"] for candidate in usable]
+    if target_weight >= 600:
+        # Without any usable candidate, a bold run must still render bold.
+        paths += ["arialbd.ttf"]
     paths += ["arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
     for path in paths:
         try:
@@ -279,6 +298,47 @@ def _text_font(style, font_size):
         return ImageFont.load_default(font_size)
     except Exception:
         return ImageFont.load_default()
+
+
+# Zero-width joiners/variation selectors are invisible formatting characters; drawing
+# them with a text font produces tofu boxes (the "broken emoji" artifact in QA).
+_ZERO_WIDTH = {0x200D, 0xFE0E, 0xFE0F}
+_EMOJI_FONT_CACHE = {}
+
+
+def _is_emoji_char(char):
+    code = ord(char)
+    return (code >= 0x1F000 or 0x2600 <= code <= 0x27BF or 0x2B00 <= code <= 0x2BFF
+            or code in (0x231A, 0x231B) or 0x23E9 <= code <= 0x23FA)
+
+
+def _emoji_font(size):
+    """Color-emoji face at ``size`` (Segoe UI Emoji on Windows), or None."""
+    size = max(1, int(round(size)))
+    if size in _EMOJI_FONT_CACHE:
+        return _EMOJI_FONT_CACHE[size]
+    from PIL import ImageFont
+    font = None
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    for path in (os.path.join(windir, "Fonts", "seguiemj.ttf"),
+                 "/System/Library/Fonts/Apple Color Emoji.ttc",
+                 "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"):
+        try:
+            font = ImageFont.truetype(path, size)
+            break
+        except Exception:
+            continue
+    _EMOJI_FONT_CACHE[size] = font
+    return font
+
+
+def _char_font(char, font):
+    """Face used for one glyph: the emoji face for pictographs when available."""
+    if _is_emoji_char(char):
+        emoji = _emoji_font(getattr(font, "size", 16))
+        if emoji is not None:
+            return emoji, True
+    return font, False
 
 
 def _line_advance(font, line, tracking):
@@ -292,19 +352,70 @@ def _line_advance(font, line, tracking):
     if not line:
         return 0.0
     width = 0.0
+    drawn = 0
     for char in line:
-        width += font.getlength(char)
-    return width + tracking * max(0, len(line) - 1)
+        if ord(char) in _ZERO_WIDTH:
+            continue
+        glyph_font, _ = _char_font(char, font)
+        width += glyph_font.getlength(char)
+        drawn += 1
+    return width + tracking * max(0, drawn - 1)
 
 
 def _draw_tracked_line(draw, origin, line, font, fill, tracking, ascent):
     x, baseline = origin
     for char in line:
+        if ord(char) in _ZERO_WIDTH:
+            continue
+        glyph_font, embedded = _char_font(char, font)
         try:
-            draw.text((x, baseline), char, font=font, fill=fill, anchor="ls")
-        except (ValueError, TypeError):
-            draw.text((x, baseline - ascent), char, font=font, fill=fill)
-        x += font.getlength(char) + tracking
+            draw.text((x, baseline), char, font=glyph_font, fill=fill, anchor="ls",
+                      embedded_color=embedded)
+        except (ValueError, TypeError, OSError):
+            try:
+                draw.text((x, baseline - ascent), char, font=glyph_font, fill=fill)
+            except (ValueError, TypeError, OSError):
+                continue
+        x += glyph_font.getlength(char) + tracking
+
+
+def _run_segments(layer, text):
+    """Validated ``text_runs`` spans covering ``text`` (gaps filled with the base
+    style), or None when runs are absent/malformed/overlapping."""
+    runs = layer.get("text_runs") or []
+    if not isinstance(runs, list) or not runs:
+        return None
+    spans = []
+    for run in runs:
+        if not isinstance(run, dict):
+            return None
+        try:
+            start, end = int(run.get("start")), int(run.get("end"))
+        except (TypeError, ValueError):
+            return None
+        if start < 0 or end > len(text) or end <= start:
+            return None
+        spans.append((start, end, run.get("style") or {}))
+    spans.sort(key=lambda item: item[0])
+    covered, cursor = [], 0
+    for start, end, run_style in spans:
+        if start < cursor:
+            return None
+        if start > cursor:
+            covered.append((cursor, start, {}))
+        covered.append((start, end, run_style))
+        cursor = end
+    if cursor < len(text):
+        covered.append((cursor, len(text), {}))
+    return covered
+
+
+# Only weight and color honor per-run overrides.  Upstream analysis attaches noisy
+# per-word fontSize/letterSpacing/family *evidence* to runs; rendering those verbatim
+# jumbles a paragraph (each word at its own sampled size).  The Codia construction
+# this mirrors (weight-split runs like "121K" bold inside a Light footer line) only
+# ever changes weight and color mid-line — size, family and tracking stay uniform.
+_RUN_STYLE_KEYS = ("fontWeight", "color")
 
 
 def _text_tile(layer, size):
@@ -314,6 +425,11 @@ def _text_tile(layer, size):
     not to ``box.w``/``box.h``.  The returned offset places that block so its
     alignment anchor (left/center/right, top/middle/bottom) coincides with the box,
     letting text spill outside a too-small box instead of being cut off.
+
+    When ``text_runs`` carry styles that differ from the layer style (Codia-style
+    weight-split runs such as "121K"(700) inside a Light line), each run segment is
+    measured and drawn with its own font/color so the preview shows the same mixed
+    weights the exported Figma text will.
     """
     from PIL import Image, ImageDraw
     style = layer.get("style", {}) or {}
@@ -321,10 +437,14 @@ def _text_tile(layer, size):
     text = str(layer.get("text", ""))
     font_size = max(1, int(round(_number(style.get("fontSize", max(12, box_h)), max(12, box_h)))))
     font = _text_font(style, font_size)
-    try:
-        ascent, descent = font.getmetrics()
-    except Exception:
-        ascent, descent = int(font_size * 0.8), int(font_size * 0.2)
+
+    def _metrics(of_font, of_size):
+        try:
+            return of_font.getmetrics()
+        except Exception:
+            return int(of_size * 0.8), int(of_size * 0.2)
+
+    ascent, descent = _metrics(font, font_size)
     line_height = _number(style.get("lineHeight", font_size * 1.2), font_size * 1.2)
     if line_height <= 0:
         line_height = font_size * 1.2
@@ -341,10 +461,52 @@ def _text_tile(layer, size):
     colour = _color(fill or "#111111")
 
     lines = text.split("\n")
-    widths = [_line_advance(font, line, tracking) for line in lines]
+    segments = _run_segments(layer, text)
+    styled = bool(segments) and any(
+        run_style.get(key) is not None and run_style.get(key) != style.get(key)
+        for _, _, run_style in segments for key in _RUN_STYLE_KEYS)
+
+    # Per line: [(segment_text, font, colour, tracking, ascent, descent)]
+    line_specs = []
+    if styled:
+        offset = 0
+        for line in lines:
+            line_start, line_end = offset, offset + len(line)
+            spec = []
+            for start, end, run_style in segments:
+                seg_start, seg_end = max(start, line_start), min(end, line_end)
+                if seg_end <= seg_start:
+                    continue
+                merged = dict(style)
+                for key in _RUN_STYLE_KEYS:
+                    value = run_style.get(key)
+                    if value is not None:
+                        merged[key] = value
+                # Run-level candidates may carry the weight-specific font file.
+                if run_style.get("fontCandidates"):
+                    merged["fontCandidates"] = run_style["fontCandidates"]
+                seg_size = font_size
+                seg_font = _text_font(merged, seg_size)
+                seg_ascent, seg_descent = _metrics(seg_font, seg_size)
+                seg_colour = _color(merged.get("color") or fill or "#111111")
+                seg_tracking = _number(merged.get("letterSpacing", tracking), tracking)
+                spec.append((text[seg_start:seg_end], seg_font, seg_colour,
+                             seg_tracking, seg_ascent, seg_descent))
+            if not spec:
+                spec = [("", font, colour, tracking, ascent, descent)]
+            line_specs.append(spec)
+            offset = line_end + 1
+    else:
+        line_specs = [[(line, font, colour, tracking, ascent, descent)] for line in lines]
+
+    widths = [sum(_line_advance(seg_font, seg_text, seg_tracking)
+                  for seg_text, seg_font, _, seg_tracking, _, _ in spec)
+              for spec in line_specs]
     content_w = max(widths + [0.0])
     line_count = max(1, len(lines))
-    content_h = (line_count - 1) * line_height + ascent + descent
+    max_ascent = max([ascent] + [seg[4] for spec in line_specs for seg in spec])
+    max_descent = max([descent] + [seg[5] for spec in line_specs for seg in spec])
+    content_h = (line_count - 1) * line_height + max_ascent + max_descent
 
     # A small margin guards side bearings, negative-tracking overshoot and descenders
     # so measured content never touches the tile edge (which would clip a glyph).
@@ -355,14 +517,18 @@ def _text_tile(layer, size):
     draw = ImageDraw.Draw(tile)
 
     y = float(pad)
-    for line, width in zip(lines, widths):
+    for spec, width in zip(line_specs, widths):
         if align == "center":
             x = pad + (content_w - width) / 2.0
         elif align == "right":
             x = pad + (content_w - width)
         else:
             x = float(pad)
-        _draw_tracked_line(draw, (x, y + ascent), line, font, colour, tracking, ascent)
+        baseline = y + max_ascent
+        for seg_text, seg_font, seg_colour, seg_tracking, seg_ascent, _ in spec:
+            _draw_tracked_line(draw, (x, baseline), seg_text, seg_font, seg_colour,
+                               seg_tracking, seg_ascent)
+            x += _line_advance(seg_font, seg_text, seg_tracking)
         y += line_height
 
     if align == "center":

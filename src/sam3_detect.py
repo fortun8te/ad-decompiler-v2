@@ -584,9 +584,13 @@ def _text_pred_threshold(scfg: dict, role: str, mask, width: int, height: int,
     if coverage > float(cfg.get("max_coverage", 0.05)):
         return base
     aspect = box["w"] / max(1, box["h"])
-    if not (float(cfg.get("min_aspect", 0.6)) <= aspect <= float(cfg.get("max_aspect", 1.7))):
-        return base
-    return min(base, float(cfg.get("min_score", 0.30)))
+    if float(cfg.get("min_aspect", 0.6)) <= aspect <= float(cfg.get("max_aspect", 1.7)):
+        return min(base, float(cfg.get("min_score", 0.30)))
+    # Wide-pill tier: small "BEST SELLER"/price badges are wider than square but still
+    # tiny; give them an intermediate bar rather than the full generic min_score.
+    if aspect <= float(cfg.get("wide_max_aspect", 3.2)):
+        return min(base, float(cfg.get("wide_min_score", 0.38)))
+    return base
 
 
 def _box_refine_min_score(scfg: dict, residual: list) -> float:
@@ -596,6 +600,46 @@ def _box_refine_min_score(scfg: dict, residual: list) -> float:
     if residual:
         return 0.32
     return float(scfg.get("confidence", 0.45))
+
+
+def _small_refine_cfg(scfg: dict) -> dict:
+    """Config for the targeted second box pass on small unresolved residual regions.
+
+    A tight box prompt around a tiny badge/checkmark often fails (score below the bar or
+    a mask that misses `_acceptable_refinement`); one padded re-prompt with local context
+    is cheap on the shared image embedding and recovers small-element recall.
+    """
+    raw = scfg.get("small_region_refine")
+    if isinstance(raw, bool):
+        out = {"enabled": raw}
+    elif isinstance(raw, dict):
+        out = dict(raw)
+    elif raw is None:
+        out = {}
+    else:
+        out = {"enabled": False}
+    out.setdefault("enabled", True)
+    out["max_regions"] = int(out.get("max_regions", 8))
+    out["pad_frac"] = float(out.get("pad_frac", 0.35))
+    out["min_pad_px"] = int(out.get("min_pad_px", 6))
+    out["min_score"] = float(out.get("min_score", 0.30))
+    out["max_coverage"] = float(out.get("max_coverage", 0.02))
+    return out
+
+
+def _pad_box(box: dict, pad_frac: float, min_pad_px: int, width: int, height: int) -> dict:
+    pad_x = max(float(min_pad_px), float(box.get("w", 0)) * float(pad_frac))
+    pad_y = max(float(min_pad_px), float(box.get("h", 0)) * float(pad_frac))
+    return _clip_box(
+        {
+            "x": float(box.get("x", 0)) - pad_x,
+            "y": float(box.get("y", 0)) - pad_y,
+            "w": float(box.get("w", 0)) + 2 * pad_x,
+            "h": float(box.get("h", 0)) + 2 * pad_y,
+        },
+        width,
+        height,
+    )
 
 
 def _acceptable_refinement(mask, box: dict, scfg: dict) -> bool:
@@ -812,6 +856,7 @@ def detect(
 
     # Positive box-refine every deterministic residual proposal. One observation is emitted
     # for every valid residual even when SAM finds nothing, preserving recall and provenance.
+    unrefined = []
     for item in residual:
         box = item.get("box") or {}
         if not _valid_box(box):
@@ -840,6 +885,7 @@ def detect(
             errors.append(f"box:{item.get('id')}: {exc}")
 
         if best is None:
+            unrefined.append((item, box, role))
             mask = _load_residual_mask(item, width, height, run_dir)
             score = float(item.get("score", item.get("confidence", 0.35)) or 0.35)
             mode = "box-refine-fallback"
@@ -870,6 +916,68 @@ def detect(
         )
         if el:
             elements.append(el)
+
+    # Targeted second pass: for small residual regions whose tight box-refine failed,
+    # re-prompt once with a padded box.  The image embedding is shared, so this costs one
+    # extra geometric prompt per region (bounded by max_regions).  The deterministic
+    # box-refine-fallback observation emitted above is kept; fusion collapses the pair.
+    srr = _small_refine_cfg(scfg)
+    small_refine_attempted = 0
+    small_refine_accepted = 0
+    if srr["enabled"] and unrefined:
+        canvas_area = float(max(1, width * height))
+        candidates = [
+            entry for entry in unrefined
+            if (float(entry[1].get("w", 0)) * float(entry[1].get("h", 0))) / canvas_area
+            <= srr["max_coverage"]
+        ]
+        candidates.sort(key=lambda entry: float(entry[1].get("w", 0)) * float(entry[1].get("h", 0)))
+        for item, box, role in candidates[: max(0, srr["max_regions"])]:
+            padded = _pad_box(box, srr["pad_frac"], srr["min_pad_px"], width, height)
+            if not padded["w"] or not padded["h"]:
+                continue
+            small_refine_attempted += 1
+            try:
+                preds = _prediction_dicts(backend.predict_box(padded), width, height)
+            except Exception as exc:
+                errors.append(f"box-small:{item.get('id')}: {exc}")
+                continue
+            best = None
+            for pred in preds:
+                mask = pred.get("mask")
+                if mask is None:
+                    continue
+                if float(pred.get("score", 0)) < srr["min_score"]:
+                    continue
+                if not _acceptable_refinement(mask, padded, scfg):
+                    continue
+                quality = 0.7 * float(pred.get("score", 0)) + 0.3 * _mask_iou_box(mask, padded)
+                if best is None or quality > best[0]:
+                    best = (quality, pred, mask)
+            if best is None:
+                continue
+            _, pred, mask = best
+            el = _make_element(
+                len(elements),
+                mask,
+                role,
+                item.get("kind") or _kind_for_role(role),
+                float(pred.get("score", 0)),
+                width,
+                height,
+                run_dir,
+                {
+                    "model": "sam3",
+                    "api": "facebookresearch/sam3 Sam3Processor.add_geometric_prompt",
+                    "mode": "box-refine-small",
+                    "residual_id": item.get("id"),
+                    "input_box": padded,
+                    "model_box": pred.get("box"),
+                },
+            )
+            if el:
+                elements.append(el)
+                small_refine_accepted += 1
 
     elements = _union_residual_guarantees(
         elements,
@@ -907,6 +1015,8 @@ def detect(
             "box_prompts_attempted": sum(1 for item in residual if _valid_box(item.get("box"))),
             "box_prompts_succeeded": box_prompt_successes,
             "box_predictions": box_prompt_predictions,
+            "small_refine_attempted": small_refine_attempted,
+            "small_refine_accepted": small_refine_accepted,
             "model_elements": model_element_count,
             "residual_fallback_elements": sum(
                 1 for item in elements if item.get("source") == "residual-fallback"

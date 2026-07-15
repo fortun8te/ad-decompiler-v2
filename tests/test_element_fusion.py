@@ -270,6 +270,234 @@ def test_overlapping_but_semantically_distinct_masks_survive():
     assert {e["role"] for e in fused} == {"photo", "badge"}
 
 
+def test_residual_obs_merges_into_its_own_box_refine_cluster(tmp_path):
+    """Regression for benchmark 009 E015/E016: a sparse residual CC (anti-aliased ring)
+    against the solid SAM mask box-refined FROM it lands in the nested IoU band and used to
+    ship twice. Provenance identity (residual_id) must merge the pair even with absorption
+    disabled, so the link path itself is what is under test."""
+    solid = _mask(20, 20, 30, 30)
+    ring = solid & ~_mask(23, 23, 24, 24)  # 3px border ring: iou 0.36, containment 1.0
+    assert 0.30 < ring.sum() / solid.sum() < 0.70
+
+    sam3 = {
+        "elements": [
+            {
+                "id": "S0",
+                "box": _box(20, 20, 30, 30),
+                "role": "icon",
+                "kind": "icon",
+                "score": 0.93,
+                "_mask": solid,
+                "provenance": {"mode": "box-refine", "residual_id": "R0"},
+            }
+        ]
+    }
+    residual = [{"id": "R0", "box": _box(20, 20, 30, 30), "kind": "icon", "_mask": ring}]
+    cfg = {"element_fusion": {"absorb_fragments": False, "sliver_absorb": False}}
+
+    fused = element_fusion.fuse(sam3, residual, [], CANVAS, cfg=cfg, run_dir=str(tmp_path))
+
+    assert len(fused) == 1
+    element = fused[0]
+    assert element["box"] == _box(20, 20, 30, 30)  # solid SAM mask wins the cluster
+    merges = element["provenance"]["nms"]["merges"]
+    assert any(m.get("reason") == "residual-refine-link" for m in merges)
+    keys = {o["key"] for o in element["provenance"]["observations"]}
+    assert keys == {"sam3:S0", "residual:R0"}
+
+
+def test_residual_refine_link_can_be_disabled():
+    solid = _mask(20, 20, 30, 30)
+    ring = solid & ~_mask(23, 23, 24, 24)
+    sam3 = {"elements": [{"id": "S0", "box": _box(20, 20, 30, 30), "role": "icon",
+                          "kind": "icon", "score": 0.93, "_mask": solid,
+                          "provenance": {"mode": "box-refine", "residual_id": "R0"}}]}
+    residual = [{"id": "R0", "box": _box(20, 20, 30, 30), "kind": "icon", "_mask": ring}]
+    cfg = {"element_fusion": {"link_residual_refine": False,
+                              "absorb_fragments": False, "sliver_absorb": False}}
+    fused = element_fusion.fuse(sam3, residual, [], CANVAS, cfg=cfg)
+    assert len(fused) == 2  # the historical duplicate leak, now opt-in only
+
+
+def test_fragmented_icon_pieces_absorb_into_whole_icon(tmp_path):
+    """Regression for benchmark 009 E017/E018/E023: box-refine snapped two residual CCs to
+    glyph pieces of one share icon while the text prompt found the whole icon. Same-role
+    contained pieces must collapse into the whole instead of shipping as three overlapping
+    top-level icons (icon parents are not 'meaningful' so the parent-link pass never fires)."""
+    whole = _mask(40, 40, 40, 40)
+    piece_a = _mask(48, 42, 20, 18)  # fully inside, 22% of whole
+    piece_b = _mask(44, 66, 30, 12)  # fully inside, 22% of whole
+    sam3 = {
+        "elements": [
+            {
+                "id": "S-whole",
+                "box": _box(40, 40, 40, 40),
+                "role": "icon",
+                "kind": "icon",
+                "score": 0.89,
+                "_mask": whole,
+                "provenance": {"mode": "text-prompt", "prompt": "icon"},
+            },
+            {
+                "id": "S-a",
+                "box": _box(48, 42, 20, 18),
+                "role": "icon",
+                "kind": "icon",
+                "score": 0.93,
+                "_mask": piece_a,
+                "provenance": {"mode": "box-refine", "residual_id": "R1"},
+            },
+            {
+                "id": "S-b",
+                "box": _box(44, 66, 30, 12),
+                "role": "icon",
+                "kind": "icon",
+                "score": 0.94,
+                "_mask": piece_b,
+                "provenance": {"mode": "box-refine", "residual_id": "R2"},
+            },
+        ]
+    }
+    residual = [
+        {"id": "R1", "box": _box(48, 42, 20, 18), "kind": "icon", "_mask": piece_a},
+        {"id": "R2", "box": _box(44, 66, 30, 12), "kind": "icon", "_mask": piece_b},
+    ]
+
+    fused = element_fusion.fuse(sam3, residual, [], CANVAS, run_dir=str(tmp_path))
+
+    assert len(fused) == 1
+    element = fused[0]
+    assert element["role"] == "icon"
+    # The whole-icon mask wins; the crop stays tight so downstream corner-radius/shape
+    # inference (reconstruct._corner_radius) sees the full clean silhouette.
+    assert element["box"] == _box(40, 40, 40, 40)
+    assert Image.open(element["mask_path"]).size == (40, 40)
+    assert len(element["provenance"]["observations"]) == 5
+    reasons = {m.get("reason") for m in element["provenance"]["nms"]["merges"]}
+    assert "absorbed-fragment" in reasons
+
+
+def test_button_fill_slivers_absorb_into_model_button(tmp_path):
+    """Regression for benchmark 009 'Volgend': OCR text dilation splits the button plate's
+    residual CC into thin slivers hugging the pill border (some poking 1-2 px past the SAM
+    mask). They are fill fragments, not children — absorbing them removes the white
+    rectangle artifact behind the button."""
+    button = _mask(10, 10, 60, 20)
+    sliver = _mask(20, 8, 40, 4)  # top strip: 2 of 4 rows above the button mask
+    sam3 = {
+        "elements": [
+            {
+                "id": "S-btn",
+                "box": _box(10, 10, 60, 20),
+                "role": "button",
+                "kind": "shape",
+                "score": 0.73,
+                "_mask": button,
+                "provenance": {"mode": "text-prompt", "prompt": "button"},
+            }
+        ]
+    }
+    residual = [{"id": "R0", "box": _box(20, 8, 40, 4), "kind": "shape", "_mask": sliver}]
+
+    fused = element_fusion.fuse(sam3, residual, [], CANVAS, run_dir=str(tmp_path))
+
+    assert len(fused) == 1
+    element = fused[0]
+    assert element["role"] == "button"
+    assert element["box"] == _box(10, 10, 60, 20)  # winner mask untouched (radius evidence)
+    reasons = {m.get("reason") for m in element["provenance"]["nms"]["merges"]}
+    assert "absorbed-sliver" in reasons
+
+
+def test_sliver_absorb_can_be_disabled():
+    button = _mask(10, 10, 60, 20)
+    sliver = _mask(20, 8, 40, 4)
+    sam3 = {"elements": [{"id": "S-btn", "box": _box(10, 10, 60, 20), "role": "button",
+                          "kind": "shape", "score": 0.73, "_mask": button,
+                          "provenance": {"mode": "text-prompt", "prompt": "button"}}]}
+    residual = [{"id": "R0", "box": _box(20, 8, 40, 4), "kind": "shape", "_mask": sliver}]
+    cfg = {"element_fusion": {"sliver_absorb": False}}
+    fused = element_fusion.fuse(sam3, residual, [], CANVAS, cfg=cfg)
+    assert len(fused) == 2
+
+
+def test_sliver_inside_card_is_preserved_as_real_child():
+    """A thin divider fully inside a card is a real element: card is not a sliver-parent
+    role, so the sliver must survive and be linked as a nested child instead."""
+    card = _mask(10, 10, 60, 40)
+    divider = _mask(16, 28, 48, 3)
+    sam3 = {
+        "elements": [
+            {"id": "S-card", "box": _box(10, 10, 60, 40), "role": "card", "kind": "shape",
+             "score": 0.8, "_mask": card, "provenance": {"mode": "text-prompt"}},
+            {"id": "S-div", "box": _box(16, 28, 48, 3), "role": "shape", "kind": "shape",
+             "score": 0.7, "_mask": divider, "provenance": {"mode": "text-prompt"}},
+        ]
+    }
+    fused = element_fusion.fuse(sam3, [], [], CANVAS)
+    assert len(fused) == 2
+    parent = next(e for e in fused if e["role"] == "card")
+    child = next(e for e in fused if e["role"] == "shape")
+    assert child["parent_id"] == parent["id"]
+
+
+def test_residual_photo_fragment_label_does_not_block_shape_dedup():
+    """Task: an element must never ship as both photo-fragment and shape. The residual-CC
+    kind is a threshold heuristic; when its mask geometrically duplicates a model shape
+    (iou >= mask_iou but < 0.88), the family conflict must not keep both."""
+    button = _mask(10, 10, 40, 20)
+    partial = _mask(10, 10, 30, 20)  # iou 0.75, area_ratio 0.75 -> duplicate band
+    sam3 = {"elements": [{"id": "S-btn", "box": _box(10, 10, 40, 20), "role": "button",
+                          "kind": "shape", "score": 0.8, "_mask": button,
+                          "provenance": {"mode": "text-prompt", "prompt": "button"}}]}
+    residual = [{"id": "R0", "box": _box(10, 10, 30, 20), "kind": "photo-fragment",
+                 "_mask": partial}]
+
+    fused = element_fusion.fuse(sam3, residual, [], CANVAS)
+
+    assert len(fused) == 1
+    assert fused[0]["role"] == "button"
+    assert fused[0]["kind"] == "shape"
+
+
+def test_model_vs_model_family_conflict_still_kept_separate():
+    """The residual-family advisory must not weaken model-vs-model semantics: two SAM
+    text-prompt observations with conflicting families and iou < 0.88 stay separate."""
+    photo = _mask(10, 10, 40, 20)
+    partial = _mask(10, 10, 30, 20)
+    sam3 = {"elements": [
+        {"id": "S-photo", "box": _box(10, 10, 40, 20), "role": "photo",
+         "kind": "photo-fragment", "score": 0.8, "_mask": photo,
+         "provenance": {"mode": "text-prompt"}},
+        {"id": "S-btn", "box": _box(10, 10, 30, 20), "role": "button", "kind": "shape",
+         "score": 0.8, "_mask": partial, "provenance": {"mode": "text-prompt"}},
+    ]}
+    fused = element_fusion.fuse(sam3, [], [], CANVAS)
+    assert len(fused) == 2
+
+
+def test_antialiased_fringe_child_still_links_to_parent():
+    """A child mask whose anti-aliased fringe pokes 2px past the model parent mask used to
+    fail the 0.90 containment bar (009 E007 vs the 'Volgend' button at 0.899); the dilated
+    containment test must still record the icon-in-button relationship."""
+    button = _mask(10, 10, 40, 20)
+    icon = _mask(12, 8, 10, 10)  # rows 8-9 sit above the button mask: raw containment 0.8
+    sam3 = {"elements": [
+        {"id": "S-btn", "box": _box(10, 10, 40, 20), "role": "button", "kind": "shape",
+         "score": 0.8, "_mask": button, "provenance": {"mode": "text-prompt"}},
+        {"id": "S-icon", "box": _box(12, 8, 10, 10), "role": "icon", "kind": "icon",
+         "score": 0.9, "_mask": icon, "provenance": {"mode": "text-prompt"}},
+    ]}
+
+    fused = element_fusion.fuse(sam3, [], [], CANVAS)
+
+    assert len(fused) == 2
+    parent = next(e for e in fused if e["role"] == "button")
+    child = next(e for e in fused if e["role"] == "icon")
+    assert child["parent_id"] == parent["id"]
+    assert child["relationships"][0]["type"] == "nested-in"
+
+
 def test_residual_stream_unions_with_sam_residual_fallback(tmp_path):
     mask = _mask(12, 12, 20, 20)
     residual = [

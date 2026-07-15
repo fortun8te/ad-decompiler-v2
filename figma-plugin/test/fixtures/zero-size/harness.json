@@ -1,0 +1,16 @@
+{
+  "installedFonts": "auto",
+  "generateAssets": {
+    "assets/img0.png": {
+      "w": 4,
+      "h": 4
+    }
+  },
+  "expect": {
+    "ok": true,
+    "minCreated": 4,
+    "skipTextContainment": [
+      "t0"
+    ]
+  }
+}

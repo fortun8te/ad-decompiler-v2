@@ -12,9 +12,20 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import shutil
 import time
 from pathlib import Path
 
+
+# Keep this aligned with doctor._DEFAULT_VLM_MODEL. The VLM moved from gemma-4-e4b to the
+# 12B model in LM Studio; the probe must expect the current identity, not the retired one.
+DEFAULT_VLM_MODEL = "google/gemma-4-e4b"
+# UB-Mannheim's winget Tesseract build installs here but is not added to PATH until a shell
+# restart; the Windows launcher prepends this dir so doctor/OCR find it the same session.
+_TESSERACT_KNOWN_DIRS = (
+    r"C:\Program Files\Tesseract-OCR",
+    r"C:\Program Files (x86)\Tesseract-OCR",
+)
 
 BASE_PROBES = ("ocr", "sam3", "vlm", "vectorization", "figma_staging")
 # All known probes. ``selected_probes`` chooses the route that the active config actually
@@ -90,20 +101,29 @@ def _probe_vlm(cfg: dict, work: Path) -> dict:
     from src.vlm_client import ask_vlm
     image, _ = _fixture(work)
     vlm = cfg.get("vlm") or {}
+    base_url = str(vlm.get("base_url", "http://127.0.0.1:1234/v1"))
+    model = str(vlm.get("model", DEFAULT_VLM_MODEL))
     schema = {"type": "object", "properties": {"label": {"type": "string"}},
               "required": ["label"], "additionalProperties": False}
-    answer = ask_vlm(
-        image.read_bytes(),
-        "Return JSON only. The label must be exactly gpu-smoke.",
-        base_url=str(vlm.get("base_url", "http://127.0.0.1:1234/v1")),
-        model=str(vlm.get("model", "google/gemma-4-e4b")),
-        timeout_s=float(vlm.get("timeout_s", 45)), max_tokens=800,
-        response_schema=schema,
-    )
+    try:
+        answer = ask_vlm(
+            image.read_bytes(),
+            "Return JSON only. The label must be exactly gpu-smoke.",
+            base_url=base_url, model=model,
+            timeout_s=float(vlm.get("timeout_s", 45)), max_tokens=800,
+            response_schema=schema,
+        )
+    except Exception as exc:
+        return {"ok": False, "detail": (
+            f"VLM call failed ({type(exc).__name__}: {exc}). Start LM Studio's local server at "
+            f"{base_url} and load {model} (run: lms load {model})."),
+            "evidence": {"error": str(exc), "model": model, "base_url": base_url}}
     payload = json.loads(answer)
     ok = str(payload.get("label", "")).strip().lower() == "gpu-smoke"
-    return {"ok": ok, "detail": f"model={vlm.get('model', 'google/gemma-4-e4b')}; answer={payload}",
-            "evidence": payload}
+    detail = f"model={model}; answer={payload}"
+    if not ok:
+        detail += f"; expected label 'gpu-smoke' — confirm {model} is the loaded VLM in LM Studio"
+    return {"ok": ok, "detail": detail, "evidence": payload}
 
 
 def _probe_big_lama(cfg: dict, work: Path) -> dict:
@@ -125,10 +145,18 @@ def _probe_big_lama(cfg: dict, work: Path) -> dict:
 
 
 def _probe_flux_comfy(cfg: dict, work: Path) -> dict:
-    """Submit a real Flux crop; liveness alone does not prove the workflow can run."""
+    """Submit a real Flux crop; liveness alone does not prove the workflow can run.
+
+    Mirrors the pipeline's VRAM choreography: the real reconstruct stage evicts the
+    resident LM Studio VLM before loading Flux Fill (they cannot coexist on a 16GB
+    card). Skipping that here made the probe try to fit ~6.3GB VLM + ~14GB Flux at
+    once, which is not a hang but a genuinely too-slow cold load — it blew the 120s
+    timeout every time and made every benchmark run report "blocked" before a single
+    image ran.
+    """
     import numpy as np
     from PIL import Image
-    from src import inpaint
+    from src import inpaint, vram
     image, mask = _fixture(work)
     output = work / "flux-inpainted.png"
     probe_cfg = copy.deepcopy(cfg)
@@ -137,7 +165,12 @@ def _probe_flux_comfy(cfg: dict, work: Path) -> dict:
     inpaint_cfg["allow_fallback"] = False
     inpaint_cfg.setdefault("comfy", {})["enabled"] = True
     inpaint_cfg["comfy"]["required"] = True
-    result = inpaint.inpaint_once(str(image), str(mask), str(output), probe_cfg)
+    evicted = vram.evict_vlm(probe_cfg)
+    try:
+        result = inpaint.inpaint_once(str(image), str(mask), str(output), probe_cfg)
+    finally:
+        if evicted:
+            vram.restore_vlm(probe_cfg)
     before = np.asarray(Image.open(image).convert("RGB"))
     after = np.asarray(Image.open(output).convert("RGB"))
     region = np.asarray(Image.open(mask).convert("L")) > 0
@@ -212,7 +245,10 @@ def _probe_figma_staging(cfg: dict, work: Path) -> dict:
     from src.figma_import import import_design
     run = work / "figma-run"
     assets = run / "assets"
-    assets.mkdir(parents=True)
+    # exist_ok: the probe re-runs into a persistent work dir (benchmark re-invokes
+    # the smoke each run), and import_design also stages into run/assets — a bare
+    # mkdir raised FileExistsError and blocked the whole benchmark before any image.
+    assets.mkdir(parents=True, exist_ok=True)
     Image.new("RGBA", (8, 8), "red").save(assets / "dot.png")
     design = {"schema_version": 2, "id": "gpu-smoke", "name": "GPU smoke",
               "canvas": {"w": 32, "h": 32}, "layers": [{"id": "dot", "type": "image",
@@ -282,3 +318,73 @@ def run_all(cfg: dict, output_dir: str | Path, *, probes=None, timeout_s: float 
               "checks": checks, "probes": list(probes), "timeout_s": timeout_s}
     (output_dir / "runtime_smoke.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
+
+
+def _which_lms() -> str | None:
+    """Locate the LM Studio `lms` CLI, including its default dir before `lms bootstrap` runs."""
+    found = shutil.which("lms")
+    if found:
+        return found
+    candidate = Path(os.path.expanduser("~")) / ".lmstudio" / "bin" / (
+        "lms.exe" if os.name == "nt" else "lms")
+    return str(candidate) if candidate.is_file() else None
+
+
+def _which_tesseract() -> str | None:
+    """Locate tesseract, including the UB-Mannheim winget install dir when it is off PATH."""
+    found = shutil.which("tesseract")
+    if found:
+        return found
+    for directory in _TESSERACT_KNOWN_DIRS:
+        candidate = Path(directory) / "tesseract.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def check_lms_cli(cfg: dict) -> dict:
+    """`lms` is needed only when the VRAM plan evicts/reloads the VLM around Flux inpaint.
+
+    runtime.vram.evict_vlm_for_inpaint shells out to `lms unload`/`lms load`, so a configured
+    eviction with no CLI on PATH is a real, silent gap the launcher self-test should surface.
+    """
+    vram = (cfg.get("runtime") or {}).get("vram") or {}
+    needs = bool(vram.get("evict_vlm_for_inpaint") or vram.get("reload_vlm_after_inpaint"))
+    path = _which_lms()
+    if not needs:
+        return {"name": "lms_cli", "ok": True,
+                "detail": f"not required (runtime.vram VLM eviction disabled); found={path or 'no'}",
+                "evidence": {"required": False, "path": path}}
+    ok = bool(path)
+    detail = (f"lms CLI at {path}" if ok else
+              "runtime.vram.evict_vlm_for_inpaint is on but `lms` was not found. Install LM Studio, "
+              "then run `lms bootstrap` (adds %USERPROFILE%\\.lmstudio\\bin to PATH).")
+    return {"name": "lms_cli", "ok": ok, "detail": detail,
+            "evidence": {"required": True, "path": path}}
+
+
+def check_tesseract(cfg: dict) -> dict:
+    """Discover tesseract — required only when it is the OCR primary, otherwise advisory."""
+    primary = str((cfg.get("ocr") or {}).get("primary", "doctr")).lower()
+    required = primary == "tesseract"
+    path = _which_tesseract()
+    on_path = bool(shutil.which("tesseract"))
+    ok = bool(path) if required else True
+    if path and on_path:
+        detail = f"tesseract at {path}"
+    elif path:
+        detail = (f"tesseract found at {path} but not on PATH; the Windows launcher prepends "
+                  "C:\\Program Files\\Tesseract-OCR to the process PATH so doctor/OCR can see it")
+    elif required:
+        detail = ("tesseract not found. Run: winget install UB-Mannheim.TesseractOCR, "
+                  "then restart the bridge")
+    else:
+        detail = (f"tesseract not installed (optional OCR fallback; primary is {primary}). "
+                  "Install with: winget install UB-Mannheim.TesseractOCR")
+    return {"name": "tesseract", "ok": ok, "detail": detail,
+            "evidence": {"required": required, "path": path, "on_path": on_path}}
+
+
+def environment_checks(cfg: dict) -> list[dict]:
+    """Cheap, model-free readiness checks the launcher self-test surfaces (no GPU loads)."""
+    return [check_lms_cli(cfg), check_tesseract(cfg)]

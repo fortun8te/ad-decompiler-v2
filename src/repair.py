@@ -18,6 +18,16 @@ import os
 from typing import Optional
 
 from src.qa_config import visual_pass_ssim
+from src.schema import raster_slice_failures, raster_slice_thresholds
+
+# Canonical fallback-contract helper (F11): read meta.fallback the same way every stage
+# does instead of an ad-hoc truthiness check. Guarded so repair.py stays import-safe on a
+# checkout that predates the schema helper landing (a thin adapter, not a redefinition).
+try:
+    from src.schema import is_raster_slice as _is_raster_slice
+except Exception:
+    def _is_raster_slice(meta) -> bool:
+        return bool(isinstance(meta, dict) and meta.get("fallback") == "raster-slice")
 
 # thresholds (overridable via cfg.repair)
 DEFAULTS = {
@@ -544,9 +554,74 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             }
         )
 
+    # ── confidence-gated raster-slice fallback (Codia-style fidelity floor) ────────────
+    # A region the pipeline cannot reconstruct faithfully should ship as a pixel-exact
+    # source slice rather than as visible garbage: 'looks right + partially editable'
+    # beats 'looks wrong + fully editable'. The repair maps to the already-actionable
+    # (reconstruct, inspect-worst-regions) resume; reconstruct.apply_raster_slice_fallback
+    # honors the layer ids via the reconstruct.focus_regions config patch.
+    fallback_thresholds = raster_slice_thresholds(cfg)
+    slice_ids: set = set()
+    if fallback_thresholds.get("enabled", True):
+        slice_rows = []
+        for pl in per_layer:
+            # Skip layers ALREADY shipped as a pixel-exact raster slice (re-gating them just
+            # wastes a harness round). Other fallback kinds are still evaluated — an ad-hoc
+            # "any truthy fallback" skip hid text→image substitutions from re-gating (F11).
+            if not isinstance(pl, dict) or _is_raster_slice({"fallback": pl.get("fallback")}):
+                continue
+            reasons = raster_slice_failures(pl, fallback_thresholds)
+            if reasons:
+                slice_rows.append((pl, reasons))
+        slice_ids = {str(pl.get("id")) for pl, _ in slice_rows}
+        if slice_rows:
+            regions = [{
+                "layer_id": pl.get("id"),
+                "region_ssim": pl.get("region_ssim"),
+                "region_color": pl.get("region_color"),
+                "ink_iou": pl.get("ink_iou"),
+                "box": pl.get("abs_box") or pl.get("box"),
+                "reasons": reasons,
+            } for pl, reasons in slice_rows[:8]]
+            out.append({
+                "stage": "reconstruct",
+                "action": "inspect-worst-regions",
+                "target_id": str(slice_rows[0][0].get("id")),
+                "reason": (
+                    f"raster-slice fallback: {len(slice_rows)} region(s) below the "
+                    "confidence gate — replace with pixel-exact source slices: "
+                    + ", ".join(sorted(slice_ids))
+                ),
+                "params": {"raster_slice": True, "regions": regions},
+                "severity": "high",
+            })
+
+    # ── unresolved glyph residue under removed text (reconstruction audit) ────────────
+    if run_dir:
+        recon_stats = (_load_json(os.path.join(run_dir, "reconstruction.json"), {})
+                       .get("stats") or {})
+        residual = recon_stats.get("text_residual") or {}
+        unresolved = [entry for entry in residual.get("flagged") or []
+                      if isinstance(entry, dict) and not entry.get("resolved")]
+        if unresolved:
+            out.append({
+                "stage": "inpaint",
+                "action": "rebuild-clean-plate",
+                "reason": (f"glyph residue remains under {len(unresolved)} removed text "
+                           "region(s): "
+                           + ", ".join(str(entry.get("id")) for entry in unresolved[:4])),
+                "params": {"strict_mask_composite": True},
+                "severity": "high",
+            })
+
     # ── per-layer diagnostics ─────────────────────────────────────────────────────────
     for pl in per_layer:
         lid = pl.get("id")
+        if str(lid) in slice_ids:
+            # The raster-slice repair supersedes generic per-layer suggestions for this
+            # region; re-running qwen/build on a region already gated to a slice wastes
+            # a harness round.
+            continue
         score = pl.get("score")
         role = pl.get("role") or pl.get("type")
         recall = pl.get("recall")

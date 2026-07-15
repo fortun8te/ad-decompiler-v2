@@ -28,6 +28,74 @@ def test_vlm_probe_requires_schema_answer(monkeypatch, tmp_path):
     assert not runtime_smoke._probe_vlm({}, tmp_path / "wrong")["ok"]
 
 
+def test_vlm_probe_defaults_to_current_gemma_identity(monkeypatch, tmp_path):
+    seen = {}
+
+    def capture(image_bytes, prompt, **kwargs):
+        seen.update(kwargs)
+        return '{"label":"gpu-smoke"}'
+
+    monkeypatch.setattr("src.vlm_client.ask_vlm", capture)
+    result = runtime_smoke._probe_vlm({}, tmp_path)
+    assert result["ok"] is True
+    assert seen["model"] == "google/gemma-4-e4b"
+    assert "google/gemma-4-e4b" in result["detail"]
+    assert runtime_smoke.DEFAULT_VLM_MODEL == "google/gemma-4-e4b"
+
+
+def test_vlm_probe_gives_windows_first_action_when_server_down(monkeypatch, tmp_path):
+    def boom(*args, **kwargs):
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr("src.vlm_client.ask_vlm", boom)
+    result = runtime_smoke._probe_vlm({}, tmp_path)
+    assert result["ok"] is False
+    assert "lms load google/gemma-4-e4b" in result["detail"]
+    assert "LM Studio" in result["detail"]
+
+
+def test_lms_cli_required_only_when_vram_eviction_is_configured(monkeypatch):
+    monkeypatch.setattr(runtime_smoke, "_which_lms", lambda: None)
+    disabled = runtime_smoke.check_lms_cli({})
+    assert disabled["ok"] is True
+    assert disabled["evidence"]["required"] is False
+
+    enabled = runtime_smoke.check_lms_cli(
+        {"runtime": {"vram": {"evict_vlm_for_inpaint": True}}})
+    assert enabled["ok"] is False
+    assert "lms bootstrap" in enabled["detail"]
+
+    monkeypatch.setattr(runtime_smoke, "_which_lms", lambda: r"C:\Users\me\.lmstudio\bin\lms.exe")
+    present = runtime_smoke.check_lms_cli(
+        {"runtime": {"vram": {"reload_vlm_after_inpaint": True}}})
+    assert present["ok"] is True
+    assert present["evidence"]["path"].endswith("lms.exe")
+
+
+def test_tesseract_discovery_is_advisory_unless_primary(monkeypatch):
+    monkeypatch.setattr(runtime_smoke, "_which_tesseract", lambda: None)
+    monkeypatch.setattr(runtime_smoke.shutil, "which", lambda name: None)
+    advisory = runtime_smoke.check_tesseract({"ocr": {"primary": "doctr"}})
+    assert advisory["ok"] is True
+    assert "winget install UB-Mannheim.TesseractOCR" in advisory["detail"]
+
+    required = runtime_smoke.check_tesseract({"ocr": {"primary": "tesseract"}})
+    assert required["ok"] is False
+    assert "winget install UB-Mannheim.TesseractOCR" in required["detail"]
+
+    known = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    monkeypatch.setattr(runtime_smoke, "_which_tesseract", lambda: known)
+    off_path = runtime_smoke.check_tesseract({"ocr": {"primary": "doctr"}})
+    assert off_path["ok"] is True
+    assert "not on PATH" in off_path["detail"]
+    assert off_path["evidence"]["path"] == known
+
+
+def test_environment_checks_returns_lms_and_tesseract_rows():
+    names = [row["name"] for row in runtime_smoke.environment_checks({})]
+    assert names == ["lms_cli", "tesseract"]
+
+
 def test_ocr_probe_rejects_silent_fallback_engine(monkeypatch, tmp_path):
     monkeypatch.setattr("src.ocr.run_ocr", lambda *args, **kwargs: {
         "status": "ok", "engine": "tesseract", "lines": [{"text": "GPU SMOKE"}],

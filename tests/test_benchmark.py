@@ -270,3 +270,59 @@ def test_entry_surfaces_existing_archetype_preset_and_regional_dispositions(tmp_
     assert row["unexplained_raster_fallbacks"] == 0
     assert row["regional_inpaint_routes"] == {"flux-comfy": 1, "big-lama": 1}
     assert row["fallback_dispositions"][0]["fallback_reason"] == "flat-large-hole"
+
+
+def test_element_recall_prefers_the_top_level_qa_json_mirror(tmp_path):
+    """pixel_diff now hoists element_recall/element_survival to qa.json's top level (the
+    same way editable_text_recall already was); _entry must read that mirror first and
+    only fall back to the nested structural.* copy for older run artifacts that predate it.
+    """
+    run = _fixture_run(tmp_path, qa={
+        "ok": True, "visual_score": 0.99, "ssim": 0.99, "hard_fails": [],
+        "element_recall": 0.42,
+        "element_survival": {"proposed": 12, "kept": 5, "recall": 0.42, "missing_ids": ["E1"]},
+        "structural": {
+            "background": {}, "layer_alpha": [],
+            # A stale/older nested value must lose to the top-level mirror above.
+            "element_recall": 1.0,
+            "hard_fails": [],
+        },
+    })
+    row = _entry(run, {"ok": True})
+    assert row["element_recall"] == 0.42
+    assert row["element_survival"]["missing_ids"] == ["E1"]
+
+    # Older run artifacts (no top-level mirror at all) still fall back to structural.*.
+    legacy_base = tmp_path / "legacy"
+    legacy_base.mkdir()
+    legacy_run = _fixture_run(legacy_base, qa={
+        "ok": True, "visual_score": 0.99, "ssim": 0.99, "hard_fails": [],
+        "structural": {"background": {}, "layer_alpha": [], "element_recall": 0.9, "hard_fails": []},
+    })
+    legacy_row = _entry(legacy_run, {"ok": True})
+    assert legacy_row["element_recall"] == 0.9
+
+
+def test_true_text_coverage_is_surfaced_in_entry_and_markdown_column(tmp_path):
+    """021-style denominator lie: editable_text_recall reads a perfect 1.0 but text_recall
+    is low (OCR only found a sliver of the ad's copy). true_text_coverage must be surfaced
+    in the per-run entry and rendered as its own benchmark.md column so it can't be missed
+    the way a nested-only field could be.
+    """
+    run = _fixture_run(tmp_path, qa={
+        "ok": False, "visual_score": 0.99, "ssim": 0.99,
+        "text_recall": 0.17, "editable_text_recall": 1.0, "true_text_coverage": 0.17,
+        "hard_fails": [{"rule": "missing-editable-text", "detail": "true text coverage 0.17 < 0.20"}],
+        "structural": {
+            "background": {}, "layer_alpha": [], "element_recall": 1.0,
+            "editable_text_recall": 1.0, "true_text_coverage": 0.17,
+            "hard_fails": [{"rule": "missing-editable-text", "detail": "true text coverage 0.17 < 0.20"}],
+        },
+    })
+    row = _entry(run, {"ok": True})
+    assert row["true_text_coverage"] == 0.17
+
+    report = {"summary": {"images": 1, "qa_passing": 0}, "runs": [row]}
+    md = _markdown(report)
+    assert "true text coverage" in md
+    assert "0.170" in md

@@ -40,16 +40,57 @@ def test_confident_text_style_confidence_alone_does_not_trigger_fallback():
 
 
 def test_ambiguous_font_match_uses_exact_raster_fallback_by_default():
+    # fidelity_confidence rides the render-fit scale (font_fit.py): correct-class
+    # substitutes score 0.33-0.58, so 0.70 is a solid match and must stay TEXT;
+    # 0.30 is wrong-class territory and must fall back to exact pixels.
     c = {
         "id": "L11", "text": "Display headline",
         "box": {"x": 120, "y": 120, "w": 620, "h": 100},
         "style": {"confidence": 0.96},
-        "meta": {"origin": "overlay", "fidelity_confidence": 0.70},
+        "meta": {"origin": "overlay", "fidelity_confidence": 0.30},
     }
     result = routing.route(c, CANVAS)
     assert result["target"] == "image"
     assert result["meta"]["fallback"] is True
     assert result["meta"]["substitution"]["reason"] == "low-confidence font/effect match"
+
+
+def test_correct_class_render_fit_routes_as_editable_text():
+    c = {
+        "id": "L12", "text": "Display headline",
+        "box": {"x": 120, "y": 120, "w": 620, "h": 100},
+        "style": {"confidence": 0.96},
+        "meta": {"origin": "overlay", "fidelity_confidence": 0.45},
+    }
+    assert routing.route(c, CANVAS)["target"] == "text"
+
+
+def test_body_copy_stays_editable_in_plausible_same_class_font():
+    # Reframe: same-class body copy in a substitute font is worth editing, not
+    # slicing. A mid-band fidelity that the old body-copy penalty (0.50) pushed
+    # under the bar must now stay TEXT — every text role shares one bar.
+    c = {
+        "id": "L20",
+        "text": "Clinically proven to reduce noise by twenty decibels overall.",
+        "box": {"x": 80, "y": 300, "w": 900, "h": 40},
+        "style": {"confidence": 0.9},
+        "meta": {"origin": "overlay", "role": "body", "semantic_role": "body-copy",
+                 "fidelity_confidence": 0.45},
+    }
+    assert routing.route(c, CANVAS)["target"] == "text"
+
+
+def test_wrong_class_body_copy_still_slices_below_bar():
+    # A wrong-CLASS render (capped below the bar upstream) still rasterizes even
+    # for body copy: that is the case that looks broken.
+    c = {
+        "id": "L21", "text": "korting krijgt op het volledige assortiment",
+        "box": {"x": 80, "y": 300, "w": 700, "h": 40},
+        "style": {"confidence": 0.9},
+        "meta": {"origin": "overlay", "role": "body", "semantic_role": "body-copy",
+                 "fidelity_confidence": 0.28},
+    }
+    assert routing.route(c, CANVAS)["target"] == "image"
 
 
 def test_wordmark_becomes_artwork_not_text():

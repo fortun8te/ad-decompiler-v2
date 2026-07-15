@@ -228,10 +228,30 @@ def _normalize_word(word: dict, engine: str) -> Optional[dict]:
     return out
 
 
+_INTERPUNCT_SEP = re.compile(r"(?<=[\w%€$£)\]]) [.\-] (?=[\w(€$£])")
+_INTERPUNCT_TAIL = re.compile(r"(?<=[\w%€$£)\]]) [.\-]$")
+
+
+def _restore_interpuncts(text: str) -> str:
+    """Restore interpunct separators ('·') that OCR reads as '.'/'-'.
+
+    UI metadata lines separate tokens with a centered dot ("05:00 PM · 12-05-2026 ·
+    121K weergaven"); OCR engines emit '.' or '-' for that glyph. Only a SEPARATOR
+    pattern is rewritten — a space-surrounded lone '.'/'-' between word characters,
+    or trailing after a token — and only on lines that contain a digit (UI/meta
+    lines), so prose punctuation and real hyphenated words are never touched.
+    """
+    if not any(ch.isdigit() for ch in text):
+        return text
+    text = _INTERPUNCT_SEP.sub(" · ", text)
+    text = _INTERPUNCT_TAIL.sub(" ·", text)
+    return text
+
+
 def _make_line(text: Any, confidence: Any, quad: Any = None, box: Any = None,
                words: Optional[list] = None, engine: str = "unknown",
                meta: Optional[dict] = None) -> Optional[dict]:
-    text = str(text or "").strip()
+    text = _restore_interpuncts(str(text or "").strip())
     if not text:
         return None
     normalized_quad = _normalize_quad(quad)
@@ -1618,6 +1638,280 @@ def _recombine_fragments(lines: list[dict], cfg: Optional[dict] = None) -> list[
 
 
 # ---------------------------------------------------------------------------
+# Contained-duplicate suppression
+#
+# Ensemble reconciliation clusters observations by IoU/row alignment, which
+# misses the "fragment inside a longer reading" case: one engine reads
+# "geld terug tot €100." while another also emits "geld" (or a full timestamp
+# row next to its own two halves).  Both survive to the compiler, paint twice,
+# and leave ghost duplicate text.  A line whose tokens are a fuzzy contiguous
+# subsequence of an overlapping longer line is the same observation, not new
+# evidence — drop it and keep the fuller reading.
+
+
+_PUNCT_TOKEN_RE = re.compile(r"^\W+$")
+
+
+def _dedup_options(cfg: Optional[dict]) -> dict:
+    raw = ((cfg or {}).get("ocr") or {}).get("dedup_contained", True)
+    if isinstance(raw, bool):
+        return {"enabled": raw}
+    if isinstance(raw, dict):
+        options = dict(raw)
+        options.setdefault("enabled", True)
+        return options
+    return {"enabled": False}
+
+
+def _content_tokens(text: Any) -> list[str]:
+    return [token for token in _text_key(text).split(" ")
+            if token and not _PUNCT_TOKEN_RE.match(token)]
+
+
+def _fuzzy_token_subsequence(inner: list[str], outer: list[str], min_similarity: float) -> bool:
+    """True when ``inner`` appears (in order, contiguously, per-token fuzzy) in
+    ``outer`` and is strictly shorter — i.e. a partial duplicate, not a peer."""
+    if not inner or len(inner) >= len(outer):
+        return False
+    for start in range(len(outer) - len(inner) + 1):
+        window = outer[start:start + len(inner)]
+        if all(a == b or _text_similarity(a, b) >= min_similarity
+               for a, b in zip(inner, window)):
+            return True
+    return False
+
+
+def _box_containment(inner: dict, outer: dict) -> float:
+    """Fraction of ``inner``'s area covered by ``outer``."""
+    a, b = _clean_box(inner), _clean_box(outer)
+    ix = max(0.0, min(a["x"] + a["w"], b["x"] + b["w"]) - max(a["x"], b["x"]))
+    iy = max(0.0, min(a["y"] + a["h"], b["y"] + b["h"]) - max(a["y"], b["y"]))
+    area = a["w"] * a["h"]
+    return (ix * iy) / area if area > 0 else 0.0
+
+
+def _suppress_contained_duplicates(lines: list[dict], cfg: Optional[dict] = None) -> list[dict]:
+    options = _dedup_options(cfg)
+    if not options.get("enabled") or len(lines) < 2:
+        return copy.deepcopy(lines)
+    containment_min = _float(options.get("containment"), 0.55)
+    token_similarity = _float(options.get("token_similarity"), 0.85)
+    conf_tolerance = _float(options.get("conf_tolerance"), 0.15)
+
+    tokens = [_content_tokens(line.get("text")) for line in lines]
+    dropped: dict[int, int] = {}
+    for i, inner in enumerate(lines):
+        for j, outer in enumerate(lines):
+            if i == j or j in dropped:
+                continue
+            if not _fuzzy_token_subsequence(tokens[i], tokens[j], token_similarity):
+                continue
+            if _box_containment(inner.get("box") or {}, outer.get("box") or {}) < containment_min:
+                continue
+            # Never let a low-confidence container absorb a clearly better
+            # fragment reading; the fragment stays in the container's meta.
+            if _float(inner.get("conf")) > _float(outer.get("conf")) + conf_tolerance:
+                continue
+            dropped[i] = j
+            break
+
+    output = []
+    for index, line in enumerate(lines):
+        if index in dropped:
+            continue
+        kept = copy.deepcopy(line)
+        absorbed = [
+            {
+                "text": lines[k].get("text", ""),
+                "conf": round(_float(lines[k].get("conf")), 4),
+                "box": copy.deepcopy(lines[k].get("box") or {}),
+                "engine": _base_engine(lines[k]),
+            }
+            for k, owner in dropped.items() if owner == index
+        ]
+        if absorbed:
+            kept.setdefault("meta", {})["absorbed_duplicates"] = absorbed
+        output.append(kept)
+    return output
+
+
+# ---------------------------------------------------------------------------
+# High-risk numeric token verification (optional VLM pass)
+#
+# Short numeric tokens (counts, prices, times) carry no dictionary context, so a
+# confidently wrong engine ships errors like a retweet count 66 read as 99.
+# When engines disagreed on such a token — or the fused confidence is low — crop
+# the region and ask the local VLM for a charset-constrained transcription.
+# Bounded, config-gated, and never raises.
+
+
+_NUMERIC_TOKEN_RE = re.compile(r"^[\s\d.,:%€$£+kKmM]{1,10}$")
+
+_NUMERIC_PROMPT = (
+    "This crop shows one short numeric label from an ad or app screenshot (a count, "
+    "price, time, or percentage). Transcribe exactly the characters shown, digit for "
+    "digit, keeping symbols (€, $, %, :, ., ,) and any K/M suffix. Do not guess a "
+    "rounder or more common number — read the actual digits. Output only the "
+    "characters, nothing else. If no legible number is visible, output an empty string."
+)
+
+
+def _numeric_verify_options(cfg: Optional[dict]) -> dict:
+    cfg = cfg or {}
+    raw = (cfg.get("ocr") or {}).get("numeric_verify", True)
+    if isinstance(raw, bool):
+        options = {"enabled": raw}
+    elif isinstance(raw, dict):
+        options = dict(raw)
+        options.setdefault("enabled", True)
+    else:
+        options = {"enabled": False}
+    vlm = cfg.get("vlm") or {}
+    # The pass needs a reachable local VLM; the root switch gates it exactly like
+    # the other judge stages.
+    if not vlm.get("enabled"):
+        options["enabled"] = False
+    options.setdefault("base_url", vlm.get("base_url"))
+    options.setdefault("model", vlm.get("model"))
+    options.setdefault("timeout_s", vlm.get("timeout_s"))
+    return options
+
+
+def _is_numeric_token(text: Any) -> bool:
+    value = str(text or "").strip()
+    return bool(value) and bool(_NUMERIC_TOKEN_RE.match(value)) and any(ch.isdigit() for ch in value)
+
+
+def _risky_numeric_lines(lines: list[dict], min_conf: float) -> list[dict]:
+    risky = []
+    for line in lines:
+        if not line.get("box") or not _is_numeric_token(line.get("text")):
+            continue
+        disagreement = bool((line.get("meta") or {}).get("disagreement"))
+        if disagreement or _float(line.get("conf"), 1.0) < min_conf:
+            risky.append((0 if disagreement else 1, _float(line.get("conf"), 1.0), id(line), line))
+    risky.sort(key=lambda item: item[:2])
+    return [line for *_, line in risky]
+
+
+def _default_numeric_ask(crop: bytes, options: dict):
+    from src import vlm_client
+
+    return vlm_client.multi_pass_answer(
+        crop,
+        _NUMERIC_PROMPT,
+        base_url=str(options.get("base_url") or vlm_client._DEFAULT_BASE_URL),
+        model=str(options.get("model") or vlm_client._DEFAULT_MODEL),
+        timeout_s=_float(options.get("timeout_s"), vlm_client._DEFAULT_TIMEOUT_S),
+        max_tokens=int(options.get("max_tokens") or 200),
+        passes=int(options.get("passes") or 2),
+    )
+
+
+def _numeric_crop_bytes(image, box: dict, padding: int = 3):
+    """Crop the token and upscale small crops so tiny UI counts stay legible."""
+    from src import vlm_client
+
+    try:
+        h = _float(box.get("h"))
+        if 0 < h < 44:
+            from PIL import Image as _Image
+            import io
+
+            raw = vlm_client.crop_box_bytes(image, box, padding)
+            if raw is None:
+                return None
+            crop = _Image.open(io.BytesIO(raw))
+            scale = max(2.0, 44.0 / max(1.0, h))
+            scale = min(scale, 4.0)
+            resized = crop.resize(
+                (max(1, int(crop.width * scale)), max(1, int(crop.height * scale))),
+                _Image.Resampling.LANCZOS,
+            )
+            buffer = io.BytesIO()
+            resized.save(buffer, format="PNG")
+            return buffer.getvalue()
+        return vlm_client.crop_box_bytes(image, box, padding)
+    except Exception:
+        return None
+
+
+def _verify_numeric_tokens(img_path: str, lines: list[dict], cfg: Optional[dict],
+                           options: Optional[dict] = None, ask=None) -> Optional[dict]:
+    """Verify high-risk numeric tokens in place.  Returns evidence or None."""
+    options = options if options is not None else _numeric_verify_options(cfg)
+    if not options.get("enabled") or not lines:
+        return None
+    try:
+        from PIL import Image
+
+        image = Image.open(img_path)
+    except Exception:
+        return None
+
+    min_conf = _float(options.get("min_conf"), 0.90)
+    max_regions = max(0, min(16, int(options.get("max_regions") or 4)))
+    candidates = _risky_numeric_lines(lines, min_conf)[:max_regions]
+    if not candidates:
+        return None
+    ask = ask or (lambda crop: _default_numeric_ask(crop, options))
+
+    checked = corrected = errors = 0
+    notes: list[dict] = []
+    for line in candidates:
+        crop = _numeric_crop_bytes(image, line["box"], int(options.get("padding") or 3))
+        if crop is None:
+            continue
+        checked += 1
+        original = str(line.get("text", "")).strip()
+        try:
+            answer, note = ask(crop)
+        except Exception:
+            answer, note = None, "vlm_error"
+        if note == "vlm_error":
+            errors += 1
+            notes.append({"line_id": line.get("id"), "note": "vlm_error", "ocr_text": original})
+            continue
+        if note:
+            notes.append({"line_id": line.get("id"), "note": note, "ocr_text": original})
+            continue
+        answer = str(answer or "").strip()
+        # Charset-constrained acceptance: the judge may only produce another
+        # plausible numeric token of comparable length, never free text.
+        if (not answer or not _is_numeric_token(answer)
+                or len(answer) > max(6, len(original) + 3)):
+            notes.append({"line_id": line.get("id"), "note": "implausible_answer",
+                          "answer": answer, "ocr_text": original})
+            continue
+        meta = copy.deepcopy(line.get("meta") or {})
+        readings = meta.get("disagreement") or []
+        evidence = {
+            "answer": answer,
+            "ocr_text": original,
+            "readings": [str(value) for value in readings],
+            "reason": "disagreement" if readings else "low-confidence",
+        }
+        if answer != original:
+            line["ocr_text"] = original
+            line["text"] = answer
+            corrected += 1
+        # This *is* a VLM arbitration of the numeric reading; mark the line so
+        # the later generic OCR judge does not spend budget re-arbitrating it.
+        line["vlm_ocr_judged"] = True
+        meta.pop("disagreement", None)
+        meta["numeric_verify"] = evidence
+        line["meta"] = meta
+    return {
+        "enabled": True,
+        "model": str(options.get("model") or ""),
+        "checked": checked,
+        "corrected": corrected,
+        "errors": errors,
+        "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public pipeline
 
 
@@ -1761,6 +2055,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
     merged = _reconcile(primary_lines, challenger_sets, cfg=cfg) if challenger_sets else _reconcile(
         primary_lines, [], cfg=cfg
     )
+    merged = _suppress_contained_duplicates(merged, cfg=cfg)
     repaired = _recombine_fragments(merged, cfg=cfg)
     ordered = _order_lines(repaired)
     lines_out = []
@@ -1776,6 +2071,12 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
         if line.get("meta"):
             output["meta"] = copy.deepcopy(line["meta"])
         lines_out.append(output)
+
+    numeric_verify = None
+    try:
+        numeric_verify = _verify_numeric_tokens(img_path, lines_out, cfg)
+    except Exception as error:  # the verification pass must never sink OCR
+        print(f"[ocr] numeric verification skipped: {error}")
 
     width = height = 0
     try:
@@ -1806,6 +2107,8 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
             "geometry": geometry,
         },
     }
+    if numeric_verify and numeric_verify.get("checked"):
+        result["numeric_verify"] = numeric_verify
     if run_dir is None:
         run_dir = cfg.get("run_dir")
     if run_dir:

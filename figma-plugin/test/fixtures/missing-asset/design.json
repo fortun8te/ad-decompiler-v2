@@ -1,0 +1,58 @@
+{
+  "id": "missing-asset",
+  "name": "missing-asset",
+  "canvas": {
+    "w": 1000,
+    "h": 800
+  },
+  "schema_version": 2,
+  "meta": {
+    "coordinate_space": "local"
+  },
+  "layers": [
+    {
+      "id": "bg",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "bg",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "w": 1000,
+        "h": 800
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#ffffff"
+      }
+    },
+    {
+      "id": "ghost",
+      "type": "image",
+      "name": "ghost",
+      "box": {
+        "x": 100,
+        "y": 100,
+        "w": 300,
+        "h": 200
+      },
+      "src": "assets/ghost.png"
+    },
+    {
+      "id": "r1",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "r1",
+      "box": {
+        "x": 500,
+        "y": 100,
+        "w": 120,
+        "h": 80
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#cccccc"
+      }
+    }
+  ]
+}

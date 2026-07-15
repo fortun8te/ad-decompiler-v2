@@ -11,8 +11,8 @@ python3 run_pipeline.py --input <image> --output runs/<id>
 python3 run_pipeline.py --input <image> --output runs/<id> --resume <stage>
 ```
 
-Stages: `normalize ocr text residual qwen sam elements merge reconstruct layout design preview
-figma export diff qa`.
+Stages: `normalize ocr text residual qwen sam elements merge structure reconstruct layout design
+preview figma export diff qa`.
 
 Inspect `ocr.json`, `sam3.json`, `fused_elements.json`, `reconstruction.json`, `layout.json`,
 `design_preflight.json`, and `qa.json`. Also inspect `background_clean.png`, `ownership.png`,

@@ -340,3 +340,28 @@ def test_intentional_raster_cluster_keeps_positive_overlay_in_named_asset_group(
     group = tree[0]
     assert group["id"] == "asset-group-receipt"
     assert [child["id"] for child in group["children"]] == ["receipt", "offer"]
+
+
+def test_ui_label_in_pill_shell_groups_as_button_with_pill_radius():
+    # Exact 009 "Volgend" geometry: a full pill shell (radius == h/2 from
+    # reconstruct) with a centered UI label whose role is plain "label" (not
+    # cta). The pair must still group as one button frame that carries the
+    # pill radius and centers its text.
+    candidates = [
+        {"id": "c_E004", "target": "shape", "box": {"x": 833, "y": 134, "w": 202, "h": 67},
+         "fill": {"kind": "flat", "color": "#eff3f4"}, "radius": 33.5,
+         "meta": {"role": "button", "button_shell": True}},
+        {"id": "c_B1", "target": "text", "box": {"x": 860, "y": 146, "w": 150, "h": 48},
+         "text": "Volgend", "meta": {"role": "label"}},
+    ]
+    tree = layout.infer(candidates, {"w": 1080, "h": 1080}, {})
+    assert len(tree) == 1
+    frame = tree[0]
+    assert frame["target"] == "group"
+    assert frame["meta"]["role"] == "button"
+    assert frame["radius"] == 33.5
+    assert frame["meta"]["cornerRadius"] == 33.5
+    assert frame["layout"]["mode"] == "HORIZONTAL"
+    assert frame["layout"]["primaryAxisAlignItems"] == "CENTER"
+    assert frame["layout"]["counterAxisAlignItems"] == "CENTER"
+    assert frame["children"][0]["id"] == "c_B1"

@@ -1,0 +1,191 @@
+{
+  "id": "hostile-tokens",
+  "name": "hostile-tokens",
+  "canvas": {
+    "w": 1000,
+    "h": 800
+  },
+  "schema_version": 2,
+  "meta": {
+    "coordinate_space": "local"
+  },
+  "layers": [
+    {
+      "id": "bg",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "bg",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "w": 1000,
+        "h": 800
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#ffffff"
+      }
+    },
+    {
+      "id": "t-strike",
+      "type": "text",
+      "name": "t-strike",
+      "box": {
+        "x": 40,
+        "y": 40,
+        "w": 300,
+        "h": 30
+      },
+      "text": "struck through",
+      "style": {
+        "fontFamily": "Arial",
+        "fontSize": 18,
+        "color": "#111111",
+        "textDecoration": "line-through"
+      }
+    },
+    {
+      "id": "t-upper",
+      "type": "text",
+      "name": "t-upper",
+      "box": {
+        "x": 40,
+        "y": 100,
+        "w": 300,
+        "h": 30
+      },
+      "text": "shouty text",
+      "style": {
+        "fontFamily": "Arial",
+        "fontSize": 18,
+        "color": "#111111",
+        "textCase": "uppercase"
+      }
+    },
+    {
+      "id": "blend-lower",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "blend-lower",
+      "box": {
+        "x": 40,
+        "y": 160,
+        "w": 100,
+        "h": 60
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#cccccc"
+      },
+      "blend_mode": "multiply"
+    },
+    {
+      "id": "stroke-inner",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "stroke-inner",
+      "box": {
+        "x": 200,
+        "y": 160,
+        "w": 100,
+        "h": 60
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#cccccc"
+      },
+      "stroke": {
+        "color": "#000000",
+        "width": 2,
+        "align": "inner"
+      }
+    },
+    {
+      "id": "noise-fill",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "noise-fill",
+      "box": {
+        "x": 360,
+        "y": 160,
+        "w": 100,
+        "h": 60
+      },
+      "fill": {
+        "kind": "noise",
+        "color": null
+      }
+    },
+    {
+      "id": "glow",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "glow",
+      "box": {
+        "x": 520,
+        "y": 160,
+        "w": 100,
+        "h": 60
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#cccccc"
+      },
+      "effects": [
+        {
+          "type": "glow",
+          "color": "#ff00ff",
+          "radius": 10
+        }
+      ]
+    },
+    {
+      "id": "one-stop",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "one-stop",
+      "box": {
+        "x": 680,
+        "y": 160,
+        "w": 100,
+        "h": 60
+      },
+      "fill": {
+        "kind": "linear_gradient",
+        "stops": [
+          {
+            "color": "#ff0000",
+            "offset": 0.5
+          }
+        ]
+      }
+    },
+    {
+      "id": "widget",
+      "type": "widget",
+      "name": "widget",
+      "box": {
+        "x": 40,
+        "y": 300,
+        "w": 100,
+        "h": 100
+      }
+    },
+    {
+      "id": "hexagon",
+      "type": "shape",
+      "shape_kind": "hexagon",
+      "name": "hexagon",
+      "box": {
+        "x": 200,
+        "y": 300,
+        "w": 100,
+        "h": 100
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#aa66cc"
+      }
+    }
+  ]
+}

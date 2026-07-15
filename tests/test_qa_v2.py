@@ -645,3 +645,380 @@ def test_pipeline_degradations_in_design_meta_are_a_hard_fail_under_acceptance(t
 
     result2 = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
     assert "pipeline-degraded" not in _rules(result2)
+
+
+# ── F2: anti-rasterization gates fire without a Figma acceptance run ─────────────────
+
+
+def test_unexplained_raster_fallback_fails_ordinary_qa_without_require_native(tmp_path):
+    # F2: these honesty gates used to be keyed to figma.require_export (false everywhere),
+    # so 052 passed with an unexplained raster. They now evaluate whenever leaf accounting
+    # exists — no acceptance opt-in required.
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (40, 30), "white").save(source)
+    Image.new("RGB", (40, 30), "white").save(render)
+    accounting = {
+        "foreground_leaf_count": 1, "native_leaf_count": 0, "raster_leaf_count": 1,
+        "intentional_raster_cluster_count": 0, "fallback_raster_count": 1,
+        "unexplained_raster_count": 1, "unexplained_raster_ids": ["c_B0"],
+        "native_leaf_ratio": 0.0,
+    }
+    design = {"layers": [], "meta": {"editable_ratio": 0, "leaf_accounting": accounting,
+                                     "native_leaf_ratio": 0.0}}
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
+    assert "unexplained-raster-fallback" in _rules(result)
+
+
+def test_low_native_leaf_ratio_fails_ordinary_qa_without_require_native(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (40, 30), "white").save(source)
+    Image.new("RGB", (40, 30), "white").save(render)
+    accounting = {
+        "foreground_leaf_count": 5, "native_leaf_count": 1, "raster_leaf_count": 4,
+        "intentional_raster_cluster_count": 0, "fallback_raster_count": 0,
+        "unexplained_raster_count": 0, "unexplained_raster_ids": [],
+        "native_leaf_ratio": 0.2,
+    }
+    design = {"layers": [], "meta": {"editable_ratio": 0.2, "leaf_accounting": accounting,
+                                     "native_leaf_ratio": 0.2}}
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
+    assert "low-native-leaf-ratio" in _rules(result)
+
+    # Config can still turn the gate off explicitly (sane default is ON).
+    off = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design,
+                             thresholds={"enforce_native_leaf_accounting": False})
+    assert "low-native-leaf-ratio" not in _rules(off)
+
+
+# ── F3: plate-destruction ceiling ───────────────────────────────────────────────────
+
+
+def test_excessive_plate_destruction_is_a_hard_fail(tmp_path):
+    # F3: the removal/inpaint erased most of the canvas (the 002 class). There is a gate for
+    # an untouched plate and a no-op removal, but none for the opposite — a plate that was
+    # almost entirely rebuilt, which means real content was erased.
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    background = tmp_path / "background_clean.png"
+    removal = tmp_path / "removal_mask.png"
+    image = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(image).rectangle((5, 5, 94, 94), fill=(20, 40, 90))  # a big product panel
+    image.save(source); image.save(render)
+    # Clean plate erased the whole panel to gray -> ~80% of the canvas changed.
+    Image.new("RGB", (100, 100), (128, 128, 128)).save(background)
+    mask = Image.new("L", (100, 100), 0)
+    ImageDraw.Draw(mask).rectangle((5, 5, 94, 94), fill=255)
+    mask.save(removal)
+    design = {"layers": [
+        {"id": "background", "type": "image", "src": "background_clean.png",
+         "meta": {"role": "background", "source": "inpaint"}},
+        {"id": "panel", "type": "shape", "box": {"x": 5, "y": 5, "w": 90, "h": 90}},
+    ], "meta": {"editable_ratio": 0.5}}
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
+    assert "excessive-plate-destruction" in _rules(result)
+    assert result["structural"]["background"]["changed_canvas_ratio"] > 0.55
+
+    # A normal small removal does not trip it.
+    small_mask = Image.new("L", (100, 100), 0)
+    ImageDraw.Draw(small_mask).rectangle((40, 40, 55, 55), fill=255)
+    small_mask.save(removal)
+    Image.new("RGB", (100, 100), "white").save(background)  # tiny change area
+    result2 = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
+    assert "excessive-plate-destruction" not in _rules(result2)
+
+
+# ── F8: archetype text_recall_min threads through and gates ──────────────────────────
+
+
+def test_archetype_text_recall_min_threads_through_and_gates(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (60, 40), "white").save(source)
+    Image.new("RGB", (60, 40), "white").save(render)
+    source_ocr = {"lines": [{"id": "L0", "text": "HELLO WORLD", "conf": 0.99}]}
+    render_ocr = {"lines": []}  # nothing recognized in the render -> text_recall 0.0
+
+    # No threshold supplied: a bare compare keeps its old behaviour (no text-recall gate).
+    base = pixel_diff.compare(str(source), str(render), str(tmp_path),
+                              source_ocr=source_ocr, render_ocr=render_ocr)
+    assert base["text_recall"] == 0.0
+    assert "low-text-recall" not in _rules(base)
+
+    # Archetype preset strictness threaded in by the caller now gates.
+    gated = pixel_diff.compare(str(source), str(render), str(tmp_path),
+                               source_ocr=source_ocr, render_ocr=render_ocr,
+                               thresholds={"text_recall_min": 0.90})
+    assert "low-text-recall" in _rules(gated)
+
+
+# ── F15: unresolved glyph residue blocks a clean QA verdict ──────────────────────────
+
+
+def test_unresolved_glyph_residue_is_a_hard_fail(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (40, 30), "white")
+    image.save(source); image.save(render)
+    (tmp_path / "reconstruction.json").write_text(json.dumps({
+        "stats": {"text_residual": {
+            "enabled": True, "checked": 1, "reinpainted": False,
+            "flagged": [{"id": "c_B1", "residual_px": 180, "resolved": False}],
+        }},
+    }), encoding="utf-8")
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path),
+                                design={"layers": [], "meta": {"editable_ratio": 0.5}})
+    assert "glyph-residue" in _rules(result)
+
+    # A resolved (reinpainted) residue does NOT fail.
+    (tmp_path / "reconstruction.json").write_text(json.dumps({
+        "stats": {"text_residual": {
+            "enabled": True, "checked": 1, "reinpainted": True,
+            "flagged": [{"id": "c_B1", "residual_px": 0, "resolved": True}],
+        }},
+    }), encoding="utf-8")
+    ok = pixel_diff.compare(str(source), str(render), str(tmp_path),
+                            design={"layers": [], "meta": {"editable_ratio": 0.5}})
+    assert "glyph-residue" not in _rules(ok)
+
+
+# ── element_recall must be readable at the qa.json top level, not only nested ───────
+
+
+def test_element_recall_is_surfaced_at_the_top_level(tmp_path):
+    """The honesty refactor added a top-level mirror of editable_text_recall (and
+    rasterized_text_count/ratio) alongside their nested structural.* copies, but never
+    extended that mirroring to element_recall/element_survival even though the nested
+    computation (_element_survival_audit) was always correct. Any caller reading
+    qa.get("element_recall") directly -- the first place a human or script would look --
+    always saw null even on a run where structural.element_recall was a real number.
+    """
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (80, 60), "white")
+    image.save(source)
+    image.save(render)
+    (tmp_path / "elements.json").write_text(json.dumps([
+        {"id": "E0", "role": "product"},
+        {"id": "E1", "role": "badge"},
+    ]), encoding="utf-8")
+    (tmp_path / "reconstruction.json").write_text(json.dumps({
+        "candidates": [
+            {"id": "E0", "target": "image"},
+            {"id": "E1", "target": "image"},
+        ],
+        "stats": {},
+    }), encoding="utf-8")
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    assert result["element_recall"] == 1.0
+    assert result["element_recall"] == result["structural"]["element_recall"]
+    assert result["element_survival"] == result["structural"]["element_survival"]
+    assert result["element_survival"] == {
+        "proposed": 2, "kept": 2, "recall": 1.0, "missing_ids": [],
+    }
+
+
+def test_element_recall_top_level_reflects_a_real_drop(tmp_path):
+    """Same top-level mirror, but for the failing case: a dropped element must be visible
+    at qa["element_recall"] (not just buried in qa["structural"]) and the low-element-recall
+    hard fail must still fire.
+    """
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (80, 60), "white")
+    image.save(source)
+    image.save(render)
+    (tmp_path / "elements.json").write_text(json.dumps([
+        {"id": "E0", "role": "product"},
+        {"id": "E1", "role": "badge"},
+        {"id": "E2", "role": "icon"},
+        {"id": "E3", "role": "shape"},
+    ]), encoding="utf-8")
+    (tmp_path / "reconstruction.json").write_text(json.dumps({
+        "candidates": [{"id": "E0", "target": "image"}],
+        "stats": {},
+    }), encoding="utf-8")
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    assert result["element_recall"] == 0.25
+    assert "low-element-recall" in _rules(result)
+
+
+# ── true_text_coverage: editable_text_recall must not lie via its own denominator ───
+
+
+def test_true_text_coverage_catches_the_editable_text_recall_denominator_lie(tmp_path):
+    """021-style case: the render's TEXT nodes carry every line's copy verbatim (so
+    editable_text_recall reads a perfect 1.0 -- every source line OCR saw became an
+    editable node), but only one of those six lines is actually verified present in the
+    rendered pixels (render OCR only recognizes "BUY NOW"). editable_text_recall alone
+    hides that 5/6 of the ad's text never actually shipped correctly; true_text_coverage
+    = text_recall * editable_text_recall must read low, and the missing-editable-text
+    hard fail must fire on that combined signal even though editable_text_recall alone
+    clears its own 0.80 bar.
+    """
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (60, 40), "white").save(source)
+    Image.new("RGB", (60, 40), "white").save(render)
+    lines = [
+        "HEADLINE COPY", "SUPPORTING LINE ONE", "SUPPORTING LINE TWO",
+        "SUPPORTING LINE THREE", "SUPPORTING LINE FOUR", "BUY NOW",
+    ]
+    source_ocr = {"lines": [
+        {"id": f"L{i}", "text": text, "conf": 0.99} for i, text in enumerate(lines)
+    ]}
+    # Only the last line is actually legible in the rendered output.
+    render_ocr = {"lines": [{"id": "R0", "text": "BUY NOW", "conf": 0.99}]}
+    design = {
+        "layers": [
+            {"id": f"line{i}", "type": "text", "text": text,
+             "style": {"fontFamily": "Inter"}, "meta": {}}
+            for i, text in enumerate(lines)
+        ],
+        "meta": {"editable_ratio": 1.0},
+    }
+
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        source_ocr=source_ocr, render_ocr=render_ocr, design=design,
+    )
+
+    assert abs(result["text_recall"] - 1 / 6) < 1e-3
+    assert result["editable_text_recall"] == 1.0
+    assert abs(result["true_text_coverage"] - 1 / 6) < 1e-3
+    assert "missing-editable-text" in _rules(result)
+    detail = next(f["detail"] for f in result["hard_fails"] if f["rule"] == "missing-editable-text")
+    assert "true text coverage" in detail
+
+
+def test_true_text_coverage_does_not_pile_on_when_coverage_is_still_reasonable(tmp_path):
+    """025-style case in reverse: editable_text_recall is ALREADY low enough to fail on
+    its own (half the detected text was rasterized, not made editable), but OCR found
+    all of the source text (text_recall 1.0), so the combined true_text_coverage (0.5)
+    is still comfortably above the 0.20 floor. The gate must fire for the existing
+    editable_text_recall reason only -- true_text_coverage must not also claim to be low
+    when it isn't, and there must be exactly one missing-editable-text entry.
+    """
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (60, 40), "white").save(source)
+    Image.new("RGB", (60, 40), "white").save(render)
+    source_ocr = {"lines": [
+        {"id": "L0", "text": "HEADLINE COPY", "conf": 0.99},
+        {"id": "L1", "text": "SUPPORTING LINE", "conf": 0.99},
+    ]}
+    render_ocr = {"lines": [
+        {"id": "R0", "text": "HEADLINE COPY", "conf": 0.99},
+        {"id": "R1", "text": "SUPPORTING LINE", "conf": 0.99},
+    ]}
+    design = {
+        "layers": [
+            {"id": "headline", "type": "text", "text": "HEADLINE COPY",
+             "style": {"fontFamily": "Inter"}, "meta": {}},
+            {"id": "supporting", "type": "image", "src": None,
+             "meta": {"layer_disposition": "foreground_raster", "source_text": "SUPPORTING LINE"}},
+        ],
+        "meta": {"editable_ratio": 0.5},
+    }
+
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        source_ocr=source_ocr, render_ocr=render_ocr, design=design,
+    )
+
+    assert result["text_recall"] == 1.0
+    assert result["editable_text_recall"] == 0.5
+    assert result["true_text_coverage"] == 0.5
+
+    fails = [f for f in result["hard_fails"] if f["rule"] == "missing-editable-text"]
+    assert len(fails) == 1
+    assert "editable text recall" in fails[0]["detail"]
+    assert "true text coverage" not in fails[0]["detail"]
+
+
+# ── local-ssim-worst-region: a catastrophic window must not hide under a good aggregate ──
+
+
+def test_worst_local_window_hard_fails_even_when_the_aggregate_score_is_high(tmp_path):
+    """009/016-style case: the multiscale/local-ssim aggregate is deliberately
+    mean-dominated (0.72 mean + 0.26 p10 + 0.02 min per scale) so one badly corrupted
+    window barely dents it when the other ~99% of windows are perfect. That let a
+    genuinely catastrophic region (measured worst-window SSIM ~0.03-0.04 on 009/016)
+    hide under an aggregate score that stays comfortably above the pass bar. The
+    worst-region gate must fire independently of that aggregate, and report the
+    offending window's bbox as evidence.
+    """
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    size = (320, 320)
+    base = Image.new("RGB", size, (140, 150, 160))
+    draw = ImageDraw.Draw(base)
+    draw.rectangle((20, 20, 120, 90), fill=(60, 90, 180))
+    draw.ellipse((180, 200, 260, 270), fill=(200, 60, 40))
+    base.save(source)
+
+    corrupted = base.copy()
+    cdraw = ImageDraw.Draw(corrupted)
+    # Corrupt exactly one local window (the grid cell at x=256..288, y=0..32) with
+    # high-frequency noise uncorrelated with the smooth source patch underneath it.
+    # Everything else in the 320x320 canvas is untouched.
+    bx, by, bw = 256, 0, 32
+    for yy in range(by, by + bw, 2):
+        for xx in range(bx, bx + bw, 2):
+            fill = (0, 0, 0) if (xx + yy) % 4 == 0 else (255, 255, 255)
+            cdraw.rectangle((xx, yy, xx + 1, yy + 1), fill=fill)
+    corrupted.save(render)
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    # The aggregate stays high -- the ordinary local-ssim gate does not fire.
+    assert result["ssim"] >= 0.9
+    assert "local-ssim" not in _rules(result)
+    # But the worst single window is a near-total collapse, and it must hard fail with
+    # a locatable bbox even though the aggregate said everything was fine.
+    assert result["local_ssim_worst_window"]["ssim"] < 0.10
+    assert result["local_ssim_worst_window"]["bbox"] == {"x": 256, "y": 0, "w": 32, "h": 32}
+    assert "local-ssim-worst-region" in _rules(result)
+    detail = next(f["detail"] for f in result["hard_fails"] if f["rule"] == "local-ssim-worst-region")
+    assert "x=256 y=0 w=32 h=32" in detail
+
+
+# ── per-archetype color/edge floors: pixel_diff reads archetype.json itself ─────────
+
+
+def test_archetype_edge_and_color_floors_are_read_from_archetype_json(tmp_path):
+    """F-per-archetype-floor: most archetype presets don't define edge_f1_min/
+    color_similarity_min at all (checked against src/archetype.py), so pixel_diff must
+    not depend on every caller manually forwarding those keys the way text_recall_min is
+    threaded today -- it reads the run's own archetype.json (written by every run) and
+    applies the preset's floor itself, the same way editable_text_recall_min etc. are
+    already archetype-aware. Caller-supplied ``thresholds=`` still wins when present.
+    """
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = _scene(source)
+    changed = image.copy()
+    ImageDraw.Draw(changed).rectangle((44, 69, 60, 80), fill=(0, 255, 0))
+    changed.save(render)
+    (tmp_path / "archetype.json").write_text(json.dumps({
+        "archetype": "comparison_grid",
+        "preset": {"thresholds": {"edge_f1_min": 0.999, "color_similarity_min": 0.999}},
+    }), encoding="utf-8")
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    assert {"edge-fidelity", "color-fidelity"} <= _rules(result)
+
+    # An explicit caller threshold still overrides the archetype-file-derived floor.
+    lenient = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        thresholds={"edge_f1_min": 0.0, "color_similarity_min": 0.0},
+    )
+    assert "edge-fidelity" not in _rules(lenient)
+    assert "color-fidelity" not in _rules(lenient)

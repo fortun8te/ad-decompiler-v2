@@ -11,17 +11,35 @@ Output: {'ok', 'paths':[{'d','fill'}], 'engine', 'score', 'gate'}. Role-based qu
 rasterizes the traced result and compares alpha to the source; ok=False when score or path
 count exceeds role-specific limits (caller keeps the raster crop instead).
 
+Additive optional result fields (backward compatible; absent unless earned):
+  * 'gradient_fill' — a flat silhouette whose paint is a simple linear/radial gradient is
+    emitted as ONE path (flat hex fill for existing consumers) plus this native paint
+    description ({kind, angle?, stops, meta}); the returned 'svg' carries the real
+    <linearGradient>/<radialGradient> so SVG-capable importers get the true paint.
+  * 'primitive' — a near-circular / rounded-rect silhouette detected analytically
+    ({kind: ellipse|rrect, geometry..., iou}); the paths are the clean 4-curve ellipse or
+    rounded-rect instead of a wobbly trace.
+  * 'cleanup' — post-trace svg_cleanup.py stats ({paths: [before, after], points: [...]});
+    cleanup that fails the same render-back gate is rolled back per-crop.
+
 NEVER throws: on a missing binary / trace failure it returns ok=False with a note.
 Binaries: vtracer (`cargo install vtracer` or download release), potrace (`choco
-install potrace` / `brew install potrace`).
+install potrace` / `brew install potrace`). A missing potrace degrades to VTracer on a
+binarized crop (single degradation note, no per-crop warning spam).
 """
 from __future__ import annotations
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 from typing import Optional
+
+# One long install-hint per process; later crops carry only the short "binarized" note.
+_BINARY_DEGRADE_NOTED = False
+
+_KAPPA = 0.5522847498307936  # cubic Bézier quarter-circle constant
 
 
 def _fail(engine, note):
@@ -310,8 +328,16 @@ def _parse_svg_paths(svg_text):
                 rm2 = re.search(r"fill-rule:\s*([^;]+)", style.group(1))
                 if rm2:
                     rule = rm2.group(1).strip().lower()
+            # VTracer (python package >= 0.6.x) puts translate() on each <path> itself
+            # rather than an enclosing <g>. Dropping it displaced every traced shape to
+            # the origin: re-serialized SVGs failed the render gate after upscaling, and
+            # exported paths[] were silently wrong even when the raw SVG text passed.
+            matrix = stack[-1]
+            ptm = re.search(r'\btransform\s*=\s*"([^"]*)"', attrs)
+            if ptm:
+                matrix = _compose(matrix, _parse_transform(ptm.group(1)))
             try:
-                d_abs = _abs_path(dm.group(1), stack[-1])
+                d_abs = _abs_path(dm.group(1), matrix)
             except Exception:
                 d_abs = dm.group(1)
             if d_abs:
@@ -359,10 +385,22 @@ _DEFAULT_VTRACER_PRESETS = [
 _DEFAULT_SCORE_MIN = {
     "default": 0.85, "icon": 0.82, "logo": 0.82, "badge": 0.80,
     "arrow": 0.82, "mask": 0.78, "chip": 0.80, "shape": 0.88,
+    # Hand-drawn annotation strokes (marker underlines, strikethroughs, connector/leader
+    # lines) trace as thin flat marks; a headline-strict 0.85 gate over-rejects a couple
+    # of aliased edge pixels and forces a raster slice. The audit's YELLOW→GREEN win needs
+    # these to stay editable vectors, so they sit at the arrow tier. The render-back gate
+    # still arbitrates: a genuinely failed trace falls back to raster honestly.
+    "underline": 0.80, "strikethrough": 0.80, "strike_through": 0.80,
+    "connector": 0.80, "leader": 0.80, "callout_leader": 0.80, "leader_line": 0.80,
+    "line": 0.80, "divider": 0.80,
 }
 _DEFAULT_MAX_PATHS = {
     "default": 40, "icon": 60, "logo": 50, "badge": 35,
     "arrow": 30, "mask": 20, "chip": 35, "shape": 45,
+    # A single authored annotation stroke is one or two paths; a scribble a handful more.
+    "underline": 14, "strikethrough": 14, "strike_through": 14,
+    "connector": 24, "leader": 24, "callout_leader": 24, "leader_line": 24,
+    "line": 14, "divider": 14,
 }
 
 
@@ -500,22 +538,52 @@ def _preprocess_crop(png_path, cfg, role=None):
         arr = original_arr.copy()
         h, w = arr.shape[:2]
 
-        # Upscale tiny icons so tracers have enough pixels to work with.
+        # Upscale small icons with a sharp kernel so tracers see smooth, well-sampled
+        # edges instead of a handful of aliased pixels. Coordinates are restored to the
+        # original crop bounds by _normalize_trace_size after tracing.
         min_dim = min(w, h)
         upscale_below = int(pre.get("upscale_below", 48))
         upscale_target = int(pre.get("upscale_target", 96))
-        if min_dim < upscale_below and min_dim > 0:
+        kernel = {
+            "nearest": Image.Resampling.NEAREST,
+            "bilinear": Image.Resampling.BILINEAR,
+            "bicubic": Image.Resampling.BICUBIC,
+            "lanczos": Image.Resampling.LANCZOS,
+        }.get(str(pre.get("upscale_kernel", "lanczos")).lower(), Image.Resampling.LANCZOS)
+        scale = 1.0
+        if 0 < min_dim < upscale_below:
             scale = upscale_target / float(min_dim)
+        else:
+            icon_below = int(pre.get("icon_upscale_below", 128))
+            icon_factor = float(pre.get("icon_upscale_factor", 2.0))
+            role_key0 = str(role or "").lower()
+            if (icon_factor > 1.0 and 0 < min_dim < icon_below
+                    and role_key0 in ("icon", "logo", "badge", "arrow", "chip", "mask")):
+                scale = icon_factor
+        if scale > 1.0:
+            # Keep the traced raster bounded; a marginal upscale is not worth re-encoding.
+            scale = min(scale, 512.0 / float(max(w, h)))
+        if scale > 1.15:
             nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
-            rgba = rgba.resize((nw, nh), Image.Resampling.NEAREST)
+            rgba = rgba.resize((nw, nh), kernel)
             arr = np.array(rgba, dtype=np.uint8, copy=True)
             h, w = arr.shape[:2]
 
-        # Remove weak anti-alias fringe while preserving meaningful edge coverage.
+        # Remove weak anti-alias fringe while preserving meaningful edge coverage. A soft
+        # one-pixel fringe makes VTracer invent translucent sliver paths, so when the
+        # semi-transparent band is fringe-sized it is snapped hard to 0/255; a genuinely
+        # translucent design element (large mid-alpha fraction) keeps its soft alpha.
         if pre.get("denoise_fringe", True):
             alpha = arr[:, :, 3].astype(np.float32)
-            hard = np.where(alpha >= 200, 255, np.where(alpha <= 40, 0, alpha)).astype(np.uint8)
-            arr[:, :, 3] = hard
+            hard = np.where(alpha >= 200, 255, np.where(alpha <= 40, 0, alpha))
+            if pre.get("fringe_snap", True) is not False:
+                visible = alpha > 40
+                middle = visible & (alpha < 200)
+                fringe_frac = (float(middle.sum()) / float(visible.sum())) if visible.any() else 0.0
+                if 0.0 < fringe_frac <= float(pre.get("fringe_max_fraction", 0.35)):
+                    snap = float(pre.get("alpha_snap", 128))
+                    hard = np.where(alpha >= snap, 255, 0)
+            arr[:, :, 3] = hard.astype(np.uint8)
 
         # Quantize colors for cleaner multi-color traces (skip for near-monochrome).
         if pre.get("quantize_colors", True):
@@ -625,6 +693,285 @@ def _analytic_straight_line_svg(png_path, role):
         return None
 
 
+def _rgb_hex(rgb):
+    r, g, b = (int(max(0, min(255, round(float(v))))) for v in list(rgb)[:3])
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _hex_rgb(value):
+    s = str(value or "").strip().lower()
+    if not s.startswith("#"):
+        return None
+    s = s[1:]
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6:
+        return None
+    try:
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _mix_hex(a, b):
+    ca, cb = _hex_rgb(a), _hex_rgb(b)
+    if not ca or not cb:
+        return a if ca else "#808080"
+    return _rgb_hex([(va + vb) / 2.0 for va, vb in zip(ca, cb)])
+
+
+def _ellipse_d(cx, cy, rx, ry):
+    """Four-cubic ellipse path (the same clean geometry a designer would draw)."""
+    k = _KAPPA
+    x0, x1 = cx - rx, cx + rx
+    y0, y1 = cy - ry, cy + ry
+    return (
+        f"M{x1:.2f} {cy:.2f}"
+        f"C{x1:.2f} {cy + k * ry:.2f} {cx + k * rx:.2f} {y1:.2f} {cx:.2f} {y1:.2f}"
+        f"C{cx - k * rx:.2f} {y1:.2f} {x0:.2f} {cy + k * ry:.2f} {x0:.2f} {cy:.2f}"
+        f"C{x0:.2f} {cy - k * ry:.2f} {cx - k * rx:.2f} {y0:.2f} {cx:.2f} {y0:.2f}"
+        f"C{cx + k * rx:.2f} {y0:.2f} {x1:.2f} {cy - k * ry:.2f} {x1:.2f} {cy:.2f}Z"
+    )
+
+
+def _rrect_d(x, y, w, h, r):
+    """Axis-aligned rounded-rect path; r=0 degenerates to a plain 4-point rect."""
+    r = max(0.0, min(float(r), w / 2.0, h / 2.0))
+    right, bottom = x + w, y + h
+    if r < 0.5:
+        return (f"M{x:.2f} {y:.2f}L{right:.2f} {y:.2f}L{right:.2f} {bottom:.2f}"
+                f"L{x:.2f} {bottom:.2f}Z")
+    k = _KAPPA * r
+    return (
+        f"M{x + r:.2f} {y:.2f}"
+        f"L{right - r:.2f} {y:.2f}"
+        f"C{right - r + k:.2f} {y:.2f} {right:.2f} {y + r - k:.2f} {right:.2f} {y + r:.2f}"
+        f"L{right:.2f} {bottom - r:.2f}"
+        f"C{right:.2f} {bottom - r + k:.2f} {right - r + k:.2f} {bottom:.2f} "
+        f"{right - r:.2f} {bottom:.2f}"
+        f"L{x + r:.2f} {bottom:.2f}"
+        f"C{x + r - k:.2f} {bottom:.2f} {x:.2f} {bottom - r + k:.2f} {x:.2f} {bottom - r:.2f}"
+        f"L{x:.2f} {y + r:.2f}"
+        f"C{x:.2f} {y + r - k:.2f} {x + r - k:.2f} {y:.2f} {x + r:.2f} {y:.2f}Z"
+    )
+
+
+def _primitive_d(prim):
+    if prim["kind"] == "ellipse":
+        return _ellipse_d(prim["cx"], prim["cy"], prim["rx"], prim["ry"])
+    return _rrect_d(prim["x"], prim["y"], prim["w"], prim["h"], prim.get("radius", 0.0))
+
+
+def _fit_primitive(mask, min_iou=0.94, allow_plain_rect=False):
+    """Fit an ellipse or rounded-rect to a boolean silhouette; None unless IoU clears.
+
+    A near-circle traced by VTracer is a dozen wobbly Béziers; the analytic primitive is
+    the clean geometry a designer would author.  Sharp-cornered plain rects are excluded
+    by default (radius < 1.5px) so ordinary tracing keeps handling them.
+    """
+    np = _require_np()
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 40:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    bw, bh = x1 - x0 + 1, y1 - y0 + 1
+    if min(bw, bh) < 6:
+        return None
+    local = mask[y0:y1 + 1, x0:x1 + 1]
+    area = float(local.sum())
+    if area / float(bw * bh) < 0.5:
+        return None  # sparse marks (crosses, arrows, glyphs) are not primitives
+    yy, xx = np.mgrid[0:bh, 0:bw]
+    cx, cy = (bw - 1) / 2.0, (bh - 1) / 2.0
+
+    def iou(candidate):
+        union = float(np.logical_or(candidate, local).sum())
+        return float(np.logical_and(candidate, local).sum()) / union if union else 0.0
+
+    best = None
+    ellipse = (((xx - cx) / (bw / 2.0)) ** 2 + ((yy - cy) / (bh / 2.0)) ** 2) <= 1.0
+    ell_iou = iou(ellipse)
+    if ell_iou >= min_iou:
+        best = {"kind": "ellipse", "cx": round(x0 + cx, 2), "cy": round(y0 + cy, 2),
+                "rx": round(bw / 2.0, 2), "ry": round(bh / 2.0, 2),
+                "iou": round(ell_iou, 4)}
+    limit = min(bw, bh) / 2.0
+    r_est = math.sqrt(max(0.0, (bw * bh - area) / (4.0 - math.pi)))
+    radii = {min(limit, max(0.0, r_est * f)) for f in (0.75, 1.0, 1.25)}
+    if allow_plain_rect:
+        radii.add(0.0)
+    for r in sorted(radii):
+        if r < 1.5 and not allow_plain_rect:
+            continue
+        # Distance from each pixel centre to the radius-inset core rectangle.
+        px = np.clip(xx, r - 0.5, bw - 0.5 - r)
+        py = np.clip(yy, r - 0.5, bh - 0.5 - r)
+        rrect = ((xx - px) ** 2 + (yy - py) ** 2) <= r * r
+        rr_iou = iou(rrect)
+        # A circle is also a maximally-rounded rect; prefer the semantic ellipse unless
+        # the rounded-rect is a materially better fit, not a float-noise winner.
+        beat = best["iou"] + (0.005 if best["kind"] == "ellipse" else 0.0) if best else 0.0
+        if rr_iou >= min_iou and (best is None or rr_iou > beat):
+            best = {"kind": "rrect", "x": float(x0), "y": float(y0),
+                    "w": float(bw), "h": float(bh), "radius": round(float(r), 2),
+                    "iou": round(rr_iou, 4)}
+    return best
+
+
+def _detect_gradient(png_path, cfg):
+    """Fit a simple linear / centred-radial paint over the crop's visible pixels.
+
+    Mirrors reconstruct.py's style_extraction regression (colour vs position, R² gate,
+    radial-preference margin) so both stages agree about what a design gradient is.  A
+    binned smoothness check rejects stepped multi-band fills (flags, colour bars) that a
+    plane can numerically explain but that are authored as discrete bands.
+    """
+    gz = _vz_cfg(cfg).get("gradient") or {}
+    if gz.get("enabled", True) is False:
+        return None
+    np = _require_np()
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            rgba = np.asarray(im.convert("RGBA"), dtype=np.uint8)
+    except Exception:
+        return None
+    h, w = rgba.shape[:2]
+    if min(w, h) < 10:
+        return None
+    visible = rgba[:, :, 3] > 8
+    if not visible.any():
+        return None
+    mask = visible if bool((~visible).any()) else np.ones((h, w), dtype=bool)
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 80:
+        return None
+    min_range = float(gz.get("min_range", 18.0))
+    min_r2 = float(gz.get("min_r2", 0.86))
+    radial_min_r2 = float(gz.get("radial_min_r2", 0.91))
+    margin = float(gz.get("radial_r2_margin", 0.035))
+    band_tol = float(gz.get("smoothness_tolerance", 10.0))
+
+    sx, sy = max(1.0, (w - 1) / 2.0), max(1.0, (h - 1) / 2.0)
+    x = (xs.astype(np.float32) - (w - 1) / 2.0) / sx
+    y = (ys.astype(np.float32) - (h - 1) / 2.0) / sy
+    colors = rgba[ys, xs, :3].astype(np.float32)
+    if len(colors) > 12000:
+        pick = np.linspace(0, len(colors) - 1, 12000).astype(int)
+        x, y, colors = x[pick], y[pick], colors[pick]
+    spread = np.percentile(colors, 95, axis=0) - np.percentile(colors, 5, axis=0)
+    range_norm = float(np.linalg.norm(spread))
+    if range_norm < min_range:
+        return None
+    total = float(np.square(colors - colors.mean(axis=0)).sum())
+    if total <= 1e-6:
+        return None
+
+    def smooth_enough(projection, prediction):
+        lo, hi = float(projection.min()), float(projection.max())
+        if hi - lo <= 1e-6:
+            return False
+        edges = np.linspace(lo, hi, 13)
+        idx = np.clip(np.digitize(projection, edges) - 1, 0, 11)
+        worst = 0.0
+        for b in range(12):
+            sel = idx == b
+            if int(sel.sum()) < 20:
+                continue
+            dev = float(np.abs(colors[sel].mean(axis=0) - prediction[sel].mean(axis=0)).max())
+            worst = max(worst, dev)
+        return worst <= band_tol
+
+    linear = None
+    design = np.column_stack((np.ones(len(x), dtype=np.float32), x, y))
+    coeff, _, _, _ = np.linalg.lstsq(design, colors, rcond=None)
+    prediction = design @ coeff
+    linear_r2 = 1.0 - float(np.square(colors - prediction).sum()) / total
+    if linear_r2 >= min_r2:
+        _, _, vh = np.linalg.svd(colors - colors.mean(axis=0), full_matrices=False)
+        principal = vh[0]
+        dx, dy = float(coeff[1] @ principal), float(coeff[2] @ principal)
+        magnitude = (dx * dx + dy * dy) ** 0.5
+        if magnitude >= 0.5:
+            dx, dy = dx / magnitude, dy / magnitude
+            projection = x * dx + y * dy
+            low, high = np.percentile(projection, (2, 98))
+            if high - low >= 0.25 and smooth_enough(projection, prediction):
+                def endpoint(value):
+                    return coeff[0] + coeff[1] * (value * dx) + coeff[2] * (value * dy)
+                cx0, cy0 = (w - 1) / 2.0, (h - 1) / 2.0
+                linear = {
+                    "kind": "linear",
+                    "angle": round(math.degrees(math.atan2(dy, dx)), 2),
+                    "stops": [
+                        {"position": 0, "color": _rgb_hex(endpoint(low))},
+                        {"position": 1, "color": _rgb_hex(endpoint(high))},
+                    ],
+                    # Pixel-space gradient axis so the emitted SVG paint is exact.
+                    "meta": {
+                        "r2": round(linear_r2, 4), "range": round(range_norm, 2),
+                        "x1": round(float(cx0 + low * dx * sx), 2),
+                        "y1": round(float(cy0 + low * dy * sy), 2),
+                        "x2": round(float(cx0 + high * dx * sx), 2),
+                        "y2": round(float(cy0 + high * dy * sy), 2),
+                    },
+                }
+
+    radial = None
+    normalizer = max(1.0, float(math.hypot((w - 1) / 2.0, (h - 1) / 2.0)))
+    radius = (np.hypot(x * sx, y * sy) / normalizer).astype(np.float32)
+    design_r = np.column_stack((np.ones(len(radius), dtype=np.float32), radius))
+    coeff_r, _, _, _ = np.linalg.lstsq(design_r, colors, rcond=None)
+    prediction_r = design_r @ coeff_r
+    radial_r2 = 1.0 - float(np.square(colors - prediction_r).sum()) / total
+    if (radial_r2 >= radial_min_r2
+            and float(np.linalg.norm(coeff_r[1])) >= min_range * 0.55):
+        low_r, high_r = np.percentile(radius, (2, 98))
+        if high_r - low_r >= 0.35 and smooth_enough(radius, prediction_r):
+            radial = {
+                "kind": "radial",
+                "stops": [
+                    {"position": 0, "color": _rgb_hex(coeff_r[0])},
+                    {"position": 1, "color": _rgb_hex(coeff_r[0] + coeff_r[1])},
+                ],
+                "meta": {"r2": round(radial_r2, 4), "range": round(range_norm, 2),
+                         "center": [0.5, 0.5]},
+            }
+
+    # Prefer radial only when it explains materially more variance (reconstruct parity).
+    linear_r2_eff = float(((linear or {}).get("meta") or {}).get("r2", -1))
+    radial_r2_eff = float(((radial or {}).get("meta") or {}).get("r2", -1))
+    return radial if radial and radial_r2_eff >= linear_r2_eff + margin else linear
+
+
+def _gradient_svg(d, w, h, grad, winding=None):
+    """One silhouette path painted with the detected native gradient."""
+    stops = "".join(
+        f'<stop offset="{float(s.get("position", i)):g}" stop-color="{s["color"]}"/>'
+        for i, s in enumerate(grad["stops"])
+    )
+    meta = grad.get("meta") or {}
+    if grad["kind"] == "linear":
+        defs = (
+            f'<linearGradient id="vg" gradientUnits="userSpaceOnUse" '
+            f'x1="{meta.get("x1", 0)}" y1="{meta.get("y1", 0)}" '
+            f'x2="{meta.get("x2", w)}" y2="{meta.get("y2", 0)}">{stops}</linearGradient>'
+        )
+    else:
+        radius = math.hypot((w - 1) / 2.0, (h - 1) / 2.0)
+        defs = (
+            f'<radialGradient id="vg" gradientUnits="userSpaceOnUse" '
+            f'cx="{(w - 1) / 2.0:.2f}" cy="{(h - 1) / 2.0:.2f}" r="{radius:.2f}">'
+            f"{stops}</radialGradient>"
+        )
+    rule = ' fill-rule="evenodd"' if winding == "EVENODD" else ""
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+        f'viewBox="0 0 {w} {h}"><defs>{defs}</defs><path d="{d}" fill="url(#vg)"{rule}/></svg>'
+    )
+
+
 def _trace_color_count(png_path):
     """Count quantized foreground colours, ignoring transparent matte RGB."""
     np = _require_np()
@@ -727,6 +1074,39 @@ def _run_potrace(png_path, cfg, alpha_threshold=8, lum_threshold=128):
                     os.unlink(path)
                 except OSError:
                     pass
+
+
+def _run_vtracer_binarized(png_path, cfg):
+    """Silhouette trace without potrace: paint the foreground mask in its representative
+    colour and run VTracer on the clean two-level image.  This is the documented
+    degradation path when the configured ``binary_engine`` is not installed."""
+    np = _require_np()
+    tmp = None
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            rgba = np.asarray(im.convert("RGBA"), dtype=np.uint8)
+        mask, _ = _foreground_mask(rgba)
+        if not mask.any():
+            return None, "binarize: empty foreground"
+        rgb = _hex_rgb(_opaque_fill(png_path)) or (0, 0, 0)
+        flat = np.zeros_like(rgba)
+        flat[mask] = (rgb[0], rgb[1], rgb[2], 255)
+        fd, tmp = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        Image.fromarray(flat).save(tmp)
+        return _run_vtracer(tmp, cfg, {
+            "mode": "spline", "colormode": "color",
+            "hierarchical": "cutout", "filter_speckle": 2,
+        })
+    except Exception as e:
+        return None, f"binarized vtracer failed: {e}"
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _contour_paths_to_svg(paths, w, h):
@@ -990,6 +1370,184 @@ def _score_render(svg_text, png_path):
     return round(max(0.0, min(1.0, 0.7 * alpha_iou + 0.3 * colour)), 4)
 
 
+def _gradient_silhouette_result(png_path, cfg, role, n_colors, grad):
+    """Ship a detected gradient as ONE silhouette path + native gradient paint.
+
+    The returned ``paths`` keep a flat hex fill (the existing downstream contract:
+    preview tints the SVG alpha with the layer fill), while ``svg`` carries the true
+    <linearGradient>/<radialGradient> for SVG-capable consumers (Figma import). Both
+    representations must pass the same render-back gate; otherwise the crop falls
+    through to the ordinary tracers and stays honest.
+    """
+    np = _require_np()
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            rgba = np.asarray(im.convert("RGBA"), dtype=np.uint8)
+    except Exception:
+        return None
+    h, w = rgba.shape[:2]
+    alpha_mask = rgba[:, :, 3] > 8
+    if not alpha_mask.any():
+        return None
+    pz = _vz_cfg(cfg).get("primitives") or {}
+    min_iou = float(pz.get("min_iou", 0.94))
+    candidates = []
+    if bool(alpha_mask.all()):
+        candidates.append((
+            _rrect_d(0.0, 0.0, float(w), float(h), 0.0), None,
+            {"kind": "rrect", "x": 0.0, "y": 0.0, "w": float(w), "h": float(h),
+             "radius": 0.0, "iou": 1.0},
+        ))
+    else:
+        prim = None
+        if pz.get("enabled", True) is not False:
+            prim = _fit_primitive(alpha_mask, min_iou, allow_plain_rect=True)
+        if prim:
+            candidates.append((_primitive_d(prim), None, prim))
+        svg, _err = _run_contour_simplify(png_path, cfg)
+        if svg:
+            parsed = _parse_svg_paths(svg)
+            if parsed:
+                candidates.append((parsed[0]["d"], parsed[0].get("windingRule"), None))
+    score_min, _ = _gate_limits(role, cfg)
+    for d, winding, prim in candidates:
+        svg_grad = _gradient_svg(d, w, h, grad, winding)
+        result, _ = _evaluate_trace(
+            svg_grad, png_path, "analytic-gradient", cfg, role, n_colors,
+            preset_note=f"gradient={grad['kind']} r2={grad['meta'].get('r2')}",
+        )
+        if not result or not result["ok"]:
+            continue
+        mid = _mix_hex(grad["stops"][0]["color"], grad["stops"][-1]["color"])
+        flat_paths = [dict(p, fill=mid) for p in result["paths"]]
+        flat_score = _score_render(_contour_paths_to_svg(flat_paths, w, h), png_path)
+        if flat_score < score_min:
+            continue
+        result["paths"] = flat_paths
+        fill = dict(grad)
+        fill["meta"] = dict(grad.get("meta") or {}, flat_score=flat_score,
+                            silhouette="primitive" if prim else "contour")
+        result["gradient_fill"] = fill
+        if prim:
+            result["primitive"] = prim
+        result["note"] += f" flat_score={flat_score}"
+        return result
+    return None
+
+
+def _flat_primitive_result(png_path, cfg, role, n_colors):
+    """Prefer a clean analytic silhouette (circle / rounded-rect) for flat marks.
+
+    Only fires for genuinely flat one-paint silhouettes and only when the ordinary
+    render-back gate passes, so a textured or multi-colour icon still gets the faithful
+    tracer treatment.  Full-bleed rectangles stay with the ordinary tracers.
+    """
+    pz = _vz_cfg(cfg).get("primitives") or {}
+    if pz.get("enabled", True) is False:
+        return None
+    np = _require_np()
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            rgba = np.asarray(im.convert("RGBA"), dtype=np.uint8)
+    except Exception:
+        return None
+    h, w = rgba.shape[:2]
+    mask, _strategy = _foreground_mask(rgba)
+    if not mask.any() or bool(mask.all()):
+        return None
+    pixels = rgba[:, :, :3][mask].astype("float32")
+    if pixels.shape[0] < 40:
+        return None
+    if float(pixels.std(axis=0).max()) > float(pz.get("max_color_std", 14.0)):
+        return None
+    prim = _fit_primitive(mask, float(pz.get("min_iou", 0.94)), allow_plain_rect=False)
+    if not prim:
+        return None
+    fill = _rgb_hex(np.median(pixels, axis=0))
+    svg = _contour_paths_to_svg([{"d": _primitive_d(prim), "fill": fill}], w, h)
+    result, _ = _evaluate_trace(
+        svg, png_path, "analytic-primitive", cfg, role, n_colors,
+        preset_note=f"primitive={prim['kind']} iou={prim['iou']}",
+    )
+    if result and result["ok"]:
+        result["primitive"] = prim
+        return result
+    return None
+
+
+_CLEANUP_ENGINES = ("vtracer", "potrace", "contour")
+
+
+def _apply_cleanup(result, png_path, cfg, role, n_colors):
+    """Post-trace path cleanup, arbitrated by the same render-back gate as the trace.
+
+    Tiered: a full pass (with same-fill merging) first, then a conservative pass without
+    merging; whichever first passes the gate wins.  A cleanup that fails the gate — or
+    costs more than ``max_score_drop`` fidelity — is rolled back per-crop.  Can also
+    rescue an over-budget trace whose only gate failure was path count.
+    """
+    if not isinstance(result, dict) or not result.get("paths"):
+        return result
+    if result.get("engine") not in _CLEANUP_ENGINES:
+        return result
+    cl = _vz_cfg(cfg).get("cleanup") or {}
+    if cl.get("enabled", True) is False:
+        return result
+    try:
+        from . import svg_cleanup
+    except ImportError:
+        try:
+            import svg_cleanup  # script execution without package context
+        except ImportError:
+            return result
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            w, h = im.size
+    except Exception:
+        return result
+    before_paths = len(result["paths"])
+    before_points = svg_cleanup.count_points(result["paths"])
+    min_area = float(cl.get("min_area", 2.0))
+    tolerance = float(cl.get("simplify_tolerance", 0.6))
+    fill_tol = int(cl.get("fill_tolerance", 10))
+    max_drop = float(cl.get("max_score_drop", 0.03))
+    merge_enabled = cl.get("merge_fills", True) is not False
+    for merge in ((True, False) if merge_enabled else (False,)):
+        try:
+            cleaned = svg_cleanup.cleanup_paths(
+                result["paths"], min_area=min_area, tolerance=tolerance,
+                fill_tolerance=fill_tol, merge=merge,
+            )
+        except Exception:
+            return result
+        if not cleaned:
+            continue
+        after_paths = len(cleaned)
+        after_points = svg_cleanup.count_points(cleaned)
+        if after_paths >= before_paths and after_points >= before_points:
+            return result  # nothing to gain; skip the extra rasterization
+        svg = svg_cleanup.serialize_svg(cleaned, w, h)
+        candidate, _ = _evaluate_trace(
+            svg, png_path, result["engine"], cfg, role, n_colors, preset_note="cleanup",
+        )
+        if not candidate or not candidate["ok"]:
+            continue
+        if result.get("ok") and candidate["score"] < result["score"] - max_drop:
+            continue
+        candidate["cleanup"] = {"paths": [before_paths, after_paths],
+                                "points": [before_points, after_points],
+                                "merged": merge}
+        candidate["note"] = (
+            f"{result.get('note', '')} | cleanup paths {before_paths}->{after_paths} "
+            f"points {before_points}->{after_points}"
+        ).strip()
+        return candidate
+    return result
+
+
 # ── public API ───────────────────────────────────────────────────────────────────────
 def _evaluate_trace(svg, png_path, engine, cfg, role, n_colors, preset_note=""):
     score_min, max_paths = _gate_limits(role, cfg)
@@ -1065,6 +1623,30 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
             if result and consider(result):
                 return result
 
+        # A flat shape with a simple gradient paint must become one silhouette + native
+        # gradient, never ten stacked colour bands; a flat near-circle / rounded-rect
+        # becomes the clean analytic primitive.  Both are gated exactly like traces.
+        gradient_note = None
+        grad = _detect_gradient(png_path, cfg)
+        if grad:
+            result = _gradient_silhouette_result(png_path, cfg, role, n_colors, grad)
+            if result is not None:
+                return result
+            gradient_note = (f"gradient={grad['kind']} r2={grad['meta'].get('r2')} "
+                             "detected but silhouette failed the gate")
+        else:
+            result = _flat_primitive_result(png_path, cfg, role, n_colors)
+            if result is not None:
+                return result
+
+        def finalize(result):
+            result = _apply_cleanup(result, png_path, cfg, role, n_colors)
+            if gradient_note and isinstance(result, dict):
+                result["note"] = f"{result.get('note', '')}; {gradient_note}".strip("; ")
+            return result
+
+        potrace_missing = _resolve_binary(cfg, "binary_engine", "potrace") is None
+
         def try_vtracer():
             nonlocal note
             for i, preset in enumerate(_vtracer_presets(cfg)):
@@ -1081,8 +1663,33 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
                     return True
             return False
 
+        def try_vtracer_binarized():
+            # Single-shot potrace replacement: binarize the crop ourselves, trace it with
+            # VTracer, and stamp one process-wide degradation note instead of repeating
+            # a "potrace not found" warning on every monochrome crop.
+            nonlocal note
+            global _BINARY_DEGRADE_NOTED
+            svg, err = _run_vtracer_binarized(work_path, cfg)
+            if not svg:
+                note = err or note
+                return False
+            svg = _normalize_trace_size(svg, work_path, png_path)
+            result, fail = _evaluate_trace(
+                svg, png_path, "vtracer", cfg, role, n_colors, preset_note="binarized",
+            )
+            if result is None:
+                note = fail or note
+                return False
+            if not _BINARY_DEGRADE_NOTED:
+                result["note"] += (" [binary_engine 'potrace' not installed; binarized "
+                                   "crops degrade to vtracer -- choco install potrace]")
+                _BINARY_DEGRADE_NOTED = True
+            return consider(result)
+
         def try_potrace():
             nonlocal note
+            if potrace_missing:
+                return try_vtracer_binarized()
             for thr in _potrace_thresholds(cfg):
                 svg, err = _run_potrace(work_path, cfg, alpha_threshold=thr, lum_threshold=thr)
                 if not svg:
@@ -1100,14 +1707,14 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
 
         if prefer_potrace:
             if try_potrace():
-                return best
+                return finalize(best)
             if try_vtracer():
-                return best
+                return finalize(best)
         else:
             if try_vtracer():
-                return best
+                return finalize(best)
             if try_potrace():
-                return best
+                return finalize(best)
 
         if n_colors <= 1:
             svg, err = _run_contour_simplify(work_path, cfg)
@@ -1115,13 +1722,15 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
                 svg = _normalize_trace_size(svg, work_path, png_path)
                 result, _ = _evaluate_trace(svg, png_path, "contour", cfg, role, n_colors)
                 if result and consider(result):
-                    return result
+                    return finalize(result)
             else:
                 note = err or note
         else:
             note = f"{note}; contour skipped for {n_colors}-colour crop"
 
-        result = best or _fail("none", note)
+        # finalize() may still rescue a trace whose only failure was path-count budget:
+        # cleanup merges the banding down and re-runs the same gate.
+        result = finalize(best or _fail("none", note))
         if not result.get("ok") and bool((cfg.get("runtime") or {}).get("require_active_models")):
             result["active_model_required"] = True
             result["note"] = f"active vector backend required: {result.get('note', note)}"

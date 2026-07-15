@@ -40,6 +40,11 @@ if (-not $SkipGpuPackages) {
   Invoke-Checked $Python @("-m", "pip", "install", "-r", "requirements-gpu.txt")
   Write-Host "Installing the high-quality inpainting fallback..."
   Invoke-Checked $Python @("-m", "pip", "install", "simple-lama-inpainting", "pytesseract")
+  # Vectorization render-back gate (VTracer trace -> raster -> SSIM fidelity check). CairoSVG
+  # is the primary rasterizer; resvg_py is the pure-Python Windows fallback. This is production
+  # vectorization -- Potrace is only an optional monochrome fallback and is NOT required.
+  Write-Host "Installing the vectorization render-back gate (CairoSVG + resvg)..."
+  Invoke-Checked $Python @("-m", "pip", "install", "cairosvg", "resvg_py", "vtracer")
   # These are deliberately isolated: Paddle's CUDA libraries and Surya's pins have
   # both broken otherwise healthy Blackwell environments in all-or-nothing installs.
   Invoke-OptionalPip "PaddleOCR fallback" @("paddleocr>=3.0", "paddlepaddle-gpu>=3.0")
@@ -83,4 +88,8 @@ if (-not $SkipDoctor) {
 Write-Host ""
 Write-Host "Flux Fill weights are installed separately with scripts\setup_flux_inpaint.ps1."
 Write-Host "PowerPaint is an optional external adapter: this setup does not install or claim a PowerPaint model."
+Write-Host "Vectorization uses VTracer + CairoSVG/resvg (installed above). Potrace is an optional"
+Write-Host "monochrome-only fallback and is NOT required for a complete setup."
+Write-Host "The VLM is google/gemma-4-12b in LM Studio; enable the lms CLI (run: lms bootstrap) if you"
+Write-Host "use runtime.vram.evict_vlm_for_inpaint so the VLM can be unloaded during Flux inpaint."
 Write-Host "Setup finished. Next: double-click Start Bridge.bat."

@@ -590,3 +590,159 @@ def test_clear_engine_caches_clears_easyocr():
     ocr._EASYOCR_ENGINES[("en", False)] = object()
     ocr.clear_engine_caches()
     assert ocr._EASYOCR_ENGINES == {}
+
+
+# ---------------------------------------------------------------------------
+# Contained-duplicate suppression (ghost duplicate text)
+
+
+def test_contained_fragment_duplicate_is_absorbed_into_longer_reading():
+    # The exact 009 failure: one engine's "geld" fragment survives next to the
+    # full "geld terug tot €100." reading and paints twice.
+    fragment = _line("geld", 0.88, _box(37, 588, 91, 54), "doctr")
+    full = _line("geld terug tot €100.", 0.93, _box(44, 594, 345, 40), "doctr")
+    other = _line("Schrijf je nu in", 0.9, _box(45, 685, 300, 39), "doctr")
+
+    result = ocr._suppress_contained_duplicates([fragment, full, other], {"ocr": {}})
+
+    assert [line["text"] for line in result] == ["geld terug tot €100.", "Schrijf je nu in"]
+    absorbed = result[0]["meta"]["absorbed_duplicates"]
+    assert absorbed[0]["text"] == "geld"
+
+
+def test_contained_dedup_fuzzy_tokens_absorb_timestamp_row_fragments():
+    # Full-row reading plus its two fragment halves (with punctuation-only
+    # separator tokens and one OCR typo) must collapse to the single row.
+    full = _line("05:00 PM . 12-05-2026 - 121K weergaver", 0.86, _box(36, 930, 670, 40), "doctr")
+    left = _line("05:00 PM", 0.75, _box(36, 932, 170, 36), "easyocr")
+    right = _line("12-05-2026 121K weergaven", 0.70, _box(240, 932, 420, 36), "easyocr")
+
+    result = ocr._suppress_contained_duplicates([full, left, right], {"ocr": {}})
+
+    assert len(result) == 1
+    assert result[0]["text"].startswith("05:00 PM")
+    assert len(result[0]["meta"]["absorbed_duplicates"]) == 2
+
+
+def test_contained_dedup_keeps_distinct_neighbors_and_better_fragments():
+    # Distinct labels that merely overlap are not duplicates.
+    price = _line("SAVE 20%", 0.95, _box(20, 40, 90, 20), "doctr")
+    cta = _line("SHOP NOW", 0.95, _box(30, 42, 120, 20), "doctr")
+    assert len(ocr._suppress_contained_duplicates([price, cta], {"ocr": {}})) == 2
+
+    # A fragment that reads much *better* than its container is kept.
+    weak_full = _line("gelt terug tot C100.", 0.40, _box(44, 594, 345, 40), "doctr")
+    strong_fragment = _line("terug tot", 0.99, _box(120, 596, 100, 36), "easyocr")
+    kept = ocr._suppress_contained_duplicates([weak_full, strong_fragment], {"ocr": {}})
+    assert [line["text"] for line in kept] == ["gelt terug tot C100.", "terug tot"]
+
+
+def test_contained_dedup_is_config_gated():
+    fragment = _line("geld", 0.88, _box(37, 588, 91, 54), "doctr")
+    full = _line("geld terug tot €100.", 0.93, _box(44, 594, 345, 40), "doctr")
+    kept = ocr._suppress_contained_duplicates(
+        [fragment, full], {"ocr": {"dedup_contained": False}}
+    )
+    assert len(kept) == 2
+
+
+# ---------------------------------------------------------------------------
+# High-risk numeric token verification (66 -> 99 error class)
+
+
+def _numeric_cfg(**overrides):
+    options = {"enabled": True, "max_regions": 4, "min_conf": 0.90}
+    options.update(overrides)
+    return {"vlm": {"enabled": True}, "ocr": {"numeric_verify": options}}
+
+
+def test_numeric_verify_corrects_disagreed_count(tmp_path):
+    image_path = tmp_path / "counts.png"
+    Image.new("RGB", (400, 120), "white").save(image_path)
+    line = _line("99", 0.95, _box(250, 40, 40, 30), "doctr")
+    line["id"] = "L0"
+    line["meta"]["disagreement"] = ["1 66", "99"]
+    asked = []
+
+    def fake_ask(crop):
+        asked.append(crop)
+        return "66", None
+
+    result = ocr._verify_numeric_tokens(
+        str(image_path), [line], _numeric_cfg(), ask=fake_ask,
+    )
+
+    assert len(asked) == 1
+    assert result["checked"] == 1 and result["corrected"] == 1
+    assert line["text"] == "66"
+    assert line["ocr_text"] == "99"
+    assert line["vlm_ocr_judged"] is True
+    assert "disagreement" not in line["meta"]
+    assert line["meta"]["numeric_verify"]["reason"] == "disagreement"
+    assert line["meta"]["numeric_verify"]["readings"] == ["1 66", "99"]
+
+
+def test_numeric_verify_rejects_non_numeric_or_overlong_answers(tmp_path):
+    image_path = tmp_path / "counts.png"
+    Image.new("RGB", (400, 120), "white").save(image_path)
+    reject_word = _line("99", 0.5, _box(250, 40, 40, 30), "doctr")
+    reject_word["id"] = "L0"
+    reject_long = _line("21", 0.5, _box(50, 40, 40, 30), "doctr")
+    reject_long["id"] = "L1"
+    answers = {"L0": "ninety-nine", "L1": "1234567890"}
+    order = []
+
+    def fake_ask(crop):
+        return answers[order.pop(0)], None
+
+    order.extend(["L0", "L1"])
+    result = ocr._verify_numeric_tokens(
+        str(image_path), [reject_word, reject_long], _numeric_cfg(), ask=fake_ask,
+    )
+
+    assert result["corrected"] == 0
+    assert reject_word["text"] == "99"
+    assert reject_long["text"] == "21"
+    assert all(note["note"] == "implausible_answer" for note in result["notes"])
+
+
+def test_numeric_verify_skips_confident_agreed_tokens_and_letters(tmp_path):
+    image_path = tmp_path / "counts.png"
+    Image.new("RGB", (400, 120), "white").save(image_path)
+    confident = _line("257", 0.96, _box(20, 40, 50, 30), "doctr")
+    words = _line("weergaven", 0.40, _box(90, 40, 140, 30), "doctr")
+    called = []
+
+    def fake_ask(crop):
+        called.append(crop)
+        return "0", None
+
+    result = ocr._verify_numeric_tokens(
+        str(image_path), [confident, words], _numeric_cfg(), ask=fake_ask,
+    )
+
+    assert result is None
+    assert called == []
+    assert confident["text"] == "257"
+
+
+def test_numeric_verify_requires_vlm_and_survives_errors(tmp_path):
+    image_path = tmp_path / "counts.png"
+    Image.new("RGB", (400, 120), "white").save(image_path)
+    line = _line("99", 0.5, _box(250, 40, 40, 30), "doctr")
+    line["id"] = "L0"
+
+    # Root VLM switch off -> the whole pass is disabled.
+    disabled = ocr._verify_numeric_tokens(
+        str(image_path), [line], {"vlm": {"enabled": False}, "ocr": {"numeric_verify": True}},
+    )
+    assert disabled is None
+
+    # A VLM error must leave the line untouched and be counted, not raised.
+    def error_ask(crop):
+        return None, "vlm_error"
+
+    result = ocr._verify_numeric_tokens(str(image_path), [line], _numeric_cfg(), ask=error_ask)
+    assert result["errors"] == 1
+    assert line["text"] == "99"
+    assert "numeric_verify" not in (line.get("meta") or {})

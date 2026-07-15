@@ -431,3 +431,127 @@ def test_dedup_text_collapses_explicit_layer_ids():
     ids = {item["id"] for item in merged}
     assert "c_B3" in ids
     assert "c_B19" not in ids
+
+
+def test_duplicate_timestamp_rows_from_different_sources_collapse_to_one():
+    """Regression for run 009: one OCR engine read the whole timestamp row, another split
+    it into a fragment. Near-identical geometry + one content subset of the other -> the
+    complete row survives, the fragment is dropped, and provenance is recorded on the
+    keeper. Without this, all copies re-render on top of each other (ghost timestamp)."""
+    ocr = {"lines": [
+        {"id": "full", "text": "05:00 PM . 12-05-2026 - 121K weergaven", "conf": 0.82,
+         "box": {"x": 20, "y": 520, "w": 560, "h": 30}, "role": "label"},
+        {"id": "frag", "text": "12-05-2026 121K weergaven", "conf": 0.90,
+         "box": {"x": 180, "y": 521, "w": 400, "h": 32}, "role": "label"},
+    ]}
+    merged = _by_id(merge_layers.merge(ocr, [], [], CANVAS, {}))
+    assert "c_full" in merged
+    assert "c_frag" not in merged  # the fragment collapsed into the complete row
+    assert "c_frag" in merged["c_full"]["meta"]["deduped_text_ids"]
+
+
+def test_text_dedup_keys_on_content_containment_not_iou_alone():
+    """A short subset fragment ('05:00 PM') can share a low IoU with the full row yet be
+    fully contained inside it. Geometry+content dedup must still collapse it — the point of
+    not relying on an IoU threshold alone."""
+    ocr = {"lines": [
+        {"id": "row", "text": "05:00 PM . 12-05-2026 - 121K weergaven", "conf": 0.80,
+         "box": {"x": 20, "y": 520, "w": 560, "h": 30}, "role": "label"},
+        {"id": "left", "text": "05:00 PM", "conf": 0.85,
+         "box": {"x": 16, "y": 521, "w": 140, "h": 28}, "role": "label"},
+    ]}
+    merged = _by_id(merge_layers.merge(ocr, [], [], CANVAS, {}))
+    assert "c_row" in merged
+    assert "c_left" not in merged  # low IoU, but fully contained + content subset
+
+
+def test_distinct_neighbouring_text_is_not_deduped():
+    """Guard against over-dedup: two different footer counts near each other must both
+    survive (no shared content tokens)."""
+    ocr = {"lines": [
+        {"id": "likes", "text": "257", "conf": 0.98,
+         "box": {"x": 100, "y": 540, "w": 60, "h": 28}, "role": "footer"},
+        {"id": "views", "text": "21K", "conf": 0.98,
+         "box": {"x": 110, "y": 542, "w": 60, "h": 28}, "role": "footer"},
+    ]}
+    merged = _by_id(merge_layers.merge(ocr, [], [], CANVAS, {}))
+    assert "c_likes" in merged
+    assert "c_views" in merged
+
+
+def test_fragment_absorbed_into_paragraph_block_is_not_rendered_twice():
+    """Regression for run 009 'geld': a lone fragment line the paragraph block absorbed
+    duplicates a richer standalone line, so the word rendered twice at different offsets.
+    The fragment is stripped from the block; the richer standalone line survives."""
+    lines = [
+        {"id": "L0", "text": "bestellingen hun", "conf": .95,
+         "box": {"x": 40, "y": 100, "w": 400, "h": 24}, "role": "body"},
+        {"id": "L_frag", "text": "geld", "conf": .70,
+         "box": {"x": 40, "y": 128, "w": 60, "h": 26}, "role": "body"},
+        {"id": "L2", "text": "Schrijf je nu in", "conf": .95,
+         "box": {"x": 40, "y": 220, "w": 380, "h": 24}, "role": "body"},
+        {"id": "L_full", "text": "geld terug tot €100.", "conf": .92,
+         "box": {"x": 44, "y": 130, "w": 250, "h": 24}, "role": "price"},
+    ]
+    blocks = [
+        {"id": "B_body", "line_ids": ["L0", "L_frag", "L2"],
+         "text": "bestellingen hun\ngeld\nSchrijf je nu in",
+         "box": {"x": 40, "y": 100, "w": 400, "h": 144}, "role": "body", "meta": {}},
+        {"id": "B_price", "line_ids": ["L_full"], "text": "geld terug tot €100.",
+         "box": dict(lines[3]["box"]), "role": "price", "meta": {}},
+    ]
+    merged = _by_id(merge_layers.merge(
+        {"lines": lines, "blocks": blocks, "styles": []}, [], [], CANVAS, {}))
+    assert merged["c_B_body"]["text"] == "bestellingen hun\nSchrijf je nu in"
+    assert "geld" not in merged["c_B_body"]["text"]
+    assert merged["c_B_price"]["text"] == "geld terug tot €100."
+
+
+def test_scene_text_is_never_also_an_editable_overlay():
+    """Contract with reconstruct: text kept baked in a product photo must not also carry
+    overlay_text/removal_required, or reconstruct._is_text_removal erases its pixels from
+    the plate without re-emitting a layer. merge enforces mutual exclusivity here."""
+    elements = [{"id": "product", "box": {"x": 100, "y": 100, "w": 300, "h": 300},
+                 "kind": "photo-fragment", "area": 90000, "coverage": .25, "role": "product"}]
+    ocr = {"lines": [{
+        "id": "printed", "text": "500ML", "conf": .95, "role": "body",
+        "box": {"x": 160, "y": 200, "w": 90, "h": 24},
+        "meta": {"scene_text_role": "printed_on_product",
+                 "overlay_text": True, "removal_required": True}}]}
+    qwen = [{"id": "Q", "box": {"x": 100, "y": 100, "w": 300, "h": 300},
+             "png": "q.png", "kind_hint": "photo"}]
+    printed = _by_id(merge_layers.merge(ocr, elements, qwen, CANVAS, {}))["c_printed"]
+    assert printed["target"] == "drop"
+    assert printed["meta"]["kept_in_photo"] is True
+    assert not printed["meta"].get("overlay_text")
+    assert not printed["meta"].get("removal_required")
+    assert "overlay_text" in printed["meta"]["scene_text_contract_enforced"]
+
+
+def test_merge_layer_order_is_deterministic():
+    """Stable sort keys (z, area, reading order, id) make the merged layer list reproducible
+    for identical inputs, so downstream runs diff cleanly."""
+    ocr = _ocr()
+    elements = _elements()
+    order_a = [c["id"] for c in merge_layers.merge(ocr, elements, _qwen(), CANVAS, {})]
+    order_b = [c["id"] for c in merge_layers.merge(ocr, elements, _qwen(), CANVAS, {})]
+    assert order_a == order_b
+
+
+def test_merge_report_records_dedup_reasons_when_run_dir_given(tmp_path):
+    """Diagnostics counts/reasons are emitted as a sidecar report next to merged.json."""
+    import json
+    ocr = {"lines": [
+        {"id": "full", "text": "05:00 PM . 12-05-2026 - 121K weergaven", "conf": 0.82,
+         "box": {"x": 20, "y": 520, "w": 560, "h": 30}, "role": "label"},
+        {"id": "frag", "text": "12-05-2026 121K weergaven", "conf": 0.90,
+         "box": {"x": 180, "y": 521, "w": 400, "h": 32}, "role": "label"},
+    ]}
+    run_dir = str(tmp_path)
+    merge_layers.merge(ocr, [], [], CANVAS, {}, run_dir=run_dir)
+    merged = json.load(open(os.path.join(run_dir, "merged.json"), encoding="utf-8"))
+    assert isinstance(merged, list)  # scene_intent requires a plain list
+    report = json.load(open(os.path.join(run_dir, "merge_report.json"), encoding="utf-8"))
+    assert report["counts"]["text_dedup"] == 1
+    assert report["text_dedup"][0]["dropped"] == "c_frag"
+    assert report["text_dedup"][0]["kept"] == "c_full"

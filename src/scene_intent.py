@@ -117,7 +117,7 @@ def plan(candidates: list[dict], canvas: dict, cfg: dict | None = None) -> dict:
 
     # ``layout.infer`` may intentionally absorb a redundant painted shell into a frame.
     # Record that fact rather than pretending the source entity was never observed.
-    return {
+    intent = {
         "schema_version": SCHEMA_VERSION,
         "kind": "scene-intent",
         "planner": "layout.infer",
@@ -129,6 +129,13 @@ def plan(candidates: list[dict], canvas: dict, cfg: dict | None = None) -> dict:
         "synthetic_ids": sorted(tree_ids - source_set),
         "tree": tree,
     }
+    # The advisory VLM grouping outcome (applied or the rejection reason) is part of
+    # the deliverable's provenance: a degraded/skipped pass must be observable in
+    # scene_intent.json, never silently identical to "the VLM agreed with us".
+    vlm_grouping = getattr(tree, "vlm_grouping", None)
+    if vlm_grouping is not None:
+        intent["vlm_grouping"] = vlm_grouping
+    return intent
 
 
 def is_current(intent: dict, candidates: list[dict], canvas: dict, cfg: dict | None = None) -> bool:

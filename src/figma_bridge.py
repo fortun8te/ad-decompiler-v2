@@ -163,6 +163,9 @@ def _read_history(inbox):
             row["finished_at"] = float(finished_at)
         if isinstance(entry.get("qa_ok"), bool):
             row["qa_ok"] = entry["qa_ok"]
+        visual_score = entry.get("visual_score")
+        if isinstance(visual_score, (int, float)) and not isinstance(visual_score, bool):
+            row["visual_score"] = float(visual_score)
         layer_count = entry.get("layer_count")
         if isinstance(layer_count, int) and layer_count >= 0:
             row["layer_count"] = layer_count
@@ -274,7 +277,8 @@ def _estimate_eta(inbox, elapsed_s, stage=None):
 
 
 def _record_history(inbox, duration_s, run_dir=None, *, job_id=None, filename=None,
-                    doc_id=None, finished_at=None, qa_ok=None, layer_count=None):
+                    doc_id=None, finished_at=None, qa_ok=None, layer_count=None,
+                    visual_score=None):
     history = _read_history(inbox)
     entry = {"duration_s": float(duration_s)}
     fracs = _parse_stage_fractions(run_dir, duration_s)
@@ -290,6 +294,8 @@ def _record_history(inbox, duration_s, run_dir=None, *, job_id=None, filename=No
         entry["finished_at"] = float(finished_at)
     if isinstance(qa_ok, bool):
         entry["qa_ok"] = qa_ok
+    if isinstance(visual_score, (int, float)) and not isinstance(visual_score, bool):
+        entry["visual_score"] = float(visual_score)
     if isinstance(layer_count, int) and layer_count >= 0:
         entry["layer_count"] = layer_count
     runs = (history.get("runs") or []) + [entry]
@@ -488,6 +494,30 @@ def _read_json_file(path):
             return json.load(fh)
     except (OSError, ValueError, TypeError):
         return None
+
+
+def _read_file_bytes(path, attempts=3):
+    """Read a file's bytes, tolerating the brief Windows sharing-violation window that
+    os.replace() opens for a concurrent reader while a writer atomically swaps the file.
+
+    Returns None (never a torn/partial read) when the file is missing or stays locked.
+    os.replace() is atomic, so a successful read always sees a whole old-or-new file —
+    the retry only covers the transient PermissionError a racing swap can raise on Windows.
+    """
+    for attempt in range(attempts):
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            if attempt < attempts - 1:
+                time.sleep(0.03)
+                continue
+            return None
+        except OSError:
+            return None
+    return None
 
 
 def _read_bridge_build():
@@ -745,6 +775,51 @@ def _rerun_qa_for_run(run_dir, config_path=None):
     return {"ok": bool(result.get("qa_ok")), "qa_ok": result.get("qa_ok"), "run_dir": run_dir}
 
 
+def _qa_evidence(run_dir):
+    """Shared QA + runtime evidence block read from a run_dir's qa.json / runtime_report.json.
+
+    Reused by /run-summary (job_id and doc_id lookups) and /run.json so a staged run's QA
+    evidence is retrievable by doc_id, not only by a live-session job_id. Returns only score
+    data — never the run_dir path — so callers can expose it without leaking bridge paths.
+    """
+    qa = _read_json_file(os.path.join(run_dir, "qa.json")) if run_dir else None
+    runtime = _read_json_file(os.path.join(run_dir, "runtime_report.json")) if run_dir else None
+    structural = (qa or {}).get("structural") or {}
+    hard_fails = (qa or {}).get("hard_fails")
+    structural_hard_fails = structural.get("hard_fails")
+    merged_hard_fails = list(hard_fails or []) if isinstance(hard_fails, list) else []
+    seen_failures = {
+        (item.get("rule"), item.get("detail"))
+        for item in merged_hard_fails if isinstance(item, dict)
+    }
+    if isinstance(structural_hard_fails, list):
+        for item in structural_hard_fails:
+            key = (item.get("rule"), item.get("detail")) if isinstance(item, dict) else None
+            if key and key not in seen_failures:
+                merged_hard_fails.append(item)
+                seen_failures.add(key)
+    qa_evidence_complete = bool(
+        isinstance(qa, dict)
+        and isinstance(hard_fails, list)
+        and isinstance(structural, dict)
+        and isinstance(structural_hard_fails, list)
+        and all(key in structural for key in ("background", "layer_alpha", "element_recall"))
+    )
+    return {
+        "qa_evidence_complete": qa_evidence_complete,
+        "hard_fails": merged_hard_fails,
+        "visual_score": (qa or {}).get("visual_score"),
+        "ssim": (qa or {}).get("ssim"),
+        "element_recall": structural.get("element_recall"),
+        "background_audit": structural.get("background"),
+        "layer_alpha_audit": structural.get("layer_alpha") or [],
+        "runtime_status": (runtime or {}).get("status"),
+        "runtime_acceptable": (runtime or {}).get("acceptable") is True,
+        "runtime_violations": (runtime or {}).get("violations") or [],
+        "qa_ok": (qa or {}).get("ok"),
+    }
+
+
 def make_handler(inbox, config_path=None):
     jobs = {}
     jobs_lock = threading.RLock()
@@ -993,6 +1068,7 @@ def make_handler(inbox, config_path=None):
                         ))
                 if job_success:
                     finished_at = time.time()
+                    visual_score = final_qa.get("visual_score") if isinstance(final_qa, dict) else None
                     _record_history(
                         inbox, finished_at - started, run_dir,
                         job_id=job_id,
@@ -1001,6 +1077,7 @@ def make_handler(inbox, config_path=None):
                         finished_at=finished_at,
                         qa_ok=qa_passed,
                         layer_count=(staging or {}).get("layer_count"),
+                        visual_score=visual_score,
                     )
                     _append_plugin_logs(inbox, [{
                         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1040,17 +1117,37 @@ def make_handler(inbox, config_path=None):
             _finish_job_thread(job_id)
 
     class H(BaseHTTPRequestHandler):
-        def _send(self, code, body=b"", ctype="application/octet-stream"):
+        def _send(self, code, body=b"", ctype="application/octet-stream", cache="no-store"):
+            # JSON responses are dynamic -> no-store. Static staged assets (preview.png,
+            # /asset) are served with the plugin's ?t=<staged_at> cache-buster as the cache
+            # key, so they get "no-cache" (may be stored, must revalidate) instead: this
+            # never serves a stale render even when two stages land in the same wall-clock
+            # second (staged_at has 1s resolution) yet still marks the asset cacheable.
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
             self.end_headers()
             if body:
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
+
+        def _fail(self, exc):
+            """Turn an unhandled handler exception into a JSON 500 instead of letting it
+            propagate to socketserver.handle_error(), which just drops the connection and
+            leaves the plugin staring at a reset it cannot diagnose."""
+            try:
+                body = json.dumps(
+                    {"ok": False, "error": "bridge internal error", "detail": str(exc)}
+                ).encode()
+                self._send(500, body, "application/json")
+            except Exception:
+                pass
 
         def _manifest(self):
             path = os.path.join(inbox, "inbox.json")
@@ -1058,14 +1155,25 @@ def make_handler(inbox, config_path=None):
 
         def _staged_root(self, manifest):
             rel = (manifest or {}).get("staged_dir") or "."
-            root = os.path.realpath(os.path.join(inbox, rel))
             allowed = os.path.realpath(inbox)
-            return root if os.path.commonpath([root, allowed]) == allowed else allowed
+            root = os.path.realpath(os.path.join(inbox, rel))
+            try:
+                inside = os.path.commonpath([root, allowed]) == allowed
+            except ValueError:
+                # Different drive/UNC root (Windows) -> commonpath raises; treat as outside.
+                inside = False
+            return root if inside else allowed
 
         def _safe_file(self, root, rel):
             rel = str(rel or "").lstrip("/\\")
             path = os.path.realpath(os.path.join(root, rel))
-            return path if os.path.commonpath([path, root]) == root else None
+            try:
+                if os.path.commonpath([path, root]) == root:
+                    return path
+            except ValueError:
+                # A crafted absolute/cross-drive rel makes commonpath raise -> reject.
+                pass
+            return None
 
         def _content_length(self, max_bytes):
             """Parse Content-Length safely; returns None if missing/non-numeric/<=0/oversized
@@ -1080,10 +1188,65 @@ def make_handler(inbox, config_path=None):
                 return None
             return n
 
+        def _run_summary_by_doc(self, doc_id):
+            """Resolve a run for a doc_id and return the same evidence shape as the job_id
+            path. Looks in (1) the currently staged manifest, (2) live in-memory jobs, then
+            (3) history rows (run_dir reconstructed from the recorded job_id's upload dir)."""
+            doc_id = str(doc_id)
+            manifest = _read_json_file(os.path.join(inbox, "inbox.json"))
+            run_dir = None
+            resolved_job = None
+            status = None
+            staged = False
+            if manifest and str(manifest.get("doc_id") or "") == doc_id:
+                run_dir = manifest.get("run_dir")
+                staged = True
+            if run_dir is None:
+                with jobs_lock:
+                    for jid, j in jobs.items():
+                        if str(j.get("doc_id") or "") == doc_id:
+                            run_dir = j.get("run_dir")
+                            resolved_job = jid
+                            status = j.get("status")
+                            break
+            if run_dir is None:
+                for row in _read_history(inbox).get("runs") or []:
+                    if str(row.get("doc_id") or "") == doc_id and row.get("job_id"):
+                        candidate = os.path.join(inbox, "uploads", str(row.get("job_id")), "run")
+                        if os.path.isdir(candidate):
+                            run_dir = candidate
+                            resolved_job = row.get("job_id")
+                            status = "done"
+                        break
+            if run_dir is None:
+                return self._send(404, b'{"ok":false,"error":"unknown doc_id"}', "application/json")
+            evidence = _qa_evidence(run_dir)
+            payload = {
+                "ok": True,
+                "doc_id": doc_id,
+                "job_id": resolved_job,
+                "status": status,
+                "staged": staged,
+                "design_url": "/design.json",
+                "run_dir": run_dir,
+                "manifest": manifest if staged else None,
+                "final_qa_ok": evidence.get("qa_ok"),
+                **evidence,
+            }
+            return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
+
         def do_OPTIONS(self):
             return self._send(204)
 
         def do_GET(self):
+            try:
+                return self._route_get()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return None
+            except Exception as exc:  # never leak a stack trace / bare reset to the plugin
+                return self._fail(exc)
+
+        def _route_get(self):
             u = urlparse(self.path)
             manifest = self._manifest()
             if u.path == "/health":
@@ -1114,6 +1277,10 @@ def make_handler(inbox, config_path=None):
                 payload["has_run"] = bool(manifest)
                 if manifest:
                     payload["schema_version"] = manifest.get("schema_version")
+                    payload["staged_doc_id"] = manifest.get("doc_id")
+                    payload["staged_at"] = manifest.get("staged_at")
+                else:
+                    payload["staged_doc_id"] = None
                 return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
             if u.path == "/history":
                 # Recent completed conversions are intentionally read-only.  The
@@ -1127,34 +1294,56 @@ def make_handler(inbox, config_path=None):
                 }
                 return self._send(200, json.dumps(payload).encode(), "application/json")
             if u.path == "/inbox.json":
-                p = os.path.join(inbox, "inbox.json")
-                return self._send(200, open(p, "rb").read(), "application/json") if os.path.exists(p) else self._send(404)
+                data = _read_file_bytes(os.path.join(inbox, "inbox.json"))
+                return self._send(200, data, "application/json") if data is not None else self._send(404)
             if u.path == "/design.json":
                 root = self._staged_root(manifest)
                 p = self._safe_file(root, (manifest or {}).get("design", "design.json"))
-                return self._send(200, open(p, "rb").read(), "application/json") if p and os.path.exists(p) else self._send(404)
+                data = _read_file_bytes(p) if p else None
+                return self._send(200, data, "application/json") if data is not None else self._send(404)
             if u.path == "/run.json":
+                # QA evidence for the *currently staged* run, retrievable without a live
+                # job_id (the plugin can key off doc_id after a bridge/session restart).
                 if not manifest:
-                    return self._send(404)
-                payload = {"doc_id": manifest.get("doc_id"), "staged_at": manifest.get("staged_at"),
-                           "summary": manifest.get("summary") or {}, "preview": manifest.get("preview")}
-                return self._send(200, json.dumps(payload).encode(), "application/json")
+                    return self._send(404, b'{"ok":false,"error":"nothing staged"}', "application/json")
+                evidence = _qa_evidence(manifest.get("run_dir"))
+                payload = {
+                    "ok": True,
+                    "doc_id": manifest.get("doc_id"),
+                    "staged_at": manifest.get("staged_at"),
+                    "summary": manifest.get("summary") or {},
+                    "preview": manifest.get("preview"),
+                    "qa_ok": evidence.get("qa_ok"),
+                    "visual_score": evidence.get("visual_score"),
+                    "qa_evidence_complete": evidence.get("qa_evidence_complete"),
+                    "hard_fails": evidence.get("hard_fails"),
+                }
+                return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
             if u.path == "/preview.png":
                 root = self._staged_root(manifest)
                 p = self._safe_file(root, (manifest or {}).get("preview"))
-                return self._send(200, open(p, "rb").read(), "image/png") if p and os.path.exists(p) else self._send(404)
+                data = _read_file_bytes(p) if p else None
+                return (self._send(200, data, "image/png", cache="no-cache")
+                        if data is not None else self._send(404))
             if u.path == "/asset":
                 rel = parse_qs(u.query).get("path", [""])[0]
                 root = self._staged_root(manifest)
                 p = self._safe_file(root, rel)
-                if p and os.path.isfile(p):
+                data = _read_file_bytes(p) if p and os.path.isfile(p) else None
+                if data is not None:
                     ext = os.path.splitext(p)[1].lower()
                     ctype = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                              ".webp": "image/webp", ".svg": "image/svg+xml"}.get(ext, "application/octet-stream")
-                    return self._send(200, open(p, "rb").read(), ctype)
+                    return self._send(200, data, ctype, cache="no-cache")
                 return self._send(404)
             if u.path == "/run-summary":
-                job_id = parse_qs(u.query).get("job_id", [""])[0]
+                query = parse_qs(u.query)
+                job_id = query.get("job_id", [""])[0]
+                doc_id = query.get("doc_id", [""])[0]
+                if not job_id and doc_id:
+                    # Retrieve a staged run's QA evidence by doc_id — works after a bridge
+                    # or plugin restart when the in-memory job_id is gone (deferred item 2).
+                    return self._run_summary_by_doc(doc_id)
                 with jobs_lock:
                     job = dict(jobs.get(job_id) or {})
                 if not job:
@@ -1165,29 +1354,6 @@ def make_handler(inbox, config_path=None):
                     manifest_run = os.path.abspath(str(manifest.get("run_dir")))
                     if manifest_run != os.path.abspath(str(run_dir)):
                         manifest = None
-                qa = _read_json_file(os.path.join(run_dir, "qa.json")) if run_dir else None
-                runtime = _read_json_file(os.path.join(run_dir, "runtime_report.json")) if run_dir else None
-                structural = (qa or {}).get("structural") or {}
-                hard_fails = (qa or {}).get("hard_fails")
-                structural_hard_fails = structural.get("hard_fails")
-                merged_hard_fails = list(hard_fails or []) if isinstance(hard_fails, list) else []
-                seen_failures = {
-                    (item.get("rule"), item.get("detail"))
-                    for item in merged_hard_fails if isinstance(item, dict)
-                }
-                if isinstance(structural_hard_fails, list):
-                    for item in structural_hard_fails:
-                        key = (item.get("rule"), item.get("detail")) if isinstance(item, dict) else None
-                        if key and key not in seen_failures:
-                            merged_hard_fails.append(item)
-                            seen_failures.add(key)
-                qa_evidence_complete = bool(
-                    isinstance(qa, dict)
-                    and isinstance(hard_fails, list)
-                    and isinstance(structural, dict)
-                    and isinstance(structural_hard_fails, list)
-                    and all(key in structural for key in ("background", "layer_alpha", "element_recall"))
-                )
                 payload = {
                     "ok": True,
                     "job_id": job_id,
@@ -1201,16 +1367,7 @@ def make_handler(inbox, config_path=None):
                     "harness_rounds": job.get("harness_rounds"),
                     "harness_stopped": job.get("harness_stopped"),
                     "final_qa_ok": job.get("final_qa_ok"),
-                    "qa_evidence_complete": qa_evidence_complete,
-                    "hard_fails": merged_hard_fails,
-                    "visual_score": (qa or {}).get("visual_score"),
-                    "ssim": (qa or {}).get("ssim"),
-                    "element_recall": structural.get("element_recall"),
-                    "background_audit": structural.get("background"),
-                    "layer_alpha_audit": structural.get("layer_alpha") or [],
-                    "runtime_status": (runtime or {}).get("status"),
-                    "runtime_acceptable": (runtime or {}).get("acceptable") is True,
-                    "runtime_violations": (runtime or {}).get("violations") or [],
+                    **_qa_evidence(run_dir),
                 }
                 return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
             if u.path == "/process/input":
@@ -1293,6 +1450,14 @@ def make_handler(inbox, config_path=None):
             return self._send(404)
 
         def do_POST(self):
+            try:
+                return self._route_post()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return None
+            except Exception as exc:  # never leak a stack trace / bare reset to the plugin
+                return self._fail(exc)
+
+        def _route_post(self):
             route = urlparse(self.path).path
             if route == "/repo/update":
                 query = parse_qs(urlparse(self.path).query)

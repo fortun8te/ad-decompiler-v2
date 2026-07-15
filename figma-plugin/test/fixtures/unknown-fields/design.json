@@ -1,0 +1,88 @@
+{
+  "id": "unknown-fields",
+  "name": "unknown-fields",
+  "canvas": {
+    "w": 1000,
+    "h": 800
+  },
+  "schema_version": 2,
+  "meta": {
+    "coordinate_space": "local"
+  },
+  "layers": [
+    {
+      "id": "bg",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "bg",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "w": 1000,
+        "h": 800
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#f6f6f6"
+      },
+      "future_flag": true,
+      "experimental": {
+        "nested": [
+          1,
+          2,
+          {
+            "deep": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "img1",
+      "type": "image",
+      "name": "img1",
+      "box": {
+        "x": 40,
+        "y": 40,
+        "w": 200,
+        "h": 150
+      },
+      "src": "assets/img1.png",
+      "fallback": {
+        "kind": "raster-slice",
+        "src": "assets/img1_slice.png",
+        "note": "future field"
+      },
+      "unknown_hint": "ignore me"
+    },
+    {
+      "id": "t1",
+      "type": "text",
+      "name": "t1",
+      "box": {
+        "x": 40,
+        "y": 220,
+        "w": 400,
+        "h": 40
+      },
+      "text": "Unknown fields around me",
+      "style": {
+        "fontFamily": "Arial",
+        "fontSize": 18,
+        "color": "#111111",
+        "someFutureTextProp": {
+          "a": 1
+        },
+        "mystery_list": [
+          1,
+          2,
+          3
+        ]
+      },
+      "another_unknown": null
+    }
+  ],
+  "future_section": {
+    "anything": "here"
+  },
+  "extra_top_level": 42
+}

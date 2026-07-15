@@ -1,0 +1,41 @@
+{
+  "installedFonts": "auto",
+  "generateAssets": {
+    "assets/hero.png": {
+      "w": 30,
+      "h": 20
+    },
+    "assets/avatar.png": {
+      "w": 12,
+      "h": 12
+    },
+    "assets/badge.png": {
+      "w": 16,
+      "h": 12
+    },
+    "assets/stamp.png": {
+      "w": 12,
+      "h": 12
+    },
+    "assets/stamp_alpha.png": {
+      "w": 12,
+      "h": 12
+    }
+  },
+  "expect": {
+    "ok": true,
+    "mustBuild": [
+      "plaingroup",
+      "pg-a",
+      "pg-b",
+      "runs-text",
+      "comp-master",
+      "comp-inst",
+      "vstack",
+      "btn"
+    ],
+    "skipGeometry": [
+      "line1"
+    ]
+  }
+}

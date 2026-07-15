@@ -1,6 +1,45 @@
 from pathlib import Path
 
+import doctor
 from doctor import _powerpaint_adapter_importable, inspect, ocr_ready_summary
+
+
+def _footprint_cfg():
+    return {
+        "device": "cuda", "qwen": {"enabled": False}, "sam3": {"enabled": False},
+        "ocr": {"primary": "easyocr", "auto_fallback_tesseract": False},
+        "vlm": {"enabled": True, "model": "google/gemma-4-e4b"},
+        "inpaint": {"mode": "flux_comfy", "comfy": {"enabled": True}},
+    }
+
+
+def test_default_vlm_identity_is_gemma_4_12b():
+    assert doctor._DEFAULT_VLM_MODEL == "google/gemma-4-e4b"
+
+
+def test_vram_headroom_warns_when_vlm_and_flux_without_eviction(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: True)
+    monkeypatch.setattr("doctor._torch", lambda device: {"name": "torch", "ok": True, "required": False, "detail": "cuda"})
+    monkeypatch.setattr("doctor._vlm_model_loaded", lambda base, model: (True, f"{model} loaded"))
+    monkeypatch.setattr("doctor._cuda_total_mib", lambda: 16303)
+    monkeypatch.setattr("doctor._http", lambda url, timeout=0.3: True)
+    cfg = _footprint_cfg()
+    report = inspect(cfg, Path(tmp_path))
+    headroom = next((c for c in report["checks"] if c["name"] == "vram headroom"), None)
+    assert headroom is not None and not headroom["ok"] and not headroom["required"]
+
+
+def test_vram_headroom_ok_when_eviction_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: True)
+    monkeypatch.setattr("doctor._torch", lambda device: {"name": "torch", "ok": True, "required": False, "detail": "cuda"})
+    monkeypatch.setattr("doctor._vlm_model_loaded", lambda base, model: (True, f"{model} loaded"))
+    monkeypatch.setattr("doctor._cuda_total_mib", lambda: 16303)
+    monkeypatch.setattr("doctor._http", lambda url, timeout=0.3: True)
+    cfg = _footprint_cfg()
+    cfg["runtime"] = {"vram": {"evict_vlm_for_inpaint": True}}
+    report = inspect(cfg, Path(tmp_path))
+    headroom = next((c for c in report["checks"] if c["name"] == "vram headroom"), None)
+    assert headroom is not None and headroom["ok"]
 
 
 def test_doctor_marks_active_missing_sam_and_primary_ocr_as_blockers(tmp_path, monkeypatch):

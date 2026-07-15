@@ -43,6 +43,32 @@ DEFAULTS = {
     # two unrelated overlapping top-level elements (duplicate ownership).
     "nested_max_area_ratio": 0.70,
     "nested_containment": 0.90,
+    # ── overlap / z-order robustness ────────────────────────────────────────────────
+    # A residual observation and the SAM mask that was box-refined FROM it are the same
+    # object by construction; merge them on provenance even when the sparse residual CC
+    # and the solid SAM mask disagree on IoU (benchmark 009: E015/E016, E007/E008).
+    "link_residual_refine": True,
+    "link_min_containment": 0.50,
+    # Same-role masks nested inside a bigger same-role mask are fragments of one object
+    # (009: whole share icon E017 + its glyph pieces E018/E023), not meaningful children;
+    # collapse them into the containing cluster instead of shipping overlapping siblings.
+    "absorb_fragments": True,
+    "absorb_containment": 0.90,
+    # Thin fill slivers (residual CCs split off a button plate by OCR text dilation)
+    # inside a model-masked button-like shell are absorbed as fill fragments
+    # (009: the white strips around the 'Volgend' pill).
+    "sliver_absorb": True,
+    "sliver_containment": 0.75,
+    "sliver_max_thickness": 10,
+    "sliver_min_aspect": 4.0,
+    "sliver_parent_roles": ("button", "badge", "sticker", "pill"),
+    # Anti-aliased fringes push child masks 1-2 px past a model parent mask; tolerate
+    # that when testing child-in-parent containment (absorption + parent linking).
+    "containment_dilate_px": 2,
+    # Residual-CC roles come from hardcoded solidity/edge-density heuristics; a family
+    # conflict against a model label must not block geometric dedup (an element must
+    # never ship as both photo-fragment and shape).
+    "residual_family_advisory": True,
     "canonical_prefix": "E",
 }
 
@@ -180,9 +206,23 @@ def _family(role: str) -> str:
     return "unknown"
 
 
-def _semantic_compatible(a: dict, b: dict, mask_iou: float) -> bool:
+def _heuristic_label(obs: dict) -> bool:
+    """True when the observation's role came from residual-CC threshold heuristics."""
+    return obs["source"] == "residual" or obs.get("mode") in (
+        "residual-fallback",
+        "box-refine-fallback",
+    )
+
+
+def _semantic_compatible(a: dict, b: dict, mask_iou: float, opts: Optional[dict] = None) -> bool:
     fa, fb = _family(a["role"]), _family(b["role"])
     if fa == fb or "unknown" in (fa, fb):
+        return True
+    # Residual-CC kinds are solidity/edge-density guesses, not semantics; when one side of
+    # the pair is heuristic, geometry alone decides and the model label wins the cluster.
+    if (opts or {}).get("residual_family_advisory", True) and (
+        _heuristic_label(a) or _heuristic_label(b)
+    ):
         return True
     # Very strong mask agreement beats a weak source label (e.g. residual shape vs SAM badge).
     return mask_iou >= 0.88
@@ -216,6 +256,10 @@ def _priority(obs: dict) -> float:
         base = 4.0
     elif source == "sam3" and mode == "text-prompt":
         base = 3.6
+    elif source == "sam3" and mode == "box-refine-small":
+        # Padded second-pass refinement of a small residual: model evidence, but the
+        # prompt geometry was loose, so a text-prompt whole-object mask outranks it.
+        base = 3.4
     elif source == "sam3":
         base = 2.8
     elif source == "qwen":
@@ -396,8 +440,150 @@ def _duplicate(a: dict, b: dict, opts: dict) -> tuple[bool, dict]:
         and b["mask_quality"] == "box"
         and _bbox_iou(a["box"], b["box"]) >= opts["bbox_iou"]
     )
-    compatible = _semantic_compatible(a, b, metrics["iou"])
+    compatible = _semantic_compatible(a, b, metrics["iou"], opts)
     return compatible and (mask_duplicate or containment_duplicate or bbox_duplicate), metrics
+
+
+_REFINE_LINK_MODES = ("box-refine", "box-refine-small")
+
+
+def _linked_refine_cluster(clusters: list, obs: dict, opts: dict):
+    """Find the cluster holding the SAM mask that was box-refined FROM this residual.
+
+    ``sam3_detect`` prompts SAM with every residual box and records ``residual_id`` in the
+    accepted refinement's provenance.  That pair is one object by construction, yet a sparse
+    residual CC (anti-aliased ring/strokes) against the solid SAM mask often lands in the
+    IoU band that the nested rule keeps separate — shipping the same element twice.
+    Provenance identity plus a weak geometric sanity floor merges them.
+    """
+    if obs["source"] != "residual":
+        return None
+    target = str(obs["source_id"])
+    for cluster in clusters:
+        for member in cluster["members"]:
+            if member["source"] != "sam3" or member.get("mode") not in _REFINE_LINK_MODES:
+                continue
+            prov = member.get("raw_provenance") or {}
+            if prov.get("residual_id") is None or str(prov["residual_id"]) != target:
+                continue
+            metrics = _mask_metrics(obs["mask"], member["mask"])
+            if (
+                metrics["containment"] >= float(opts["link_min_containment"])
+                or metrics["iou"] >= float(opts["mask_iou"])
+            ):
+                return cluster, metrics
+    return None
+
+
+def _dilate(mask, px: int):
+    """Cheap 4-neighbourhood binary dilation via numpy shifts (no scipy dependency)."""
+    if px <= 0:
+        return mask
+    out = mask.copy()
+    for _ in range(int(px)):
+        grown = out.copy()
+        grown[1:, :] |= out[:-1, :]
+        grown[:-1, :] |= out[1:, :]
+        grown[:, 1:] |= out[:, :-1]
+        grown[:, :-1] |= out[:, 1:]
+        out = grown
+    return out
+
+
+def _containment_in(child_mask, parent_mask) -> float:
+    """Fraction of the child mask covered by the (possibly dilated) parent mask."""
+    child_area = int(child_mask.sum())
+    if not child_area:
+        return 0.0
+    return int((child_mask & parent_mask).sum()) / child_area
+
+
+def _is_sliver(box: dict, opts: dict) -> bool:
+    w, h = int(box.get("w", 0)), int(box.get("h", 0))
+    if w <= 0 or h <= 0:
+        return False
+    if min(w, h) > int(opts.get("sliver_max_thickness", 10)):
+        return False
+    return max(w, h) / max(1, min(w, h)) >= float(opts.get("sliver_min_aspect", 4.0))
+
+
+def _absorb_fragment_clusters(clusters: list, opts: dict) -> list:
+    """Collapse fragment clusters into the cluster that visually contains them.
+
+    Two evidence-backed fragment classes (runs/golden-optimized-check/009):
+
+    * same-role/kind masks nested inside a bigger mask that is NOT a meaningful parent —
+      glyph pieces of one icon detected alongside the whole icon;
+    * thin fill slivers inside a model-masked button-like shell — residual CCs of the
+      button plate split apart by OCR text dilation (the white strips around 'Volgend').
+
+    The containing cluster's winner mask is preserved untouched, so downstream corner
+    radius inference (reconstruct._corner_radius) keeps a clean, tight shape mask.
+    Meaningful nesting (icon in a button, badge on a photo) is skipped here and recorded
+    by the parent-link pass instead.
+    """
+    absorb_enabled = bool(opts.get("absorb_fragments", True))
+    sliver_enabled = bool(opts.get("sliver_absorb", True))
+    if not (absorb_enabled or sliver_enabled) or len(clusters) < 2:
+        return clusters
+    dilate_px = int(opts.get("containment_dilate_px", 0))
+    sliver_roles = {normalized_role(r) for r in (opts.get("sliver_parent_roles") or ())}
+    areas = [int(c["winner"]["mask"].sum()) for c in clusters]
+    order = sorted(range(len(clusters)), key=lambda i: areas[i])
+    alive = [True] * len(clusters)
+    dilated = {}
+    for child_i in order:
+        child = clusters[child_i]
+        cw = child["winner"]
+        best = None
+        for parent_i in order:
+            if parent_i == child_i or not alive[parent_i] or areas[parent_i] <= areas[child_i]:
+                continue
+            pw = clusters[parent_i]["winner"]
+            if parent_i not in dilated:
+                dilated[parent_i] = _dilate(pw["mask"], dilate_px)
+            containment = _containment_in(cw["mask"], dilated[parent_i])
+            same_role = (
+                normalized_role(pw["role"]) == normalized_role(cw["role"])
+                and pw["kind"] == cw["kind"]
+            )
+            fragment = (
+                absorb_enabled
+                and same_role
+                and not _meaningful_parent(pw, cw)
+                and containment >= float(opts["absorb_containment"])
+            )
+            sliver = (
+                sliver_enabled
+                and _is_sliver(cw["box"], opts)
+                and normalized_role(pw["role"]) in sliver_roles
+                and pw["source"] == "sam3"
+                and pw.get("mask_quality") == "mask"
+                and containment >= float(opts["sliver_containment"])
+            )
+            if not (fragment or sliver):
+                continue
+            reason = "absorbed-fragment" if fragment else "absorbed-sliver"
+            if best is None or areas[parent_i] < areas[best[0]]:
+                best = (parent_i, containment, reason)
+        if best is None:
+            continue
+        parent_i, containment, reason = best
+        parent = clusters[parent_i]
+        metrics = _mask_metrics(cw["mask"], parent["winner"]["mask"])
+        parent["members"].extend(child["members"])
+        parent["merges"].extend(child["merges"])
+        parent["merges"].append(
+            {
+                "key": cw["key"],
+                "mask_iou": round(metrics["iou"], 4),
+                "containment": round(containment, 4),
+                "area_ratio": round(metrics["area_ratio"], 4),
+                "reason": reason,
+            }
+        )
+        alive[child_i] = False
+    return [cluster for keep, cluster in zip(alive, clusters) if keep]
 
 
 def _infer_canvas(sam3, residual, qwen) -> dict:
@@ -493,22 +679,36 @@ def fuse(
         match = None
         match_score = -1.0
         match_metrics = None
-        for cluster in clusters:
-            duplicate, metrics = _duplicate(obs, cluster["winner"], opts)
-            if duplicate and metrics["iou"] > match_score:
-                match, match_score, match_metrics = cluster, metrics["iou"], metrics
+        match_reason = None
+        # Provenance identity beats geometry: a residual observation always joins the
+        # cluster holding the SAM mask that was box-refined from it.
+        if opts.get("link_residual_refine", True):
+            linked = _linked_refine_cluster(clusters, obs, opts)
+            if linked is not None:
+                match, match_metrics = linked
+                match_reason = "residual-refine-link"
+        if match is None:
+            for cluster in clusters:
+                duplicate, metrics = _duplicate(obs, cluster["winner"], opts)
+                if duplicate and metrics["iou"] > match_score:
+                    match, match_score, match_metrics = cluster, metrics["iou"], metrics
         if match is None:
             clusters.append({"winner": obs, "members": [obs], "merges": []})
         else:
             match["members"].append(obs)
-            match["merges"].append(
-                {
-                    "key": obs["key"],
-                    "mask_iou": round(match_metrics["iou"], 4),
-                    "containment": round(match_metrics["containment"], 4),
-                    "area_ratio": round(match_metrics["area_ratio"], 4),
-                }
-            )
+            merge_record = {
+                "key": obs["key"],
+                "mask_iou": round(match_metrics["iou"], 4),
+                "containment": round(match_metrics["containment"], 4),
+                "area_ratio": round(match_metrics["area_ratio"], 4),
+            }
+            if match_reason:
+                merge_record["reason"] = match_reason
+            match["merges"].append(merge_record)
+
+    # Fragment absorption: contained same-role pieces and button-fill slivers collapse
+    # into the containing cluster before canonical IDs are assigned.
+    clusters = _absorb_fragment_clusters(clusters, opts)
 
     # Stable IDs are based on final geometry, not model/source order.
     clusters.sort(
@@ -587,7 +787,11 @@ def fuse(
         )
 
     # Preserve meaningful nesting. The smallest containing candidate wins as the direct parent;
-    # nested masks were never eligible for NMS suppression above.
+    # nested masks were never eligible for NMS suppression above.  Containment is tested
+    # against a slightly dilated parent so a child's anti-aliased fringe (1-2 px past the
+    # model parent mask) cannot break a real icon-in-button relationship.
+    link_dilate_px = int(opts.get("containment_dilate_px", 0))
+    dilated_parents = {}
     for child_i, child_cluster in enumerate(clusters):
         child_mask = child_cluster["winner"]["mask"]
         child_area = int(child_mask.sum())
@@ -599,24 +803,27 @@ def fuse(
             parent_area = int(parent_mask.sum())
             if parent_area <= child_area:
                 continue
-            metrics = _mask_metrics(child_mask, parent_mask)
+            if parent_i not in dilated_parents:
+                dilated_parents[parent_i] = _dilate(parent_mask, link_dilate_px)
+            containment = _containment_in(child_mask, dilated_parents[parent_i])
+            area_ratio = child_area / parent_area
             if (
-                metrics["containment"] >= opts["nested_containment"]
-                and metrics["area_ratio"] <= opts["nested_max_area_ratio"]
+                containment >= opts["nested_containment"]
+                and area_ratio <= opts["nested_max_area_ratio"]
                 and _meaningful_parent(parent_cluster["winner"], child_cluster["winner"])
             ):
                 if best is None or parent_area < best[0]:
-                    best = (parent_area, parent_i, metrics)
+                    best = (parent_area, parent_i, containment, area_ratio)
         if best is not None:
-            _, parent_i, metrics = best
+            _, parent_i, containment, area_ratio = best
             parent_id = results[parent_i]["id"]
             results[child_i]["parent_id"] = parent_id
             results[child_i]["relationships"].append(
                 {
                     "type": "nested-in",
                     "target": parent_id,
-                    "containment": round(metrics["containment"], 4),
-                    "area_ratio": round(metrics["area_ratio"], 4),
+                    "containment": round(containment, 4),
+                    "area_ratio": round(area_ratio, 4),
                 }
             )
 

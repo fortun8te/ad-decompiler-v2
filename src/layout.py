@@ -14,6 +14,8 @@ import math
 from statistics import median
 from typing import Optional
 
+from . import vlm_layout_group
+
 
 def _area(box):
     return max(0.0, box.get("w", 0)) * max(0.0, box.get("h", 0))
@@ -87,8 +89,30 @@ def _is_centered(child_box, parent_box, tol_x=None, tol_y=None):
     return abs(cx - pcx) <= tol_x and abs(cy - pcy) <= tol_y
 
 
+def _is_padded_child(child_box, parent_box):
+    """Whether a single child genuinely fills a plate with real inset padding.
+
+    Guards the padded-card HUG path: the child must sit inside the plate, be a
+    substantial fraction of it (not a speck on a backdrop), and not be full-bleed
+    (which would leave no padding to hug).  Because it is fully inside, the
+    four-side measured padding reconstructs the plate's box exactly.
+    """
+    cb, pb = child_box or {}, parent_box or {}
+    if _inside(cb, pb) < 0.95:
+        return False
+    ca, pa = _area(cb), _area(pb)
+    if pa <= 0 or ca < pa * 0.25 or ca > pa * 0.98:
+        return False
+    return (cb.get("w", 0) >= pb.get("w", 0) * 0.5) or (cb.get("h", 0) >= pb.get("h", 0) * 0.5)
+
+
 _BUTTON_TEXT_ROLES = {"cta", "button", "offer", "price"}
 _BUTTON_CONTAINER_ROLES = {"button", "badge", "chip", "card"}
+
+# Brand marks stay independent so a wordmark never fuses into a paragraph flow.
+# Every other text role is an ordinary copy line and may join a stack/row when the
+# geometry gate below agrees.
+_NON_FLOW_TEXT_ROLES = {"logo", "wordmark", "watermark", "brand"}
 
 
 def _is_button_pattern(container, children):
@@ -115,11 +139,50 @@ def _layout_padding(container_box, children):
     pb = container_box or {}
     boxes = [_paint_box(child) for child in children]
     return {
-        "left": max(0.0, min(b.get("x", 0) for b in boxes) - pb.get("x", 0)),
-        "right": max(0.0, pb.get("x", 0) + pb.get("w", 0) - max(b.get("x", 0) + b.get("w", 0) for b in boxes)),
-        "top": max(0.0, min(b.get("y", 0) for b in boxes) - pb.get("y", 0)),
-        "bottom": max(0.0, pb.get("y", 0) + pb.get("h", 0) - max(b.get("y", 0) + b.get("h", 0) for b in boxes)),
+        "left": round(max(0.0, min(b.get("x", 0) for b in boxes) - pb.get("x", 0)), 2),
+        "right": round(max(0.0, pb.get("x", 0) + pb.get("w", 0) - max(b.get("x", 0) + b.get("w", 0) for b in boxes)), 2),
+        "top": round(max(0.0, min(b.get("y", 0) for b in boxes) - pb.get("y", 0)), 2),
+        "bottom": round(max(0.0, pb.get("y", 0) + pb.get("h", 0) - max(b.get("y", 0) + b.get("h", 0) for b in boxes)), 2),
     }
+
+
+def _item_spacing(gaps):
+    """Median gap, snapped to the nearest integer when the samples justify it."""
+    if not gaps:
+        return 0
+    value = median(gaps)
+    if abs(value - round(value)) <= 0.75:
+        return int(round(value))
+    return round(value, 2)
+
+
+def _counter_alignment(boxes, mode):
+    """Measure the counter-axis edge children actually share instead of assuming one.
+
+    Returns the Figma alignment token with the tightest measured spread (MIN/CENTER/MAX)
+    when that spread is within tolerance, otherwise the historical default for the axis.
+    """
+    if mode == "HORIZONTAL":
+        starts = [b.get("y", 0) for b in boxes]
+        ends = [b.get("y", 0) + b.get("h", 0) for b in boxes]
+        centers = [b.get("y", 0) + b.get("h", 0) / 2 for b in boxes]
+        tol = max(2.0, median([max(1.0, b.get("h", 1)) for b in boxes]) * 0.08)
+        default = "CENTER"
+        candidates = ("CENTER", "MIN", "MAX")
+    else:
+        starts = [b.get("x", 0) for b in boxes]
+        ends = [b.get("x", 0) + b.get("w", 0) for b in boxes]
+        centers = [b.get("x", 0) + b.get("w", 0) / 2 for b in boxes]
+        tol = max(2.0, median([max(1.0, b.get("w", 1)) for b in boxes]) * 0.08)
+        default = "MIN"
+        candidates = ("MIN", "CENTER", "MAX")
+    spreads = {
+        "MIN": max(starts) - min(starts),
+        "CENTER": max(centers) - min(centers),
+        "MAX": max(ends) - min(ends),
+    }
+    best = min(candidates, key=lambda name: spreads[name])
+    return best if spreads[best] <= tol else default
 
 
 def _emit_figma_layout_aliases(layout):
@@ -166,6 +229,21 @@ def infer_auto_layout(container, children):
                 "primaryAxisAlignItems": "CENTER", "counterAxisAlignItems": "CENTER",
                 "primarySizing": "HUG", "counterSizing": "HUG",
             })
+        # Padded card: a surfaced plate/card wrapping one substantial, fully-inset
+        # child becomes a HUG frame so the plate resizes with its content instead of
+        # freezing at pixel size.  The measured four-side padding reproduces the
+        # original box exactly (see _is_padded_child), so this never moves geometry.
+        if (_has_surface(container)
+                and role in (None, "card", "container", "plate", "panel")
+                and children[0].get("target") in ("text", "image", "icon")
+                and _is_padded_child(paint, pb)):
+            mode = "VERTICAL" if pb.get("h", 0) >= pb.get("w", 0) else "HORIZONTAL"
+            return _emit_figma_layout_aliases({
+                "mode": mode, "confidence": 0.85, "gap": 0, "itemSpacing": 0,
+                "padding": padding, "align": "MIN", "counterAlign": "MIN",
+                "primaryAxisAlignItems": "MIN", "counterAxisAlignItems": "MIN",
+                "primarySizing": "HUG", "counterSizing": "HUG",
+            })
         return {"mode": "NONE", "confidence": 0.3}
 
     if any(_overlap(a, b) > 0.06 for i, a in enumerate(boxes) for b in boxes[i + 1:]):
@@ -184,8 +262,8 @@ def infer_auto_layout(container, children):
         if _consistent(gaps):
             return _emit_figma_layout_aliases({
                 "mode": "HORIZONTAL", "confidence": round(0.95 - min(.2, row_spread * .2), 3),
-                "gap": round(median(gaps), 2) if gaps else 0, "padding": padding,
-                "align": "MIN", "counterAlign": "CENTER",
+                "gap": _item_spacing(gaps), "padding": padding,
+                "align": "MIN", "counterAlign": _counter_alignment(boxes, "HORIZONTAL"),
                 "primarySizing": "FIXED", "counterSizing": "FIXED",
             })
     if col_spread <= 0.35:
@@ -195,8 +273,8 @@ def infer_auto_layout(container, children):
         if _consistent(gaps):
             return _emit_figma_layout_aliases({
                 "mode": "VERTICAL", "confidence": round(0.95 - min(.2, col_spread * .2), 3),
-                "gap": round(median(gaps), 2) if gaps else 0, "padding": padding,
-                "align": "MIN", "counterAlign": "MIN",
+                "gap": _item_spacing(gaps), "padding": padding,
+                "align": "MIN", "counterAlign": _counter_alignment(boxes, "VERTICAL"),
                 "primarySizing": "FIXED", "counterSizing": "FIXED",
             })
     return {"mode": "NONE", "confidence": 0.25}
@@ -400,6 +478,314 @@ def _wrap_repeated_card_grids(roots):
     out.extend(wrappers)
     out.sort(key=lambda node: (_node_z(node), node.get("id", "")))
     return out
+
+
+def _backgroundish(node, canvas):
+    meta = node.get("meta") or {}
+    role = str(meta.get("role") or "").lower()
+    if role in {"background", "plate", "clean plate"}:
+        return True
+    canvas_area = max(1.0, float(canvas.get("w", 1) or 1) * float(canvas.get("h", 1) or 1))
+    return _area(node.get("box") or {}) >= canvas_area * 0.88
+
+
+def _merged_spans(boxes, axis):
+    """Merge box projections on one axis into disjoint occupied spans."""
+    key, size = ("y", "h") if axis == "y" else ("x", "w")
+    intervals = sorted(
+        (float(b.get(key, 0) or 0), float(b.get(key, 0) or 0) + float(b.get(size, 0) or 0))
+        for b in boxes
+    )
+    spans = []
+    for start, end in intervals:
+        if spans and start <= spans[-1][1] + 2.0:
+            spans[-1][1] = max(spans[-1][1], end)
+        else:
+            spans.append([start, end])
+    return spans
+
+
+def _cut_bands(members, canvas, ncfg):
+    """One XY-cut level: split members along genuinely empty whitespace, or None."""
+    if len(members) < 4:
+        return None
+    boxes = [node.get("box") or {} for node in members]
+    for axis in ("y", "x"):
+        dim = float(canvas.get("h" if axis == "y" else "w", 1) or 1)
+        min_gap = max(float(ncfg.get("min_gap_px", 18.0)),
+                      float(ncfg.get("min_gap_frac", 0.05)) * dim)
+        spans = _merged_spans(boxes, axis)
+        if len(spans) < 2:
+            continue
+        cuts = [index for index in range(len(spans) - 1)
+                if spans[index + 1][0] - spans[index][1] >= min_gap]
+        if not cuts:
+            continue
+        # Band ranges between cuts; assign members by projected center.
+        limits = [spans[index][1] for index in cuts]
+        key, size = ("y", "h") if axis == "y" else ("x", "w")
+        bands = [[] for _ in range(len(limits) + 1)]
+        for node in members:
+            box = node.get("box") or {}
+            center = float(box.get(key, 0) or 0) + float(box.get(size, 0) or 0) / 2
+            slot = sum(1 for limit in limits if center > limit)
+            bands[slot].append(node)
+        bands = [band for band in bands if band]
+        if len(bands) >= 2:
+            return axis, bands
+    return None
+
+
+def _band_name(members, box, canvas):
+    roles = {str((node.get("meta") or {}).get("role") or "").lower() for node in members}
+    targets = {node.get("target") for node in members}
+    ch = max(1.0, float(canvas.get("h", 1) or 1))
+    cy = (box.get("y", 0) + box.get("h", 0) / 2) / ch
+    if roles & {"cta", "button"} and len(members) <= 4:
+        return "CTA cluster"
+    if "logo" in roles and cy <= 0.30:
+        return "Header"
+    if cy <= 0.16:
+        return "Header"
+    if cy >= 0.84:
+        return "Footer"
+    if roles & {"product", "person", "product_cluster", "illustration", "avatar"}:
+        return "Hero"
+    if targets <= {"text"}:
+        return "Copy block"
+    return "Content group"
+
+
+def _band_wrap(members, canvas, ncfg, depth):
+    """Recursively wrap whitespace-separated bands, or None when no confident cut exists."""
+    if depth > int(ncfg.get("max_depth", 2)):
+        return None
+    cut = _cut_bands(members, canvas, ncfg)
+    if not cut:
+        return None
+    axis, bands = cut
+    if not any(len(band) >= 2 for band in bands):
+        return None
+    out = []
+    for band in bands:
+        if len(band) < 2:
+            out.extend(band)
+            continue
+        inner = _band_wrap(band, canvas, ncfg, depth + 1)
+        children = inner if inner else sorted(
+            band, key=lambda node: (_node_z(node), node.get("id", "")))
+        box = _union([node.get("box") or {} for node in band])
+        layout = infer_auto_layout({"box": box, "meta": {"role": "band"}}, children)
+        wrapper = {
+            "id": "band-" + hashlib.sha1(
+                "|".join(sorted(str(node.get("id")) for node in band)).encode("utf-8")
+            ).hexdigest()[:10],
+            "target": "group",
+            "box": box,
+            "z": min(_node_z(node) for node in band),
+            "children": children,
+            "layout": layout,
+            "meta": {
+                "role": "band",
+                "band_axis": axis,
+                "semantic_name": _band_name(band, box, canvas),
+                "layout_confidence": layout.get("confidence"),
+                "deterministic_geometry": True,
+                "source": "xycut",
+            },
+        }
+        out.append(wrapper)
+    return out
+
+
+def _band_groups(roots, canvas, lcfg):
+    """Conservative XY-cut: only whitespace that no element crosses can split bands.
+
+    Ads are simpler than app UIs — a clear horizontal/vertical whitespace corridor is
+    almost always a real design seam (header / hero / footer).  Groups are created only
+    when a cut produces at least two bands and a band has two or more members, so a
+    layout without strong separation stays exactly as flat as before.
+    """
+    ncfg = (lcfg or {}).get("nesting") or {}
+    if not ncfg.get("enabled", True):
+        return roots
+    movable = [node for node in roots if not _backgroundish(node, canvas)]
+    if len(movable) < int(ncfg.get("min_nodes", 6)):
+        return roots
+    wrapped = _band_wrap(movable, canvas, ncfg, depth=1)
+    if wrapped is None:
+        return roots
+    out = [node for node in roots if _backgroundish(node, canvas)]
+    out.extend(wrapped)
+    out.sort(key=lambda node: (_node_z(node), node.get("id", "")))
+    return out
+
+
+def _relaxed_group_signature(group):
+    """Structure-only signature: ignores text content and fine size differences."""
+    box = group.get("box") or {}
+    payload = [
+        (
+            child.get("target"),
+            (child.get("meta") or {}).get("role"),
+            round(float((child.get("box") or {}).get("w", 0) or 0) / max(1.0, box.get("w", 1)), 1),
+            round(float((child.get("box") or {}).get("h", 0) or 0) / max(1.0, box.get("h", 1)), 1),
+        )
+        for child in group.get("children") or []
+    ]
+    payload.append(round(float(box.get("w", 1) or 1) / max(1.0, float(box.get("h", 1) or 1)), 1))
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:10]
+
+
+def _annotate_component_candidates(roots, rcfg):
+    """Mark repeated structures/leaves as component candidates (metadata only).
+
+    Exact repeats are already instantiated via ``component``; this pass adds the
+    additive ``meta.component_candidate`` marker for near-repeats (same structure,
+    different copy) and repeated identical leaves (rating stars, feature icons) so
+    the plugin/compiler can turn them into components later without any geometry
+    or material change here.
+    """
+    if not (rcfg or {}).get("enabled", True):
+        return
+    size_tol = float((rcfg or {}).get("size_tolerance", 0.12))
+    min_leaf = int((rcfg or {}).get("min_leaf_instances", 3))
+
+    groups, leaves = [], []
+
+    def _walk(node):
+        children = node.get("children") or []
+        if node.get("target") == "group" and children:
+            groups.append(node)
+        elif not children and node.get("target") in {"icon", "image", "shape"}:
+            leaves.append(node)
+        for child in children:
+            _walk(child)
+
+    for root in roots:
+        _walk(root)
+
+    by_relaxed = {}
+    for group in groups:
+        by_relaxed.setdefault(_relaxed_group_signature(group), []).append(group)
+    for signature, members in by_relaxed.items():
+        if len(members) < 2 or all(member.get("component") for member in members):
+            continue
+        ids = sorted(str(member.get("id")) for member in members)
+        for member in members:
+            member.setdefault("meta", {})["component_candidate"] = {
+                "key": f"repeat~{signature}", "confidence": 0.75,
+                "count": len(members), "members": ids,
+            }
+
+    by_kind = {}
+    for leaf in leaves:
+        role = str((leaf.get("meta") or {}).get("role") or "").lower()
+        if role in {"background", "plate", "clean plate"}:
+            continue
+        by_kind.setdefault((leaf.get("target"), role), []).append(leaf)
+    for (target, role), members in by_kind.items():
+        if len(members) < min_leaf:
+            continue
+        med_w = median([max(1.0, (leaf.get("box") or {}).get("w", 1)) for leaf in members])
+        med_h = median([max(1.0, (leaf.get("box") or {}).get("h", 1)) for leaf in members])
+        similar = [
+            leaf for leaf in members
+            if abs((leaf.get("box") or {}).get("w", 0) - med_w) <= med_w * size_tol
+            and abs((leaf.get("box") or {}).get("h", 0) - med_h) <= med_h * size_tol
+        ]
+        if len(similar) < min_leaf:
+            continue
+        signature = hashlib.sha1(
+            f"{target}:{role}:{round(med_w, 1)}x{round(med_h, 1)}".encode()
+        ).hexdigest()[:10]
+        ids = sorted(str(leaf.get("id")) for leaf in similar)
+        for leaf in similar:
+            leaf.setdefault("meta", {}).setdefault("component_candidate", {
+                "key": f"leafrep~{signature}", "confidence": 0.6,
+                "count": len(similar), "members": ids,
+            })
+
+
+def _first_text_content(node):
+    if node.get("target") == "text" and node.get("text"):
+        return str(node["text"])
+    best = None
+    for child in sorted(
+        node.get("children") or [],
+        key=lambda item: ((item.get("box") or {}).get("y", 0), (item.get("box") or {}).get("x", 0)),
+    ):
+        best = _first_text_content(child)
+        if best:
+            return best
+    return best
+
+
+def _short(value, length=24):
+    value = " ".join(str(value or "").split())
+    return value if len(value) <= length else value[: length - 1] + "…"
+
+
+def _apply_semantic_names(nodes):
+    """Give structural frames designer-facing names; explicit/VLM names always win."""
+    for node in nodes:
+        children = node.get("children") or []
+        if children:
+            _apply_semantic_names(children)
+        if node.get("target") != "group":
+            continue
+        meta = node.setdefault("meta", {})
+        if node.get("name") or meta.get("semantic_name"):
+            continue
+        role = str(meta.get("role") or "")
+        label = None
+        if role == "button":
+            text = _first_text_content(node)
+            label = f'CTA Button — "{_short(text)}"' if text else "CTA Button"
+        elif role == "text-stack":
+            text = _first_text_content(node)
+            label = f'Copy — "{_short(text)}"' if text else "Copy block"
+        elif role == "card-grid":
+            label = f"Card grid ({len(children)})"
+        elif role == "panel-set":
+            label = f"Panel set ({len(children)})"
+        elif role == "structural-grid":
+            label = f"Grid ({len(children)} rows)"
+        elif role == "native-chart":
+            label = "Chart"
+        elif role == "card":
+            label = "Card"
+        if label:
+            meta["semantic_name"] = label
+
+
+def _finalize_vlm_group_layouts(nodes):
+    """Evidence-gated Auto Layout for VLM wrappers: the hint never overrides geometry."""
+    for node in nodes:
+        children = node.get("children") or []
+        if children:
+            _finalize_vlm_group_layouts(children)
+        meta = node.get("meta") or {}
+        if meta.get("source") != "vlm-grouping" or node.get("layout") is not None:
+            continue
+        layout = infer_auto_layout(node, children)
+        hint = str(meta.get("vlm_direction_hint") or "none")
+        if layout.get("mode") in ("HORIZONTAL", "VERTICAL"):
+            agrees = (layout["mode"] == "HORIZONTAL") == (hint == "row") if hint != "none" else None
+            if agrees is not None:
+                meta["vlm_direction_agrees"] = agrees
+        node["layout"] = layout
+        meta["layout_confidence"] = layout.get("confidence")
+
+
+class _TreeWithNotice(list):
+    """Root list that carries the optional VLM-grouping outcome for the caller.
+
+    Subclassing list keeps every existing consumer working unchanged (iteration,
+    JSON serialization, equality), while scene_intent.plan can surface the advisory
+    grouping status instead of it being silently dropped."""
+
+    vlm_grouping: Optional[dict] = None
 
 
 _STRUCTURE_GROUP_KEYS = (
@@ -674,12 +1060,18 @@ def _union(boxes):
 
 
 def _text_alignment(a, b):
-    """Strong alignment test for a real text stack, not loose nearby copy."""
+    """Strong alignment test for a real text stack, not loose nearby copy.
+
+    A shared left edge or shared centre is the primary evidence.  The positional
+    overlap fallback is measured against the *wider* line so a narrow element that
+    merely sits within a much wider headline's horizontal span (e.g. a mid-canvas
+    CTA under a full-bleed title) is not mistaken for the same column.
+    """
     ax, aw = a["x"], max(1.0, a["w"])
     bx, bw = b["x"], max(1.0, b["w"])
     left = abs(ax - bx) <= max(4.0, min(aw, bw) * 0.12)
     center = abs((ax + aw / 2) - (bx + bw / 2)) <= max(5.0, min(aw, bw) * 0.10)
-    overlap = max(0.0, min(ax + aw, bx + bw) - max(ax, bx)) / min(aw, bw)
+    overlap = max(0.0, min(ax + aw, bx + bw) - max(ax, bx)) / max(aw, bw)
     return left or center or overlap >= 0.72
 
 
@@ -716,9 +1108,12 @@ def _semantic_text_stacks(roots):
     OCR already emits paragraph blocks. This handles the common separate headline/subhead/body
     stack without inventing a group for every unrelated sentence on the canvas.
     """
-    eligible_roles = {"eyebrow", "headline", "title", "subtitle", "subheadline", "body", "caption"}
+    # Any real copy line can participate in a vertical paragraph flow; the strict
+    # alignment + gap gate below (not the semantic role) is what decides membership.
+    # Only brand marks are held out so a wordmark never merges into body copy.
     texts = [node for node in roots if node.get("target") == "text"
-             and (node.get("meta") or {}).get("role", "text") in eligible_roles]
+             and str((node.get("meta") or {}).get("role", "text")).lower()
+             not in _NON_FLOW_TEXT_ROLES]
     texts.sort(key=lambda node: (node.get("box", {}).get("y", 0), node.get("id", "")))
     groups, current = [], []
     for node in texts:
@@ -768,11 +1163,109 @@ def _semantic_text_stacks(roots):
                     for i in range(len(group) - 1)
                 ]), 2),
                 "padding": {"left": 0, "right": 0, "top": 0, "bottom": 0},
-                "align": "MIN", "counterAlign": "MIN",
+                "align": "MIN",
+                "counterAlign": _counter_alignment([node["box"] for node in group], "VERTICAL"),
                 "primarySizing": "FIXED", "counterSizing": "FIXED",
             },
             "meta": {"role": "text-stack", "semantic_roles": role_names,
                      "layout_confidence": 0.9},
+        })
+        _annotate_stack_children(out[-1], group)
+    return out
+
+
+def _semantic_text_rows(roots):
+    """Group evenly-spaced peer text/icon leaves on one baseline into a HORIZONTAL frame.
+
+    Handles real horizontal bars the vertical stack pass leaves flat — stat rows,
+    inline label runs, social action counts.  The gate is deliberately strict
+    (shared baseline band, similar-height peers, left-to-right non-overlapping
+    columns, evenly spaced) so items that merely share a ``y`` are never fused: a
+    wrong row is worse than an absolute layer.  Runs after the stack pass, so any
+    text already claimed by a vertical column is untouched here.
+    """
+    leaves = [node for node in roots
+              if node.get("target") in ("text", "icon")
+              and not node.get("children")
+              and str((node.get("meta") or {}).get("role", "")).lower() not in _NON_FLOW_TEXT_ROLES]
+    leaves.sort(key=lambda node: (node.get("box", {}).get("x", 0), node.get("id", "")))
+    used, groups = set(), []
+    for seed in leaves:
+        if seed.get("id") in used:
+            continue
+        row = [seed]
+        for node in leaves:
+            if node is seed or node.get("id") in used or node in row:
+                continue
+            box = node.get("box") or {}
+            prev = row[-1].get("box") or {}
+            heights = [max(1.0, item.get("box", {}).get("h", 1)) for item in row + [node]]
+            mh = median(heights)
+            cy_row = median([item["box"].get("y", 0) + item["box"].get("h", 0) / 2 for item in row])
+            cy = box.get("y", 0) + box.get("h", 0) / 2
+            if abs(cy - cy_row) > max(4.0, mh * 0.30):       # off the shared baseline band
+                continue
+            if not _consistent(heights, max_cv=0.35):        # not a peer (very different size)
+                continue
+            mw = median([max(1.0, item.get("box", {}).get("w", 1)) for item in row + [node]])
+            gap = box.get("x", 0) - (prev.get("x", 0) + prev.get("w", 0))
+            # Inline row items are separated by roughly a line-height, not by their
+            # own width — scaling tolerance to width would fuse far-apart display
+            # fragments and side-by-side comparison columns into bogus rows.
+            if gap < -0.15 * mw or gap > max(1.2 * mh, 0.5 * mw):
+                continue
+            row.append(node)
+        if len(row) < 2:
+            continue
+        ordered = sorted(row, key=lambda n: (n["box"].get("x", 0), n.get("id", "")))
+        gaps = [ordered[i + 1]["box"].get("x", 0)
+                - (ordered[i]["box"].get("x", 0) + ordered[i]["box"].get("w", 0))
+                for i in range(len(ordered) - 1)]
+        mw = median([max(1.0, n["box"].get("w", 1)) for n in ordered])
+        mh = median([max(1.0, n["box"].get("h", 1)) for n in ordered])
+        positive = [g for g in gaps if g >= 0]
+        if not _consistent(positive):                        # unevenly spaced -> not a real bar
+            continue
+        if positive and max(positive) > max(1.2 * mh, 0.5 * mw):  # a lone wide void -> not a row
+            continue
+        if not any(n.get("target") == "text" for n in ordered):  # need a label, not loose icons
+            continue
+        # A bare two-item text+text pair is weak evidence (adjacent display fragments
+        # read as a row). Require either an icon (a labelled stat/action) or a genuine
+        # three-plus-item bar before committing to a horizontal frame.
+        if len(ordered) == 2 and not any(n.get("target") == "icon" for n in ordered):
+            continue
+        groups.append(ordered)
+        used.update(n.get("id") for n in ordered)
+
+    if not groups:
+        return roots
+    members = {node.get("id") for group in groups for node in group}
+    out = [node for node in roots if node.get("id") not in members]
+    for group in groups:
+        boxes = [node["box"] for node in group]
+        box = _union(boxes)
+        gaps = [group[i + 1]["box"]["x"] - (group[i]["box"]["x"] + group[i]["box"]["w"])
+                for i in range(len(group) - 1)]
+        row_boxes = [_paint_box(node) for node in group]
+        layout = _emit_figma_layout_aliases({
+            "mode": "HORIZONTAL", "confidence": 0.88,
+            "gap": _item_spacing([g for g in gaps if g >= 0]),
+            "padding": {"left": 0, "right": 0, "top": 0, "bottom": 0},
+            "align": "MIN", "counterAlign": _counter_alignment(row_boxes, "HORIZONTAL"),
+            "primarySizing": "FIXED", "counterSizing": "FIXED",
+        })
+        row_id = "text-row-" + hashlib.sha1(
+            "|".join(str(node.get("id")) for node in group).encode()
+        ).hexdigest()[:10]
+        out.append({
+            "id": row_id,
+            "target": "group",
+            "box": box,
+            "z": max(_node_z(node) for node in group),
+            "children": group,
+            "layout": layout,
+            "meta": {"role": "text-row", "layout_confidence": 0.88},
         })
         _annotate_stack_children(out[-1], group)
     return out
@@ -953,6 +1446,7 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
     # structures before the generic text-stack pass can absorb their labels.
     roots = _wrap_structural_sets(roots)
     roots = _semantic_text_stacks(roots)
+    roots = _semantic_text_rows(roots)
     for node in nodes:
         if node.get("children"):
             node["children"].sort(key=lambda c: (_node_z(c), c.get("id", "")))
@@ -975,8 +1469,24 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
                 }
 
     roots = _wrap_repeated_card_grids(roots)
+    # Deterministic deeper nesting: whitespace bands (header/hero/footer) on top of the
+    # proven containment groups above, then near-repeat component candidates (metadata).
+    roots = _band_groups(roots, canvas, lcfg)
+    _annotate_component_candidates(roots, lcfg.get("repeats") or {})
+
+    # Advisory VLM semantic grouping/naming.  It can only ADD wrapper groups and
+    # names on top of the deterministic tree; every invalid proposal is rejected
+    # whole and recorded for the caller (scene_intent persists the outcome).
+    vlm_notice = None
+    if vlm_layout_group.enabled(cfg):
+        roots, vlm_notice = vlm_layout_group.regroup(roots, canvas, cfg, z_key=_node_z)
+        _finalize_vlm_group_layouts(roots)
+
+    _apply_semantic_names(roots)
     _finalize_layout(roots)
 
     for root in roots:
         _relativize(root)
-    return roots
+    out = _TreeWithNotice(roots)
+    out.vlm_grouping = vlm_notice
+    return out

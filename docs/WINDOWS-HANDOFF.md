@@ -63,11 +63,13 @@ it is an advisory layer/alpha source, not the element detector.
 - Python 3.12 and Git.
 - A current NVIDIA driver for the RTX 5080.
 - The official SAM 3 image checkpoint at `C:\models\sam3.pt` (or update its config path).
-- LM Studio with `google/gemma-4-e4b` loaded and its local server enabled.
+- LM Studio with `google/gemma-4-12b` loaded and its local server enabled.
 - ComfyUI plus the configured Qwen workflow only when `qwen.required: true`.
-- VTracer and two SVG render checkers are installed by `setup_rtx.ps1`; `choco install potrace`
-  adds the optional monochrome backup tracer.
-- Recommended OCR backup: `winget install UB-Mannheim.TesseractOCR`.
+- VTracer plus the resvg/cairosvg render-back checkers are the production vector pair, installed
+  by `setup_rtx.ps1`. Potrace is deliberately **not** installed; `choco install potrace` only adds
+  an optional monochrome backup tracer.
+- Tesseract is installed on this box as an OCR fallback (`pytesseract` plus the
+  `UB-Mannheim.TesseractOCR` binary).
 
 Run `.\.venv\Scripts\python.exe doctor.py`. Every failed item now includes a direct `FIX:` line.
 PaddleOCR and Surya are attempted separately because their Windows packages can conflict with
@@ -175,8 +177,9 @@ Every run also writes `runtime_report.json`: `ok` means no model degraded, `degr
 advisory path (normally Qwen) fell back, and a listed `violation` means a required OCR/SAM model
 did not run and the benchmark is invalid. Do not use `--skip-doctor` for acceptance evidence.
 
-VTracer, Big-LaMa, and the SVG render-back checker are installed by setup. Potrace on `PATH` is
-an optional monochrome backup. OpenCV inpainting remains available for diagnosis, but strict
+VTracer, Big-LaMa, and the resvg/cairosvg render-back checker are installed by setup. Potrace is
+deliberately not installed here; it is only an optional monochrome backup if placed on `PATH`.
+OpenCV inpainting remains available for diagnosis, but strict
 acceptance must use and smoke-prove the selected active route; it cannot represent Flux or
 PowerPaint evidence.
 

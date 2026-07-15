@@ -1,0 +1,47 @@
+{
+  "id": "replace-mode",
+  "name": "replace-mode",
+  "canvas": {
+    "w": 1000,
+    "h": 800
+  },
+  "schema_version": 2,
+  "meta": {
+    "coordinate_space": "local"
+  },
+  "layers": [
+    {
+      "id": "bg",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "bg",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "w": 1000,
+        "h": 800
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#ffffff"
+      }
+    },
+    {
+      "id": "t1",
+      "type": "text",
+      "name": "t1",
+      "box": {
+        "x": 100,
+        "y": 100,
+        "w": 300,
+        "h": 40
+      },
+      "text": "Replace me",
+      "style": {
+        "fontFamily": "Arial",
+        "fontSize": 18,
+        "color": "#111111"
+      }
+    }
+  ]
+}

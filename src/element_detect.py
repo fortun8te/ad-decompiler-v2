@@ -3,8 +3,10 @@
 Deterministic CPU port of the validated Node harness
 `studio/lib/element-detect.mjs` (residual connected-component detector).
 
-Algorithm (identical to the .mjs):
+Algorithm (identical to the .mjs, plus optional adaptive threshold scaling):
   1. residual = |source - explained(background)| thresholded on luma AND chroma
+     (thresholds and minArea adapt to residual noise / canvas area when
+     opts["adaptive"] is on — see _adaptive_opts; defaults stay the anchors)
   2. mask OUT every OCR line box, dilated ~30% (15% each side)
   3. morphological close (radius 2 -> 5px window)
   4. 8-connected component labeling
@@ -59,6 +61,19 @@ DEFAULTS = {
     "edgeGradThresh": 50.0,
     "nestedInsideFrac": 0.85,
     "maxElements": 64,
+    # ── adaptive scaling (see _adaptive_opts) ────────────────────────────────────────
+    # The historical constants above remain the anchors; when `adaptive` is on they are
+    # scaled by measured residual noise (contrast thresholds) and canvas area (minArea),
+    # clamped so effective values never stray past the min/max scale bounds. At the
+    # reference canvas (1080x1080) with reference noise the effective values equal the
+    # defaults exactly.  Set "adaptive": False to restore fixed constants.
+    "adaptive": True,
+    "adaptiveRefSigma": 12.0,     # robust residual-luma sigma at which scale == 1.0
+    "adaptiveScaleMin": 0.6,      # flat, clean backgrounds: lower bars, better small recall
+    "adaptiveScaleMax": 1.6,      # noisy/photographic residuals: raise bars, less junk
+    "adaptiveRefArea": 1166400,   # 1080 * 1080 normalized benchmark canvas
+    "adaptiveMinAreaFloor": 8,    # px^2; never drop below this even on tiny canvases
+    "adaptiveMinAreaCap": 4.0,    # x minArea; upper bound on canvas-area scaling
 }
 
 
@@ -165,6 +180,46 @@ def _luma(arr):
     return arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114
 
 
+def _adaptive_opts(opts, dY, n):
+    """Return opts with contrast thresholds and minArea adapted to this image.
+
+    * ``lumaThresh``/``chromaThresh`` scale with the robust (median/MAD) sigma of the
+      residual luma difference.  A flat, clean background (sigma ~ 0, e.g. the dark X-post
+      benchmark 009) lowers the bars toward ``adaptiveScaleMin`` so low-contrast small
+      badges/checkmarks survive; a noisy or photographic residual raises them toward
+      ``adaptiveScaleMax`` so junk CCs shrink.  MAD is used instead of std so real
+      elements (a minority of pixels) do not inflate the noise estimate.
+    * ``minArea`` scales linearly with canvas area relative to ``adaptiveRefArea``
+      (24 px^2 means something very different at 1080p vs 4K), clamped to
+      [adaptiveMinAreaFloor, minArea * adaptiveMinAreaCap].
+
+    At the reference canvas and reference sigma the effective values equal the configured
+    constants, so the historical defaults remain the calibration anchors.
+    """
+    np = _require_np()
+    out = dict(opts)
+    med = float(np.median(dY))
+    sigma = 1.4826 * float(np.median(np.abs(dY - med)))
+    ref_sigma = float(opts.get("adaptiveRefSigma", 12.0))
+    lo = float(opts.get("adaptiveScaleMin", 0.6))
+    hi = float(opts.get("adaptiveScaleMax", 1.6))
+    scale = min(hi, max(lo, (sigma / ref_sigma) if ref_sigma > 0 else 1.0))
+    out["lumaThresh"] = float(opts["lumaThresh"]) * scale
+    out["chromaThresh"] = float(opts["chromaThresh"]) * scale
+    area_scale = n / max(1.0, float(opts.get("adaptiveRefArea", 1166400)))
+    min_area = int(round(float(opts["minArea"]) * area_scale))
+    cap = int(round(float(opts["minArea"]) * float(opts.get("adaptiveMinAreaCap", 4.0))))
+    out["minArea"] = max(int(opts.get("adaptiveMinAreaFloor", 8)), min(min_area, cap))
+    out["_adaptive"] = {
+        "noise_sigma": round(sigma, 3),
+        "threshold_scale": round(scale, 3),
+        "lumaThresh": round(out["lumaThresh"], 3),
+        "chromaThresh": round(out["chromaThresh"], 3),
+        "minArea": out["minArea"],
+    }
+    return out
+
+
 def _line_boxes(ocr):
     """Extract axis boxes from a schema.OcrResult dict (or a list of boxes/lines)."""
     boxes = []
@@ -218,6 +273,8 @@ def detect(
     dY = np.abs(ys - ye)
     dCr = np.abs((rgb[..., 0] - ys) - (explained[..., 0] - ye))
     dCb = np.abs((rgb[..., 2] - ys) - (explained[..., 2] - ye))
+    if opts.get("adaptive", True):
+        opts = _adaptive_opts(opts, dY, n)
     mask = ((dY > opts["lumaThresh"]) | (dCr + dCb > opts["chromaThresh"])).astype(
         np.uint8
     )

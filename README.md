@@ -19,8 +19,9 @@ image
 
 ## What is implemented
 
-- Current PaddleOCR 3/PP-OCRv6 parsing, Surya/docTR challengers, calibrated reconciliation,
-  word geometry, and targeted 2× retries for small/uncertain text.
+- Default docTR primary with an easyocr challenger; PaddleOCR 3/PP-OCRv6, Surya, and Tesseract
+  are supported optional backends. Calibrated reconciliation, word geometry, and targeted 2×
+  retries for small/uncertain text.
 - Painted glyph boxes, baseline/rotation/color estimates, paragraph grouping, hierarchy,
   shared style IDs, and bounded local font retrieval with ranked candidates.
 - Official local SAM 3 image adapter. It prompt-sweeps products, people, logos, icons, arrows,
@@ -96,7 +97,7 @@ Figma Desktop needs `figma-plugin\manifest.json` imported once. For a full bench
 `.\start_rtx.ps1 -InputDir C:\images\benchmark` after the bridge reports the machine ready.
 
 After the model files and LM Studio are ready, run `Start Bridge.bat -SelfTest` once. It really
-runs the configured OCR, SAM 3, Gemma vision, Big-LaMa, VTracer, Figma staging, and one integrated
+runs the configured OCR, SAM 3, the Gemma VLM (google/gemma-4-12b), Big-LaMa, VTracer, Figma staging, and one integrated
 synthetic pipeline. Proof is saved under `runs\rtx-self-test`. Normal restarts only read that
 small proof; they do not reload models. Use `-ForceSelfTest` after driver/model changes.
 

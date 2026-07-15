@@ -89,6 +89,52 @@ def _module(name):
     return importlib.util.find_spec(name) is not None
 
 
+def _cuda_total_mib() -> int | None:
+    """Total VRAM (MiB) on device 0, or None when CUDA is unavailable."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.get_device_properties(0).total_memory // (1024 * 1024))
+    except Exception:
+        return None
+
+
+# Rough resident footprints (MiB) for the concurrent-model VRAM sanity check.  gemma-4-e4b
+# (~6.3 GB) lives persistently in LM Studio; Flux Fill (unet + t5xxl fp8 + clip_l + vae)
+# lives in ComfyUI.  On a 16 GB card these two cannot coexist, which is why the inpaint
+# boundary can evict the VLM (runtime.vram.evict_vlm_for_inpaint).
+_VRAM_FOOTPRINT_MIB = {"vlm": 6300, "flux": 14000, "sam3": 3000}
+
+
+def _vram_footprint_check(cfg: dict, flux_enabled: bool) -> dict | None:
+    """Warn when the persistent VLM and Flux Fill would exceed VRAM without eviction."""
+    if str(cfg.get("device", "cpu")).lower() != "cuda":
+        return None
+    vlm_on = _vlm_feature_enabled(cfg)
+    if not (vlm_on and flux_enabled):
+        return None
+    evict = bool(((cfg.get("runtime") or {}).get("vram") or {}).get("evict_vlm_for_inpaint", False))
+    total = _cuda_total_mib()
+    concurrent = _VRAM_FOOTPRINT_MIB["vlm"] + _VRAM_FOOTPRINT_MIB["flux"]
+    over = total is not None and concurrent > total
+    if evict:
+        return _check(
+            "vram headroom", True,
+            f"VLM (~{_VRAM_FOOTPRINT_MIB['vlm']}MiB) + Flux Fill (~{_VRAM_FOOTPRINT_MIB['flux']}MiB) "
+            f"= ~{concurrent}MiB > {total or '?'}MiB GPU, but runtime.vram.evict_vlm_for_inpaint "
+            "unloads the VLM during inpaint",
+            required=False,
+        )
+    return _check(
+        "vram headroom", not over,
+        (f"VLM + Flux Fill ~{concurrent}MiB exceeds {total}MiB GPU with no eviction; set "
+         "runtime.vram.evict_vlm_for_inpaint: true to unload the VLM during Flux inpaint"
+         if over else f"~{concurrent}MiB estimated concurrent footprint fits {total or '?'}MiB GPU"),
+        required=False,
+    )
+
+
 _FLUX_INPAINT_MODES = {"flux_comfy", "flux-comfy", "flux"}
 _POWERPAINT_MODES = {"powerpaint", "power-paint"}
 
@@ -564,6 +610,9 @@ def inspect(cfg, root: Path) -> dict:
             stack_detail,
             required=lama_required,
         ))
+    footprint = _vram_footprint_check(cfg, flux_enabled)
+    if footprint is not None:
+        checks.append(footprint)
     checks.append(_check("Figma bridge", _module("requests"), "required only for plugin staging"))
 
     for item in checks:

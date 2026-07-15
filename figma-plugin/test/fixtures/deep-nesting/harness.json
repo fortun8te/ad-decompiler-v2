@@ -1,0 +1,7 @@
+{
+  "installedFonts": "auto",
+  "expect": {
+    "ok": true,
+    "minCreated": 12
+  }
+}

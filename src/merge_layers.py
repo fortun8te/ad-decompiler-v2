@@ -26,8 +26,10 @@ from __future__ import annotations
 import importlib
 import os
 import copy
+import difflib
 import json
 import re
+from collections import Counter
 from typing import Optional
 from .wordmark import is_platform_lockup, semantic_text_role
 from .raster_clusters import is_intentional_raster_cluster
@@ -80,6 +82,208 @@ def _raster_cluster_owner(box: dict, owners: list[dict], threshold: float):
 
 def _normalize_text_key(value):
     return " ".join(str(value or "").strip().upper().split())
+
+
+# ── content-similarity helpers ───────────────────────────────────────────────────────
+# Dedup keys on geometry overlap AND content, never IoU alone: two OCR engines (or the
+# block-vs-orphan-line paths) that describe the same physical text usually disagree only
+# on separators/whitespace, so we compare normalized alphanumeric/currency tokens.
+_CONTENT_TOKEN_RE = re.compile(r"[0-9A-Z€£$%]+")
+
+
+def _content_tokens(value):
+    """Uppercased alphanumeric/currency runs; OCR-noisy punctuation/whitespace dropped."""
+    return _CONTENT_TOKEN_RE.findall(_normalize_text_key(value))
+
+
+def _token_containment(inner, outer):
+    """Multiset fraction of ``inner`` tokens also present in ``outer`` (0..1)."""
+    inner_tokens = _content_tokens(inner)
+    if not inner_tokens:
+        return 0.0
+    available = Counter(_content_tokens(outer))
+    hit = 0
+    for token in inner_tokens:
+        if available.get(token, 0) > 0:
+            available[token] -= 1
+            hit += 1
+    return hit / len(inner_tokens)
+
+
+def _text_similarity(a, b):
+    """Character-level ratio on normalized text (0..1); 1.0 on an exact normalized match."""
+    na, nb = _normalize_text_key(a), _normalize_text_key(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def _geometry_overlap(a, b):
+    """Return (iou, fraction_of_smaller_box_inside_the_larger) — orientation-independent."""
+    iou = _iou(a, b)
+    area_a = float(a.get("w", 0) or 0) * float(a.get("h", 0) or 0)
+    area_b = float(b.get("w", 0) or 0) * float(b.get("h", 0) or 0)
+    small, big = (a, b) if area_a <= area_b else (b, a)
+    return iou, _inside_frac(small, big)
+
+
+def _dedup_overlapping_text(candidates, merge_cfg: dict, dedup_iou: float, diagnostics=None):
+    """Collapse text candidates that describe the SAME physical text but arrived from
+    different sources (OCR ensemble members, block-vs-orphan line, fragment recombination).
+
+    A pair is a duplicate when it overlaps geometrically AND one's content is essentially
+    contained in the other (content-similarity, not IoU alone). The most complete
+    observation survives; the redundant fragment is dropped with provenance recorded on the
+    keeper (``meta.deduped_text_ids``) and in the merge diagnostics.
+
+    Real failure this fixes: run 009 emitted the timestamp row three times
+    ('05:00 PM . 12-05-2026 - 121K weergaven', '05:00 PM', '12-05-2026 121K weergaven')
+    because one engine read the whole row and another split it into two fragments; all three
+    survived as separate sole-member blocks and re-rendered on top of each other.
+    """
+    overlap_thresh = float(merge_cfg.get("dedup_text_overlap", 0.6))
+    content_thresh = float(merge_cfg.get("dedup_text_content", 0.8))
+    sim_thresh = float(merge_cfg.get("dedup_text_similarity", 0.85))
+
+    texts = [
+        c for c in candidates
+        if (c.get("meta") or {}).get("source") == "ocr"
+        and c.get("target") != "drop"
+        and str(c.get("text") or "").strip()
+    ]
+
+    def _order_key(c):
+        # Best (most complete) observation first: more content tokens, longer text, higher
+        # confidence, larger visible coverage. Ascending id is the final deterministic
+        # tie-break so the surviving layer is reproducible across runs.
+        box = c.get("visible_box") or c.get("box") or {}
+        return (
+            -len(_content_tokens(c.get("text"))),
+            -len(_normalize_text_key(c.get("text"))),
+            -float((c.get("meta") or {}).get("confidence", 0) or 0),
+            -(float(box.get("w", 0) or 0) * float(box.get("h", 0) or 0)),
+            str(c.get("id") or ""),
+        )
+
+    ordered = sorted(texts, key=_order_key)
+    dropped = {}
+    for index, keeper in enumerate(ordered):
+        if keeper.get("id") in dropped:
+            continue
+        for other in ordered[index + 1:]:
+            oid = other.get("id")
+            if oid in dropped:
+                continue
+            iou, inside = _geometry_overlap(keeper.get("box", {}), other.get("box", {}))
+            if inside < overlap_thresh and iou < dedup_iou:
+                continue
+            containment = _token_containment(other.get("text"), keeper.get("text"))
+            similarity = _text_similarity(other.get("text"), keeper.get("text"))
+            if containment < content_thresh and similarity < sim_thresh:
+                continue
+            dropped[oid] = {
+                "dropped": oid,
+                "kept": keeper.get("id"),
+                "reason": "duplicate-text-overlapping-geometry",
+                "content_containment": round(containment, 3),
+                "text_similarity": round(similarity, 3),
+                "iou": round(iou, 3),
+                "inside_frac": round(inside, 3),
+            }
+            keeper.setdefault("meta", {}).setdefault("deduped_text_ids", []).append(oid)
+    if diagnostics is not None:
+        diagnostics.extend(dropped[oid] for oid in dropped)
+    if not dropped:
+        return candidates
+    return [c for c in candidates if c.get("id") not in dropped]
+
+
+def _suppressed_fragment_line_ids(lines_by_id: dict, blocks: list, diagnostics=None):
+    """OCR line ids to drop from *multi-line* blocks because they are near-duplicate
+    fragments of a richer line owned by a DIFFERENT block.
+
+    This is the fragment-recombination failure (run 009 'geld'): OCR read the wrapped line
+    'geld terug tot €100.' as its own line/block AND a lone 'geld' fragment that
+    text_analysis absorbed into the body paragraph, so 'geld' rendered twice at different
+    offsets. Only members of blocks that retain another line are eligible here, so a whole
+    duplicate block or orphan line is left for candidate-level dedup rather than emptied.
+    """
+    owner = {}
+    member_count = {}
+    for block in blocks:
+        bid = block.get("id")
+        ids = [lid for lid in (block.get("line_ids") or []) if lid in lines_by_id]
+        member_count[bid] = len(ids)
+        for lid in ids:
+            owner[lid] = bid
+    suppressed = {}
+    for lid, line in lines_by_id.items():
+        bid = owner.get(lid)
+        if bid is None or member_count.get(bid, 0) < 2:
+            continue  # orphan or sole-member block -> candidate dedup owns this case
+        frag_tokens = _content_tokens(line.get("text"))
+        if not frag_tokens:
+            continue
+        for other_id, other in lines_by_id.items():
+            if other_id == lid or owner.get(other_id) == bid:
+                continue
+            if len(_content_tokens(other.get("text"))) <= len(frag_tokens):
+                continue  # only a strictly richer line may subsume the fragment
+            if _token_containment(line.get("text"), other.get("text")) < 0.9:
+                continue
+            _iou_v, inside = _geometry_overlap(line.get("box", {}), other.get("box", {}))
+            if inside < 0.5:
+                continue
+            suppressed[lid] = {
+                "line_id": lid,
+                "block_id": bid,
+                "superset_line_id": other_id,
+                "reason": "fragment-duplicate-of-richer-line-in-another-block",
+            }
+            break
+    if diagnostics is not None:
+        diagnostics.extend(suppressed[lid] for lid in suppressed)
+    return suppressed
+
+
+# ── scene-text contract enforcement ──────────────────────────────────────────────────
+# kept_in_photo scene text stays baked in the photo; reconstruct._is_text_removal erases
+# pixels for any target=='drop' item that still carries removal_required, so a scene-text
+# candidate holding an editable/overlay flag would be deleted from the plate without a
+# replacement layer. These flags are mutually exclusive with baked scene text.
+_SCENE_TEXT_EDITABLE_FLAGS = (
+    "overlay_text", "removal_required", "promote_text", "editable_text",
+    "text_promoted", "external_overlay",
+)
+
+
+def _enforce_scene_text_contract(candidate: dict, diagnostics=None):
+    """Guarantee a kept_in_photo scene-text candidate is never ALSO an editable overlay."""
+    if candidate.get("text") is None:
+        return
+    meta = candidate.setdefault("meta", {})
+    is_scene = bool(
+        candidate.get("kept_in_photo") or meta.get("kept_in_photo")
+        or meta.get("origin") == "scene" or meta.get("role") == "scene-text"
+    )
+    if not is_scene:
+        return
+    candidate["target"] = "drop"
+    candidate["kept_in_photo"] = True
+    meta["kept_in_photo"] = True
+    cleared = [flag for flag in _SCENE_TEXT_EDITABLE_FLAGS if meta.get(flag)]
+    for flag in cleared:
+        meta.pop(flag, None)
+    if cleared:
+        meta["scene_text_contract_enforced"] = cleared
+        if diagnostics is not None:
+            diagnostics.append({
+                "id": candidate.get("id"),
+                "cleared_flags": cleared,
+                "reason": "scene-text-not-also-editable-overlay",
+            })
 
 
 def _dedup_text_candidates(candidates, merge_cfg: dict, dedup_iou: float):
@@ -326,7 +530,7 @@ def _annotate_native_text_repetitions(candidates: list[dict]) -> None:
             })
 
 
-def _text_sources(ocr):
+def _text_sources(ocr, diagnostics=None):
     if not isinstance(ocr, dict):
         return ocr or []
     blocks = ocr.get("blocks") or []
@@ -334,12 +538,27 @@ def _text_sources(ocr):
         return ocr.get("lines", [])
     styles = {style.get("id"): style for style in (ocr.get("styles") or [])}
     lines = {line.get("id"): line for line in (ocr.get("lines") or [])}
+    # Drop fragment lines that duplicate a richer line owned by a different block before
+    # a block's paragraph text is assembled (run 009 'geld' render-twice bug).
+    suppressed_fragments = _suppressed_fragment_line_ids(lines, blocks, diagnostics)
     out = []
     represented_line_ids = set()
     for raw in blocks:
         block = dict(raw)
-        members = [lines[line_id] for line_id in block.get("line_ids", []) if line_id in lines]
-        represented_line_ids.update(line.get("id") for line in members if line.get("id"))
+        member_ids = [line_id for line_id in block.get("line_ids", []) if line_id in lines]
+        kept_ids = [line_id for line_id in member_ids if line_id not in suppressed_fragments]
+        members = [lines[line_id] for line_id in kept_ids]
+        if len(kept_ids) != len(member_ids) and members:
+            # Only rebuild the paragraph when text_analysis's newline-join invariant holds,
+            # so a suppressed fragment is removed without mangling a post-corrected block.
+            original_join = "\n".join(str(lines[lid].get("text") or "") for lid in member_ids)
+            if str(block.get("text") or "") == original_join:
+                block["text"] = "\n".join(str(m.get("text") or "") for m in members)
+            else:
+                members = [lines[line_id] for line_id in member_ids]  # fail-closed: keep all
+        # Represent every ORIGINAL member (incl. suppressed) so a dropped fragment is not
+        # resurrected below as an orphan candidate.
+        represented_line_ids.update(line_id for line_id in member_ids if line_id)
         style_id = block.get("style_id")
         block_style = dict(block.get("style") or styles.get(style_id) or
                            (members[0].get("style") if members else {}) or {})
@@ -459,9 +678,19 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     overlay_text_roles = {"headline", "title", "subtitle", "subheadline", "eyebrow",
                           "cta", "button", "price", "offer"}
 
+    # Merge diagnostics: counts + reasons for every deduped/suppressed/enforced item, so a
+    # ghost/duplicate regression is auditable from the run dir (see merge_report.json).
+    diagnostics = {
+        "kind": "merge-diagnostics",
+        "fragment_suppressed": [],
+        "text_dedup": [],
+        "element_dedup": [],
+        "scene_text_contract": [],
+    }
+
     # text_analysis emits paragraph/headline blocks. Prefer those over one Figma node per
     # OCR line so wrapping, hierarchy, and repeated text styles survive downstream.
-    ocr_lines = _text_sources(ocr)
+    ocr_lines = _text_sources(ocr, diagnostics["fragment_suppressed"])
     elements = elements or []
     qwen = qwen or []
 
@@ -706,13 +935,25 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             if role in ("button", "badge", "chip"):
                 kept.append(c)
                 continue
-            covered = any(
-                t.get("target") != "drop"
-                and _inside_frac(t["box"], c["box"]) >= 0.9
-                and _iou(t["box"], c["box"]) >= dedup_iou
-                for t in text_cands
+            # A shape/icon is really just an OCR text box when the text sits almost
+            # entirely inside it AND the two boxes are near-coincident — measured by IoU
+            # OR mutual containment (the element is also mostly inside the text box), so a
+            # slightly different aspect ratio no longer keeps a redundant plate fragment.
+            cover_text = next(
+                (t for t in text_cands
+                 if t.get("target") != "drop"
+                 and _inside_frac(t["box"], c["box"]) >= 0.9
+                 and (_iou(t["box"], c["box"]) >= dedup_iou
+                      or _inside_frac(c["box"], t["box"]) >= 0.85)),
+                None,
             )
-            if covered:
+            if cover_text is not None:
+                diagnostics["element_dedup"].append({
+                    "dropped": c.get("id"),
+                    "covered_by": cover_text.get("id"),
+                    "reason": "element-box-is-ocr-text-box",
+                    "iou": round(_iou(cover_text["box"], c["box"]), 3),
+                })
                 continue  # the "shape" is just the text's bounding box
             # Button shells are larger than the CTA label — keep the painted backdrop.
             if role in ("shape", "card", "container", None) and any(
@@ -726,7 +967,24 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                 continue
         kept.append(c)
 
-    kept = _dedup_text_candidates(kept, cfg.get("merge") or {}, dedup_iou)
+    # text-vs-text dedup: collapse the same physical text arriving from different sources
+    # (OCR ensemble split disagreement, block-vs-orphan line) before the explicit
+    # harness/VLM-critic list is applied.
+    merge_cfg = cfg.get("merge") or {}
+    kept = _dedup_overlapping_text(kept, merge_cfg, dedup_iou, diagnostics["text_dedup"])
+    ids_before_cfg = {c.get("id") for c in kept}
+    kept = _dedup_text_candidates(kept, merge_cfg, dedup_iou)
+    already_recorded = {entry["dropped"] for entry in diagnostics["text_dedup"]}
+    for rid in sorted(x for x in (ids_before_cfg - {c.get("id") for c in kept})
+                      if x and x not in already_recorded):
+        diagnostics["text_dedup"].append({
+            "dropped": rid, "reason": "explicit-duplicate-text-config",
+        })
+
+    # Contract: scene text that stays baked in the photo is never ALSO an editable overlay
+    # (reconstruct would erase its pixels without re-emitting the layer).
+    for c in kept:
+        _enforce_scene_text_contract(c, diagnostics["scene_text_contract"])
 
     # stable z: keep qwen-derived z, then order remaining by area (large=back)
     def _area(c):
@@ -737,7 +995,27 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
         if c["z"] == 0 and c["meta"].get("source") == "ocr":
             c["z"] = max_z + 1  # text sits above shapes by default
 
-    kept.sort(key=lambda c: (c["z"], -_area(c)))
+    # Deterministic reading/z order: z, then back-to-front by area, then reading order
+    # (top-to-bottom, left-to-right), with a stable id tie-break so identical scenes
+    # reproduce byte-for-byte across runs.
+    def _sort_key(c):
+        box = c.get("box") or {}
+        return (
+            c["z"], -_area(c),
+            round(float(box.get("y", 0) or 0), 3),
+            round(float(box.get("x", 0) or 0), 3),
+            str(c.get("id") or ""),
+        )
+
+    kept.sort(key=_sort_key)
+
+    diagnostics["counts"] = {
+        "candidates": len(kept),
+        "fragment_suppressed": len(diagnostics["fragment_suppressed"]),
+        "text_dedup": len(diagnostics["text_dedup"]),
+        "element_dedup": len(diagnostics["element_dedup"]),
+        "scene_text_contract": len(diagnostics["scene_text_contract"]),
+    }
 
     if run_dir:
         try:
@@ -748,6 +1026,9 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             schema = importlib.import_module("schema")
         os.makedirs(run_dir, exist_ok=True)
         schema.dump(kept, os.path.join(run_dir, "merged.json"))
+        # merged.json is a strict list (scene_intent contract); diagnostics ride alongside
+        # as a sidecar report, mirroring reconstruction.json / qa.json.
+        schema.dump(diagnostics, os.path.join(run_dir, "merge_report.json"))
 
     return kept
 

@@ -148,11 +148,16 @@ def run(config_path: Path, output: Path, force: bool = False) -> dict:
     run_dir = (output / fp).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     started = int(time.time())
+    # Cheap, model-free readiness (lms CLI for VLM eviction, Tesseract discovery). Surfaced
+    # even when dependency preflight fails so the readiness table can still be actionable.
+    from runtime_smoke import environment_checks
+    env_checks = environment_checks(cfg)
     preflight = inspect(cfg, root)
     _atomic_json(run_dir / "dependency_preflight.json", preflight)
     if not preflight.get("ok"):
         checks = [_check("dependency_readiness", False, "doctor has blockers",
                          blockers=preflight.get("blockers") or [])]
+        checks.extend(env_checks)
     else:
         image_path = run_dir / "self-test-input.png"
         _synthetic_image(image_path)
@@ -163,6 +168,7 @@ def run(config_path: Path, output: Path, force: bool = False) -> dict:
         from runtime_smoke import run_all
         smoke = run_all(cfg, run_dir / "runtime-smoke", timeout_s=120)
         checks.extend(smoke.get("checks") or [])
+        checks.extend(env_checks)
         pipeline_cfg = copy.deepcopy(cfg)
         pipeline_cfg.setdefault("runtime", {})["auto_repair"] = False
         pipeline_cfg["runtime"].setdefault("harness", {})["enabled"] = False
@@ -201,6 +207,98 @@ def run(config_path: Path, output: Path, force: bool = False) -> dict:
     return report
 
 
+DEFAULT_VLM_MODEL = "google/gemma-4-e4b"
+# Rough resident footprints (MiB); kept in sync with doctor._VRAM_FOOTPRINT_MIB when importable.
+_FALLBACK_FOOTPRINT_MIB = {"vlm": 7500, "flux": 14000, "sam3": 3000}
+
+
+def _footprints() -> dict:
+    footprints = dict(_FALLBACK_FOOTPRINT_MIB)
+    try:
+        from doctor import _VRAM_FOOTPRINT_MIB
+        footprints.update(_VRAM_FOOTPRINT_MIB)
+    except Exception:
+        pass
+    return footprints
+
+
+def readiness_rows(report: dict, cfg: dict) -> list[dict]:
+    """Compact per-model readiness for the launcher table: model, status, footprint, action."""
+    checks = {str(item.get("name")): item for item in (report.get("checks") or [])}
+    footprints = _footprints()
+
+    def gb(mib) -> str:
+        return f"{mib / 1024:.1f}"
+
+    model = str((cfg.get("vlm") or {}).get("model") or DEFAULT_VLM_MODEL)
+    mode = str((cfg.get("inpaint") or {}).get("mode", "auto")).lower()
+    if mode in ("flux_comfy", "flux-comfy", "flux"):
+        inpaint = ("Inpaint - Flux Fill (ComfyUI)", "flux_comfy", gb(footprints["flux"]),
+                   "Start ComfyUI :8188; run scripts\\setup_flux_inpaint.ps1")
+    elif mode in ("powerpaint", "power-paint"):
+        inpaint = ("Inpaint - PowerPaint", "powerpaint", "",
+                   "Install PowerPaint adapter; set inpaint.powerpaint in config.yaml")
+    else:
+        inpaint = ("Inpaint - Big-LaMa", "big_lama", "",
+                   "pip install simple-lama-inpainting")
+
+    spec = [
+        ("OCR - docTR", ("ocr", "ocr_runtime"), "", "Rerun setup_rtx.ps1"),
+        ("OCR - Tesseract (fallback)", ("tesseract",), "",
+         "winget install UB-Mannheim.TesseractOCR"),
+        ("SAM 3 detector", ("sam3", "sam3_runtime"), gb(footprints["sam3"]),
+         "Set sam3.checkpoint; rerun setup_rtx.ps1"),
+        (f"VLM - {model}", ("vlm",), gb(footprints["vlm"]),
+         f"LM Studio: load {model} (lms load {model})"),
+        ("LM Studio CLI (lms)", ("lms_cli",), "",
+         "Install LM Studio, then run: lms bootstrap"),
+        (inpaint[0], (inpaint[1], "pipeline_inpaint_evidence"), inpaint[2], inpaint[3]),
+        ("Vectorize - VTracer + CairoSVG/resvg", ("vectorization",), "",
+         "Rerun setup_rtx.ps1 (Potrace not required)"),
+        ("Figma staging", ("figma_staging",), "", "Rerun setup_rtx.ps1"),
+    ]
+
+    rows = []
+    for label, names, footprint, action in spec:
+        check = next((checks[name] for name in names if name in checks), None)
+        if check is None:
+            status = "-"
+        else:
+            status = "READY" if check.get("ok") else "MISSING"
+        rows.append({"model": label, "status": status, "vram_gb": footprint,
+                     "action": "" if status == "READY" else action})
+    return rows
+
+
+def _print_readiness_table(report: dict, cfg: dict) -> None:
+    rows = readiness_rows(report, cfg)
+    headers = ("MODEL", "STATUS", "~VRAM GB", "ACTION IF MISSING")
+    widths = [len(header) for header in headers]
+    for row in rows:
+        widths[0] = max(widths[0], len(row["model"]))
+        widths[1] = max(widths[1], len(row["status"]))
+        widths[2] = max(widths[2], len(row["vram_gb"]))
+        widths[3] = max(widths[3], len(row["action"]))
+
+    def fmt(cols) -> str:
+        return "  ".join(str(col).ljust(width) for col, width in zip(cols, widths))
+
+    print()
+    print("RTX readiness")
+    print(fmt(headers))
+    print(fmt(["-" * width for width in widths]))
+    for row in rows:
+        print(fmt([row["model"], row["status"], row["vram_gb"], row["action"]]))
+    vram = (cfg.get("runtime") or {}).get("vram") or {}
+    flags = ", ".join(
+        f"{key}={vram[key]}" for key in (
+            "evict_vlm_for_inpaint", "reload_vlm_after_inpaint",
+            "unload_ocr_before_sam", "empty_cache_between_stages") if key in vram)
+    if flags:
+        print(f"VRAM plan (runtime.vram): {flags}")
+    print()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run or inspect the cached RTX model smoke test")
     parser.add_argument("--config", default="config.yaml")
@@ -214,8 +312,14 @@ def main() -> int:
         print(json.dumps(cache_status(output, config_path)))
         return 0
     report = run(config_path, output, force=args.force)
+    try:
+        from doctor import load_cfg
+        cfg = load_cfg(str(config_path))
+    except Exception:
+        cfg = {}
     print("RTX SELF-TEST PASSED" if report.get("ok") else "RTX SELF-TEST FAILED")
     print(f"Evidence: {report.get('evidence_path')}")
+    _print_readiness_table(report, cfg)
     for item in report.get("checks") or []:
         print(f"{'OK' if item.get('ok') else 'FAIL':4} {item.get('name')}: {item.get('detail')}")
     return 0 if report.get("ok") else 2

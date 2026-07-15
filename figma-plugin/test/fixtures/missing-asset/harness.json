@@ -1,0 +1,14 @@
+{
+  "installedFonts": "auto",
+  "expect": {
+    "ok": true,
+    "minCreated": 2,
+    "failedLayers": [
+      "ghost"
+    ],
+    "errorsContain": [
+      "Missing image asset"
+    ],
+    "assetsMissing": 1
+  }
+}

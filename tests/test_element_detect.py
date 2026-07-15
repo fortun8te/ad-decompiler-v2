@@ -118,6 +118,59 @@ def test_border_touching_icon_is_not_misclassified_by_wrapped_gradient():
     assert any(_contains(e["box"], 10, 95) for e in els), "border-touching element missing"
 
 
+def test_adaptive_recovers_low_contrast_small_element_on_flat_bg():
+    """On a flat, clean background the residual noise sigma is ~0, so the adaptive pass
+    lowers the luma bar (clamped at adaptiveScaleMin) and a low-contrast element that the
+    fixed 14.0 threshold silently dropped is recovered. With adaptive disabled the
+    historical constants apply unchanged."""
+    img = np.full((400, 600, 3), 240, np.uint8)
+    img[100:130, 200:230, :] = 228  # gray-on-gray square: |dY| = 12, chroma 0
+    path, _ = _write(img)
+
+    fixed = element_detect.detect(path, {"lines": []}, {"element_detect": {"adaptive": False}})
+    assert not any(_contains(e["box"], 215, 115) for e in fixed), "12-level delta above 14 bar?"
+
+    adaptive = element_detect.detect(path, {"lines": []}, {})
+    assert any(_contains(e["box"], 215, 115) for e in adaptive), "low-contrast square missed"
+
+
+def test_adaptive_opts_scales_thresholds_and_min_area():
+    ref_area = element_detect.DEFAULTS["adaptiveRefArea"]
+
+    # flat residual -> sigma 0 -> scale clamps at adaptiveScaleMin
+    flat = np.zeros((100, 100), dtype=np.float64)
+    opts = element_detect._adaptive_opts(dict(element_detect.DEFAULTS), flat, ref_area)
+    assert opts["lumaThresh"] == 14.0 * 0.6
+    assert opts["chromaThresh"] == 20.0 * 0.6
+    assert opts["minArea"] == 24  # reference canvas keeps the historical default
+
+    # noisy residual -> big sigma -> scale clamps at adaptiveScaleMax
+    noisy = np.zeros((100, 100), dtype=np.float64)
+    noisy[::2, :] = 60.0  # median 30, MAD 30 -> sigma ~44.5
+    opts = element_detect._adaptive_opts(dict(element_detect.DEFAULTS), noisy, ref_area)
+    assert opts["lumaThresh"] == 14.0 * 1.6
+    assert opts["chromaThresh"] == 20.0 * 1.6
+
+    # reference sigma reproduces the historical constants exactly
+    at_ref = np.zeros((100, 100), dtype=np.float64)
+    at_ref[::2, :] = 2 * element_detect.DEFAULTS["adaptiveRefSigma"] / 1.4826
+    opts = element_detect._adaptive_opts(dict(element_detect.DEFAULTS), at_ref, ref_area)
+    assert abs(opts["lumaThresh"] - 14.0) < 1e-9
+    assert abs(opts["chromaThresh"] - 20.0) < 1e-9
+
+    # minArea follows canvas area: 4x reference canvas hits the 4x cap, tiny canvas floors
+    opts = element_detect._adaptive_opts(dict(element_detect.DEFAULTS), flat, 5 * ref_area)
+    assert opts["minArea"] == 24 * 4
+    opts = element_detect._adaptive_opts(dict(element_detect.DEFAULTS), flat, 100 * 100)
+    assert opts["minArea"] == element_detect.DEFAULTS["adaptiveMinAreaFloor"]
+
+
+def test_adaptive_flat_image_still_yields_no_elements():
+    img = np.full((120, 120, 3), 200, np.uint8)
+    path, _ = _write(img)
+    assert element_detect.detect(path, {"lines": []}, {}) == []
+
+
 def test_writes_artifacts(tmp_path):
     img = _make_ad()
     path, _ = _write(img)

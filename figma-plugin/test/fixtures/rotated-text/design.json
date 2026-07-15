@@ -1,0 +1,65 @@
+{
+  "id": "rotated-text",
+  "name": "rotated-text",
+  "canvas": {
+    "w": 1000,
+    "h": 800
+  },
+  "schema_version": 2,
+  "meta": {
+    "coordinate_space": "local"
+  },
+  "layers": [
+    {
+      "id": "bg",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "bg",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "w": 1000,
+        "h": 800
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#ffffff"
+      }
+    },
+    {
+      "id": "t-rot",
+      "type": "text",
+      "name": "t-rot",
+      "box": {
+        "x": 200,
+        "y": 200,
+        "w": 300,
+        "h": 50
+      },
+      "text": "Tilted headline",
+      "style": {
+        "fontFamily": "Arial",
+        "fontSize": 24,
+        "color": "#111111"
+      },
+      "rotation": 30
+    },
+    {
+      "id": "r-rot",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "r-rot",
+      "box": {
+        "x": 500,
+        "y": 400,
+        "w": 120,
+        "h": 60
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#ff9900"
+      },
+      "rotation": 45
+    }
+  ]
+}

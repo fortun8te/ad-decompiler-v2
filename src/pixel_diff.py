@@ -16,6 +16,33 @@ from typing import Optional
 
 from src.qa_config import DEFAULT_VISUAL_PASS_SSIM
 
+# Canonical fallback-contract helpers live in src.schema (F11). Import them so every stage
+# reads meta.fallback the SAME way instead of ad-hoc truthiness/equality checks. They are
+# added by the reconstruct/schema agent; guard the import so this module stays usable if a
+# checkout predates them (the guard is a thin adapter, NOT a redefinition of the contract).
+try:
+    from src.schema import is_raster_slice as _is_raster_slice, fallback_kind as _fallback_kind
+except Exception:  # pragma: no cover - only when a checkout predates the schema helpers
+    def _is_raster_slice(meta) -> bool:
+        return bool(isinstance(meta, dict) and meta.get("fallback") == "raster-slice")
+
+    def _fallback_kind(meta):
+        if not isinstance(meta, dict) or meta.get("fallback") in (None, False, "", 0):
+            return None
+        return "raster-slice" if meta.get("fallback") == "raster-slice" else "fidelity-image"
+
+# Template-free Codia construction scoring (scripts/codia_parity.score_construction). Guarded
+# so pixel_diff stays importable if the scripts package is unavailable; the construction block
+# then degrades to None rather than breaking QA.
+try:
+    import sys as _sys
+    _scripts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if _scripts_dir not in _sys.path:
+        _sys.path.insert(0, _scripts_dir)
+    from codia_parity import score_construction as _score_construction
+except Exception:  # pragma: no cover - only when scripts/codia_parity is unavailable
+    _score_construction = None
+
 
 DEFAULT_THRESHOLDS = {
     "local_ssim_min": DEFAULT_VISUAL_PASS_SSIM,
@@ -30,12 +57,66 @@ DEFAULT_THRESHOLDS = {
     # to police photo-heavy-but-honest layouts, only near-total rasterization.
     "native_leaf_ratio_min": 0.30,
     "editable_text_recall_min": 0.80,
+    # Structural-honesty gates that are NOT keyed to a Figma acceptance run (F2): they
+    # evaluate whenever leaf accounting exists (it always does now) and fire the
+    # unexplained-raster / near-total-rasterization hard-fails. Config can turn them off,
+    # but the sane default is ON so a good screenshot cannot buy off a rasterized page.
+    "enforce_native_leaf_accounting": True,
+    # Upper bound on how much of the canvas the removal/inpaint pass may destroy (F3). 002
+    # rebuilt 85% of the plate (products erased) and tripped nothing; >0.55 of canvas being
+    # altered inside the removal mask is a red flag that real content was erased.
+    "background_changed_ratio_max": 0.55,
+    # Unresolved glyph residue under a removed text region is a structural failure, not a
+    # mere repair suggestion (F15): QA must not report ok while it stands.
+    "glyph_residue_gate": True,
     "background_exact_match_max": 0.995,
     "background_changed_min": 0.01,
     "background_edge_retention_max": 0.90,
     "background_outside_damage_max": 0.01,
     "layer_internal_hole_fraction_max": 0.025,
     "element_survival_min": 0.75,
+    # Per-archetype text strictness (F8) is threaded in by the caller (archetype preset's
+    # text_recall_min). Left None here so a bare compare() keeps its old behaviour and only
+    # archetype-configured runs gate on global text recall.
+    "text_recall_min": None,
+    # F-honesty: editable_text_recall alone can lie about its own denominator. If OCR only
+    # found 17% of the source text and every found line happens to be editable, recall reads
+    # 1.0 while 83% of the ad's copy silently doesn't exist anywhere in the reconstruction.
+    # true_text_coverage = text_recall * editable_text_recall folds both fractions into one
+    # honest share-of-ALL-source-text-that-became-correct-editable-text number. 0.20 is a
+    # deliberately low floor: it only rejects the severe "OCR missed most of the ad" case
+    # (measured on the 021 fixture: text_recall 0.17 x editable_text_recall 1.0 = 0.17) and
+    # does not double-penalize runs that already clear editable_text_recall_min on its own.
+    "true_text_coverage_min": 0.20,
+    # F-worst-region: the multiscale/local-ssim aggregate is deliberately mean-dominated
+    # (0.72 mean + 0.26 p10 + 0.02 min per scale — see _multiscale_ssim) so one isolated
+    # near-zero cell from a legitimate editable overlap does not sink an otherwise-good
+    # score. That same de-emphasis lets a genuinely catastrophic region (009/016 measured
+    # worst-window SSIM ~0.03-0.04) hide under a good aggregate. This floor is a SEPARATE,
+    # independent gate on the single worst window regardless of the aggregate score.
+    # Configurable — callers/archetypes may raise or lower it.
+    "local_ssim_worst_window_min": 0.10,
+    # ── CODIA CONSTRUCTION CONTRACT (docs/CODIA-PARITY-SPEC.md) ───────────────────────
+    # The QA objective is Codia's construction, not screenshot SSIM: every string is native
+    # editable TEXT, everything hard is an image cutout, flat chrome is a solid plate,
+    # placed absolutely. These floors score that contract and demote global SSIM to a floor
+    # gate. They are REPORTED on every run; the contract pass/fail summary leads with them.
+    #
+    # native_text_ratio (= native editable TEXT lines / all readable OCR lines) must be high
+    # for every non-handwriting archetype — there is no handwriting archetype, so 0.90 is the
+    # universal contract bar. It is enforced by the existing missing-editable-text /
+    # true_text_coverage hard-fails (which fire well below this); this floor drives the
+    # contract PASS summary and the harness reward, not a new duplicate hard-fail.
+    "native_text_ratio_min": 0.90,
+    # Global SSIM is a FLOOR gate for the contract summary, not the objective. A Codia-shaped
+    # output (100% native text, clean plate, decent placement) must PASS the contract even at
+    # a modest SSIM, so the contract's own SSIM floor is deliberately low and separate from
+    # the archetype visual_pass_ssim gate. Anti-degenerate only: a near-empty/garbage render
+    # still fails it.
+    "contract_ssim_floor": 0.45,
+    # Placement: mean translation-aligned text ink-IoU across native text rows. "decent
+    # placement" for the contract; Figma re-fits glyph placement so this is lenient.
+    "contract_placement_ink_iou_min": 0.35,
 }
 
 
@@ -128,6 +209,41 @@ def _local_ssim_values_preserved(a, b, preserve_mask, target_windows=10):
         if pa.size:
             values.append(_ssim(pa, pb))
     return values or _local_ssim_values(a, b, target_windows)
+
+
+def _local_ssim_worst_window(a, b, preserve_mask=None, target_windows=10):
+    """Locate the single worst-scoring local SSIM window, with its pixel bbox.
+
+    Uses the exact same non-overlapping window grid as :func:`_local_ssim_values`
+    (and, at scale 1.0, the same grid `_multiscale_ssim` scores) so its "ssim" value
+    matches ``local_ssim.min`` for the un-resized image — this is deliberately the
+    same signal, just kept alongside a locatable bbox instead of being diluted into
+    a 2%-weighted term of the aggregate (F-worst-region: a catastrophic region must
+    be nameable/pinpointable evidence, not just a number lost inside a mean).
+    """
+    h, w = a.shape
+    window = max(8, min(64, int(round(min(h, w) / max(1, target_windows)))))
+    cells = []
+    relaxed = []
+    for y in range(0, h, window):
+        for x in range(0, w, window):
+            pa = a[y : min(h, y + window), x : min(w, x + window)]
+            pb = b[y : min(h, y + window), x : min(w, x + window)]
+            if not pa.size:
+                continue
+            bbox = {"x": int(x), "y": int(y), "w": int(pa.shape[1]), "h": int(pa.shape[0])}
+            if preserve_mask is not None:
+                km = preserve_mask[y : min(h, y + window), x : min(w, x + window)]
+                if km.size == 0 or float(km.mean()) < 0.70:
+                    if km.size and float(km.mean()) >= 0.30:
+                        relaxed.append((bbox, pa, pb))
+                    continue
+            cells.append((bbox, pa, pb))
+    source_cells = cells or relaxed
+    if not source_cells:
+        return {"ssim": round(float(_ssim(a, b)), 5), "bbox": {"x": 0, "y": 0, "w": int(w), "h": int(h)}}
+    worst_bbox, worst_pa, worst_pb = min(source_cells, key=lambda item: _ssim(item[1], item[2]))
+    return {"ssim": round(float(_ssim(worst_pa, worst_pb)), 5), "bbox": worst_bbox}
 
 
 def _multiscale_ssim(a, b, preserve_mask=None):
@@ -562,6 +678,210 @@ def _build_per_layer(reconstruction, design):
     return out
 
 
+def _iter_leaf_layers_abs(layers, offset_x=0.0, offset_y=0.0):
+    """Yield (leaf_layer, absolute_box) pairs.
+
+    design.json children carry PARENT-RELATIVE coordinates (coordinate_space="local"),
+    so group offsets accumulate on the way down. Only leaves are yielded; groups are
+    containers, not paint.
+    """
+    for layer in layers or []:
+        if not isinstance(layer, dict):
+            continue
+        box = layer.get("box") or {}
+        try:
+            ax = offset_x + float(box.get("x", 0) or 0)
+            ay = offset_y + float(box.get("y", 0) or 0)
+            w = float(box.get("w", 0) or 0)
+            h = float(box.get("h", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if layer.get("type") == "group":
+            yield from _iter_leaf_layers_abs(layer.get("children") or [], ax, ay)
+            continue
+        yield layer, {"x": ax, "y": ay, "w": w, "h": h}
+
+
+def _region_ink_mask(crop_rgb):
+    """Painted-ink estimate for a crop: pixels contrasting with the local plate.
+
+    Border pixels estimate the plate colour; an Otsu split on the colour distance
+    separates glyph/graphic ink from background. Deterministic and CPU-only.
+    """
+    import cv2
+    import numpy as np
+
+    if crop_rgb.size == 0 or crop_rgb.shape[0] < 2 or crop_rgb.shape[1] < 2:
+        return None
+    crop = crop_rgb.astype(np.float32)
+    border = np.concatenate([
+        crop[:1].reshape(-1, 3), crop[-1:].reshape(-1, 3),
+        crop[:, :1].reshape(-1, 3), crop[:, -1:].reshape(-1, 3),
+    ], axis=0)
+    plate = np.median(border, axis=0)
+    distance = np.linalg.norm(crop - plate, axis=2)
+    peak = float(distance.max())
+    if peak < 18.0:
+        return np.zeros(distance.shape, dtype=bool)
+    scaled = np.clip(distance / peak * 255.0, 0, 255).astype(np.uint8)
+    threshold, _ = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return distance >= max(24.0, float(threshold) / 255.0 * peak)
+
+
+def _layer_region_rows(source_rgb, render_rgb, design):
+    """PER-LAYER region scores: crop SSIM for every foreground leaf, ink-IoU for text.
+
+    This is the measurement half of the Codia-style confidence gate: each emitted
+    layer's bbox is compared render-vs-source locally, so one wrong region cannot
+    hide inside a good global score. Rows carry raw metrics only; thresholds are
+    applied by schema.raster_slice_failures (repair.assess and the reconstruct
+    fallback share that gate).
+    """
+    import numpy as np
+
+    layers = (design or {}).get("layers") or []
+    if not layers:
+        return []
+    height, width = source_rgb.shape[:2]
+    source_gray = source_rgb[..., 0] * 0.299 + source_rgb[..., 1] * 0.587 + source_rgb[..., 2] * 0.114
+    render_gray = render_rgb[..., 0] * 0.299 + render_rgb[..., 1] * 0.587 + render_rgb[..., 2] * 0.114
+    rows = []
+    for layer, abs_box in _iter_leaf_layers_abs(layers):
+        if layer.get("type") not in ("text", "shape", "image"):
+            continue
+        meta = layer.get("meta") or {}
+        lid = str(layer.get("id") or "")
+        if not lid or lid == "background":
+            continue
+        if str(meta.get("role") or "").lower() == "background" or meta.get("source") == "inpaint":
+            continue
+        pad = 2
+        if layer.get("type") == "text":
+            # Text boxes are emitted GENEROUSLY (>=1.6x lineHeight, Codia-style), so
+            # scoring on the emitted box would pull neighbouring lines' ink into the
+            # region. The compiler preserves the pre-growth ink box in meta — score
+            # against that tight evidence box instead (same parent offset as `box`).
+            prefit = meta.get("prefit_ink_box")
+            own_box = layer.get("box") or {}
+            if isinstance(prefit, dict) and prefit.get("w") and prefit.get("h"):
+                abs_box = {
+                    "x": abs_box["x"] + float(prefit.get("x", 0) or 0) - float(own_box.get("x", 0) or 0),
+                    "y": abs_box["y"] + float(prefit.get("y", 0) or 0) - float(own_box.get("y", 0) or 0),
+                    "w": float(prefit.get("w", 0) or 0),
+                    "h": float(prefit.get("h", 0) or 0),
+                }
+            # Preview text may legitimately spill a little outside its fitted box;
+            # a proportional margin also catches ghost ink right next to the box.
+            pad = max(3, int(round(abs_box["h"] * 0.18)))
+        x0 = max(0, int(np.floor(abs_box["x"])) - pad)
+        y0 = max(0, int(np.floor(abs_box["y"])) - pad)
+        x1 = min(width, int(np.ceil(abs_box["x"] + abs_box["w"])) + pad)
+        y1 = min(height, int(np.ceil(abs_box["y"] + abs_box["h"])) + pad)
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            continue
+        crop_source = source_gray[y0:y1, x0:x1]
+        crop_render = render_gray[y0:y1, x0:x1]
+        values = np.clip(
+            np.asarray(_local_ssim_values(crop_source, crop_render, target_windows=4),
+                       dtype=np.float64), 0, 1,
+        )
+        region_ssim = float(0.7 * values.mean() + 0.3 * np.percentile(values, 10))
+        # Grayscale SSIM is blind to pure hue swaps on flat regions (a red button
+        # rendered blue can score ~1.0); a local Lab delta catches exactly that.
+        delta_e = float(np.linalg.norm(
+            _rgb_to_lab(source_rgb[y0:y1, x0:x1]) - _rgb_to_lab(render_rgb[y0:y1, x0:x1]),
+            axis=2,
+        ).mean())
+        row = {
+            "id": lid,
+            "type": layer.get("type"),
+            "role": meta.get("role") or layer.get("type"),
+            "abs_box": {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0},
+            "region_px": int((x1 - x0) * (y1 - y0)),
+            "region_ssim": round(region_ssim, 4),
+            "region_color": round(max(0.0, 1.0 - delta_e / 50.0), 4),
+        }
+        if meta.get("fallback"):
+            row["fallback"] = meta.get("fallback")
+        if layer.get("type") == "text":
+            source_ink = _region_ink_mask(source_rgb[y0:y1, x0:x1])
+            render_ink = _region_ink_mask(render_rgb[y0:y1, x0:x1])
+            if source_ink is not None and render_ink is not None:
+                src_px = int(source_ink.sum())
+                if src_px >= 8:
+                    row["ink_iou"] = _aligned_ink_iou(source_ink, render_ink)
+                    # Extra rendered ink relative to the source: double/ghosted text
+                    # produces near-duplicate ink mass that IoU alone can miss.
+                    row["ink_excess"] = round(int((render_ink & ~source_ink).sum()) / src_px, 4)
+        rows.append(row)
+    return rows
+
+
+def _aligned_ink_iou(source_ink, render_ink, max_shift=None):
+    """Best ink IoU over small translations of the rendered ink.
+
+    The local preview is a placement PROXY: Figma performs its own render-and-fit,
+    so a text block drawn a few pixels off its source baseline is repairable and
+    must not be judged as a wrong reconstruction. Wrong glyph shapes, rotated
+    baselines, ghost doubles, and missing text cannot be fixed by translation and
+    stay low under the best alignment.
+    """
+    import numpy as np
+
+    src_px = int(source_ink.sum())
+    ren_px = int(render_ink.sum())
+    if not src_px and not ren_px:
+        return None
+    if not src_px or not ren_px:
+        return 0.0
+    if max_shift is None:
+        max_shift = max(4, int(round(source_ink.shape[0] * 0.25)))
+        max_shift = min(max_shift, 12)
+    best = 0.0
+    h, w = source_ink.shape
+    for dy in range(-max_shift, max_shift + 1):
+        sy0, sy1 = max(0, dy), min(h, h + dy)
+        ry0, ry1 = max(0, -dy), min(h, h - dy)
+        if sy1 <= sy0:
+            continue
+        src_rows = source_ink[sy0:sy1]
+        ren_rows = render_ink[ry0:ry1]
+        for dx in range(-max_shift, max_shift + 1):
+            sx0, sx1 = max(0, dx), min(w, w + dx)
+            rx0, rx1 = max(0, -dx), min(w, w - dx)
+            if sx1 <= sx0:
+                continue
+            inter = int(np.count_nonzero(src_rows[:, sx0:sx1] & ren_rows[:, rx0:rx1]))
+            union = src_px + ren_px - inter
+            if union and inter / union > best:
+                best = inter / union
+    return round(best, 4)
+
+
+def score_layer_regions(source_path, render_path, design, run_dir=None):
+    """Public loader wrapper around :func:`_layer_region_rows` (used by reconstruct)."""
+    source_rgb = _load_rgb(source_path)
+    height, width = source_rgb.shape[:2]
+    render_rgb = _load_rgb(render_path, size=(width, height))
+    design_data = _load_design(design, run_dir or "")
+    return _layer_region_rows(source_rgb, render_rgb, design_data)
+
+
+def _merge_region_rows(per_layer, region_rows):
+    """Attach region metrics to existing per-layer rows; add rows for new layers."""
+    by_id = {str(row.get("id")): row for row in per_layer if isinstance(row, dict)}
+    for region in region_rows or []:
+        rid = str(region.get("id"))
+        existing = by_id.get(rid)
+        if existing is None:
+            per_layer.append(region)
+            by_id[rid] = region
+        else:
+            for key, value in region.items():
+                existing.setdefault(key, value)
+    return per_layer
+
+
 def _duplicate_ownership(layers):
     owners, duplicates = {}, []
     for layer in layers:
@@ -589,29 +909,57 @@ def _duplicate_ownership(layers):
     return sorted(set(duplicates))
 
 
-def _editable_text_recall(source_ocr, design, layers):
+def _text_editability(source_ocr, design, layers):
+    """Honest text-editability accounting (F4).
+
+    ``editable_text_recall`` = detected source text lines that ship as a CORRECT editable
+    TEXT node / all detected source text lines that are NOT baked scene-text-by-design.
+
+    Critically, a raster slice, a wordmark/lockup image, or a ``foreground_raster`` image
+    that carries a text line counts as **non-editable** and LOWERS the recall — rasterizing
+    failed overlay text is a quality loss, never a way to remove that text from the metric's
+    denominator. The only text excluded from the denominator is ``kept_in_photo`` scene text
+    (legitimately not-editable-by-design), which is tracked separately.
+
+    Returns a dict of counts/ratios (or ``None`` when there is nothing to score):
+      editable_text_recall, text_lines_total, kept_in_photo_lines,
+      rasterized_text_count, rasterized_text_ratio, editable_text_correct.
+    """
     if not source_ocr or not design:
         return None
-    rasterized = set()
+    editable_texts = []
+    raster_line_ids = set()
+    raster_texts = []
     for layer in _flatten_layers(layers):
         meta = layer.get("meta") or {}
-        if layer.get("type") != "text" and not (
-            layer.get("type") == "image" and (
-                meta.get("wordmark") or meta.get("platform_lockup")
-                or meta.get("layer_disposition") == "foreground_raster"
-            )
-        ):
+        ltype = layer.get("type")
+        if ltype == "text":
+            # A TEXT node is editable in Figma regardless of wordmark/lockup styling.
+            norm = _norm(layer.get("text"))
+            if norm:
+                editable_texts.append(norm)
             continue
-        if layer.get("type") == "text" and not (
-            meta.get("wordmark") or meta.get("platform_lockup")
-        ):
+        # Image layers that carry text pixels are non-editable text: raster slices of failed
+        # overlay copy, fidelity-image substitutions (legacy fallback=True headline images),
+        # wordmark/lockup artwork, or whole-region foreground_raster fallbacks.
+        is_raster_text = ltype == "image" and (
+            _fallback_kind(meta) is not None
+            or meta.get("wordmark") or meta.get("platform_lockup")
+            or meta.get("layer_disposition") == "foreground_raster"
+        )
+        if not is_raster_text:
             continue
         for line_id in meta.get("line_ids") or []:
-            rasterized.add(str(line_id))
-        text = _norm(layer.get("text"))
-        if text:
-            rasterized.add(text)
-    source = []
+            raster_line_ids.add(str(line_id))
+        norm = _norm(layer.get("text") or meta.get("source_text"))
+        if norm:
+            raster_texts.append(norm)
+
+    editable_blob = " ".join(editable_texts)
+    raster_blob = " ".join(raster_texts)
+    kept_blob = " ".join(_norm(text) for text in (design.get("kept_in_photo") or []))
+
+    total = kept = correct = rasterized = 0
     for line in source_ocr.get("lines", []):
         if line.get("conf", 1) < 0.5:
             continue
@@ -619,14 +967,36 @@ def _editable_text_recall(source_ocr, design, layers):
         if len(norm) < 3:
             continue
         line_id = str(line.get("id") or "")
-        if line_id in rasterized:
+        total += 1
+        # By-design baked scene text is not something the pipeline promises to make editable.
+        if kept_blob and norm and norm in kept_blob:
+            kept += 1
             continue
-        source.append(norm)
-    if not source:
-        return 1.0
-    editable = " ".join(_norm(layer.get("text")) for layer in layers if layer.get("type") == "text")
-    kept = " ".join(_norm(text) for text in design.get("kept_in_photo", []))
-    return sum(1 for text in source if text in editable or text in kept) / len(source)
+        if norm and norm in editable_blob:
+            correct += 1
+        elif line_id in raster_line_ids or (raster_blob and norm and norm in raster_blob):
+            rasterized += 1
+        # else: the line is simply missing — not editable and not even rasterized. It counts
+        # against recall (stays in the denominator, never in the numerator).
+    denom = total - kept
+    recall = 1.0 if denom <= 0 else correct / denom
+    rasterized_ratio = (rasterized / denom) if denom > 0 else 0.0
+    return {
+        "editable_text_recall": round(recall, 4),
+        # native_text_ratio (Codia contract, docs/CODIA-PARITY-SPEC.md §2): native editable
+        # TEXT lines / all readable OCR lines that are NOT by-design baked scene text. Slices,
+        # wordmark/lockup rasters, foreground_raster bakes, AND simply-missing lines all count
+        # against it (they stay in the denominator, never in the numerator). This is the QA
+        # objective — "every string is native TEXT" — surfaced under its contract name. It is
+        # numerically the same fraction as editable_text_recall; the alias makes the contract
+        # dimension nameable by codia_parity/qa_reward/benchmark without re-deriving it.
+        "native_text_ratio": round(recall, 4),
+        "text_lines_total": total,
+        "kept_in_photo_lines": kept,
+        "rasterized_text_count": rasterized,
+        "rasterized_text_ratio": round(rasterized_ratio, 4),
+        "editable_text_correct": correct,
+    }
 
 
 def _resolve_path(path, run_dir):
@@ -675,11 +1045,17 @@ def _background_audit(source_rgb, background_path, removal_mask):
     if not np.any(mask):
         return {"mask_supplied": mask_supplied, "masked_pixels": 0,
                 "exact_match_ratio": 0.0, "changed_ratio": 1.0,
+                "changed_canvas_ratio": 0.0,
                 "edge_retention": None, "mean_change": 0.0,
                 "outside_changed_ratio": 0.0, "outside_mean_change": 0.0}
+    total_px = int(height) * int(width)
     delta = np.abs(source_rgb - background).mean(axis=2)
     exact = float((delta[mask] < 0.5).mean())
     changed = float((delta[mask] > 8.0).mean())
+    # Fraction of the WHOLE canvas that was actually altered inside the removal region.
+    # changed_ratio is per-mask; this is per-canvas, so it measures how much of the plate
+    # the removal/inpaint pass destroyed regardless of how large the mask was (F3).
+    changed_canvas = float(int((delta[mask] > 8.0).sum()) / max(1, total_px))
     mean_change = float(delta[mask].mean())
     outside = ~mask
     outside_changed = float((delta[outside] > 8.0).mean()) if np.any(outside) else 0.0
@@ -699,6 +1075,7 @@ def _background_audit(source_rgb, background_path, removal_mask):
         "masked_pixels": int(mask.sum()),
         "exact_match_ratio": round(exact, 5),
         "changed_ratio": round(changed, 5),
+        "changed_canvas_ratio": round(changed_canvas, 5),
         "edge_retention": None if retained is None else round(retained, 5),
         "mean_change": round(mean_change, 4),
         "outside_changed_ratio": round(outside_changed, 5),
@@ -789,6 +1166,40 @@ def _add_fail(fails, rule, detail):
         fails.append({"rule": rule, "detail": detail, "hard": True})
 
 
+def _archetype_threshold_overrides(run_dir):
+    """Read the archetype preset's own edge/color floors straight from archetype.json.
+
+    F-per-archetype-floor: only 2 of the 5 presets in src.archetype.PRESETS define
+    edge_f1_min (social_screenshot 0.35, comparison_grid 0.45) and NONE define
+    color_similarity_min, so most runs silently fell back to a single global default
+    regardless of archetype — the same gap text_recall_min had before F8 threaded it
+    through explicitly. archetype.json is written by every run (it is the persisted
+    decision from src.archetype.decision), so pixel_diff can read the preset's own
+    floors itself instead of depending on every caller to forward each key by hand.
+    A DEFAULT_THRESHOLDS floor still always applies when the archetype doesn't define
+    one, so a floor is guaranteed to exist per archetype either way — never silently
+    absent. Explicit caller-supplied ``thresholds=`` still wins (merged in after this).
+    """
+    payload = _load_design(os.path.join(run_dir, "archetype.json"), run_dir)
+    if not isinstance(payload, dict):
+        return {}
+    preset_thresholds = (payload.get("preset") or {}).get("thresholds") or {}
+    if not isinstance(preset_thresholds, dict):
+        return {}
+    overrides = {}
+    # native_text_ratio_min lets a future handwriting/scene-text archetype relax the contract
+    # bar; contract_* floors let an archetype tune the contract summary's SSIM/placement floor.
+    for key in ("edge_f1_min", "color_similarity_min", "native_text_ratio_min",
+                "contract_ssim_floor", "contract_placement_ink_iou_min"):
+        value = preset_thresholds.get(key)
+        if value is not None:
+            try:
+                overrides[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+    return overrides
+
+
 def _structural_audit(
     source_rgb,
     run_dir,
@@ -798,6 +1209,7 @@ def _structural_audit(
     background_path,
     removal_mask,
     thresholds,
+    text_recall=None,
 ):
     supplied = dict(supplied or {})
     layers = _flatten_layers((design or {}).get("layers") or [])
@@ -881,7 +1293,21 @@ def _structural_audit(
         editable = sum(1 for layer in layers if layer.get("type") in ("text", "shape", "group"))
         editable_ratio = editable / len(layers)
     editable_ratio = None if editable_ratio is None else float(editable_ratio)
-    editable_text_recall = _editable_text_recall(source_ocr, design, layers)
+    text_editability = _text_editability(source_ocr, design, layers)
+    editable_text_recall = None if text_editability is None else text_editability["editable_text_recall"]
+    native_text_ratio_metric = None if text_editability is None else text_editability["native_text_ratio"]
+    rasterized_text_count = None if text_editability is None else text_editability["rasterized_text_count"]
+    rasterized_text_ratio = None if text_editability is None else text_editability["rasterized_text_ratio"]
+    # F-honesty: editable_text_recall's own denominator is "detected source text lines"
+    # (from OCR), never the FULL source text. When OCR itself only finds a sliver of the
+    # ad's copy, a 100%-editable sliver still reads as a perfect 1.0 and hides the loss.
+    # true_text_coverage multiplies in text_recall (OCR-detected / all-source-text) so the
+    # combined number is honest about the share of ALL source text that ended up correct
+    # AND editable — it can only be high when both stages are.
+    true_text_coverage = (
+        None if text_recall is None or editable_text_recall is None
+        else round(float(text_recall) * float(editable_text_recall), 4)
+    )
     design_meta = (design or {}).get("meta") or {}
     leaf_accounting = design_meta.get("leaf_accounting")
     if not isinstance(leaf_accounting, dict):
@@ -903,6 +1329,14 @@ def _structural_audit(
     reconstruction_stats = reconstruction.get("stats") or {}
     degradations = design_meta.get("degradations")
     degradations = degradations if isinstance(degradations, list) else []
+
+    # Confidence-gated raster slices are honest, reported degradations of editability,
+    # never hidden: QA surfaces the count/ids so 'looks right + partially editable'
+    # is a visible, auditable tradeoff instead of a silent one.
+    raster_slice_ids = sorted(
+        str(layer.get("id") or "unnamed") for layer in layers
+        if _is_raster_slice(layer.get("meta") or {})
+    )
 
     if background_path is None:
         candidate = os.path.join(run_dir, "background_clean.png")
@@ -956,7 +1390,11 @@ def _structural_audit(
             fails, "native-accounting-missing",
             "acceptance requires foreground leaf accounting; rebuild design.json with the current compiler",
         )
-    if require_native_accounting and leaf_accounting:
+    # F2: the anti-rasterization honesty gates are NOT keyed to a Figma acceptance run. They
+    # fire whenever leaf accounting exists (it always does now) so a page that quietly
+    # rasterized nearly everything, or emitted an unexplained raster fallback, hard-fails in
+    # ordinary QA — not only when someone opts into figma.require_export. Config-gated ON.
+    if leaf_accounting and thresholds.get("enforce_native_leaf_accounting", True):
         unexplained = int(leaf_accounting.get("unexplained_raster_count", 0) or 0)
         if unexplained:
             ids = ", ".join(str(value) for value in
@@ -976,9 +1414,32 @@ def _structural_audit(
                 f"native leaf ratio {ratio:.2f} < {thresholds['native_leaf_ratio_min']:.2f} "
                 f"over {foreground_leaf_count} foreground leaf(ves) — almost everything was rasterized",
             )
-    if editable_text_recall is not None and editable_text_recall < thresholds["editable_text_recall_min"]:
-        _add_fail(fails, "missing-editable-text",
-                  f"editable text recall {editable_text_recall:.2f} < {thresholds['editable_text_recall_min']:.2f}")
+    low_editable_text_recall = (
+        editable_text_recall is not None
+        and editable_text_recall < thresholds["editable_text_recall_min"]
+    )
+    true_text_coverage_min = thresholds.get("true_text_coverage_min")
+    low_true_text_coverage = (
+        true_text_coverage is not None and true_text_coverage_min is not None
+        and true_text_coverage < float(true_text_coverage_min)
+    )
+    # F-honesty: an ad where OCR missed most of the text must not pass the text gate just
+    # because the sliver it did find happens to be 100% editable (021: text_recall 0.17,
+    # editable_text_recall 1.0). true_text_coverage catches that denominator trick even
+    # when editable_text_recall alone clears its own bar.
+    if low_editable_text_recall or low_true_text_coverage:
+        details = []
+        if low_editable_text_recall:
+            details.append(
+                f"editable text recall {editable_text_recall:.2f} < {thresholds['editable_text_recall_min']:.2f}"
+            )
+        if low_true_text_coverage:
+            details.append(
+                f"true text coverage {true_text_coverage:.2f} < {float(true_text_coverage_min):.2f} "
+                f"(text_recall {text_recall:.2f} x editable_text_recall {editable_text_recall:.2f} "
+                "— OCR missed most of the source text)"
+            )
+        _add_fail(fails, "missing-editable-text", "; ".join(details))
     if duplicate_ownership:
         _add_fail(fails, "duplicate-ownership",
                   f"{len(duplicate_ownership)} observation ownership conflict(s): " + duplicate_ownership[0])
@@ -1016,6 +1477,36 @@ def _structural_audit(
                 "inpaint-outside-mask",
                 "clean plate changed "
                 f"{background['outside_changed_ratio']:.1%} of pixels outside the removal mask",
+            )
+        # F3: cap plate destruction. There are gates for an untouched plate and a no-op
+        # removal, but none for the opposite failure — a removal/inpaint that rebuilds most
+        # of the canvas (002 erased the whole product cluster, changed_canvas_ratio 0.69).
+        # When more than the configured fraction of the WHOLE canvas is altered inside the
+        # removal region, real content was almost certainly erased.
+        canvas_ratio = background.get("changed_canvas_ratio")
+        ceiling = thresholds.get("background_changed_ratio_max")
+        if (background.get("mask_supplied") and canvas_ratio is not None
+                and ceiling is not None and canvas_ratio > float(ceiling)):
+            _add_fail(
+                fails,
+                "excessive-plate-destruction",
+                f"removal/inpaint altered {canvas_ratio:.1%} of the canvas "
+                f"(> {float(ceiling):.0%}) — likely erased real content, not just a removed object",
+            )
+    # F15: unresolved glyph residue under a removed text region is a structural failure, not
+    # a bare repair suggestion. QA must not report ok while it stands (009 shipped ok with a
+    # high-severity glyph-residue repair still outstanding after no-op harness rounds).
+    if thresholds.get("glyph_residue_gate", True):
+        text_residual = reconstruction_stats.get("text_residual") or {}
+        unresolved_residue = [
+            entry for entry in (text_residual.get("flagged") or [])
+            if isinstance(entry, dict) and not entry.get("resolved")
+        ]
+        if unresolved_residue:
+            ids = ", ".join(str(entry.get("id")) for entry in unresolved_residue[:4])
+            _add_fail(
+                fails, "glyph-residue",
+                f"{len(unresolved_residue)} removed text region(s) still show glyph residue: {ids}",
             )
     for rule, detail in alpha_failures:
         _add_fail(fails, rule, detail)
@@ -1058,6 +1549,12 @@ def _structural_audit(
         "native_leaf_ratio": None if native_leaf_ratio is None else round(native_leaf_ratio, 4),
         "leaf_accounting": leaf_accounting,
         "editable_text_recall": None if editable_text_recall is None else round(editable_text_recall, 4),
+        # native_text_ratio (Codia contract): native editable TEXT / all readable lines.
+        "native_text_ratio": None if native_text_ratio_metric is None else round(native_text_ratio_metric, 4),
+        "true_text_coverage": true_text_coverage,
+        "rasterized_text_count": rasterized_text_count,
+        "rasterized_text_ratio": rasterized_text_ratio,
+        "raster_slices": {"count": len(raster_slice_ids), "ids": raster_slice_ids},
         "duplicate_ownership": duplicate_ownership,
         "duplicates_removed": int(stats.get("duplicates_removed", supplied.get("duplicates_removed", 0)) or 0),
         "element_recall": None if element_survival is None else element_survival["recall"],
@@ -1065,6 +1562,96 @@ def _structural_audit(
         "background": background,
         "layer_alpha": alpha_layers,
         "hard_fails": fails,
+    }
+
+
+def _placement_ink_iou(per_layer):
+    """Mean translation-aligned ink-IoU over native text rows (contract placement).
+
+    Figma re-fits glyph placement, so this is the lenient "decent placement" signal, not a
+    pixel-exact one. Returns None when no text row carries ink evidence.
+    """
+    values = [row.get("ink_iou") for row in per_layer or []
+              if isinstance(row, dict) and row.get("type") == "text"
+              and isinstance(row.get("ink_iou"), (int, float))]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 4)
+
+
+def _contract_summary(design_data, structure, source_ocr, per_layer, ssim, thresholds,
+                      archetype=None):
+    """Lead-with-the-contract QA summary (docs/CODIA-PARITY-SPEC.md).
+
+    Scores Codia's construction CONTRACT — native editable text, Inter/display font policy,
+    single-weight nodes, emoji-as-image, node budget, flatness — and folds in the two gates
+    the contract also demands: zero unresolved glyph residue and decent placement. Global
+    SSIM is a low floor here, never the objective. ``contract_score`` is the QA metric of
+    record; ``pass`` is the per-run contract verdict the benchmark's --contract line uses.
+    """
+    native_text_ratio = structure.get("native_text_ratio")
+    if native_text_ratio is None:
+        native_text_ratio = structure.get("editable_text_recall")
+
+    construction = None
+    if _score_construction is not None and design_data:
+        try:
+            construction = _score_construction(
+                design_data, native_text_ratio=native_text_ratio,
+                archetype=archetype, ocr=source_ocr)
+        except Exception:
+            construction = None
+
+    # Glyph-residue cleanliness: a removed text region still showing glyph ghosts is a
+    # contract failure (the plate is not clean). Mirror the glyph-residue hard-fail gate.
+    residue_unresolved = 0
+    for fail in structure.get("hard_fails") or []:
+        if isinstance(fail, dict) and fail.get("rule") == "glyph-residue":
+            residue_unresolved += 1
+    glyph_residue_clean = residue_unresolved == 0
+
+    placement_iou = _placement_ink_iou(per_layer)
+    placement_min = thresholds.get("contract_placement_ink_iou_min")
+    placement_ok = (placement_iou is None or placement_min is None
+                    or placement_iou >= float(placement_min))
+
+    ntr_min = thresholds.get("native_text_ratio_min")
+    native_ok = (native_text_ratio is None or ntr_min is None
+                 or float(native_text_ratio) >= float(ntr_min))
+    ssim_floor = thresholds.get("contract_ssim_floor")
+    ssim_floor_ok = ssim is None or ssim_floor is None or float(ssim) >= float(ssim_floor)
+
+    # contract_score (0..1) LEADS with native text, then construction quality, with global
+    # SSIM contributing only a small floor-shaped term. This is the QA composite of record.
+    construction_norm = None if construction is None else construction["score"] / 100.0
+    terms = []
+    if native_text_ratio is not None:
+        terms.append((0.50, float(native_text_ratio)))
+    if construction_norm is not None:
+        terms.append((0.35, construction_norm))
+    if ssim is not None:
+        terms.append((0.15, float(ssim)))
+    if terms:
+        wsum = sum(w for w, _ in terms)
+        contract_score = round(sum(w * v for w, v in terms) / wsum, 4)
+    else:
+        contract_score = None
+
+    contract_pass = bool(native_ok and glyph_residue_clean and placement_ok and ssim_floor_ok)
+    return {
+        "contract_score": contract_score,
+        "pass": contract_pass,
+        "native_text_ratio": None if native_text_ratio is None else round(float(native_text_ratio), 4),
+        "native_text_ratio_min": ntr_min,
+        "native_text_ok": bool(native_ok),
+        "glyph_residue_clean": glyph_residue_clean,
+        "glyph_residue_unresolved": residue_unresolved,
+        "placement_ink_iou": placement_iou,
+        "placement_ok": bool(placement_ok),
+        "ssim": None if ssim is None else round(float(ssim), 4),
+        "ssim_floor": ssim_floor,
+        "ssim_floor_ok": bool(ssim_floor_ok),
+        "construction": construction,
     }
 
 
@@ -1146,6 +1733,9 @@ def compare(
         text_recall = _text_recall(source_ocr, render_ocr)
 
     opts = dict(DEFAULT_THRESHOLDS)
+    # F-per-archetype-floor: apply the archetype preset's own edge/color floors (if any)
+    # before the caller's explicit thresholds, so an explicit override always still wins.
+    opts.update(_archetype_threshold_overrides(run_dir))
     opts.update(thresholds or {})
     design_data = _load_design(design, run_dir)
     structure = _structural_audit(
@@ -1157,6 +1747,7 @@ def compare(
         background_path,
         removal_mask,
         opts,
+        text_recall=text_recall,
     )
     quality_flags = []
     if multiscale < opts["local_ssim_min"]:
@@ -1165,6 +1756,31 @@ def compare(
         quality_flags.append({"rule": "edge-fidelity", "detail": f"{edge['f1']:.3f} < {opts['edge_f1_min']:.3f}"})
     if color["similarity"] < opts["color_similarity_min"]:
         quality_flags.append({"rule": "color-fidelity", "detail": f"{color['similarity']:.3f} < {opts['color_similarity_min']:.3f}"})
+    # F8: per-archetype text strictness. The archetype preset's text_recall_min (0.90 for
+    # social) is threaded into thresholds by the caller; enforce it here so the strict text
+    # bar the preset promises actually gates instead of being wired nowhere. Only fires when
+    # a render-OCR text_recall exists AND a threshold was supplied.
+    text_recall_min = opts.get("text_recall_min")
+    if text_recall is not None and text_recall_min is not None and text_recall < float(text_recall_min):
+        quality_flags.append({"rule": "low-text-recall",
+                              "detail": f"text recall {text_recall:.3f} < {float(text_recall_min):.3f}"})
+
+    # F-worst-region: gate the single worst local SSIM window independently of the
+    # mean-dominated aggregate, so a catastrophic region (009/016: worst window ~0.03-0.04)
+    # cannot hide under a good global/aggregate score. Evidence carries the pixel bbox.
+    worst_window = _local_ssim_worst_window(source_gray, render_gray, preserve_mask)
+    worst_window_min = opts.get("local_ssim_worst_window_min")
+    if (worst_window is not None and worst_window_min is not None
+            and worst_window["ssim"] < float(worst_window_min)):
+        bbox = worst_window["bbox"]
+        quality_flags.append({
+            "rule": "local-ssim-worst-region",
+            "detail": (
+                f"worst local window ssim {worst_window['ssim']:.3f} < {float(worst_window_min):.3f} "
+                f"at x={bbox['x']} y={bbox['y']} w={bbox['w']} h={bbox['h']}"
+            ),
+            "bbox": bbox,
+        })
 
     # quality_flags must actually gate acceptance — merge them into hard_fails rather than
     # leaving them as inert diagnostics that _structural_audit knows nothing about.
@@ -1177,6 +1793,21 @@ def compare(
             seen_fails.add(key)
     structure["hard_fails"] = hard_fails
     per_layer = _build_per_layer(_load_reconstruction(run_dir), design_data)
+    # PER-LAYER region scores (crop SSIM + text ink-IoU) make one wrong region visible
+    # even under a good global score, and drive the raster-slice confidence fallback.
+    per_layer = _merge_region_rows(per_layer, _layer_region_rows(source_rgb, render_rgb, design_data))
+
+    # ── CODIA CONSTRUCTION CONTRACT: the QA objective, scored ahead of SSIM. ──────────
+    # SSIM stays a REPORT + a low floor gate; the contract (native text, font policy,
+    # emoji-as-image, clean plate, placement) is what pass/fail and the reward now lead with.
+    archetype = None
+    arch_decision = _load_design(os.path.join(run_dir, "archetype.json"), run_dir)
+    if isinstance(arch_decision, dict):
+        archetype = arch_decision.get("archetype")
+    if archetype is None:
+        archetype = ((design_data or {}).get("meta") or {}).get("archetype")
+    contract = _contract_summary(design_data, structure, source_ocr, per_layer,
+                                 round(multiscale, 4), opts, archetype=archetype)
 
     return {
         # Compatibility: callers still read `ssim`, now the harder local/multiscale metric.
@@ -1197,6 +1828,28 @@ def compare(
         "quality_flags": quality_flags,
         "text_recall": None if text_recall is None else round(text_recall, 4),
         "editable_text_recall": structure["editable_text_recall"],
+        # ── Codia construction contract (the QA objective — see _contract_summary) ────
+        # contract_score is the composite of record (native text first, then construction
+        # quality, then a small SSIM floor term). contract.pass is the per-run verdict.
+        # native_text_ratio / construction are surfaced for benchmark columns + the reward.
+        "native_text_ratio": structure.get("native_text_ratio"),
+        "contract_score": contract.get("contract_score"),
+        "contract_pass": contract.get("pass"),
+        "contract": contract,
+        "construction": contract.get("construction"),
+        # F-honesty: mirror element_recall/element_survival and true_text_coverage to the
+        # top level the same way editable_text_recall/rasterized_text_* already are. Nested
+        # structural.element_recall was always computed correctly (see _element_survival_audit)
+        # but never hoisted here when editable_text_recall's top-level mirror was added, so any
+        # caller reading qa.get("element_recall") directly (rather than
+        # qa["structural"]["element_recall"]) — including a bare ``jq .element_recall qa.json``
+        # look — always saw null even on runs where the nested value was 1.0.
+        "element_recall": structure.get("element_recall"),
+        "element_survival": structure.get("element_survival"),
+        "true_text_coverage": structure.get("true_text_coverage"),
+        "rasterized_text_count": structure.get("rasterized_text_count"),
+        "rasterized_text_ratio": structure.get("rasterized_text_ratio"),
+        "local_ssim_worst_window": worst_window,
         "per_layer": per_layer,
         "per_region_max_delta": float(cells.max()),
         "per_region": {"rows": gy, "cols": gx, "mean_delta": cells.round(3).tolist(), "worst": ranked[:8]},

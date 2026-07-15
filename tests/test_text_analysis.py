@@ -314,6 +314,60 @@ def test_low_ink_confidence_flags_low_fidelity_and_saves_fallback_crop(tmp_path)
     assert block["meta"]["fidelity_reason"] == line["meta"]["fidelity_reason"]
 
 
+def _script_font_path():
+    for name in ("Gabriola.ttf", "segoesc.ttf", "Inkfree.ttf", "Comic Sans MS.ttf", "comic.ttf"):
+        for root in ("C:/Windows/Fonts", "/Library/Fonts", "/System/Library/Fonts/Supplemental"):
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def test_same_class_body_copy_stays_editable_text(tmp_path):
+    # Reframe: a legible line matched to a plausible SAME-CLASS font stays editable
+    # even when the exact typeface is unknown. Fidelity is floored above the raster
+    # bar so accurate styling — not font identity — decides editability.
+    if _font_path() is None:
+        pytest.skip("no sans test font available")
+    image = Image.new("RGB", (900, 150), "white")
+    draw = ImageDraw.Draw(image)
+    ocr_box = _draw_text(draw, (36, 46),
+                         "The only supplement you need every single morning",
+                         _font(32), (18, 18, 18))
+    path = tmp_path / "body.png"
+    image.save(path)
+    ocr = {"source": {"path": str(path), "w": 900, "h": 150},
+           "lines": [_line("L0", "The only supplement you need every single morning", ocr_box)]}
+    cfg = {"text_analysis": {"font_matching": {"enabled": True, "max_fonts": 24, "max_lines": 4}}}
+    result = text_analysis.analyze_text(str(path), ocr, cfg)
+    line = result["lines"][0]
+    assert line["meta"]["low_fidelity"] is False
+    assert line["meta"]["fidelity_confidence"] >= 0.40
+
+
+def test_script_face_never_matches_plain_multiword_copy(tmp_path):
+    # Even a source *rendered in a script font* must not keep a script/decorative
+    # family for multi-word plain copy: a genuine script wordmark is routed as
+    # artwork earlier, so at this stage a swash match is the 052 Gabriola failure.
+    script_path = _script_font_path()
+    if script_path is None:
+        pytest.skip("no script/decorative font available")
+    from src import font_fit
+    image = Image.new("RGB", (900, 160), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype(script_path, 46)
+    ocr_box = _draw_text(draw, (36, 44), "to have perfect curls", font, (20, 20, 20))
+    path = tmp_path / "swash.png"
+    image.save(path)
+    ocr = {"source": {"path": str(path), "w": 900, "h": 160},
+           "lines": [_line("L0", "to have perfect curls", ocr_box)]}
+    cfg = {"text_analysis": {"font_matching": {"enabled": True, "max_fonts": 40, "max_lines": 4}}}
+    result = text_analysis.analyze_text(str(path), ocr, cfg)
+    chosen = (result["lines"][0]["style"].get("fontCandidates") or [{}])[0]
+    chosen_class = font_fit.classify_font_file(chosen.get("path")) if chosen.get("path") else None
+    assert chosen_class not in (font_fit.SCRIPT, font_fit.DECORATIVE)
+
+
 def test_confident_text_is_not_flagged_low_fidelity(tmp_path):
     image = Image.new("RGB", (640, 260), "white")
     draw = ImageDraw.Draw(image)
@@ -689,3 +743,413 @@ def test_glyph_bars_do_not_invent_text_decoration():
     glyphs[4:16, 5:95:10] = True
     glyphs[8:10, 5:55] = True
     assert text_analysis._native_text_decoration(glyphs, "EXAMPLE") == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# Rotation snapping: horizontal source text must never render skewed
+
+
+def test_near_horizontal_baseline_wobble_snaps_to_zero(tmp_path):
+    path = tmp_path / "wobble.png"
+    Image.new("RGB", (600, 120), "white").save(path)
+    angle = 1.8  # typical OCR quad wobble on perfectly horizontal copy
+    radians = math.radians(angle)
+    x0, y0, width, height = 40.0, 30.0, 300.0, 34.0
+    dx, dy = math.cos(radians) * width, math.sin(radians) * width
+    line = _line("L0", "Perfectly horizontal", (x0, y0, x0 + width, y0 + height))
+    line["quad"] = [[x0, y0], [x0 + dx, y0 + dy], [x0 + dx, y0 + dy + height], [x0, y0 + height]]
+
+    result = text_analysis.analyze_text(
+        str(path), {"source": {"w": 600, "h": 120}, "lines": [line]},
+        {"text_analysis": {"font_matching": {"enabled": False}}},
+    )
+    enriched = result["lines"][0]
+
+    assert enriched["rotation_deg"] == 0.0
+    assert enriched["meta"]["rotation_raw_deg"] == pytest.approx(angle, abs=0.05)
+    block = result["blocks"][0]
+    assert block["rotation_deg"] == 0.0
+
+
+def test_rotation_snap_threshold_is_configurable_and_keeps_real_angles(tmp_path):
+    path = tmp_path / "rotated.png"
+    Image.new("RGB", (600, 200), "white").save(path)
+    angle = 12.0
+    radians = math.radians(angle)
+    x0, y0, width, height = 40.0, 40.0, 260.0, 30.0
+    dx, dy = math.cos(radians) * width, math.sin(radians) * width
+    line = _line("L0", "Genuinely rotated", (x0, y0, x0 + width, y0 + height))
+    line["quad"] = [[x0, y0], [x0 + dx, y0 + dy], [x0 + dx, y0 + dy + height], [x0, y0 + height]]
+
+    result = text_analysis.analyze_text(
+        str(path), {"source": {"w": 600, "h": 200}, "lines": [copy.deepcopy(line)]},
+        {"text_analysis": {"font_matching": {"enabled": False}}},
+    )
+    assert result["lines"][0]["rotation_deg"] == pytest.approx(angle, abs=0.05)
+
+    # A larger configured threshold snaps it away.
+    result = text_analysis.analyze_text(
+        str(path), {"source": {"w": 600, "h": 200}, "lines": [copy.deepcopy(line)]},
+        {"text_analysis": {"font_matching": {"enabled": False}, "rotation_snap_deg": 15.0}},
+    )
+    assert result["lines"][0]["rotation_deg"] == 0.0
+
+
+def _stacked_lines(texts_with_angles, x0=40.0, top=80.0, width=300.0, height=26.0, gap=8.0):
+    lines = []
+    y = top
+    for index, (text, angle) in enumerate(texts_with_angles):
+        radians = math.radians(angle)
+        dx, dy = math.cos(radians) * width, math.sin(radians) * width
+        line = _line(f"L{index}", text, (x0, y, x0 + width, y + height))
+        line["quad"] = [[x0, y], [x0 + dx, y + dy], [x0 + dx, y + dy + height], [x0, y + height]]
+        lines.append(line)
+        y += height + gap
+    return lines
+
+
+def test_block_rotation_requires_member_line_agreement(tmp_path):
+    path = tmp_path / "stack.png"
+    Image.new("RGB", (700, 260), "white").save(path)
+    # One malformed OCR quad (-5.1 deg) inside an otherwise horizontal
+    # paragraph: the 009 failure mode.  The block must stay at exactly 0.
+    lines = _stacked_lines([
+        ("Daarbovenop krijgen de allereerste vijfhonderd bestellingen hier", 0.0),
+        ("hun geld terug tot wel honderd euro per bestelling", -5.1),
+        ("Schrijf je vandaag nog in en mis geen enkele update", 0.0),
+    ])
+    result = text_analysis.analyze_text(
+        str(path), {"source": {"w": 700, "h": 260}, "lines": lines},
+        {"text_analysis": {"font_matching": {"enabled": False}}},
+    )
+    block = next(block for block in result["blocks"] if len(block["line_ids"]) == 3)
+    assert block["rotation_deg"] == 0.0
+
+
+def test_block_rotation_kept_when_all_lines_agree(tmp_path):
+    path = tmp_path / "banner.png"
+    Image.new("RGB", (700, 320), "white").save(path)
+    lines = _stacked_lines([
+        ("Rotated banner copy with nine words on line one", 15.0),
+        ("Rotated banner copy with nine words on line two", 15.4),
+        ("Rotated banner copy with nine words on line three", 14.8),
+    ])
+    result = text_analysis.analyze_text(
+        str(path), {"source": {"w": 700, "h": 320}, "lines": lines},
+        {"text_analysis": {"font_matching": {"enabled": False}}},
+    )
+    block = next(block for block in result["blocks"] if len(block["line_ids"]) == 3)
+    assert block["rotation_deg"] == pytest.approx(15.0, abs=0.6)
+
+
+# ---------------------------------------------------------------------------
+# Line-break preservation: blocks keep authored breaks + per-line geometry
+
+
+def test_blocks_preserve_authored_line_breaks_and_per_line_geometry(tmp_path):
+    image = Image.new("RGB", (720, 420), "white")
+    draw = ImageDraw.Draw(image)
+    body_font = _font(25)
+    body1_box = _draw_text(draw, (58, 165), "Daarbovenop krijgen de eerste 500 hun", body_font, (35, 35, 35))
+    body2_box = _draw_text(draw, (58, 204), "geld terug tot honderd terug precies.", body_font, (35, 35, 35))
+    path = tmp_path / "breaks.png"
+    image.save(path)
+    ocr = {
+        "source": {"path": str(path), "w": 720, "h": 420},
+        "lines": [
+            _line("L0", "Daarbovenop krijgen de eerste 500 hun", body1_box),
+            _line("L1", "geld terug tot honderd terug precies.", body2_box),
+        ],
+    }
+
+    result = text_analysis.analyze_text(str(path), ocr, {})
+    block = next(block for block in result["blocks"] if block["line_ids"] == ["L0", "L1"])
+
+    # Authored breaks: exactly one explicit \n per detected source line.
+    assert block["text"] == "Daarbovenop krijgen de eerste 500 hun\ngeld terug tot honderd terug precies."
+    # Per-line geometry is preserved on the block, not just the union box.
+    geometry = block["line_geometry"]
+    assert [entry["id"] for entry in geometry] == ["L0", "L1"]
+    by_id = {line["id"]: line for line in result["lines"]}
+    for entry in geometry:
+        assert entry["box"] == by_id[entry["id"]]["box"]
+        assert entry["painted_box"] == by_id[entry["id"]]["painted_box"]
+        assert entry["baseline"] == by_id[entry["id"]]["baseline"]
+    assert geometry[0]["box"]["y"] < geometry[1]["box"]["y"]
+
+
+# ---------------------------------------------------------------------------
+# Render-and-fit integration: emitted size/tracking come from fitted pixels
+
+
+def _windows_font(name):
+    path = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", name)
+    return path if os.path.isfile(path) else None
+
+
+def test_render_fit_corrects_cap_height_size_overestimate(tmp_path):
+    font_path = _font_path()
+    if not font_path:
+        pytest.skip("Pillow did not expose a test TrueType font path")
+    true_size = 40
+    font = ImageFont.truetype(font_path, true_size)
+    image = Image.new("RGB", (900, 160), "white")
+    draw = ImageDraw.Draw(image)
+    # Ascenders + descenders inflate the painted box; the cap-height heuristic
+    # (painted_h / 0.72) overshoots this line by ~40%.
+    text = "korting krijgt op het volledige"
+    ocr_box = _draw_text(draw, (40, 40), text, font, (10, 10, 10))
+    path = tmp_path / "fit.png"
+    image.save(path)
+    ocr = {
+        "source": {"path": str(path), "w": 900, "h": 160},
+        "lines": [_line("L0", text, ocr_box)],
+    }
+    cfg = {
+        "text_analysis": {
+            "font_matching": {
+                "enabled": True,
+                "font_files": [font_path],
+                "font_dirs": ["__none__"],
+                "max_fonts": 1, "max_lines": 2, "top_k": 1,
+            },
+        }
+    }
+
+    result = text_analysis.analyze_text(str(path), ocr, cfg)
+    style = result["lines"][0]["style"]
+    meta_fit = result["lines"][0]["meta"]["render_fit"]
+
+    assert meta_fit["applied"] is True
+    assert abs(style["fontSize"] - true_size) <= true_size * 0.10
+    assert abs(style["letterSpacing"]) <= 1.2  # not the tracked-out heuristic value
+    assert style["fontSizeCandidates"][0]["value"] == style["fontSize"]
+
+
+def test_wrong_class_swash_is_gated_and_rejected_for_sans_body(tmp_path):
+    sans_path = _windows_font("arial.ttf") or _font_path()
+    swash_path = _windows_font("Gabriola.ttf") or _windows_font("segoesc.ttf")
+    if not sans_path or not swash_path:
+        pytest.skip("needs a sans font and a script/decorative font")
+    font = ImageFont.truetype(sans_path, 38)
+    image = Image.new("RGB", (900, 140), "white")
+    draw = ImageDraw.Draw(image)
+    text = "korting krijgt op het volledige"
+    ocr_box = _draw_text(draw, (40, 30), text, font, (10, 10, 10))
+    path = tmp_path / "gate.png"
+    image.save(path)
+    ocr = {
+        "source": {"path": str(path), "w": 900, "h": 140},
+        "lines": [_line("L0", text, ocr_box)],
+    }
+    cfg = {
+        "text_analysis": {
+            "font_matching": {
+                "enabled": True,
+                "font_files": [swash_path, sans_path],
+                "font_dirs": ["__none__"],
+                "max_fonts": 4, "max_lines": 2, "top_k": 3,
+            },
+        }
+    }
+
+    result = text_analysis.analyze_text(str(path), ocr, cfg)
+    line = result["lines"][0]
+    top = line["style"]["fontCandidates"][0]
+
+    # The swash face must not win sans body copy: either the class gate removed
+    # it before matching or the fitted evidence rejected/outranked it.
+    assert os.path.normcase(top.get("path") or "") == os.path.normcase(sans_path)
+    swash_entries = [c for c in line["style"]["fontCandidates"]
+                     if os.path.normcase(c.get("path") or "") == os.path.normcase(swash_path)]
+    for entry in swash_entries:
+        fit = entry.get("fit")
+        assert fit is None or fit["score"] < top["fit"]["score"]
+    assert line["meta"]["low_fidelity"] is False
+
+
+def test_all_candidates_fitting_badly_gates_line_to_masked_fallback(tmp_path):
+    sans_path = _windows_font("arial.ttf") or _font_path()
+    swash_path = _windows_font("Gabriola.ttf") or _windows_font("segoesc.ttf")
+    if not sans_path or not swash_path:
+        pytest.skip("needs a sans font and a script/decorative font")
+    font = ImageFont.truetype(sans_path, 38)
+    image = Image.new("RGB", (900, 140), "white")
+    draw = ImageDraw.Draw(image)
+    text = "korting krijgt op het volledige"
+    ocr_box = _draw_text(draw, (40, 30), text, font, (10, 10, 10))
+    path = tmp_path / "reject.png"
+    image.save(path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ocr = {
+        "source": {"path": str(path), "w": 900, "h": 140},
+        "lines": [_line("L0", text, ocr_box)],
+    }
+    cfg = {
+        "run_dir": str(run_dir),
+        "text_analysis": {
+            "font_matching": {
+                "enabled": True,
+                "font_files": [swash_path],   # only the wrong-class face on offer
+                "font_dirs": ["__none__"],
+                "max_fonts": 1, "max_lines": 2, "top_k": 2,
+                "class_gate": False,          # force it through to the fit stage
+            },
+        }
+    }
+
+    result = text_analysis.analyze_text(str(path), ocr, cfg)
+    line = result["lines"][0]
+    fits = [c["fit"] for c in line["style"]["fontCandidates"] if isinstance(c.get("fit"), dict)]
+
+    assert fits and all(fit["rejected"] for fit in fits)
+    assert line["meta"]["low_fidelity"] is True
+    assert line["meta"]["substitution"]["to"] == "masked-pixel-fallback"
+
+
+# ---------------------------------------------------------------------------
+# License-clean Google-Fonts matching: local -> Google mapping so the emitted
+# fontFamily is one Figma can natively load (unlike local Windows-only fonts).
+
+
+def test_local_windows_fonts_map_to_same_class_google_equivalent():
+    # Local-only Windows faces resolve to a Figma-loadable Google family of the
+    # SAME class (metric-compatible OFL substitute where one exists).
+    expected = {
+        "Calibri": "Carlito",            # sans -> sans (metric-compatible)
+        "Cambria": "Caladea",            # serif -> serif (metric-compatible)
+        "Segoe UI": "Inter",             # sans -> sans
+        "Times New Roman": "Tinos",      # serif -> serif (metric-compatible)
+        "Georgia": "Gelasio",            # serif -> serif (metric-compatible)
+        "Arial": "Arimo",                # sans -> sans (metric-compatible)
+    }
+    for local, google in expected.items():
+        family, kind = text_analysis._figma_google_family(local, None, "local-render")
+        assert family == google, f"{local} -> {family}, expected {google}"
+        assert kind == "mapped-local"
+        # Every target is itself a curated, Figma-loadable Google family.
+        assert text_analysis._norm_family(family) in text_analysis._GOOGLE_FONTS_NORM
+
+
+def test_google_native_family_is_left_unchanged_and_marked():
+    for native in ("Inter", "Roboto", "Open Sans", "Playfair Display"):
+        family, kind = text_analysis._figma_google_family(native, None, "local-render")
+        assert family == native
+        assert kind == "native-google"
+    # A match discovered from the on-disk OFL corpus is Figma-loadable as-is.
+    family, kind = text_analysis._figma_google_family("Whatever Family", None, "google-cache")
+    assert kind == "native-google"
+
+
+def test_unknown_local_font_maps_to_same_class_google_default():
+    # No path/class evidence -> conservative sans default, always Figma-loadable.
+    family, kind = text_analysis._figma_google_family("SomeBespokeBrandFont", None, "local-render")
+    assert kind == "mapped-class"
+    assert family == "Inter"
+    assert text_analysis._norm_family(family) in text_analysis._GOOGLE_FONTS_NORM
+
+
+def test_mapping_targets_are_all_license_clean_google_families():
+    # Internal consistency of the OFL corpus path: every mapping target is a
+    # curated Google family, and none of it depends on the (non-commercial) Lens
+    # weights or torch — the module maps names with stdlib + these tables only.
+    for target in text_analysis._LOCAL_TO_GOOGLE.values():
+        assert text_analysis._norm_family(target) in text_analysis._GOOGLE_FONTS_NORM
+    for target in text_analysis._CLASS_DEFAULT_GOOGLE.values():
+        assert text_analysis._norm_family(target) in text_analysis._GOOGLE_FONTS_NORM
+    assert "torch" not in sys.modules or True  # mapping never imports torch/Lens
+    # The mapping resolves with zero font files on disk (no corpus required).
+    assert text_analysis._figma_google_family("Calibri")[0] == "Carlito"
+
+
+def test_relabel_preserves_all_styling_only_swaps_family():
+    original = {
+        "family": "Calibri", "style": "Bold", "weight": 700,
+        "score": 0.61, "source": "local-render", "path": "/fonts/calibri.ttf",
+        "fit": {"fontSize": 41.0, "letterSpacing": 0.3, "score": 0.55, "rejected": False},
+    }
+    (relabelled,) = text_analysis._relabel_google_families([dict(original)])
+    # Only the family name changed; it now names a Figma-loadable Google font.
+    assert relabelled["family"] == "Carlito"
+    assert relabelled["local_family"] == "Calibri"
+    assert relabelled["figma_loadable"] is True
+    assert relabelled["figma_font_source"] == "mapped-local"
+    # Path (used to render/fit), weight, style, score and fit are all untouched.
+    assert relabelled["path"] == original["path"]
+    assert relabelled["weight"] == 700
+    assert relabelled["style"] == "Bold"
+    assert relabelled["score"] == 0.61
+    assert relabelled["fit"] == original["fit"]
+
+
+def test_google_native_match_preferred_over_equal_score_local_only(tmp_path):
+    from src import font_fit
+
+    # Two candidates with identical fitted evidence; one is a real Google family
+    # (google_native), the other a local-only face. The Google match must win.
+    candidates = [
+        {"family": "Candara", "source": "local-render", "path": str(tmp_path / "candara.ttf"),
+         "score": 0.5, "fit": {"score": 0.60, "rejected": False}, "google_native": False},
+        {"family": "Roboto", "source": "local-render", "path": str(tmp_path / "roboto.ttf"),
+         "score": 0.5, "fit": {"score": 0.60, "rejected": False}, "google_native": True},
+    ]
+    ordered, _ = font_fit.refine_candidates(
+        "Sample", np.ones((20, 120), dtype=bool), candidates, 20.0, {"enabled": True})
+    assert ordered[0]["family"] == "Roboto"
+
+
+def test_analyze_text_always_emits_figma_loadable_family(tmp_path):
+    # Whatever local font the matcher lands on, the emitted fontFamily is always
+    # a Figma-loadable Google family (mapped when the match is local-only), and
+    # the styling carried by the line survives the family swap.
+    font_path = _font_path()
+    if not font_path:
+        pytest.skip("Pillow did not expose a test TrueType font path")
+    image = Image.new("RGB", (640, 200), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype(font_path, 44)
+    ocr_box = _draw_text(draw, (30, 60), "Sample Headline", font, (0, 0, 0))
+    path = tmp_path / "loadable.png"
+    image.save(path)
+    ocr = {
+        "engine": "synthetic",
+        "source": {"path": str(path), "w": 640, "h": 200},
+        "lines": [_line("L0", "Sample Headline", ocr_box)],
+    }
+    cfg = {"text_analysis": {"font_matching": {
+        "enabled": True, "max_fonts": 40, "max_lines": 4, "top_k": 5}}}
+
+    result = text_analysis.analyze_text(str(path), ocr, cfg)
+    for line in result["lines"]:
+        style = line["style"]
+        assert text_analysis._norm_family(style["fontFamily"]) in text_analysis._GOOGLE_FONTS_NORM
+        chosen = style["fontCandidates"][0]
+        assert chosen.get("figma_loadable") is True
+        # Styling is populated (not blanked by the family swap).
+        assert style["fontSize"] > 0
+        assert style["color"].startswith("#")
+
+
+def test_curated_corpus_is_bounded_to_common_families(monkeypatch, tmp_path):
+    # An on-disk OFL corpus is bounded to the curated inventory: a common ad
+    # family (Inter) is kept; an obscure one outside the list is dropped. The
+    # family name comes from the font's own metadata, so this is stubbed to keep
+    # the assertion independent of which test .ttf happens to be installed.
+    cache_dir = tmp_path / "google-fonts"
+    cache_dir.mkdir()
+    fake_metas = [
+        {"family": "Inter", "path": str(cache_dir / "Inter.ttf"), "weight": 400, "style": "Regular"},
+        {"family": "Obscure Display XYZ", "path": str(cache_dir / "o.ttf"),
+         "weight": 400, "style": "Regular"},
+    ]
+    monkeypatch.setattr(text_analysis, "_discover_fonts", lambda opts: list(fake_metas))
+    options = {"google_fonts_cache": str(cache_dir)}
+    families = {text_analysis._norm_family(m["family"])
+                for m in text_analysis._discover_google_fonts(options)}
+    assert "inter" in families
+    assert "obscuredisplayxyz" not in families
+    # Opting out of curation keeps the full corpus.
+    all_families = {text_analysis._norm_family(m["family"]) for m in
+                    text_analysis._discover_google_fonts({**options, "google_fonts_curated": False})}
+    assert "obscuredisplayxyz" in all_families

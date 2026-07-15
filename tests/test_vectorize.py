@@ -495,3 +495,247 @@ def test_arrowhead_is_not_simplified_to_a_plain_line(tmp_path):
     draw.polygon([(105, 12), (119, 25), (105, 38)], fill=(0, 0, 0, 255))
     image.save(source)
     assert vectorize._analytic_straight_line_svg(str(source), "arrow") is None
+
+
+def test_parse_svg_paths_bakes_path_level_transform():
+    # VTracer's python package emits translate() on each <path> itself (no wrapping <g>).
+    # Dropping it displaced every traced shape to the origin, so upscaled traces always
+    # failed the render gate and exported paths[] were wrong even when it passed.
+    svg = ('<svg width="40" height="40">'
+           '<path d="M0 0L8 0L8 8L0 8Z" transform="translate(16,4)" fill="#0a141e"/></svg>')
+    paths = vectorize._parse_svg_paths(svg)
+    assert "M16.00 4.00" in paths[0]["d"]
+    assert "L24.00 12.00" in paths[0]["d"]
+
+
+def _linear_gradient_crop(path, w=64, h=40):
+    xx = np.linspace(0, 1, w, dtype=np.float32)[None, :].repeat(h, 0)[..., None]
+    c0 = np.array([20, 50, 100], np.float32)
+    c1 = np.array([150, 200, 255], np.float32)
+    rgb = (c0[None, None] * (1 - xx) + c1[None, None] * xx).astype(np.uint8)
+    Image.fromarray(np.dstack([rgb, np.full((h, w), 255, np.uint8)])).save(path)
+
+
+def test_gradient_crop_emits_one_silhouette_and_native_gradient_fill(tmp_path):
+    source = tmp_path / "grad.png"
+    _linear_gradient_crop(source)
+
+    result = vectorize.vectorize_crop(str(source), {}, role="icon")
+
+    assert result["ok"] is True
+    assert result["engine"] == "analytic-gradient"
+    assert len(result["paths"]) == 1  # not ten stacked colour bands
+    assert result["paths"][0]["fill"].startswith("#")  # flat hex for existing consumers
+    fill = result["gradient_fill"]
+    assert fill["kind"] == "linear"
+    assert abs(fill["angle"]) < 6.0
+    assert [s["position"] for s in fill["stops"]] == [0, 1]
+    assert all(s["color"].startswith("#") for s in fill["stops"])
+    assert "<linearGradient" in result["svg"]  # true paint for SVG-capable importers
+    assert fill["meta"]["flat_score"] >= vectorize._gate_limits("icon", {})[0]
+
+
+def test_gradient_detection_is_config_gated(tmp_path):
+    source = tmp_path / "grad_off.png"
+    _linear_gradient_crop(source)
+    cfg = {"vectorize": {"gradient": {"enabled": False}}}
+    assert vectorize._detect_gradient(str(source), cfg) is None
+
+
+def test_stepped_flag_bands_are_not_a_gradient(tmp_path):
+    source = tmp_path / "flag.png"
+    flag = np.zeros((40, 60, 4), np.uint8)
+    flag[:, :20] = (0, 85, 164, 255)
+    flag[:, 20:40] = (255, 255, 255, 255)
+    flag[:, 40:] = (239, 65, 53, 255)
+    Image.fromarray(flag).save(source)
+    assert vectorize._detect_gradient(str(source), {}) is None
+
+
+def test_radial_gradient_disk_gets_ellipse_silhouette_and_radial_fill(tmp_path):
+    source = tmp_path / "radial.png"
+    yy, xx = np.mgrid[0:60, 0:60].astype(np.float32)
+    rr = np.hypot(xx - 29.5, yy - 29.5)
+    t = np.clip(rr / 28.0, 0, 1)[..., None]
+    rgb = (np.array([32, 32, 32], np.float32)[None, None] * (1 - t)
+           + np.array([224, 224, 224], np.float32)[None, None] * t).astype(np.uint8)
+    alpha = np.where(rr <= 28.0, 255, 0).astype(np.uint8)
+    Image.fromarray(np.dstack([rgb, alpha])).save(source)
+
+    result = vectorize.vectorize_crop(str(source), {}, role="icon")
+
+    assert result["ok"] is True
+    assert result["engine"] == "analytic-gradient"
+    assert result["gradient_fill"]["kind"] == "radial"
+    assert result["primitive"]["kind"] == "ellipse"
+    assert "<radialGradient" in result["svg"]
+
+
+def test_near_circle_icon_prefers_analytic_ellipse_primitive(tmp_path):
+    source = tmp_path / "disk.png"
+    icon = Image.new("RGBA", (48, 48), (0, 0, 0, 0))
+    ImageDraw.Draw(icon).ellipse((4, 4, 43, 43), fill=(208, 64, 16, 255))
+    icon.save(source)
+
+    result = vectorize.vectorize_crop(str(source), {}, role="icon")
+
+    assert result["ok"] is True
+    assert result["engine"] == "analytic-primitive"
+    prim = result["primitive"]
+    assert prim["kind"] == "ellipse"
+    assert prim["iou"] >= 0.94
+    assert len(result["paths"]) == 1
+    assert result["paths"][0]["d"].count("C") == 4  # the clean 4-curve ellipse
+    assert result["score"] >= result["gate"]["score_min"]
+
+
+def test_cross_shape_is_not_forced_into_a_primitive(tmp_path):
+    source = tmp_path / "cross_prim.png"
+    rgba = np.zeros((140, 140, 4), np.uint8)
+    rgba[56:84, 8:132] = (10, 20, 30, 255)
+    rgba[8:132, 56:84] = (10, 20, 30, 255)
+    Image.fromarray(rgba).save(source)
+    assert vectorize._flat_primitive_result(str(source), {}, "icon", 1) is None
+
+
+def test_icon_midsize_upscale_traces_2x_and_restores_coordinates(tmp_path, monkeypatch):
+    source = tmp_path / "two_tone.png"
+    rgba = np.zeros((60, 60, 4), np.uint8)
+    rgba[:, :30] = (200, 40, 40, 255)
+    rgba[:, 30:] = (40, 40, 200, 255)
+    Image.fromarray(rgba).save(source)
+    traced_sizes = []
+
+    def fake_vtracer(path, cfg, preset=None):
+        traced_sizes.append(Image.open(path).size)
+        return ('<svg viewBox="0 0 120 120">'
+                '<path d="M0 0L120 0L120 120L0 120Z" fill="#c82828"/></svg>'), None
+
+    monkeypatch.setattr(vectorize, "_run_vtracer", fake_vtracer)
+    monkeypatch.setattr(vectorize, "_run_potrace", lambda *a, **k: (None, "skip"))
+    monkeypatch.setattr(vectorize, "_score_render", lambda _s, _p: 0.95)
+
+    result = vectorize.vectorize_crop(str(source), {}, role="icon")
+
+    assert result["ok"] is True
+    assert traced_sizes[0] == (120, 120)  # sharp 2x conditioning before the trace
+    assert "L60.00 60.00" in result["paths"][0]["d"]  # restored to crop coordinates
+
+    traced_sizes.clear()
+    cfg = {"vectorize": {"preprocess": {"icon_upscale_factor": 1.0}}}
+    vectorize.vectorize_crop(str(source), cfg, role="icon")
+    assert traced_sizes[0] == (60, 60)  # config-gated off
+
+
+def test_fringe_alpha_is_snapped_but_translucent_design_kept(tmp_path):
+    cfg = {"vectorize": {"preprocess": {"icon_upscale_factor": 1.0}}}
+    fringe = tmp_path / "fringe.png"
+    rgba = np.zeros((60, 60, 4), np.uint8)
+    rgba[10:50, 10:50] = (10, 20, 30, 255)
+    rgba[9, 10:50] = (10, 20, 30, 100)  # one-pixel AA fringe
+    Image.fromarray(rgba).save(fringe)
+    out, cleanup = vectorize._preprocess_crop(str(fringe), cfg, role="icon")
+    try:
+        alpha = np.asarray(Image.open(out).convert("RGBA"))[:, :, 3]
+        assert set(np.unique(alpha)) <= {0, 255}
+    finally:
+        if cleanup:
+            os.unlink(out)
+
+    translucent = tmp_path / "translucent.png"
+    rgba2 = np.zeros((60, 60, 4), np.uint8)
+    rgba2[10:50, 10:50] = (10, 20, 30, 120)  # a real translucent panel
+    Image.fromarray(rgba2).save(translucent)
+    out2, cleanup2 = vectorize._preprocess_crop(str(translucent), cfg, role="icon")
+    try:
+        alpha2 = np.asarray(Image.open(out2).convert("RGBA"))[:, :, 3]
+        assert 120 in np.unique(alpha2)  # mid-alpha kept: not a fringe
+    finally:
+        if cleanup2:
+            os.unlink(out2)
+
+
+def test_missing_potrace_degrades_once_to_binarized_vtracer(tmp_path, monkeypatch):
+    source = tmp_path / "cross.png"
+    rgba = np.zeros((140, 140, 4), np.uint8)
+    rgba[56:84, 8:132] = (10, 20, 30, 255)
+    rgba[8:132, 56:84] = (10, 20, 30, 255)
+    Image.fromarray(rgba).save(source)
+    observed = {}
+
+    def fake_vtracer(path, cfg, preset=None):
+        arr = np.asarray(Image.open(path).convert("RGBA"))
+        observed["alpha"] = set(np.unique(arr[:, :, 3]).tolist())
+        observed["colors"] = len(np.unique(arr[arr[:, :, 3] > 0][:, :3], axis=0))
+        return ('<svg viewBox="0 0 140 140">'
+                '<path d="M8 56L132 56L132 84L8 84Z" fill="#0a141e"/></svg>'), None
+
+    def no_potrace(*_a, **_k):
+        raise AssertionError("potrace must not be invoked when the binary is missing")
+
+    real_resolve = vectorize._resolve_binary
+    monkeypatch.setattr(
+        vectorize, "_resolve_binary",
+        lambda cfg, key, default: None if key == "binary_engine"
+        else real_resolve(cfg, key, default),
+    )
+    monkeypatch.setattr(vectorize, "_run_vtracer", fake_vtracer)
+    monkeypatch.setattr(vectorize, "_run_potrace", no_potrace)
+    monkeypatch.setattr(vectorize, "_score_render", lambda _s, _p: 0.9)
+    monkeypatch.setattr(vectorize, "_BINARY_DEGRADE_NOTED", False)
+
+    first = vectorize.vectorize_crop(str(source), {}, role="icon")
+    assert first["ok"] is True
+    assert first["engine"] == "vtracer"
+    assert observed["alpha"] <= {0, 255}  # traced a truly binarized crop
+    assert observed["colors"] == 1
+    assert "potrace" in first["note"] and "binarized" in first["note"]
+
+    second = vectorize.vectorize_crop(str(source), {}, role="icon")
+    assert "not installed" not in second["note"]  # degradation is noted once, not spammed
+    assert "binarized" in second["note"]
+
+
+def test_cleanup_is_rolled_back_when_render_gate_fails(tmp_path):
+    source = tmp_path / "two_squares.png"
+    rgba = np.zeros((64, 64, 4), np.uint8)
+    rgba[2:22, 2:22] = (16, 32, 64, 255)
+    rgba[28:58, 28:58] = (16, 32, 64, 255)
+    Image.fromarray(rgba).save(source)
+    paths = [
+        {"d": "M2 2L22 2L22 22L2 22Z", "fill": "#102040"},
+        {"d": "M28 28L58 28L58 58L28 58Z", "fill": "#102040"},
+    ]
+    result = {"ok": True, "engine": "vtracer", "score": 0.99, "note": "synthetic",
+              "paths": paths, "svg": "", "gate": {}}
+    # min_area chosen to drop a REAL 400px piece of the icon: the re-gated render must
+    # fail and the whole cleanup must be rolled back for this crop.
+    cfg = {"vectorize": {"cleanup": {"min_area": 450, "merge_fills": False}}}
+
+    out = vectorize._apply_cleanup(result, str(source), cfg, "icon", 1)
+
+    assert out is result
+    assert "cleanup" not in out
+    assert len(out["paths"]) == 2
+
+
+def test_cleanup_rescues_trace_that_only_failed_path_budget(tmp_path):
+    source = tmp_path / "plate.png"
+    rgba = np.zeros((40, 64, 4), np.uint8)
+    rgba[5:35, 2:62] = (51, 102, 204, 255)
+    Image.fromarray(rgba).save(source)
+    strips = []
+    for i in range(50):
+        x0 = 2 + i * 60 / 50.0
+        x1 = 2 + (i + 1) * 60 / 50.0
+        strips.append({"d": f"M{x0:.2f} 5L{x1:.2f} 5L{x1:.2f} 35L{x0:.2f} 35Z",
+                       "fill": "#3366cc"})
+    over_budget = {"ok": False, "engine": "vtracer", "score": 0.99,
+                   "note": "paths=50 over budget", "paths": strips, "svg": "", "gate": {}}
+
+    out = vectorize._apply_cleanup(over_budget, str(source), {}, "icon", 1)
+
+    assert out["ok"] is True
+    assert out["cleanup"]["paths"] == [50, 1]
+    assert len(out["paths"]) == 1
+    assert out["score"] >= vectorize._gate_limits("icon", {})[0]

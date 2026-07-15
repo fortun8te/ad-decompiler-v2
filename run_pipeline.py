@@ -15,7 +15,7 @@ import argparse, copy, hashlib, os, sys, time, glob, traceback, json
 sys.path.insert(0, os.path.dirname(__file__))
 from src.console_io import configure_stdio, safe_print
 from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
-                 element_fusion, qwen_worker, merge_layers, reconstruct, layout,
+                 element_fusion, qwen_worker, peel_scene, merge_layers, reconstruct, layout,
                  scene_intent,
                  build_design_json, figma_import, pixel_diff, repair, render_preview,
                  vlm_proofread, vlm_ocr_judge, vlm_font_judge, vlm_scene_text,
@@ -30,7 +30,7 @@ from src.qa_config import pixel_diff_thresholds, visual_pass_ssim
 configure_stdio()
 
 STAGES = ["normalize", "ocr", "text", "residual", "qwen", "sam", "elements",
-          "merge", "structure", "reconstruct", "layout", "design", "preview", "figma",
+          "peel", "merge", "structure", "reconstruct", "layout", "design", "preview", "figma",
           "export", "diff", "qa"]
 
 
@@ -191,6 +191,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
     cfg = copy.deepcopy(cfg or {})
     cfg["run_dir"] = os.path.abspath(run_dir)
     report = RunReport(run_dir, input_path, cfg, start_from)
+    vram.reset_telemetry()  # fresh per-boundary VRAM telemetry for this run
     A = lambda n: os.path.join(run_dir, n)          # artifact path
     exists = lambda n: _artifact_ready(A(n))
     begin = STAGES.index(start_from) if start_from in STAGES else 0
@@ -388,12 +389,58 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             _log(run_dir, f"element fusion → {len(fused)} canonical → {len(els)} after filter")
         els = load(A("elements.json")) if exists("elements.json") else load(A("fused_elements.json"))
 
+        # 5b OPTIONAL occlusion-attributed peel (docs/PEEL-DECOMPOSITION.md).
+        # Completes layers that sit UNDER other layers so they stay whole when moved.
+        # Default-OFF (peel.enabled): runs only when fused elements genuinely overlap;
+        # a peel failure degrades with a note and must never abort the run.
+        peel_layers = []
+        if (cfg.get("peel") or {}).get("enabled"):
+            if stage("peel") or dirty or not exists("peel.json"):
+                current_stage = "peel"
+                dirty = True
+                try:
+                    scene_elements = peel_scene.elements_from_run(
+                        run_dir, els, canvas, cfg=cfg, ocr=ocr_res)
+
+                    def _peel_inpaint(rgb, mask, meta=None):
+                        # Route through the pipeline's entropy-routed ladder; text
+                        # holes are pinned to LaMa/OpenCV (Flux leaves glyph residue).
+                        from src import inpaint as inpaint_mod
+                        route_cfg = cfg
+                        if (meta or {}).get("text_occluder"):
+                            route_cfg = dict(cfg)
+                            route_cfg["inpaint"] = {**(cfg.get("inpaint") or {}), "mode": "lama"}
+                        out, _backend, _diag = inpaint_mod.inpaint_array(
+                            rgb, mask.astype("uint8") * 255, route_cfg, return_diagnostics=True)
+                        return out
+
+                    result = peel_scene.peel_scene(
+                        norm_path, scene_elements, inpaint=_peel_inpaint, cfg=cfg)
+                    if result.skipped:
+                        dump([], A("peel.json"))
+                        report.stage("peel", "ok", detail=f"skipped: {result.skip_reason}")
+                        _log(run_dir, f"peel → skipped ({result.skip_reason})")
+                    else:
+                        peel_scene.write_outputs(result, os.path.join(run_dir, "peel"))
+                        dump(peel_scene.write_pipeline_layers(result, run_dir), A("peel.json"))
+                        rc = result.meta.get("recomposite") or {}
+                        report.stage("peel", "ok",
+                                     detail=f"{len(result.layers)} layers, "
+                                            f"recomposite max_diff={rc.get('max_abs_diff')}",
+                                     artifacts=["peel.json", "peel"])
+                        _log(run_dir, f"peel → {len(result.layers)} complete layers")
+                except Exception as exc:
+                    dump([], A("peel.json"))
+                    report.stage("peel", "fallback", detail=f"peel failed: {exc}")
+                    _log(run_dir, f"peel fallback → {exc}")
+            peel_layers = load(A("peel.json"))
+
         # 6 merge/routing creates semantic candidates.  Freeze the hierarchy before
         # reconstruction changes asset material or removes pixels for the clean plate.
         if stage("merge") or dirty or not exists("merged.json"):
             current_stage = "merge"
             dirty = True
-            merged = merge_layers.merge(ocr_res, els, qwen, canvas, cfg, run_dir=run_dir)
+            merged = merge_layers.merge(ocr_res, els, peel_layers or qwen, canvas, cfg, run_dir=run_dir)
             dump(merged, A("merged.json")); _log(run_dir, f"merge → {len(merged)} candidates")
         merged = load(A("merged.json"))
 
@@ -455,6 +502,16 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             routes = ",".join(f"{name}:{count}" for name, count in sorted(backend_counts.items()))
             route_note = f"; routes={routes}" if routes else ""
             report.stage("inpaint", "ok", detail=f"backend={inpaint_backend}{route_note}{comfy_note}{pass_note}")
+
+        # VRAM boundary: reload the LM Studio VLM evicted for the heavy Flux inpaint (no-op
+        # unless runtime.vram.reload_vlm_after_inpaint), and fold per-boundary VRAM telemetry
+        # (free/used from torch + nvidia-smi, plus any eviction/quant decisions) into the
+        # runtime report as honest evidence of how 16 GB was juggled across stages.
+        vram.restore_vlm(cfg, run_dir, log_fn=lambda msg: _log(run_dir, msg))
+        telemetry = vram.telemetry()
+        if telemetry:
+            report.data["vram"] = {"boundaries": telemetry}
+            report.write()
 
         if stage("layout") or dirty or not exists("layout.json"):
             current_stage = "layout"
@@ -522,6 +579,12 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 report.stage("preview", "partial", detail=detail, artifacts=["preview.png"])
                 report.degraded("preview", detail, required=True)
                 runtime_violations = report.violations
+            # Codia-style confidence gate: regions the reconstruction got visibly wrong
+            # become pixel-exact source slices (design/layout rebuilt + preview re-rendered).
+            fb = reconstruct.apply_raster_slice_fallback(run_dir, norm_path, cfg)
+            if fb.get("slices") or fb.get("dropped"):
+                _log(run_dir, f"fallback → {len(fb.get('slices') or [])} raster slice(s), "
+                     f"{len(fb.get('dropped') or [])} plate passthrough(s); see fallback.json")
 
         # 9 figma import (optional — Figma export can come later)
         if stage("figma") and cfg.get("figma", {}).get("enabled", False):
@@ -566,10 +629,21 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                     detail = f"render OCR judge failed: {exc}"
                     report.degraded("qa-ocr", detail, required=True)
                     runtime_violations = report.violations
+            # Gate wiring: thread the archetype preset's text strictness (F8) and let config
+            # toggle the structural-honesty gates that now default ON (F2/F3/F15).
+            qa_thresholds = pixel_diff_thresholds(cfg)
+            _arch_thresholds = (cfg.get("qa") or {}).get("archetype_thresholds") or {}
+            if _arch_thresholds.get("text_recall_min") is not None:
+                qa_thresholds["text_recall_min"] = float(_arch_thresholds["text_recall_min"])
+            _qa_cfg = cfg.get("qa") or {}
+            for _key in ("enforce_native_leaf_accounting", "background_changed_ratio_max",
+                         "glyph_residue_gate"):
+                if _qa_cfg.get(_key) is not None:
+                    qa_thresholds[_key] = _qa_cfg[_key]
             try:
                 qa_partial = pixel_diff.compare(norm_path, qa_render, run_dir,
                                                 source_ocr=ocr_res, render_ocr=ren_ocr,
-                                                thresholds=pixel_diff_thresholds(cfg),
+                                                thresholds=qa_thresholds,
                                                 structural={
                                                     "require_figma_report": bool(
                                                         require_figma_export or (

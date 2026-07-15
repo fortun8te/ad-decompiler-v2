@@ -4,6 +4,13 @@ Flow per round:
   run_pipeline.run_one → if QA not ok → execute_repairs → critic → fixer → repeat
 
 Never lowers QA thresholds. Writes ``harness_loop.json`` with a full audit trail.
+
+Reward (``runtime.harness.reward``): ``phase2`` (default) scores each round with the
+src.qa_reward metric ladder — per-element local SSIM + LPIPS perceptual + text recall —
+and uses one capped VLM critique per round as the primary repair driver; ``legacy``
+keeps the old composite/mean-of-metrics score. Acceptance hard-fail semantics are
+identical in both modes: structural fails can never be bought by a good score, and the
+phase2 gate is strictly additional (it can only refuse, never grant, acceptance).
 """
 from __future__ import annotations
 
@@ -42,11 +49,28 @@ from src.harness import (
     _load_json,
     _write_json,
 )
+from src import qa_reward
 from src.qa_config import visual_pass_ssim
 
 # Artifacts that together define "the design produced this round". Snapshotting these lets
 # the loop keep the best-scoring design and roll back a regressing round.
-_SNAPSHOT_FILES = ("design.json", "qa.json", "preview.png", "layout.json", "figma_export.png")
+#
+# This must cover every artifact a report treats as authoritative per-round evidence, not
+# just the ones the reward math itself reads. benchmark.py's row builder reads
+# reconstruction.json directly (vectorized/backend/route counts, archetype/preset
+# fallback), and runtime_report.json embeds its own qa_evidence/qa_ok/stage-detail mirror
+# of qa.json. A repair round that resumes from "text" (or earlier) regenerates all of
+# these, so leaving them out of the snapshot let a rollback restore qa.json/design.json to
+# the best round while reconstruction.json/fallback.json/runtime_report.json kept whatever
+# the last (regressed) round's pipeline run had written -- a "mixed rounds" state where the
+# shipped qa.json disagreed with the shipped runtime_report.json (observed in
+# runs/benchmark-final/016_attached_ac1eeeabce759396: qa.json restored to the round-0 ssim
+# 0.874 while runtime_report.json.qa_evidence still showed round-1's ssim 0.7586 / "editable
+# text recall 0.33 < 0.88").
+_SNAPSHOT_FILES = (
+    "design.json", "qa.json", "preview.png", "layout.json", "figma_export.png",
+    "reconstruction.json", "fallback.json", "runtime_report.json",
+)
 
 # Metrics folded into the harness-local round score. This is a read-only aggregation of QA
 # fields already written by pixel_diff — the loop never computes a new visual metric here.
@@ -76,7 +100,7 @@ def plateau_round_limit(cfg: Optional[dict] = None, default: int = _DEFAULT_PLAT
 
 
 def _qa_score(qa: Optional[dict]) -> Optional[float]:
-    """Scalar round quality from existing QA fields. Higher is better; None if unknown."""
+    """Legacy scalar round quality from existing QA fields (composite / metric mean)."""
     qa = qa or {}
     if _qa_accepts(qa, allow_summary=True):
         return 1.0
@@ -91,6 +115,35 @@ def _qa_score(qa: Optional[dict]) -> Optional[float]:
     hard_fails = qa.get("hard_fails")
     penalty = 0.12 * len(hard_fails) if isinstance(hard_fails, list) else 0.0
     return round(max(0.0, base - penalty), 6)
+
+
+def _score_round(run_dir: str, cfg: Optional[dict], qa: Optional[dict]) -> tuple[Optional[float], Optional[dict]]:
+    """Round score for best-kept/rollback/plateau: phase2 metric ladder, else legacy.
+
+    Returns ``(score, reward)``; ``reward`` is the full qa_reward record when the
+    phase2 ladder produced the score, ``None`` otherwise. Accepted QA scores 1.0 in
+    both modes (acceptance is decided by ``_qa_accepts``, never by the reward).
+    """
+    qa = qa or {}
+    if _qa_accepts(qa, allow_summary=True):
+        return 1.0, None
+    if qa_reward.reward_mode(cfg) == "phase2":
+        try:
+            reward = qa_reward.compute_reward(run_dir, cfg, qa=qa)
+            score = reward.get("score")
+            if isinstance(score, (int, float)):
+                return float(score), reward
+        except Exception:
+            pass
+    return _qa_score(qa), None
+
+
+def _reward_gate(run_dir: str, cfg: Optional[dict], qa: Optional[dict]) -> dict:
+    """Anti-degenerate acceptance gate (phase2 only). Failure-proof: defaults to ok."""
+    try:
+        return qa_reward.acceptance_gate(run_dir, cfg, qa=qa)
+    except Exception as exc:
+        return {"ok": True, "skipped": f"gate_error:{type(exc).__name__}"}
 
 
 def _snapshot_artifacts(run_dir: str) -> dict[str, bytes]:
@@ -131,6 +184,21 @@ def _invoke_execute_repairs(fn, run_dir, cfg, *, max_iterations, run_one, blocke
         return fn(run_dir, cfg, max_iterations=max_iterations, run_one=run_one,
                   blocked_repairs=set(blocked_repairs or ()))
     return fn(run_dir, cfg, max_iterations=max_iterations, run_one=run_one)
+
+
+def _round_made_progress(round_record: dict) -> bool:
+    """True if a round moved QA metrics or applied a fixer patch (F13c plateau input).
+
+    Used only when no scalar reward score is available (legacy mode or a run with no QA
+    metrics); the reward-delta path handles the phase2 case. A round that neither improved
+    metrics nor applied a fix is a no-op and should push the loop toward a plateau stop.
+    """
+    progress = (round_record or {}).get("repair_progress") or {}
+    if progress.get("improved"):
+        return True
+    if (round_record.get("fixer") or {}).get("fixes"):
+        return True
+    return False
 
 
 def _round_repair_signatures(repair_summary: dict) -> tuple[list, set]:
@@ -179,6 +247,7 @@ def _threshold_snapshot(cfg: dict) -> dict:
     return {
         "visual_pass_ssim": visual_pass_ssim(cfg),
         "repair": copy.deepcopy(cfg.get("repair") or {}),
+        "reward_gate": dict(qa_reward.gate_thresholds(cfg)),
     }
 
 
@@ -194,6 +263,11 @@ def _assert_thresholds_unchanged(snapshot: dict, cfg: dict) -> None:
         if key.endswith("_min") and key in repair:
             if float(repair[key]) < float(baseline):
                 raise ValueError(f"harness must not lower repair threshold {key}")
+    current_gate = qa_reward.gate_thresholds(cfg)
+    for key, baseline in (snapshot.get("reward_gate") or {}).items():
+        current = current_gate.get(key)
+        if current is not None and float(current) < float(baseline):
+            raise ValueError(f"harness must not lower reward gate threshold {key}")
 
 
 def _cfg_for_pipeline(cfg: dict) -> dict:
@@ -277,6 +351,47 @@ def _fallback_critic(run_dir: str, cfg: dict) -> dict:
     }
 
 
+def _apply_vlm_critique(run_dir: str, cfg: dict, critic_output: dict) -> dict:
+    """Fold the phase2 VLM critique into the critic output as the PRIMARY repair driver.
+
+    Critique repairs (already mapped onto the existing repair-action vocabulary by
+    qa_reward.critique_to_repairs) are prepended to ``filtered_repairs`` so
+    ``recommended_resume`` picks them first; metric/tool repairs remain as fallback
+    (the VLM is never the sole authority). Failure-proof: any error leaves the critic
+    output untouched.
+    """
+    try:
+        if qa_reward.reward_mode(cfg) != "phase2" or not qa_reward.critique_enabled(cfg):
+            return critic_output
+        critique = qa_reward.run_critique(run_dir, cfg)
+        items = critique.get("items") or []
+        critic_output["vlm_critique"] = {
+            "items": items,
+            "count": len(items),
+            "model": critique.get("model"),
+            "error": critique.get("error"),
+        }
+        if not items:
+            return critic_output
+        design = _load_json(os.path.join(run_dir, "design.json"), None)
+        critique_repairs = qa_reward.critique_to_repairs(
+            items, design if isinstance(design, dict) else None)
+        if not critique_repairs:
+            return critic_output
+        merged: list = []
+        seen: set[tuple] = set()
+        for repair in critique_repairs + list(critic_output.get("filtered_repairs") or []):
+            signature = (repair.get("stage"), repair.get("action"), repair.get("target_id"))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            merged.append(repair)
+        critic_output["filtered_repairs"] = merged
+    except Exception:
+        pass
+    return critic_output
+
+
 def _run_fixer_pass(run_dir: str, cfg: dict, critic_output: dict) -> dict:
     try:
         from src.harness_fixer import apply_fixer_round
@@ -346,18 +461,27 @@ def _run_round(
         if not qa_fresh and production_result:
             round_record["pipeline"]["qa_stale"] = True
         elif _qa_accepts(qa, allow_summary=True) and qa_fresh:
-            round_record["stopped"] = "qa_ok"
-            return round_record, working_cfg, True
+            gate = _reward_gate(run_dir, working_cfg, qa)
+            round_record["reward_gate"] = gate
+            if gate.get("ok", True):
+                round_record["stopped"] = "qa_ok"
+                return round_record, working_cfg, True
+            # Anti-degenerate: metric QA passed but the perceptual/per-element gate did
+            # not — keep repairing instead of accepting a bought-looking score.
 
     qa_before_repairs = _load_json(os.path.join(run_dir, "qa.json"), {})
     # Run critic before repairs so execute_repairs can use filtered_repairs this round.
+    # The phase2 VLM critique is folded in afterwards as the primary repair driver.
     critic_output = _run_critic_pass(run_dir, working_cfg)
+    critic_output = _apply_vlm_critique(run_dir, working_cfg, critic_output)
     _write_json(os.path.join(run_dir, "critic.json"), critic_output)
     round_record["critic"] = {
         "issues": len(critic_output.get("prioritized_issues") or critic_output.get("issues") or []),
         "suggested_fix_ids": critic_output.get("suggested_fix_ids") or [],
         "blockers": len(critic_output.get("blockers") or []),
     }
+    if critic_output.get("vlm_critique"):
+        round_record["critic"]["vlm_critique"] = critic_output["vlm_critique"].get("count", 0)
     repair_cfg = _cfg_for_pipeline(working_cfg)
     try:
         repair_summary = _invoke_execute_repairs(
@@ -382,8 +506,11 @@ def _run_round(
     round_record["qa_after_repairs"] = _qa_summary(qa)
     pipeline_stale = bool((round_record.get("pipeline") or {}).get("qa_stale"))
     if _qa_accepts(qa, allow_summary=True) and not pipeline_stale:
-        round_record["stopped"] = "qa_ok_after_repairs"
-        return round_record, working_cfg, True
+        gate = _reward_gate(run_dir, working_cfg, qa)
+        round_record["reward_gate"] = gate
+        if gate.get("ok", True):
+            round_record["stopped"] = "qa_ok_after_repairs"
+            return round_record, working_cfg, True
 
     fixer_result = _run_fixer_pass(run_dir, working_cfg, critic_output)
     _write_json(os.path.join(run_dir, "fixer.json"), {
@@ -445,12 +572,19 @@ def run_until_acceptable(
     # Convergence state — the direct fix for the observed oscillation.
     blocked: set = set()                       # repairs proven non-improving (no-repeat)
     convergence: list[dict] = []               # per-round (repair, before, after, kept/rolled)
-    before_score = _qa_score(_load_json(os.path.join(run_dir, "qa.json"), {}))
+    before_score, _ = _score_round(run_dir, cfg, _load_json(os.path.join(run_dir, "qa.json"), {}))
     best_score = before_score if before_score is not None else float("-inf")
     best_round = 0
     best_snapshot = _snapshot_artifacts(run_dir) if before_score is not None else {}
     plateau = 0
     rolled_back_rounds = 0
+    # Which round's artifacts are actually on disk right now (0 = the pre-loop pipeline
+    # result). This is the single source of truth the final "emit best design" step and
+    # the harness reports below use to say what shipped -- distinct from ``best_round``,
+    # which only advances on a *strict* score improvement and can otherwise lag behind a
+    # tied/no-op round that was legitimately left on disk (see the ``abs(delta) <= epsilon``
+    # branch below).
+    disk_round = 0
 
     next_resume = start_from
     last_repair_refreshed_qa = False
@@ -478,10 +612,15 @@ def run_until_acceptable(
         round_stopped = round_record.get("stopped")
         attempts = (round_record.get("repairs") or {}).get("attempts") or []
         last_repair_refreshed_qa = any(attempt.get("qa_fresh") for attempt in attempts)
+        if round_stopped not in {"pipeline_exception", "pipeline_failed"}:
+            # The pipeline and/or repairs actually ran and wrote fresh artifacts this
+            # round; it is what's on disk until the scoring below proves otherwise. The
+            # two exceptions above return from _run_round before touching run_dir at all.
+            disk_round = round_num
 
         # ── convergence bookkeeping ────────────────────────────────────────────────
         after_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
-        after_score = _qa_score(after_qa)
+        after_score, after_reward = _score_round(run_dir, working_cfg, after_qa)
         applied, non_improving = _round_repair_signatures(round_record.get("repairs") or {})
         blocked |= non_improving
         record: dict[str, Any] = {
@@ -492,8 +631,14 @@ def run_until_acceptable(
             "delta": None,
             "kept": False,
             "rolled_back": False,
-            "blocked": [list(sig) for sig in sorted(non_improving)],
+            # None-safe sort: signatures may carry None parts (e.g. critique repairs
+            # without a stage/param), and tuple comparison raises on None < str.
+            "blocked": [list(sig) for sig in sorted(
+                non_improving, key=lambda sig: tuple(str(part) for part in sig))],
         }
+        reward_record = qa_reward.reward_evidence(after_reward)
+        if reward_record:
+            record["reward"] = reward_record
 
         if after_score is not None:
             delta = after_score - (before_score if before_score is not None else after_score)
@@ -505,6 +650,7 @@ def run_until_acceptable(
             elif after_score < best_score - epsilon and best_snapshot and not should_stop:
                 # Regression: restore the best design and force a different repair next round.
                 _restore_artifacts(run_dir, best_snapshot)
+                disk_round = best_round
                 rolled_back_rounds += 1
                 record["rolled_back"] = True
                 blocked |= set(applied)
@@ -517,10 +663,21 @@ def run_until_acceptable(
                 if steer:
                     next_resume = steer["resume"]
             elif applied and abs(delta) <= epsilon:
-                # No-op repair — never retry it.
+                # No-op repair — never retry it (F13a admission control: a repair whose
+                # observed reward delta is ~0 must not re-run a full pipeline next round).
                 blocked |= set(applied)
-            plateau = plateau + 1 if abs(delta) < epsilon else 0
+            # A rolled-back round left the design at the previous best: net progress is
+            # zero, so it counts toward the plateau. This is what makes a reward that
+            # flips between two states (the observed 0.87/0.5 ↔ 0.37/0.79 oscillation)
+            # plateau-stop instead of bouncing until max_rounds.
+            plateau = plateau + 1 if (record["rolled_back"] or abs(delta) < epsilon) else 0
             before_score = after_score
+        elif not _round_made_progress(round_record):
+            # F13c: even with no scalar reward (legacy / metrics unavailable), a round that
+            # neither improved QA metrics nor applied a fix is a no-op — count it toward the
+            # plateau and block its repairs so the loop stops instead of chasing OCR noise.
+            blocked |= set(applied)
+            plateau += 1
         convergence.append(record)
         rounds.append(round_record)
 
@@ -557,37 +714,84 @@ def run_until_acceptable(
 
     # Emit the BEST design seen, not merely the last one.
     final_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
-    live_score = _qa_score(final_qa)
+    live_score, _ = _score_round(run_dir, working_cfg, final_qa)
     if best_snapshot and best_score != float("-inf") and (
         live_score is None or live_score < best_score
     ):
         _restore_artifacts(run_dir, best_snapshot)
+        disk_round = best_round
         final_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
 
-    success_stop = stopped in {"qa_ok", "qa_ok_after_repairs"}
+    # Final reward + gate evidence. The gate is strictly additional: it can only turn a
+    # metric-accepted result into "not ok" (anti-degenerate), never the other way round.
+    reward_mode = qa_reward.reward_mode(cfg)
+    final_reward = None
+    final_gate: dict = {"ok": True, "skipped": "legacy"}
+    if reward_mode == "phase2":
+        final_reward = qa_reward.compute_reward(run_dir, working_cfg, qa=final_qa)
+        final_gate = _reward_gate(run_dir, working_cfg, final_qa)
+    qa_ok = _qa_accepts(final_qa, allow_summary=True) and bool(final_gate.get("ok", True))
+
     summary = {
         "run_dir": run_dir,
         "rounds": rounds,
         "rounds_completed": len(rounds),
         "max_rounds": max_rounds,
-        "qa_ok": _qa_accepts(final_qa, allow_summary=True),
+        "qa_ok": qa_ok,
         "stopped": stopped,
+        # Which round's artifacts are provably on disk right now (0 = pre-loop pipeline
+        # result). Recorded explicitly so a reader never has to infer "what shipped" from
+        # best_round/rolled_back_rounds alone -- see the _SNAPSHOT_FILES note above.
+        "shipped_round": disk_round,
         "thresholds": threshold_snapshot,
+        "reward": {
+            "mode": reward_mode,
+            "final": qa_reward.reward_evidence(final_reward),
+            "gate": final_gate,
+        },
         "convergence": {
             "epsilon": epsilon,
             "plateau_rounds": plateau_limit,
             "best_round": best_round,
             "best_score": None if best_score == float("-inf") else round(best_score, 6),
             "rolled_back_rounds": rolled_back_rounds,
+            "shipped_round": disk_round,
             "trail": convergence,
         },
     }
     _write_json(os.path.join(run_dir, "harness_loop.json"), summary)
-    _patch_runtime_report(run_dir, summary["convergence"], stopped, summary["qa_ok"])
+    _patch_harness_report(run_dir, summary["reward"], shipped_round=summary["shipped_round"])
+    _patch_runtime_report(run_dir, summary["convergence"], stopped, summary["qa_ok"],
+                          reward=summary["reward"])
     return summary
 
 
-def _patch_runtime_report(run_dir: str, convergence: dict, stopped: str, qa_ok: bool) -> None:
+def _patch_harness_report(run_dir: str, reward: dict, shipped_round: Optional[int] = None) -> None:
+    """Attach the final reward evidence and shipped round to harness.json.
+
+    harness.json (written by execute_repairs) is a per-attempt audit trail and is
+    intentionally left as whatever the last repair attempt wrote -- it documents what was
+    *tried*, including attempts that were later rolled back. ``shipped_round`` answers the
+    separate question "which round's artifacts are actually on disk", so a reader does not
+    have to infer that from the (possibly rolled-back) attempt list.
+    """
+    path = os.path.join(run_dir, "harness.json")
+    if not os.path.exists(path):
+        return
+    report = _load_json(path, None)
+    if not isinstance(report, dict):
+        return
+    report["reward"] = reward
+    if shipped_round is not None:
+        report["shipped_round"] = shipped_round
+    try:
+        _write_json(path, report)
+    except OSError:
+        pass
+
+
+def _patch_runtime_report(run_dir: str, convergence: dict, stopped: str, qa_ok: bool,
+                          reward: Optional[dict] = None) -> None:
     """Surface convergence behaviour in runtime_report.json when it exists (visible/testable)."""
     path = os.path.join(run_dir, "runtime_report.json")
     if not os.path.exists(path):
@@ -601,10 +805,13 @@ def _patch_runtime_report(run_dir: str, convergence: dict, stopped: str, qa_ok: 
         "best_round": convergence.get("best_round"),
         "best_score": convergence.get("best_score"),
         "rolled_back_rounds": convergence.get("rolled_back_rounds"),
+        "shipped_round": convergence.get("shipped_round"),
         "epsilon": convergence.get("epsilon"),
         "plateau_rounds": convergence.get("plateau_rounds"),
         "trail": convergence.get("trail"),
     }
+    if reward is not None:
+        report["harness_convergence"]["reward"] = reward
     try:
         _write_json(path, report)
     except OSError:

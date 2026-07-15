@@ -9,6 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from src.figma_bridge import (
+    _atomic_write,
     _estimate_eta,
     _parse_stage_fractions,
     _read_history,
@@ -1207,3 +1208,317 @@ def test_stage_job_output_rejects_stale_manifest(tmp_path, monkeypatch):
 
     assert result["staged"] is False
     assert result["staging_error"] == "disk full"
+
+
+# ---------------------------------------------------------------------------
+# Deferred UI item 1: /history carries visual_score + qa_ok so the plugin can
+# render a QA badge for a staged run that has no live-session job.
+# ---------------------------------------------------------------------------
+def test_history_round_trips_visual_score_for_qa_badge(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _record_history(
+        str(inbox), 30.0, job_id="j1", filename="ad.png", doc_id="doc-1",
+        finished_at=100.0, qa_ok=True, visual_score=0.9123, layer_count=7,
+    )
+    # A stray bool must never masquerade as a score (would render "QA 1.00").
+    _record_history(
+        str(inbox), 12.0, job_id="j2", filename="b.png", doc_id="doc-2",
+        finished_at=110.0, qa_ok=True, visual_score=True,
+    )
+    runs = {row["doc_id"]: row for row in _read_history(str(inbox))["runs"]}
+    assert runs["doc-1"]["visual_score"] == 0.9123
+    assert runs["doc-1"]["qa_ok"] is True
+    assert "visual_score" not in runs["doc-2"]
+
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        served = {row["doc_id"]: row for row in json.loads(urlopen(base + "/history", timeout=2).read())["runs"]}
+        assert served["doc-1"]["visual_score"] == 0.9123
+        assert served["doc-1"]["qa_ok"] is True
+        assert "run_dir" not in served["doc-1"]  # still path-free
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Deferred UI item 2: a staged run's QA evidence is retrievable by doc_id, not
+# only by a live job_id -- via the enriched /run.json and /run-summary?doc_id=.
+# ---------------------------------------------------------------------------
+def _write_qa(run_dir, *, ok=True, visual_score=0.88, complete=True):
+    structural = (
+        {"background": {"ok": True}, "layer_alpha": [], "element_recall": 1.0, "hard_fails": []}
+        if complete else {}
+    )
+    (run_dir / "qa.json").write_text(json.dumps({
+        "ok": ok, "visual_score": visual_score, "ssim": 0.95,
+        "hard_fails": [], "structural": structural,
+    }), encoding="utf-8")
+
+
+def test_run_json_exposes_staged_qa_evidence(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    staged = inbox / "runs" / "demo"
+    staged.mkdir(parents=True)
+    (staged / "design.json").write_text(json.dumps({"id": "demo", "canvas": {"w": 1, "h": 1}, "layers": []}), encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_qa(run_dir, visual_score=0.88)
+    manifest = {
+        "schema_version": 2, "doc_id": "demo", "design": "design.json",
+        "staged_dir": "runs/demo", "run_dir": str(run_dir), "staged_at": 123,
+        "summary": {"layers": 0}, "preview": "preview.png",
+    }
+    (inbox / "inbox.json").write_text(json.dumps(manifest), encoding="utf-8")
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        run = json.loads(urlopen(base + "/run.json", timeout=2).read())
+        assert run["ok"] is True
+        assert run["doc_id"] == "demo"
+        assert run["qa_ok"] is True
+        assert run["visual_score"] == 0.88
+        assert run["qa_evidence_complete"] is True
+        assert run["hard_fails"] == []
+        # legacy identity fields remain (backward compatible)
+        assert run["staged_at"] == 123 and run["preview"] == "preview.png"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_run_json_returns_json_404_when_nothing_staged(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        urlopen(base + "/run.json", timeout=2)
+        assert False, "empty inbox should 404"
+    except HTTPError as error:
+        assert error.code == 404
+        assert json.loads(error.read())["ok"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_run_summary_by_doc_id_from_currently_staged_manifest(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_qa(run_dir, visual_score=0.81)
+    manifest = {"schema_version": 2, "doc_id": "staged", "design": "design.json",
+                "staged_dir": ".", "run_dir": str(run_dir)}
+    (inbox / "inbox.json").write_text(json.dumps(manifest), encoding="utf-8")
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        summary = json.loads(urlopen(base + "/run-summary?doc_id=staged", timeout=2).read())
+        assert summary["ok"] is True
+        assert summary["doc_id"] == "staged"
+        assert summary["staged"] is True
+        assert summary["visual_score"] == 0.81
+        assert summary["final_qa_ok"] is True
+        assert summary["manifest"]["doc_id"] == "staged"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_run_summary_by_doc_id_reconstructs_from_history_after_restart(tmp_path):
+    """No live job_id (bridge restarted) -> resolve run_dir from the history job_id."""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    job_id = "abc123def456"
+    run_dir = inbox / "uploads" / job_id / "run"
+    run_dir.mkdir(parents=True)
+    _write_qa(run_dir, visual_score=0.77, complete=False)
+    _record_history(
+        str(inbox), 20.0, str(run_dir), job_id=job_id, filename="old.png",
+        doc_id="old-doc", finished_at=100.0, qa_ok=True, visual_score=0.77,
+    )
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        summary = json.loads(urlopen(base + "/run-summary?doc_id=old-doc", timeout=2).read())
+        assert summary["ok"] is True
+        assert summary["doc_id"] == "old-doc"
+        assert summary["job_id"] == job_id
+        assert summary["staged"] is False
+        assert summary["visual_score"] == 0.77
+        assert summary["final_qa_ok"] is True
+        try:
+            urlopen(base + "/run-summary?doc_id=does-not-exist", timeout=2)
+            assert False, "unknown doc_id should 404"
+        except HTTPError as error:
+            assert error.code == 404
+            assert json.loads(error.read())["ok"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Task 3: /health answers staged doc_id + plugin client build + job state in one call.
+# ---------------------------------------------------------------------------
+def test_health_reports_staged_doc_and_client_and_job_state_in_one_call(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "plugin_client.json").write_text(json.dumps({"build": 9, "label": "v2+b9"}), encoding="utf-8")
+    (inbox / "inbox.json").write_text(json.dumps({"schema_version": 2, "doc_id": "staged-doc", "staged_at": 555}), encoding="utf-8")
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        health = json.loads(urlopen(base + "/health", timeout=4).read())
+        assert health["ok"] is True
+        assert health["has_run"] is True
+        assert health["staged_doc_id"] == "staged-doc"
+        assert health["staged_at"] == 555
+        assert health["plugin_client"]["build"] == 9
+        assert "active_job" in health and health["active_job"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Task 2: path-traversal safety (incl. absolute + cross-drive), caching headers,
+# graceful JSON errors, and torn-read safety under concurrent restaging.
+# ---------------------------------------------------------------------------
+def test_asset_rejects_absolute_and_cross_drive_paths(tmp_path):
+    from urllib.parse import quote
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    staged = inbox / "runs" / "demo"
+    staged.mkdir(parents=True)
+    (staged / "keep.png").write_bytes(b"ok")
+    (inbox / "inbox.json").write_text(json.dumps(
+        {"doc_id": "demo", "design": "design.json", "staged_dir": "runs/demo"}), encoding="utf-8")
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        # A crafted cross-drive path makes os.path.commonpath raise ValueError; the handler
+        # must reject it as 404, not 500 (the ValueError guard) -- and never leak a file.
+        for bad in ["../../secret.txt", "..\\..\\secret", "/etc/passwd",
+                    "C:/Windows/win.ini", "Z:/nope/passwd"]:
+            try:
+                urlopen(base + "/asset?path=" + quote(bad, safe=""), timeout=2)
+                assert False, f"expected 404 for {bad}"
+            except HTTPError as error:
+                assert error.code == 404, f"{bad} -> {error.code}"
+        # the legitimate staged asset still serves
+        assert urlopen(base + "/asset?path=keep.png", timeout=2).read() == b"ok"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_preview_and_asset_use_revalidate_cache_json_stays_no_store(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    staged = inbox / "runs" / "demo"
+    staged.mkdir(parents=True)
+    (staged / "preview.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    (inbox / "inbox.json").write_text(json.dumps({
+        "doc_id": "demo", "design": "design.json", "staged_dir": "runs/demo",
+        "preview": "preview.png",
+    }), encoding="utf-8")
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        # The plugin busts the cache with ?t=<staged_at>; the image is cacheable but must
+        # revalidate so two stages in the same wall-clock second never show a stale render.
+        resp = urlopen(base + "/preview.png?t=123", timeout=2)
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type") == "image/png"
+        assert resp.headers.get("Cache-Control") == "no-cache"
+        assert resp.read() == b"\x89PNG\r\n\x1a\nfake"
+        json_resp = urlopen(base + "/inbox.json", timeout=2)
+        assert json_resp.headers.get("Content-Type") == "application/json"
+        assert json_resp.headers.get("Cache-Control") == "no-store"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_handler_returns_json_500_instead_of_dropping_connection(tmp_path, monkeypatch):
+    import src.figma_bridge as fb
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+
+    def boom(*a, **k):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(fb, "_read_history", boom)
+    try:
+        urlopen(base + "/history", timeout=2)
+        assert False, "an unhandled handler error should surface as HTTP 500, not a reset"
+    except HTTPError as error:
+        assert error.code == 500
+        body = json.loads(error.read())
+        assert body["ok"] is False
+        assert "kaboom" in body.get("detail", "")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_inbox_polling_never_sees_a_torn_read_during_restage(tmp_path):
+    """The plugin polls /inbox.json + /design.json while a run re-stages. Atomic replace
+    plus a read-retry must guarantee every 200 body is a whole JSON doc, never a torn one."""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    staged = inbox / "runs" / "demo"
+    staged.mkdir(parents=True)
+    (staged / "design.json").write_text(
+        json.dumps({"id": "demo", "canvas": {"w": 1, "h": 1}, "layers": []}), encoding="utf-8")
+    base_manifest = {"schema_version": 2, "design": "design.json", "staged_dir": "runs/demo"}
+    inbox_json = str(inbox / "inbox.json")
+    _atomic_write(inbox_json, json.dumps({**base_manifest, "doc_id": "demo-0"}).encode())
+
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    stop = threading.Event()
+    errors = []
+
+    def restage():
+        i = 0
+        while not stop.is_set():
+            i += 1
+            payload = {**base_manifest, "doc_id": f"demo-{i}", "pad": "x" * (i % 400)}
+            try:
+                _atomic_write(inbox_json, json.dumps(payload).encode())
+            except Exception as exc:  # pragma: no cover - writer must not die
+                errors.append(("write", str(exc)))
+            time.sleep(0.001)
+
+    writer = threading.Thread(target=restage, daemon=True)
+    writer.start()
+    try:
+        for _ in range(150):
+            for path in ("/inbox.json", "/design.json"):
+                try:
+                    resp = urlopen(base + path, timeout=3)
+                    assert resp.status == 200
+                    parsed = json.loads(resp.read())  # a torn read raises here
+                    assert "doc_id" in parsed or "canvas" in parsed
+                except HTTPError as error:
+                    # a transient manifest-read miss may 404 /design.json; never a 500
+                    assert error.code == 404, f"{path} -> {error.code}"
+                except Exception as exc:
+                    errors.append((path, str(exc)))
+    finally:
+        stop.set()
+        writer.join(timeout=2)
+        server.shutdown()
+        server.server_close()
+    assert not errors, errors[:5]

@@ -1,0 +1,15 @@
+{
+  "installedFonts": "auto",
+  "expect": {
+    "ok": true,
+    "minCreated": 6,
+    "failedLayers": [
+      "t-strike",
+      "t-upper",
+      "widget"
+    ],
+    "errorsContain": [
+      "Unsupported layer type"
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "ad-decompiler-plugin-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Mock-Figma E2E harness for figma-plugin/code.js (plain Node, zero deps)",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node run_e2e.js --all"
+  }
+}

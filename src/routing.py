@@ -36,10 +36,15 @@ PRIMITIVE_SHAPE_ROLES = ("badge", "chip", "button", "divider", "card")
 # reproduced as editable text (glyph too hard to isolate, or the closest font/effect
 # match is a poor fit) — it is routed to a masked-pixel fallback layer instead of
 # emitting a guessed rendering. Overridable via cfg["routing"]["min_text_fidelity"].
-# Scores in the low 0.70s are generally still a solid local glyph match; below
-# that we preserve exact pixels.  A higher cutoff made normal, proofread overlay
-# copy disappear into raster fallbacks, defeating the editable Figma contract.
-MIN_TEXT_FIDELITY = 0.75
+# Anchored to the render-fit score scale (font_fit.py): exact font 0.72-0.88,
+# correct-class substitute 0.33-0.58, wrong class 0.14-0.42 (wrong-class candidates
+# are already filtered by the serif/sans class gate before this confidence is
+# published). A correct-class fit must route as editable TEXT — the per-layer
+# ink-IoU raster-slice gate (schema.raster_slice_thresholds) is the downstream
+# arbiter that catches a fit that still renders badly. Pre-emptively rasterizing
+# here at the old shape-match scale (0.75) silently converted whole ads to images
+# (benchmark 009: 12/14 text blocks became rasters).
+MIN_TEXT_FIDELITY = 0.40
 
 # Roles whose rasterized cutout should be delivered as an IMAGE clipped by a swappable
 # shape mask (see _image_mask). The raster is the swappable fill; the mask is the shape.
@@ -113,6 +118,19 @@ def _num(value, default):
         return float(default)
 
 
+# Archetypes whose plate is flat enough that an icon chip's baked-in surround is
+# invisible (Codia's cutout trick). Photographic archetypes keep the vector/matte path.
+_CHIP_ARCHETYPES = {"social_screenshot", "product_on_flat"}
+
+
+def _icons_as_chips(cfg) -> bool:
+    """Config gate for icon→image-chip routing (default: ON for flat-plate archetypes)."""
+    routing_cfg = (cfg or {}).get("routing") or {}
+    if routing_cfg.get("icons_as_chips") is not None:
+        return bool(routing_cfg.get("icons_as_chips"))
+    return str(((cfg or {}).get("scene") or {}).get("archetype") or "") in _CHIP_ARCHETYPES
+
+
 def _wordmark_as_raster(cfg: dict | None) -> bool:
     """Raster is the conservative default when brand artwork has no explicit override."""
     return bool((cfg or {}).get("wordmark_as_raster", True))
@@ -122,12 +140,14 @@ def _text_fidelity_fallback(c: dict, meta: dict, cfg: dict | None) -> dict | Non
     """If this text candidate's ink/font-match confidence is below the fidelity gate,
     return a routed masked-pixel-fallback candidate; otherwise None (route as text)."""
     threshold = _num((cfg or {}).get("routing", {}).get("min_text_fidelity"), MIN_TEXT_FIDELITY)
-    # Long social/body copy amplifies a small font mismatch across a large area.
-    # Keep the ordinary overlay threshold permissive for CTA/headline editing,
-    # but require a stronger render match before rebuilding a paragraph.
-    semantic_role = str(meta.get("semantic_role") or meta.get("role") or "").lower()
-    if semantic_role in {"body-copy", "body", "caption"}:
-        threshold = max(threshold, 0.85)
+    # One bar for every text role. The user's explicit preference is to keep text
+    # EDITABLE in a plausible same-class font rather than slice it to pixels: body
+    # copy in a clean substitute sans reads fine and is worth editing. The upstream
+    # fidelity_confidence already encodes correct-class + legibility (a wrong-CLASS
+    # render is capped below this bar in text_analysis), so a paragraph no longer
+    # needs a stricter gate than a headline — the old body-copy bump to 0.50 only
+    # rasterized long copy that a substitute font renders perfectly well
+    # (benchmark 009: all 5 body blocks became pixels).
     style = c.get("style") or {}
     fidelity_conf = meta.get("fidelity_confidence")
     if fidelity_conf is None:
@@ -247,8 +267,21 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
         return c
 
     # 2. Explicit emoji candidate ----------------------------------------------------
+    # Codia parity: emoji are PIXELS, never glyphs or traces (spec §2b/§7.4).
+    # A color emoji vectorized to a flat single-color path was the single worst
+    # visual artifact in benchmark 009; a text glyph depends on the platform's
+    # emoji font and never matches the painted pixels. Ship the exact source
+    # cutout at its tight pixel box (the baked-in local plate surround makes a
+    # matte unnecessary on flat plates, exactly like Codia's cutouts).
     if meta.get("emoji") or c.get("codepoint"):
-        c["target"] = "text"; meta["emoji"] = True
+        c["target"] = "image"
+        meta["emoji"] = True
+        meta["role"] = meta.get("role") or "emoji"
+        meta.setdefault("layer_disposition", "foreground_raster")
+        meta.setdefault("intentional_raster_cluster", True)
+        mask = dict(c.get("mask")) if isinstance(c.get("mask"), dict) else {}
+        mask["kind"] = "alpha"
+        c["mask"] = mask
         return c
 
     # 3. Photos / products / people → raster + mask ---------------------------------
@@ -272,6 +305,20 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
     # 4. Icons / badges / simple graphics → vectorize (small only) ------------------
     if kind in {"icon", "line"} or meta.get("role") in VECTORIZE_ROLES:
         role = str(meta.get("role") or "").lower().replace("-", "_")
+        # Codia confidence ladder: on flat-plate archetypes an icon ships as an exact
+        # IMAGE chip with its local plate surround baked in — vector tracing is a
+        # declared non-goal (chips are pixel-exact and trivially swappable; Codia's
+        # engagement icons/badges are all cutouts). Leaders/bursts keep the vector
+        # path (they are often diagonal linework a chip box would mangle).
+        if (_icons_as_chips(cfg) and role not in EXTENDED_VECTOR_ROLES
+                and _area_frac(c.get("box", {}), canvas) <= 0.20):
+            c["target"] = "image"
+            meta["icon_chip"] = True
+            meta.setdefault("intentional_raster_cluster", True)
+            mask = dict(c.get("mask")) if isinstance(c.get("mask"), dict) else {}
+            mask["kind"] = "alpha"
+            c["mask"] = mask
+            return c
         max_fraction = 0.20 if role in EXTENDED_VECTOR_ROLES else ICON_MAX_AREA_FRAC
         if _area_frac(c.get("box", {}), canvas) <= max_fraction:
             c["target"] = "icon"

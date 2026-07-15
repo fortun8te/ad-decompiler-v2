@@ -17,6 +17,23 @@ $Python = Join-Path $Root ".venv\Scripts\python.exe"
 $SetupStamp = Join-Path $Root ".venv\.rtx-setup-v4"
 $BridgeHost = "127.0.0.1"
 
+function Ensure-ToolOnPath([string]$Tool, [string[]]$KnownDirs) {
+  if (Get-Command $Tool -ErrorAction SilentlyContinue) { return }
+  foreach ($dir in $KnownDirs) {
+    if ($dir -and (Test-Path (Join-Path $dir "$Tool.exe"))) {
+      $env:PATH = "$dir;$env:PATH"
+      return
+    }
+  }
+}
+
+# Tesseract (winget UB-Mannheim build) and the LM Studio `lms` CLI are frequently not on PATH
+# until the user logs out and back in. Prepend their known install dirs to this process's PATH
+# so doctor.py finds tesseract and the VLM-eviction feature (runtime.vram.evict_vlm_for_inpaint)
+# can shell out to `lms` without a shell restart.
+Ensure-ToolOnPath "tesseract" @("$env:ProgramFiles\Tesseract-OCR", "${env:ProgramFiles(x86)}\Tesseract-OCR")
+Ensure-ToolOnPath "lms" @("$env:USERPROFILE\.lmstudio\bin")
+
 function Ensure-Venv {
   if ((Test-Path $Python) -and (Test-Path $SetupStamp)) { return }
   Write-Host ""

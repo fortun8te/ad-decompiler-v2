@@ -44,6 +44,22 @@ vtracer>=0.6.11
 #   pip install -e C:\src\sam3
 # Request/download the official checkpoint once and set sam3.checkpoint in config.yaml.
 
+# ── Phase-2 QA reward (harness metric ladder) ──
+lpips>=0.1.4              # perceptual distance term + acceptance gate; CPU-capable
+#                           (default net "squeeze" downloads a ~5 MB torchvision backbone once)
+
 # ── background inpainting ──
 # Big-LaMa is optional; OpenCV is the deterministic fallback:
 #   pip install simple-lama-inpainting
+
+# ── LayerD-style peel decomposition (src/peel_decompose.py) — OPTIONAL ──
+# No new package is strictly required: the default matting backend rides the torch +
+# torchvision + transformers stack above (AutoModelForImageSegmentation with
+# trust_remote_code). BiRefNet checkpoints (~1 GB) download from HF on first use:
+#   cyberagent/layerd-birefnet   (LayerD's top-layer fine-tune — preferred)
+#   ZhengPeng7/BiRefNet          (generic salient-object fallback)
+# Alternative ONNX matting backend, only if the transformers path is unavailable
+# (pulls onnxruntime; uncomment deliberately, never both CPU+GPU variants):
+# rembg[cpu]>=2.0.61        # peel_decompose.make_rembg_matting("birefnet-general")
+# The peel loop's LayerD-faithful hole filler is Big-LaMa via simple-lama-inpainting
+# (already listed above); OpenCV Telea remains the zero-install default.

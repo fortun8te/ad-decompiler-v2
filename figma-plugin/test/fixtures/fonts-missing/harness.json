@@ -1,0 +1,13 @@
+{
+  "installedFonts": [],
+  "expect": {
+    "ok": true,
+    "minCreated": 2,
+    "failedLayers": [
+      "t1"
+    ],
+    "errorsContain": [
+      "Layer failed"
+    ]
+  }
+}

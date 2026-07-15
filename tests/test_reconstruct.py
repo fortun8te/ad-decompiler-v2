@@ -926,3 +926,192 @@ def test_removal_ledger_makes_overlapping_regions_exclusive():
     assert np.array_equal(union > 0, (left > 0) | (right > 0))
     assert set(np.unique(ledger)) == {0, 1, 2}
     assert not np.any((records[0]["mask_array"] > 0) & (records[1]["mask_array"] > 0))
+
+
+# ── Button/pill plate fidelity (009 "Volgend" failure class) ───────────────────────
+
+
+def _pill_mask(w=202, h=67, holes=()):
+    image = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((0, 0, w - 1, h - 1), radius=(h - 1) // 2, fill=255)
+    for x0, y0, x1, y1 in holes:
+        draw.rectangle((x0, y0, x1, y1), fill=0)
+    return np.asarray(image) > 16
+
+
+def test_corner_radius_full_pill_snaps_to_half_height():
+    # A fully-rounded pill (radius == h/2) is the most common ad button. The old
+    # first-occupied-edge scan clamped it below min(h, w) * .48 and shipped a
+    # sharp rectangle instead.
+    assert reconstruct._corner_radius(_pill_mask()) == 33.5
+
+
+def test_corner_radius_survives_debris_outside_the_corners():
+    # 009's "Volgend" pill mask carried a one-row residual ledge welded to the
+    # mid-bottom of its silhouette; the old whole-row scan returned None for it.
+    mask = _pill_mask().copy()
+    mask[-1, :] = False
+    mask[-1, 72:114] = True
+    assert reconstruct._corner_radius(mask) == 33.5
+
+
+def test_corner_radius_moderate_rounding_is_not_snapped_to_pill():
+    image = Image.new("L", (160, 80), 0)
+    ImageDraw.Draw(image).rounded_rectangle((0, 0, 159, 79), radius=12, fill=255)
+    radius = reconstruct._corner_radius(np.asarray(image) > 16)
+    assert isinstance(radius, float)
+    assert 9 <= radius <= 14
+
+
+def test_corner_radius_sharp_rect_and_noise_stay_conservative():
+    assert reconstruct._corner_radius(np.ones((50, 100), dtype=bool)) == 0
+    rng = np.random.default_rng(7)
+    assert reconstruct._corner_radius(rng.random((60, 120)) > 0.3) is None
+
+
+def test_plate_hole_restoration_keeps_carved_button_a_full_pill():
+    # Ownership carves the label's glyph pixels out of the plate mask. The text
+    # renders on top as its own editable layer, so the plate must still fit as
+    # the full primitive — a pill with a text hole is a pill, never a donut.
+    holes = ((30, 14, 78, 52), (88, 14, 136, 52))
+    mask = _pill_mask(holes=holes)
+    assert float(mask.mean()) < .70  # carved enough that geometry would fail
+    rgb = np.full((120, 260, 3), 24, dtype=np.uint8)
+    canvas_mask = np.zeros((120, 260), dtype=np.uint8)
+    canvas_mask[30:97, 20:222] = mask.astype(np.uint8) * 255
+    rgb[30:97, 20:222][mask] = (239, 243, 244)
+    box = {"x": 20, "y": 30, "w": 202, "h": 67}
+
+    extracted = reconstruct._extract_shape_style(rgb, canvas_mask, box, {}, role="button")
+
+    assert extracted is not None
+    assert extracted["shape_kind"] == "rect"
+    assert extracted["radius"] == 33.5
+    assert extracted["fill"] == {"kind": "flat", "color": "#eff3f4"}
+    assert extracted["meta"]["plate_holes_filled_px"] > 0
+    # Without the plate role the carved mask stays conservative (no invented shape).
+    assert reconstruct._extract_shape_style(rgb, canvas_mask, box, {}, role="photo") is None
+    # Config gate: restoration off reproduces the conservative behaviour.
+    off = {"reconstruct": {"style_extraction": {"restore_plate_mask": False}}}
+    assert reconstruct._extract_shape_style(rgb, canvas_mask, box, off, role="button") is None
+
+
+def test_outline_only_ghost_button_is_not_solidified():
+    # A hollow ring (outline/ghost button) must not be "restored" into a solid
+    # plate: filling its interior would invent a fill that is not in the source.
+    image = Image.new("L", (160, 60), 0)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((0, 0, 159, 59), radius=29, fill=255)
+    draw.rounded_rectangle((4, 4, 155, 55), radius=25, fill=0)
+    ring = np.asarray(image) > 16
+
+    restored, filled = reconstruct._fill_plate_holes(ring)
+
+    assert filled == 0
+    assert np.array_equal(restored, ring)
+
+
+def test_plate_boundary_fragments_fold_back_into_the_button():
+    # SAM peeled both anti-aliased end caps of 009's pill into separate "icons";
+    # rendered above the native plate they re-drew the source's dark background
+    # ring (the bitten edge). A real icon that sits clear of the rim is kept.
+    def candidates():
+        return [
+            {"id": "plate", "target": "shape", "box": {"x": 833, "y": 134, "w": 202, "h": 67},
+             "meta": {"role": "button", "button_shell": True}},
+            {"id": "left-cap", "target": "icon", "box": {"x": 832, "y": 147, "w": 12, "h": 39},
+             "meta": {"role": "icon"}},
+            {"id": "right-cap", "target": "icon", "box": {"x": 1032, "y": 153, "w": 7, "h": 28},
+             "meta": {"role": "icon"}},
+            {"id": "chevron", "target": "icon", "box": {"x": 1000, "y": 155, "w": 24, "h": 24},
+             "meta": {"role": "icon"}},
+            {"id": "far-icon", "target": "icon", "box": {"x": 351, "y": 157, "w": 29, "h": 29},
+             "meta": {"role": "icon"}},
+        ]
+
+    out, suppressed = reconstruct._suppress_plate_boundary_fragments(candidates(), {})
+
+    assert suppressed == 2
+    by_id = {c["id"]: c for c in out}
+    for cap in ("left-cap", "right-cap"):
+        assert by_id[cap]["target"] == "drop"
+        assert by_id[cap]["meta"]["suppression_reason"] == "plate-boundary-fragment"
+        assert by_id[cap]["meta"]["plate_id"] == "plate"
+        assert by_id[cap]["meta"]["removal_required"] is True
+    assert by_id["chevron"]["target"] == "icon"
+    assert by_id["far-icon"]["target"] == "icon"
+    assert by_id["plate"]["target"] == "shape"
+
+    # Config gate keeps the old behaviour available.
+    off, count = reconstruct._suppress_plate_boundary_fragments(
+        candidates(), {"reconstruct": {"suppress_plate_fragments": False}})
+    assert count == 0
+    assert all(c["target"] != "drop" for c in off)
+
+
+def test_f7_before_after_label_stays_editable_when_not_over_a_column():
+    # F7: a literal before_after_pair no longer forces every Before/After label to be
+    # baked into a column photo. A label sitting in the gutter (overlapping no column)
+    # must remain a real, swappable TEXT layer; only a label physically inside a column
+    # photo is baked (its pixels are part of that raster).
+    cfg = {"scene": {"archetype": "comparison_grid", "facts": {"before_after_pair": True}}}
+    candidates = [
+        {"id": "col-before", "target": "image",
+         "box": {"x": 0, "y": 0, "w": 100, "h": 200},
+         "meta": {"comparison_side": "before"}},
+        {"id": "col-after", "target": "image",
+         "box": {"x": 120, "y": 0, "w": 100, "h": 200},
+         "meta": {"comparison_side": "after"}},
+        # Label baked into the left column photo (contained) -> dropped.
+        {"id": "lbl-inside", "target": "text", "text": "Before",
+         "box": {"x": 20, "y": 10, "w": 40, "h": 16}},
+        # Label in the gutter/below, overlapping no column -> stays editable.
+        {"id": "lbl-gutter", "target": "text", "text": "After",
+         "box": {"x": 105, "y": 210, "w": 40, "h": 16}},
+    ]
+    out = {c["id"]: c for c in reconstruct._suppress_comparison_column_labels(candidates, cfg)}
+    assert out["lbl-inside"]["target"] == "drop"
+    assert out["lbl-inside"]["meta"]["suppression_reason"] == "comparison-column-label-baked"
+    assert out["lbl-gutter"]["target"] == "text", "gutter label must stay editable (F7)"
+    assert "suppression_reason" not in out["lbl-gutter"].get("meta", {})
+
+
+def test_f10_slice_budget_truncation_is_recorded(tmp_path, monkeypatch):
+    # F10: when more regions fail than the slice budget, the excess used to be dropped
+    # silently. They must now be recorded honestly in fallback.json.
+    from PIL import Image
+    from src import pixel_diff
+
+    run_dir = tmp_path
+    canvas = {"w": 1000, "h": 1000}
+    Image.new("RGB", (1000, 1000), "white").save(run_dir / "preview.png")
+    source = run_dir / "source.png"
+    Image.new("RGB", (1000, 1000), "white").save(source)
+    (run_dir / "design.json").write_text(json.dumps({
+        "id": "d", "canvas": canvas, "layers": []}), encoding="utf-8")
+    (run_dir / "reconstruction.json").write_text(json.dumps({"candidates": []}),
+                                                 encoding="utf-8")
+
+    failing_rows = [
+        {"id": f"c_{i}", "type": "shape", "region_ssim": 0.10 + 0.01 * i,
+         "region_px": 5000}
+        for i in range(5)
+    ]
+    monkeypatch.setattr(pixel_diff, "score_layer_regions",
+                        lambda *a, **k: failing_rows)
+
+    # Budget 0 records every failing region as truncated and returns before slicing.
+    report = reconstruct.apply_raster_slice_fallback(
+        str(run_dir), str(source), {"fallback": {"max_slices": 0}})
+
+    assert report["truncated"]["reason"] == "slice-budget-exhausted"
+    assert report["truncated"]["un_sliced_count"] == 5
+    assert set(report["truncated"]["un_sliced_ids"]) == {f"c_{i}" for i in range(5)}
+    budget_skips = [s for s in report["skipped"]
+                    if s.get("reason") == "slice-budget-exhausted"]
+    assert len(budget_skips) == 5
+    assert all("failing_reasons" in s for s in budget_skips)
+    # Auditable on disk too.
+    on_disk = json.loads((run_dir / "fallback.json").read_text(encoding="utf-8"))
+    assert on_disk["truncated"]["un_sliced_count"] == 5

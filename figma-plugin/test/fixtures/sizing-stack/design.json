@@ -1,0 +1,166 @@
+{
+  "id": "sizing-stack",
+  "name": "sizing-stack",
+  "canvas": {
+    "w": 360,
+    "h": 320
+  },
+  "schema_version": 2,
+  "meta": {
+    "coordinate_space": "local"
+  },
+  "layers": [
+    {
+      "id": "card",
+      "type": "frame",
+      "name": "card",
+      "box": {
+        "x": 40,
+        "y": 40,
+        "w": 280,
+        "h": 206
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#ffffff"
+      },
+      "radius": 12,
+      "layout": {
+        "mode": "VERTICAL",
+        "gap": 16,
+        "padding": {
+          "top": 20,
+          "right": 20,
+          "bottom": 20,
+          "left": 20
+        }
+      },
+      "sizing": {
+        "w": "fixed",
+        "h": "hug"
+      },
+      "children": [
+        {
+          "id": "headline",
+          "type": "text",
+          "name": "headline",
+          "box": {
+            "x": 20,
+            "y": 20,
+            "w": 240,
+            "h": 28
+          },
+          "text": "Sizing Stack",
+          "style": {
+            "fontFamily": "Arial",
+            "fontSize": 18,
+            "color": "#111111",
+            "autoResize": "WIDTH_AND_HEIGHT"
+          },
+          "sizing": {
+            "w": "hug",
+            "h": "hug"
+          }
+        },
+        {
+          "id": "body",
+          "type": "text",
+          "name": "body",
+          "box": {
+            "x": 20,
+            "y": 64,
+            "w": 240,
+            "h": 44
+          },
+          "text": "Resize me and the layout still behaves.",
+          "style": {
+            "fontFamily": "Arial",
+            "fontSize": 14,
+            "color": "#444444",
+            "autoResize": "HEIGHT",
+            "multiline": true
+          },
+          "sizing": {
+            "w": "fill",
+            "h": "hug"
+          }
+        },
+        {
+          "id": "divider",
+          "type": "shape",
+          "shape_kind": "rect",
+          "name": "divider",
+          "box": {
+            "x": 20,
+            "y": 124,
+            "w": 240,
+            "h": 2
+          },
+          "fill": {
+            "kind": "flat",
+            "color": "#cccccc"
+          },
+          "sizing": {
+            "w": "fill",
+            "h": "fixed"
+          }
+        },
+        {
+          "id": "cta",
+          "type": "group",
+          "name": "cta",
+          "box": {
+            "x": 20,
+            "y": 142,
+            "w": 140,
+            "h": 44
+          },
+          "meta": {
+            "role": "button"
+          },
+          "sizing": {
+            "w": "hug",
+            "h": "hug"
+          },
+          "children": [
+            {
+              "id": "cta-bg",
+              "type": "shape",
+              "shape_kind": "rect",
+              "name": "cta-bg",
+              "box": {
+                "x": 0,
+                "y": 0,
+                "w": 140,
+                "h": 44
+              },
+              "fill": {
+                "kind": "flat",
+                "color": "#3366ff"
+              },
+              "radius": 22
+            },
+            {
+              "id": "cta-label",
+              "type": "text",
+              "name": "cta-label",
+              "box": {
+                "x": 20,
+                "y": 12,
+                "w": 100,
+                "h": 20
+              },
+              "text": "Buy now",
+              "style": {
+                "fontFamily": "Arial",
+                "fontSize": 16,
+                "color": "#ffffff",
+                "align": "CENTER"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

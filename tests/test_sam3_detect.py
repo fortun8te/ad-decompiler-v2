@@ -265,6 +265,99 @@ def test_small_icon_pass_can_be_disabled(tmp_path):
     assert [e for e in result["elements"] if e["provenance"]["mode"] == "text-prompt"] == []
 
 
+def test_small_wide_badge_accepted_at_intermediate_bar(tmp_path):
+    """Small wide pills (BEST SELLER/price badges) sit between the square small-icon
+    rescue and the generic bar: aspect <= wide_max_aspect accepts at wide_min_score,
+    anything wider keeps the full generic min_score."""
+
+    class WideBadgeBackend(FakeSam3):
+        def predict_text(self, prompt):
+            self.text_calls.append(prompt)
+            if prompt == "badge":
+                wide = np.zeros((100, 120), dtype=bool)
+                wide[10:22, 40:76] = True  # 36x12, aspect 3.0, ~3.6% coverage
+                too_wide = np.zeros((100, 120), dtype=bool)
+                too_wide[40:52, 30:78] = True  # 48x12, aspect 4.0, ~4.8% coverage
+                return [
+                    {"mask": wide, "box": [40, 10, 76, 22], "score": 0.40},
+                    {"mask": too_wide, "box": [30, 40, 78, 52], "score": 0.40},
+                ]
+            return []
+
+    cfg = {"sam3": {"prompts": [{"prompt": "badge", "role": "badge", "kind": "icon"}],
+                    "confidence": 0.45}}
+    result = sam3_detect.detect(_image(tmp_path), [], cfg, run_dir=str(tmp_path),
+                                backend=WideBadgeBackend())
+    accepted = [e for e in result["elements"] if e["provenance"]["mode"] == "text-prompt"]
+    assert len(accepted) == 1                      # 0.40 >= wide_min_score 0.38
+    assert accepted[0]["box"]["w"] == 36           # the aspect-4.0 pill kept the 0.45 bar
+
+
+def test_small_region_second_pass_recovers_failed_small_residual(tmp_path):
+    """A tight box prompt that fails on a tiny region is retried once with a padded box;
+    the recovered mask ships as a box-refine-small observation alongside the deterministic
+    fallback (fusion collapses the pair by residual_id provenance)."""
+
+    class TightFailsPaddedWorks(FakeSam3):
+        def predict_box(self, box):
+            self.box_calls.append(dict(box))
+            if box["w"] <= 12:  # the tight first-pass prompt
+                return []
+            mask = np.zeros((100, 120), dtype=bool)
+            x, y, w, h = (int(box[k]) for k in ("x", "y", "w", "h"))
+            mask[y + 4 : y + h - 4, x + 4 : x + w - 4] = True
+            return [{"mask": mask, "box": [x + 4, y + 4, x + w - 4, y + h - 4], "score": 0.61}]
+
+    backend = TightFailsPaddedWorks()
+    residual = [{"id": "R0", "kind": "icon", "box": {"x": 30, "y": 30, "w": 10, "h": 10}}]
+    result = sam3_detect.detect(
+        _image(tmp_path), residual, {"sam3": {"prompts": []}}, run_dir=str(tmp_path),
+        backend=backend,
+    )
+
+    assert len(backend.box_calls) == 2  # tight prompt + one padded retry
+    small = [e for e in result["elements"] if e["provenance"]["mode"] == "box-refine-small"]
+    assert len(small) == 1
+    assert small[0]["provenance"]["residual_id"] == "R0"
+    assert small[0]["source"] == "sam3"
+    assert small[0]["score"] == 0.61
+    # padded input box is recorded and larger than the residual box
+    assert small[0]["provenance"]["input_box"]["w"] > 10
+    # the deterministic fallback observation is preserved, not replaced
+    modes = {e["provenance"]["mode"] for e in result["elements"]}
+    assert "box-refine-fallback" in modes
+    assert result["diagnostics"]["small_refine_attempted"] == 1
+    assert result["diagnostics"]["small_refine_accepted"] == 1
+
+
+def test_small_region_second_pass_respects_gate_and_coverage(tmp_path):
+    class CountingBackend(FakeSam3):
+        def predict_box(self, box):
+            self.box_calls.append(dict(box))
+            return []
+
+    # disabled -> no retry
+    backend = CountingBackend()
+    residual = [{"id": "R0", "kind": "icon", "box": {"x": 30, "y": 30, "w": 10, "h": 10}}]
+    result = sam3_detect.detect(
+        _image(tmp_path), residual,
+        {"sam3": {"prompts": [], "small_region_refine": {"enabled": False}}},
+        run_dir=str(tmp_path), backend=backend,
+    )
+    assert len(backend.box_calls) == 1
+    assert result["diagnostics"]["small_refine_attempted"] == 0
+
+    # large region (coverage > max_coverage) -> not a small-refine candidate
+    backend = CountingBackend()
+    residual = [{"id": "R1", "kind": "shape", "box": {"x": 10, "y": 10, "w": 60, "h": 60}}]
+    result = sam3_detect.detect(
+        _image(tmp_path), residual, {"sam3": {"prompts": []}},
+        run_dir=str(tmp_path), backend=backend,
+    )
+    assert len(backend.box_calls) == 1
+    assert result["diagnostics"]["small_refine_attempted"] == 0
+
+
 def test_box_refine_accepts_lower_score_when_residuals_exist(tmp_path):
     class LowScoreBoxBackend(FakeSam3):
         def predict_box(self, box):

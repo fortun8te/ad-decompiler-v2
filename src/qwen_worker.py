@@ -305,7 +305,9 @@ _FLUX_DEFAULTS = {
     "workflow": "workflows/flux_fill_inpaint_api.json",
     "steps": 8,
     "cfg": 1.0,
-    "guidance": 30.0,
+    # guidance 3.5 won the 2026-07-15 settings A/B (runs/flux-settings-ab) on the
+    # crop-local photo/complex holes this backend actually receives; see config.yaml.
+    "guidance": 3.5,
     "denoise": 1.0,
     "seed": 0,
     "prompt": "",

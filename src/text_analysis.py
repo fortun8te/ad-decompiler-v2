@@ -29,6 +29,13 @@ boolean or mapping under ``font_matching``::
         font_dirs: []       # optional; platform font dirs are used otherwise
         font_files: []      # useful for a controlled/private font catalogue
         families: []        # optional filename/family filter
+        google_fonts_cache: ~/.cache/google-fonts   # optional on-disk OFL corpus
+
+Matched families are always relabelled to a Figma-loadable Google Fonts family
+of the same class (Figma can natively load Google Fonts but not local
+Windows-only faces), so the emitted ``fontFamily`` is always editable in Figma
+while all measured styling is preserved.  See ``_figma_google_family`` and the
+``GOOGLE_FONTS_FAMILIES`` / ``_LOCAL_TO_GOOGLE`` tables.
 
 The returned mapping remains OCR-shaped: all original top-level keys and line
 fields are preserved, while ``lines`` are enriched and ``blocks``, ``styles``,
@@ -52,7 +59,7 @@ _FONT_META_CACHE: dict[str, dict] = {}
 _FONT_MATCH_CACHE: "OrderedDict[tuple, list[dict]]" = OrderedDict()
 _FONT_MATCH_CACHE_LIMIT = 128
 
-_DEFAULT_FAMILIES = ["Inter", "Arial", "Helvetica", "Roboto", "DejaVu Sans"]
+_DEFAULT_FAMILIES = ["Inter", "Roboto", "Open Sans", "Lato", "Montserrat"]
 _DEFAULT_LOCAL_SCORE_THRESHOLD = 0.55
 _GOOGLE_FONTS_CACHE_DIRS = [
     "~/.cache/google-fonts",
@@ -151,6 +158,21 @@ def _quad_rotation(quad: Any) -> float:
     while angle <= -90.0:
         angle += 180.0
     return round(angle, 3)
+
+
+_DEFAULT_ROTATION_SNAP_DEG = 2.5
+
+
+def _snap_rotation(angle: float, snap_deg: float) -> float:
+    """Snap a near-zero baseline angle to exactly horizontal.
+
+    OCR quads on perfectly horizontal ad copy routinely wobble by a degree or
+    two; rendering that wobble skews text that the source paints straight.  A
+    genuinely rotated element keeps its angle (|angle| >= snap_deg).
+    """
+    if snap_deg > 0 and abs(float(angle)) < float(snap_deg):
+        return 0.0
+    return float(angle)
 
 
 def _rgb_hex(rgb: Iterable[float]) -> str:
@@ -281,9 +303,9 @@ def _ink_mask(crop):
     return mask, round(confidence, 4)
 
 
-def _fallback_geometry(line: dict) -> tuple[dict, dict, float, None]:
+def _fallback_geometry(line: dict, snap_deg: float = 0.0) -> tuple[dict, dict, float, None]:
     box = _clean_box(line.get("box"))
-    rotation = _quad_rotation(line.get("quad"))
+    rotation = _snap_rotation(_quad_rotation(line.get("quad")), snap_deg)
     baseline_y = box["y"] + box["h"] * 0.82
     slope = math.tan(math.radians(rotation))
     baseline = {
@@ -542,12 +564,12 @@ def _measure_shear_angle(mask) -> Optional[float]:
     return round(angle, 2)
 
 
-def _painted_geometry(image, line: dict) -> tuple[dict, dict, str, float, Any, dict]:
+def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, dict, str, float, Any, dict]:
     import numpy as np
 
     box = _clean_box(line.get("box"))
     if image is None or box["w"] <= 0 or box["h"] <= 0:
-        painted, baseline, confidence, mask = _fallback_geometry(line)
+        painted, baseline, confidence, mask = _fallback_geometry(line, snap_deg)
         paint = {"fill": dict(_FLAT_FILL_BLACK), "stroke": None}
         return painted, baseline, "#000000", confidence, mask, paint
 
@@ -559,7 +581,7 @@ def _painted_geometry(image, line: dict) -> tuple[dict, dict, str, float, Any, d
     crop = image[y0:y1, x0:x1]
     mask, confidence = _ink_mask(crop)
     if mask is None or not mask.any():
-        painted, baseline, fallback_conf, _ = _fallback_geometry(line)
+        painted, baseline, fallback_conf, _ = _fallback_geometry(line, snap_deg)
         paint = {"fill": dict(_FLAT_FILL_BLACK), "stroke": None}
         return painted, baseline, "#000000", fallback_conf, None, paint
 
@@ -599,7 +621,7 @@ def _painted_geometry(image, line: dict) -> tuple[dict, dict, str, float, Any, d
         if rows.size:
             bottoms.append(float(rows.max()))
     baseline_local = float(np.percentile(bottoms, 68)) if bottoms else float(ly1 - 1)
-    rotation = _quad_rotation(line.get("quad"))
+    rotation = _snap_rotation(_quad_rotation(line.get("quad")), snap_deg)
     slope = math.tan(math.radians(rotation))
     baseline_y = y0 + baseline_local
     baseline = {
@@ -817,17 +839,18 @@ def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
     font_size = _num(style.get("fontSize"), max(1.0, _num(fitted.get("h"), 12.0)))
     if font_size <= 0:
         font_size = max(1.0, _num(fitted.get("h"), 12.0))
-    tracking = _num(style.get("letterSpacing"), 0.0)
+    # CODIA-PARITY POLICY: letterSpacing is ALWAYS 0 in the emitted style. Codia ships
+    # tracking 0 on every text node; fitted tracking was measurement noise that made
+    # renders worse than the naive choice (spec §2/§7). Width error is absorbed by the
+    # box/fontSize, never by tracking. Measurement below therefore uses 0 as well so
+    # the fitted fontSize reflects the final (untracked) render.
+    tracking = 0.0
     line_height = _num(style.get("lineHeight"), font_size * 1.2) or font_size * 1.2
     align = str(style.get("align", "LEFT")).upper()
     font = _fit_font(style, font_size)
     if font is None:
-        return fitted, "NONE", {}
-    # Tracking larger than 12% of the em is almost always an OCR/font-substitution
-    # compensation artefact.  Scale it with the chosen font size rather than letting a
-    # fixed -4px value crush a much smaller fitted font.
-    tracking_limit = font_size * 0.12
-    bounded_tracking = max(-tracking_limit, min(tracking_limit, tracking))
+        return fitted, "NONE", {"letterSpacing": 0.0}
+    bounded_tracking = 0.0
     widths = [_line_advance(font, line, bounded_tracking) for line in lines]
     content_w = max(widths + [0.0])
     line_count = max(1, len(lines))
@@ -842,51 +865,31 @@ def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
     glyph_room = max(1.0, avail_h - (line_count - 1) * line_height)
     height_scale = min(1.0, glyph_room / max(1.0, glyph_h))
     target_scale = min(width_scale, height_scale)
-    fit_tracking = bounded_tracking
     if target_scale < 0.999:
         new_size = max(1.0, font_size * target_scale)
-        fit_tracking = bounded_tracking * target_scale
         patch["fontSize"] = round(new_size, 2)
-        patch["letterSpacing"] = round(fit_tracking, 3)
         # Multiline OCR boxes carry a measured line height for the original font.
         # Keeping that absolute value after shrinking a substitute font is a common
         # source of clipped final lines in both the preview and Figma.
         if line_count > 1:
             patch["lineHeight"] = round(max(new_size, line_height * target_scale), 2)
-    elif abs(bounded_tracking - tracking) > 0.001:
-        patch["letterSpacing"] = round(bounded_tracking, 3)
-
-    # Rounding/font hinting can leave a small residual.  Correct it with bounded tracking,
-    # never by growing the source box.  This is deterministic and shared by both renderers.
-    effective_size = patch.get("fontSize", font_size)
-    fit_font = _fit_font({**style, **patch}, effective_size) or font
-    measured = [(_line_advance(fit_font, line, fit_tracking), line) for line in lines]
-    current, widest_line = max(measured, default=(0.0, ""), key=lambda item: item[0])
-    # Match the painted width when a modest tracking correction can do so. This prevents
-    # height fitting from leaving a substituted font visibly 15–20% too narrow, while the
-    # em-relative clamp rejects the extreme tracking that previously crushed ad9 copy.
-    source_width_is_tight = content_w >= avail_w * 0.72
-    if source_width_is_tight and abs(current - avail_w) > 0.25 and len(widest_line) > 1:
-        correction = (avail_w - current) / (len(widest_line) - 1)
-        floor, ceiling = -effective_size * 0.12, effective_size * 0.12
-        fit_tracking = max(floor, min(ceiling, fit_tracking + correction))
-        patch["letterSpacing"] = round(fit_tracking, 3)
 
     # At very small sizes Pillow rounds to whole-pixel font sizes, so the linear estimate
     # can still overshoot by a pixel.  A short bounded refinement keeps the contract exact
-    # without opening the box or resorting to extreme tracking.
+    # without opening the box; tracking is never used to chase the painted width.
     for _ in range(4):
         effective_size = patch.get("fontSize", font_size)
-        fit_tracking = patch.get("letterSpacing", bounded_tracking)
         fit_font = _fit_font({**style, **patch}, effective_size) or font
-        current = max((_line_advance(fit_font, line, fit_tracking) for line in lines), default=0.0)
+        current = max((_line_advance(fit_font, line, 0.0) for line in lines), default=0.0)
         if current <= avail_w + 0.25:
             break
         ratio = max(0.5, min(0.99, avail_w / max(1.0, current)))
         new_size = max(1.0, effective_size * ratio)
         patch["fontSize"] = round(new_size, 2)
-        patch["letterSpacing"] = round(max(-new_size * 0.12, fit_tracking * ratio), 3)
 
+    # Emit the tracking policy explicitly so preview, plugin and parity all read 0.
+    if _num(style.get("letterSpacing"), 0.0) != 0.0:
+        patch["letterSpacing"] = 0.0
     return fitted, "WIDTH" if line_count <= 1 else "HEIGHT", patch
 
 
@@ -896,13 +899,21 @@ def _fallback_font_candidates(weight: int, options: dict, top_k: int, italic: bo
         families = [families]
     out = []
     for index, family in enumerate(families):
-        out.append({
-            "family": str(family),
+        # Fallbacks must also be Figma-loadable: remap any configured non-Google
+        # family (e.g. Arial/Helvetica) to its Google equivalent by name.
+        gfam, kind = _figma_google_family(family)
+        entry = {
+            "family": gfam,
             "style": _style_name(weight, italic=italic),
             "weight": int(weight),
             "score": round(max(0.25, 0.62 - index * 0.07), 3),
             "source": "fallback",
-        })
+            "figma_loadable": True,
+            "figma_font_source": kind,
+        }
+        if gfam != str(family):
+            entry["local_family"] = str(family)
+        out.append(entry)
         if len(out) >= top_k:
             break
     return out
@@ -928,6 +939,176 @@ def _meta_alignment_adjustment(meta: dict, profile: dict) -> float:
     return adjustment
 
 
+# ---------------------------------------------------------------------------
+# Google Fonts inventory + license-clean local->Google mapping
+#
+# Figma natively loads any Google Fonts family but NOT local Windows-only fonts,
+# so matching to a Google family is strictly better for editability: the emitted
+# ``fontFamily`` is one Figma can actually render. Two license-clean sources
+# feed this (neither depends on the non-commercial Lens weights rejected in
+# docs/FONT-MATCHER-EVAL.md; Google Fonts are OFL/Apache = free/commercial-OK):
+#
+#   * an on-disk Google Fonts corpus under the ``google_fonts_cache`` path —
+#     matched natively when present (see ``_discover_google_fonts``); AND
+#   * the curated inventory + local->Google mapping below, which needs NO font
+#     files on disk: it substitutes the *reported* family for a Figma-loadable
+#     Google equivalent of the SAME CLASS while the local .ttf is still used to
+#     render and score the fit, so all styling (size/weight/tracking/leading/
+#     colour) is preserved.
+#
+# One-time OFL corpus install (optional — matching works without it via the
+# mapping): ``git clone --depth 1 https://github.com/google/fonts \
+# ~/.cache/google-fonts`` then leave ``google_fonts_cache`` at its default.
+
+# Curated Google Fonts families covering the bulk of ad typography. Used to
+# (a) recognise a matched family that is ALREADY a Google font (emitted
+# unchanged and preferred in ranking) and (b) validate every mapping target
+# below. Not exhaustive: an on-disk corpus is matched in full regardless.
+GOOGLE_FONTS_FAMILIES = (
+    # grotesque / geometric / humanist sans
+    "Inter", "Roboto", "Open Sans", "Lato", "Montserrat", "Poppins", "Raleway",
+    "Nunito", "Nunito Sans", "Work Sans", "Source Sans 3", "PT Sans", "Noto Sans",
+    "Rubik", "Karla", "Mulish", "Manrope", "DM Sans", "Barlow", "Barlow Condensed",
+    "Archivo", "Libre Franklin", "Josefin Sans", "Jost", "Questrial", "Fira Sans",
+    "Cabin", "Quicksand", "Comfortaa", "Dosis", "Titillium Web", "Heebo",
+    "Assistant", "Hind", "Catamaran", "Oxygen", "Signika", "Exo 2", "Saira",
+    "Chivo", "Figtree", "Sora", "Outfit", "Plus Jakarta Sans", "Kanit", "Prompt",
+    "Space Grotesk", "IBM Plex Sans", "Schibsted Grotesk", "Albert Sans",
+    "Roboto Condensed",
+    # display / condensed headline
+    "Oswald", "Bebas Neue", "Anton", "Teko", "Abril Fatface",
+    # serif
+    "Playfair Display", "Merriweather", "PT Serif", "Noto Serif", "Lora",
+    "Bitter", "Crimson Text", "Cormorant Garamond", "EB Garamond",
+    "Libre Baskerville", "Source Serif 4", "DM Serif Display", "IBM Plex Serif",
+    "Bree Serif", "Marcellus", "Roboto Serif",
+    # slab
+    "Roboto Slab", "Zilla Slab",
+    # monospace
+    "Roboto Mono", "Space Mono", "JetBrains Mono", "Fira Code", "IBM Plex Mono",
+    "Source Code Pro",
+    # script / handwriting
+    "Dancing Script", "Pacifico", "Great Vibes", "Caveat", "Sacramento",
+    "Lobster", "Comic Neue",
+    # metric-compatible OFL substitutes for the common local-only faces
+    "Arimo", "Tinos", "Cousine", "Carlito", "Caladea", "Gelasio",
+)
+
+_GOOGLE_FONTS_NORM = {re.sub(r"\s+", "", name.lower()): name for name in GOOGLE_FONTS_FAMILIES}
+
+
+def _norm_family(name: Any) -> str:
+    return re.sub(r"\s+", "", str(name or "").lower())
+
+
+# Closest Google-Fonts equivalent for common local-only (Windows/macOS) faces.
+# Every target is the SAME CLASS as its source and appears in
+# GOOGLE_FONTS_FAMILIES. The metric-compatible OFL substitutes are used where
+# they exist (Arimo=Arial, Tinos=Times, Cousine=Courier, Carlito=Calibri,
+# Caladea=Cambria, Gelasio=Georgia) so the substitution changes as little as
+# possible about the rendered line.
+_LOCAL_TO_GOOGLE = {
+    # sans-serif
+    "arial": "Arimo", "arialmt": "Arimo", "helvetica": "Arimo",
+    "helveticaneue": "Arimo", "liberationsans": "Arimo",
+    "calibri": "Carlito", "segoeui": "Inter",
+    "candara": "Open Sans", "corbel": "Open Sans", "tahoma": "Open Sans",
+    "verdana": "Open Sans", "lucidasans": "Open Sans", "lucidagrande": "Open Sans",
+    "trebuchetms": "Fira Sans", "trebuchet": "Fira Sans",
+    "gadugi": "Inter", "leelawadeeui": "Inter", "malgungothic": "Inter",
+    "dejavusans": "Inter", "notosans": "Noto Sans",
+    "franklingothic": "Libre Franklin", "franklingothicmedium": "Libre Franklin",
+    "centurygothic": "Jost", "futura": "Jost", "gillsans": "Lato",
+    "bahnschrift": "Barlow Condensed",
+    "impact": "Anton", "haettenschweiler": "Anton",
+    # serif
+    "cambria": "Caladea", "cambriamath": "Caladea", "constantia": "PT Serif",
+    "georgia": "Gelasio", "timesnewroman": "Tinos", "times": "Tinos",
+    "liberationserif": "Tinos",
+    "garamond": "EB Garamond", "bookantiqua": "PT Serif", "palatino": "PT Serif",
+    "palatinolinotype": "PT Serif", "baskerville": "Libre Baskerville",
+    "baskervilleoldface": "Libre Baskerville",
+    "rockwell": "Zilla Slab", "notoserif": "Noto Serif",
+    # monospace
+    "consolas": "Source Code Pro", "couriernew": "Cousine", "courier": "Cousine",
+    "lucidaconsole": "Cousine", "cascadiacode": "JetBrains Mono",
+    "cascadiamono": "JetBrains Mono",
+    # script / handwriting
+    "gabriola": "Dancing Script", "segoescript": "Dancing Script",
+    "brushscriptmt": "Pacifico", "brushscript": "Pacifico",
+    "comicsansms": "Comic Neue", "inkfree": "Caveat", "mistral": "Great Vibes",
+    "freestylescript": "Great Vibes",
+}
+
+# Same-class Google default when a local face is neither a known Google family
+# nor in the explicit map — keyed by the class the font FILE reports
+# (font_fit.classify_font_file), so an unknown local sans still emits a sans.
+_CLASS_DEFAULT_GOOGLE = {
+    "sans": "Inter", "serif": "PT Serif", "script": "Dancing Script",
+    "decorative": "Oswald", "text": "Inter",
+}
+
+
+def _figma_google_family(family: Any, path: Optional[str] = None,
+                         source: Optional[str] = None) -> tuple[str, str]:
+    """Map a matched family to a Figma-loadable Google Fonts family (same class).
+
+    Returns ``(google_family, kind)`` where ``kind`` is ``native-google`` (the
+    match is already a Google family — emitted unchanged, preferred in ranking),
+    ``mapped-local`` (a known local-only face swapped for its closest same-class
+    Google equivalent) or ``mapped-class`` (an unknown local face swapped for the
+    same-class Google default). Only the *family name* changes; callers keep the
+    local ``path`` for rendering, so every styling attribute is preserved.
+    """
+    name = str(family or "").strip()
+    norm = _norm_family(name)
+    # A match from the on-disk OFL corpus, or whose name is already curated, is
+    # Figma-loadable as-is.
+    if source == "google-cache":
+        return (name or "Inter"), "native-google"
+    if norm in _GOOGLE_FONTS_NORM:
+        return _GOOGLE_FONTS_NORM[norm], "native-google"
+    if norm in _LOCAL_TO_GOOGLE:
+        return _LOCAL_TO_GOOGLE[norm], "mapped-local"
+    cls = None
+    if path:
+        try:
+            from src import font_fit
+
+            cls = font_fit.classify_font_file(path)
+        except Exception:
+            cls = None
+    return _CLASS_DEFAULT_GOOGLE.get(cls or "sans", "Inter"), "mapped-class"
+
+
+def _relabel_google_families(candidates: list) -> list:
+    """Relabel each candidate's reported ``family`` to a Figma-loadable Google
+    family (same class), preserving the local ``path`` and every other field so
+    styling and fit evidence are untouched. Records ``local_family`` when the
+    name changed and ``figma_font_source`` (the mapping kind); marks
+    ``figma_loadable``. Order and count are preserved (no dedup) so callers that
+    inspect the candidate chain — and its per-source diversity — see it intact.
+    """
+    out = []
+    for cand in candidates or []:
+        if not isinstance(cand, dict):
+            out.append(cand)
+            continue
+        item = dict(cand)
+        gfam = item.pop("_google_family", None)
+        kind = item.pop("_google_kind", None)
+        if gfam is None:
+            gfam, kind = _figma_google_family(item.get("family"), item.get("path"), item.get("source"))
+        if gfam and str(item.get("family")) != gfam:
+            item["local_family"] = item.get("family")
+            item["family"] = gfam
+        if kind:
+            item["figma_font_source"] = kind
+        item["figma_loadable"] = True
+        out.append(item)
+    return out
+
+
 def _google_fonts_cache_dirs(options: dict) -> list[str]:
     explicit = options.get("google_fonts_cache") or options.get("google_fonts_dir")
     dirs = []
@@ -935,10 +1116,18 @@ def _google_fonts_cache_dirs(options: dict) -> list[str]:
         if isinstance(explicit, str):
             explicit = [explicit]
         dirs.extend(os.path.expanduser(path) for path in explicit)
-    for path in _GOOGLE_FONTS_CACHE_DIRS:
-        expanded = os.path.expanduser(path)
-        if expanded not in dirs:
-            dirs.append(expanded)
+    # A caller that pins an explicit ``font_files`` universe has chosen the exact
+    # candidate set deliberately; do NOT inject the ambient default OFL corpus on
+    # top of it (that would smuggle Inter/other Google faces into a match that was
+    # meant to consider only the given files, defeating the class/fit gate). An
+    # explicit ``google_fonts_cache`` above is still honored. The normal
+    # auto-discovery path (no ``font_files``) keeps the ambient corpus, so
+    # corpus-primary matching is unchanged.
+    if not options.get("font_files"):
+        for path in _GOOGLE_FONTS_CACHE_DIRS:
+            expanded = os.path.expanduser(path)
+            if expanded not in dirs:
+                dirs.append(expanded)
     return [path for path in dirs if os.path.isdir(path)]
 
 
@@ -949,7 +1138,18 @@ def _discover_google_fonts(options: dict) -> list[dict]:
     cache_options = dict(options)
     cache_options["font_dirs"] = dirs
     cache_options["font_files"] = []
-    return _discover_fonts(cache_options)
+    fonts = _discover_fonts(cache_options)
+    # Bound the corpus to the curated inventory unless the caller overrides it,
+    # so the match set stays the common-ad families rather than the entire
+    # (huge) google/fonts tree. Fail open: if the filter would empty the corpus,
+    # keep everything present so an unfamiliar-but-installed OFL family can match.
+    if options.get("google_fonts_curated", True):
+        allow = options.get("google_fonts_families") or GOOGLE_FONTS_FAMILIES
+        allow_norm = {_norm_family(name) for name in allow}
+        curated = [meta for meta in fonts if _norm_family(meta.get("family")) in allow_norm]
+        if curated:
+            fonts = curated
+    return fonts
 
 
 def _candidate_key(item: dict) -> tuple:
@@ -1122,7 +1322,23 @@ def _discover_fonts(options: dict) -> list[dict]:
         metas = [m for m in metas if any(value in (m["family"] + " " + m["path"]).lower()
                                              for value in filters)]
 
-    preferred = ["inter", "arial", "helvetica", "roboto", "dejavu", "liberation", "noto"]
+    # Inventory preference order. This ranking decides which families survive the
+    # downstream ``max_fonts`` cut (after class filtering), so it must cover the
+    # staples ads actually use — the old 7-name list let the cut degenerate to the
+    # alphabetical head of C:\Windows\Fonts (Calibri/Cambria/Candara/"Dodo"…) and
+    # Segoe UI never even entered the match (benchmark 009: every line matched a
+    # different arbitrary system font). Order ≈ how often the family (or a close
+    # metric twin) appears in ad creative; Inter first (Figma default, Chirp-alike).
+    preferred = [
+        "inter", "segoe ui", "helvetica", "arial", "roboto", "open sans", "lato",
+        "montserrat", "poppins", "source sans", "sf pro", "verdana", "tahoma",
+        "trebuchet", "franklin gothic", "futura", "century gothic", "gill sans",
+        "calibri", "candara", "corbel", "georgia", "garamond", "times new roman",
+        "cambria", "playfair", "merriweather", "baskerville", "bahnschrift",
+        "impact", "oswald", "bebas", "haettenschweiler", "rockwell", "courier new",
+        "consolas", "comic sans", "segoe script", "brush script",
+        "dejavu", "liberation", "noto",
+    ]
 
     def rank(meta):
         haystack = (meta["family"] + " " + meta["path"]).lower()
@@ -1257,17 +1473,83 @@ def _match_fonts(text: str, source_mask, estimated_size: float, options: dict,
     return deduped
 
 
-def _resolve_font_candidates(text: str, source_mask, geo: dict, options: dict) -> list[dict]:
+def _resolve_font_candidates(text: str, source_mask, geo: dict, options: dict,
+                             render_fit: Optional[dict] = None) -> tuple[list[dict], dict]:
+    """Rank font candidates for one style-cluster representative.
+
+    Returns ``(candidates, evidence)``.  Before shape matching, the source ink
+    is classed serif/sans/script and the candidate inventory is hard-filtered by
+    that class (``font_matching.class_gate``); after matching, the top candidates
+    are render-and-fit refined against the ink mask (``text_analysis.render_fit``)
+    so the emitted ranking reflects fitted pixel evidence, not aspect-blind
+    shape scores.
+    """
     top_k = max(1, min(12, int(options.get("top_k", 5))))
     profile = _typography_profile(geo)
     estimated_size = profile["font_size"]
+    evidence: dict[str, Any] = {}
     if options.get("repair_pass") or options.get("force_rematch"):
         _FONT_MATCH_CACHE.clear()
 
-    local = _match_fonts(text, source_mask, estimated_size, options, profile=profile)
+    max_fonts = max(1, min(256, int(options.get("max_fonts", 48))))
+    source_class = None
+    if options.get("class_gate", True):
+        try:
+            from src import font_fit
+
+            class_info = font_fit.classify_source(text, source_mask, estimated_size, options)
+            gate_min = _num(options.get("class_gate_min_confidence"), 0.5)
+            text_gate = _num(options.get("class_gate_text_min_confidence"), 0.5)
+            cls = class_info.get("class")
+            words = len(text.split())
+            glyphs = len(text.replace(" ", ""))
+            # A genuine script SOURCE is a short wordmark-like run; multi-word or long
+            # copy classed "script" is almost always an ornate serif/display headline
+            # that fits the script reference deceptively well (052's Gabriola headline).
+            # Distrust it: a real script wordmark is routed as artwork before this.
+            script_plausible = cls == font_fit.SCRIPT and words <= 1 and glyphs <= 5
+            if cls == font_fit.SCRIPT and not script_plausible:
+                source_class = font_fit.TEXT
+            elif cls and _num(class_info.get("confidence")) >= gate_min:
+                # A confident sans/serif (or wordmark-short script) call hard-filters
+                # to that class.
+                source_class = cls
+            elif _num(class_info.get("text_confidence")) >= text_gate and cls != font_fit.SCRIPT:
+                # Sans-vs-serif undecided but the source is clearly plain text:
+                # keep both text classes, exclude only script/decorative faces so a
+                # swash face can never win plain body/headline copy (the Gabriola
+                # failure) while any clean same-class substitute stays eligible.
+                source_class = font_fit.TEXT
+            # Numeric / stat strings ("257", "21K", "121K", "66") carry too few, too
+            # simple glyphs for the class vote to fire, so a swash/serif display face
+            # wins the shape match by luck (benchmark 009: '666'/'89' -> Dancing
+            # Script, '257'/'21K' -> Caladea serif — where Codia ships plain Inter).
+            # These are effectively never set in a script/decorative face; when the
+            # class call stays undecided, still exclude script/decorative so a clean
+            # same-class face is picked. A confident script call above is untouched.
+            if source_class is None and cls != font_fit.SCRIPT:
+                compact = text.replace(" ", "")
+                numericish = bool(compact) and (
+                    sum(ch.isdigit() for ch in compact) / len(compact) >= 0.5)
+                if numericish:
+                    source_class = font_fit.TEXT
+            evidence["class_gate"] = class_info
+            evidence["source_class"] = source_class
+        except Exception:
+            source_class = None
+
+    def _gated(fonts: list[dict]) -> list[dict]:
+        if not source_class or not fonts:
+            return fonts[:max_fonts]
+        from src import font_fit
+
+        return font_fit.filter_fonts_by_class(fonts, source_class)[:max_fonts]
+
+    local = _match_fonts(text, source_mask, estimated_size, options, profile=profile,
+                         fonts=_gated(_discover_fonts(options)))
     google = []
     if _google_fonts_cache_dirs(options):
-        google_fonts = _discover_google_fonts(options)[:max(1, min(256, int(options.get("max_fonts", 48))))]
+        google_fonts = _gated(_discover_google_fonts(options))
         if google_fonts:
             google = _match_fonts(
                 text, source_mask, estimated_size, options, profile=profile,
@@ -1277,7 +1559,61 @@ def _resolve_font_candidates(text: str, source_mask, geo: dict, options: dict) -
     fallback = _fallback_font_candidates(
         profile["weight"], options, max(1, fallback_slots or top_k), italic=profile["italic"],
     )
-    return _merge_font_candidates(local, google, fallback, top_k=top_k)
+    # Corpus-primary: the on-disk Google/OFL corpus is the reference the render-fit
+    # ranks against, so a plausible VISUAL match — chunky display sans -> Anton/Oswald/
+    # Archivo Black, geometric -> Poppins/Montserrat, editorial serif -> Playfair —
+    # can win over a generic local remap that flattens everything to Arimo/Carlito.
+    # The corpus is merged FIRST and a wider pre-refine pool keeps both corpus and
+    # local candidates so refine_candidates render-fits and ranks BOTH by fitted
+    # pixel evidence (with a small Figma-loadable-Google tie bonus). Curation, the
+    # class gate and the short-string discount already bound and vet the corpus set.
+    # Corpus-primary applies to AUTO-DISCOVERED platform fonts (the generic-remap
+    # problem: everything collapses to Arimo/Carlito). An explicit ``font_files`` list
+    # is a deliberate caller choice and is respected as-is (local-first, unchanged).
+    corpus_primary = bool(google) and not options.get("font_files")
+    pool_k = max(top_k, int(_num(options.get("fit_pool"), 8))) if corpus_primary else top_k
+    if corpus_primary:
+        merged = _merge_font_candidates(google, local, fallback, top_k=pool_k)
+    else:
+        merged = _merge_font_candidates(local, google, fallback, top_k=top_k)
+
+    # Tag Figma-loadability BEFORE ranking so refine_candidates can prefer a
+    # genuine Google match over a local-only face that must be remapped; stash the
+    # resolved Google family so the relabel after ranking is a pure name swap.
+    for cand in merged:
+        if not isinstance(cand, dict):
+            continue
+        gfam, kind = _figma_google_family(cand.get("family"), cand.get("path"), cand.get("source"))
+        cand["google_native"] = kind == "native-google"
+        cand["_google_family"] = gfam
+        cand["_google_kind"] = kind
+
+    fit_opts = render_fit if render_fit is not None else {"enabled": True}
+    if corpus_primary:
+        # Fit enough of the widened pool that the best corpus AND best local faces are
+        # both render-fitted before ranking (default only fits the first 3).
+        fit_opts = dict(fit_opts)
+        fit_opts.setdefault("max_candidates", max(6, int(_num(fit_opts.get("max_candidates"), 6))))
+    if fit_opts.get("enabled", True):
+        try:
+            from src import font_fit
+
+            merged, fit_evidence = font_fit.refine_candidates(
+                text, source_mask, merged, estimated_size, fit_opts,
+            )
+            evidence["render_fit"] = fit_evidence
+        except Exception:
+            pass
+    # Emit the top_k by the fitted (visual) ranking; the wider pool above was only to
+    # give the corpus a fair render-fit against the local candidates.
+    if corpus_primary and len(merged) > top_k:
+        merged = merged[:top_k]
+
+    # Relabel the reported family to a Figma-loadable Google equivalent AFTER
+    # ranking (local path kept for rendering, so styling/fit are untouched). Every
+    # emitted fontFamily is now one Figma can natively load.
+    merged = _relabel_google_families(merged)
+    return merged, evidence
 
 
 def local_score_threshold(cfg: Optional[dict]) -> float:
@@ -1356,7 +1692,7 @@ def _base_style(line: dict, painted: dict, colour: str, ink_confidence: float,
         style = _style_name(weight, italic=True)
     primary_is_italic = "italic" in style.lower()
     alt_style = _style_name(weight, italic=not primary_is_italic)
-    return {
+    built = {
         "fontFamily": chosen.get("family", "Inter"),
         "fontSize": round(font_size, 2),
         "fontWeight": weight,
@@ -1378,6 +1714,238 @@ def _base_style(line: dict, painted: dict, colour: str, ink_confidence: float,
         "fill": (paint or {}).get("fill") or {"kind": "flat", "color": colour},
         "stroke": (paint or {}).get("stroke"),
     }
+    # The preview renderer draws candidates[0]; declared weight/style must match it
+    # (also covers a google-cache top candidate whose weight differs from the coarse
+    # ink-density estimate above).
+    _reconcile_style_weight(built)
+    return built
+
+
+def _reconcile_style_weight(style: dict) -> None:
+    """Keep ``fontWeight``/``fontStyle`` consistent with the rendered top candidate.
+
+    render_preview draws the preview from ``fontCandidates[0].path`` while the Figma
+    export node reads ``fontWeight``/``fontStyle``. When a later pass (font consensus,
+    per-line refit) swaps the top candidate to a different weight *without* updating
+    these fields, the preview renders one weight while the exported node claims
+    another. In the benchmark this desynced 25 text layers — a family's bold headline
+    face was rendered onto regular body copy (and vice-versa), roughly doubling
+    rendered-ink and slicing otherwise-editable text. The top renderable candidate is
+    the single source of truth for what is actually drawn, so mirror it here.
+    (test_text_analysis asserts exactly this invariant: candidates[0].weight ==
+    fontWeight.)
+    """
+    if not isinstance(style, dict):
+        return
+    cands = style.get("fontCandidates") or []
+    top = cands[0] if cands and isinstance(cands[0], dict) else None
+    if not top or top.get("source") not in {"local-render", "google-cache"}:
+        return
+    weight = top.get("weight")
+    if isinstance(weight, (int, float)):
+        weight = int(weight)
+        style["fontWeight"] = weight
+        # Preserve an already-italic style label; only correct the weight token.
+        italic = "italic" in str(style.get("fontStyle") or "").lower()
+        top_style = str(top.get("style") or "")
+        if top_style and (("italic" in top_style.lower()) == italic):
+            style["fontStyle"] = top_style
+        else:
+            style["fontStyle"] = _style_name(weight, italic=italic)
+        style["fontWeightCandidates"] = _weight_candidates(weight)
+
+
+def _render_fit_options(config: dict) -> dict:
+    """Normalize ``text_analysis.render_fit`` via font_fit (bool or mapping, default ON)."""
+    try:
+        from src import font_fit
+
+        return font_fit.fit_options(config)
+    except Exception:
+        return {"enabled": False}
+
+
+def _apply_line_render_fit(line: dict, mask, painted: dict, render_fit_options: dict) -> Optional[dict]:
+    """Refine one line's emitted size/tracking by fitting its chosen font to its
+    own ink mask (cluster representatives share matched candidates, but every
+    line has its own painted geometry).  Applies the fitted ``fontSize`` and
+    ``letterSpacing`` when the fit passes ``min_score``; always records the fit
+    evidence on ``meta.render_fit`` so downstream fidelity gating can see a bad
+    fit even when nothing was applied.  Returns the fit mapping or ``None``.
+    """
+    if not render_fit_options.get("enabled", True) or mask is None:
+        return None
+    style = line.get("style") or {}
+    candidates = style.get("fontCandidates") or []
+    chosen = candidates[0] if candidates and isinstance(candidates[0], dict) else None
+    if not chosen or not chosen.get("path") or not os.path.exists(str(chosen["path"])):
+        return None
+    try:
+        from src import font_fit
+
+        fit = font_fit.fit_line(
+            line.get("text", ""), chosen["path"], mask,
+            _num(style.get("fontSize"), 16.0), render_fit_options,
+        )
+    except Exception:
+        return None
+    if fit is None:
+        return None
+    min_score = _num(render_fit_options.get("min_score"), 0.30)
+    applied = fit["score"] >= min_score
+    if applied:
+        new_size = _num(fit.get("fontSize"), style.get("fontSize"))
+        style["fontSize"] = round(new_size, 2)
+        style["letterSpacing"] = round(_num(fit.get("letterSpacing")), 3)
+        style["lineHeight"] = round(max(new_size * 1.15, _num(painted.get("h"))), 2)
+        style["fontSizeCandidates"] = _size_candidates(new_size)
+    line.setdefault("meta", {})["render_fit"] = {
+        "family": chosen.get("family"),
+        "score": fit["score"],
+        "fontSize": fit["fontSize"],
+        "letterSpacing": fit["letterSpacing"],
+        "applied": applied,
+    }
+    return fit
+
+
+def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
+                          font_options: dict) -> Optional[dict]:
+    """Document-level font family consensus across all matched lines.
+
+    Votes each line's chosen family weighted by ink area x fit score, then
+    re-fits outlier lines against the winning family's font file. A line adopts
+    the consensus only when its consensus fit passes ``render_fit.min_score``
+    AND comes within ``tolerance`` of (or beats) its own fit — so a genuinely
+    different family (serif headline over sans body, a script wordmark) keeps
+    its own match: the fit itself is the guard, no class bookkeeping needed.
+    Lines whose own fit is already exact-font territory (``strong_keep``) are
+    never touched. Returns an evidence dict for the run artifact, or None.
+    """
+    opts = (font_options or {}).get("consensus") or {}
+    if opts.get("enabled", True) is False:
+        return None
+    if len(prepared) < int(_num(opts.get("min_lines"), 3)):
+        return None
+
+    votes: dict[str, dict] = {}
+    for item in prepared:
+        line = item.get("line") or {}
+        style = line.get("style") or {}
+        family = style.get("fontFamily")
+        fit_meta = (line.get("meta") or {}).get("render_fit") or {}
+        score = fit_meta.get("score")
+        if not family or score is None:
+            continue
+        painted = item.get("painted") or {}
+        area = max(1.0, _num(painted.get("w"), 1.0) * _num(painted.get("h"), 1.0))
+        candidate = next(
+            (c for c in (style.get("fontCandidates") or [])
+             if isinstance(c, dict) and str(c.get("family")) == str(family) and c.get("path")),
+            None,
+        )
+        entry = votes.setdefault(str(family), {"weight": 0.0, "lines": 0,
+                                               "candidate": candidate, "best_fit": 0.0})
+        entry["weight"] += area * max(_num(score, 0.0), 0.05)
+        entry["lines"] += 1
+        if _num(score, 0.0) > entry["best_fit"]:
+            entry["best_fit"] = _num(score, 0.0)
+            if candidate:
+                entry["candidate"] = candidate
+    if not votes:
+        return None
+    total = sum(entry["weight"] for entry in votes.values())
+    family, info = max(votes.items(), key=lambda kv: kv[1]["weight"])
+    share = (info["weight"] / total) if total > 0 else 0.0
+    evidence: dict[str, Any] = {
+        "family": family, "share": round(share, 3),
+        "lines_voting": info["lines"], "applied": False, "refit": [],
+    }
+    candidate = info.get("candidate")
+    path = str((candidate or {}).get("path") or "")
+    if share < _num(opts.get("min_share"), 0.30) or not path or not os.path.exists(path):
+        return evidence
+
+    tolerance = _num(opts.get("tolerance"), 0.10)
+    strong_keep = _num(opts.get("strong_keep"), 0.72)
+    min_score = _num(render_fit_options.get("min_score"), 0.30)
+    try:
+        from src import font_fit
+    except Exception:
+        return evidence
+    for item in prepared:
+        line = item.get("line") or {}
+        style = line.get("style") or {}
+        if str(style.get("fontFamily")) == family:
+            continue
+        # Family consensus must NOT flatten weight. The stored representative
+        # candidate carries one fixed weight (the family's loudest, best-fitting
+        # voter — often a bold headline). Promoting it onto a line of a different
+        # weight class renders the wrong stroke thickness: a bold face on regular
+        # body copy doubles rendered ink (region_ssim collapses, the raster-slice
+        # gate then fires), and a regular face on a bold headline renders too light.
+        # Only unify the FAMILY across same-weight lines; a genuinely different
+        # weight keeps its own correct-weight match (benchmark 025/091/002:
+        # weight-flattened body/headlines drove the editable-text collapse).
+        rep_weight = candidate.get("weight") if isinstance(candidate, dict) else None
+        line_weight = style.get("fontWeight")
+        max_weight_delta = _num(opts.get("max_weight_delta"), 200)
+        if (isinstance(rep_weight, (int, float)) and isinstance(line_weight, (int, float))
+                and abs(int(rep_weight) - int(line_weight)) >= max_weight_delta):
+            continue
+        meta = line.setdefault("meta", {})
+        own = _num((meta.get("render_fit") or {}).get("score"), 0.0)
+        if own >= strong_keep:
+            continue  # near-exact per-line match outranks consistency
+        mask = item.get("font_mask")
+        if mask is None:
+            continue
+        try:
+            fit = font_fit.fit_line(
+                line.get("text", ""), path, mask,
+                _num(style.get("fontSize"), 16.0), render_fit_options,
+            )
+        except Exception:
+            continue
+        if fit is None:
+            continue
+        new_score = _num(fit.get("score"), 0.0)
+        if new_score < max(min_score, own - tolerance):
+            continue
+        # Never trade text-editability for consistency: if the line's own match
+        # already clears the keep-as-text bar, refuse a consensus fit that would
+        # drop it under (routing then rasterizes it — the exact regression we're
+        # fighting). Consistency only reshuffles among already-editable lines.
+        if own >= min_score and new_score < min_score:
+            continue
+        previous = style.get("fontFamily")
+        new_size = _num(fit.get("fontSize"), _num(style.get("fontSize"), 16.0))
+        style["fontFamily"] = family
+        style["fontSize"] = round(new_size, 2)
+        style["letterSpacing"] = round(_num(fit.get("letterSpacing")), 3)
+        style["lineHeight"] = round(
+            max(new_size * 1.15, _num((item.get("painted") or {}).get("h"))), 2)
+        style["fontSizeCandidates"] = _size_candidates(new_size)
+        promoted = dict(candidate)
+        promoted["fit"] = {"score": new_score}
+        style["fontCandidates"] = [promoted] + [
+            c for c in (style.get("fontCandidates") or [])
+            if not (isinstance(c, dict) and str(c.get("family")) == family)
+        ]
+        # The renderer draws candidates[0]; keep the declared weight/style in sync
+        # so the exported Figma node matches the promoted face.
+        _reconcile_style_weight(style)
+        meta["render_fit"] = {
+            "family": family, "score": new_score, "fontSize": fit.get("fontSize"),
+            "letterSpacing": fit.get("letterSpacing"), "applied": True, "consensus": True,
+        }
+        item["line_fit"] = fit
+        evidence["refit"].append({
+            "id": line.get("id"), "from": previous, "to": family,
+            "own_score": round(own, 3), "new_score": round(new_score, 3),
+        })
+    evidence["applied"] = True
+    return evidence
 
 
 def _enrich_word_styles(image, line: dict, config: dict) -> None:
@@ -1398,7 +1966,13 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
     min_conf = _num(config.get("word_style_min_ink_confidence"), 0.42)
     colour_delta = _num(config.get("word_style_color_distance"), 58.0)
     size_ratio_gate = _num(config.get("word_style_size_ratio"), 1.16)
-    weight_delta = int(_num(config.get("word_style_weight_delta"), 180))
+    # Per-word weight is estimated from stroke density, which is the noisiest signal —
+    # same-weight lines jitter ±100-150. Codia only splits on CLEAR contrast (its real
+    # splits are ~400 apart: 121K/700 vs weergaven/300). Keep the delta well above the
+    # noise floor and require higher ink confidence for a weight change specifically, so
+    # a heavy-inked regular word can't fragment an otherwise-uniform line.
+    weight_delta = int(_num(config.get("word_style_weight_delta"), 260))
+    weight_min_conf = _num(config.get("word_style_weight_min_ink_confidence"), 0.60)
 
     for raw_word in line.get("words") or []:
         if not isinstance(raw_word, dict) or not str(raw_word.get("text") or "").strip():
@@ -1414,7 +1988,8 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
         ratio = max(measured_size, base_size) / max(1.0, min(measured_size, base_size))
         colour_changed = _colour_distance(colour, base_colour) >= colour_delta
         size_changed = ratio >= size_ratio_gate
-        weight_changed = abs(measured_weight - base_weight) >= weight_delta
+        weight_changed = (abs(measured_weight - base_weight) >= weight_delta
+                          and ink_conf >= weight_min_conf)
         shear = geo.get("shear_angle")
         italic_changed = bool(shear is not None and abs(shear) >= _num(config.get("italic_shear_deg"), 6.0)) \
             != ("italic" in str(base.get("fontStyle") or "").lower())
@@ -1603,12 +2178,20 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
             line["style"]["lineHeight"] = round(line_height, 2)
             line["hierarchy"]["parent_id"] = block_id
         rotations = [float(line.get("rotation_deg", 0.0) or 0.0) for line in group]
-        rotation = _median(rotations)
-        # A block is normally a stack of horizontal lines.  Do not let one
-        # malformed OCR quad rotate the whole paragraph; preserve a strong
-        # angle for a genuine single-line rotated element.
-        if len(group) > 1 and abs(rotation) > 20.0:
-            rotation = 0.0
+        snap_deg = _num(config.get("rotation_snap_deg"), _DEFAULT_ROTATION_SNAP_DEG)
+        if len(group) == 1:
+            rotation = rotations[0]
+        else:
+            # A paragraph rotates only when every member line agrees on the same
+            # substantial angle.  One malformed OCR quad (or a mix of snapped and
+            # wobbly lines) must never skew copy the source paints horizontal.
+            agreeing = [angle for angle in rotations if abs(angle) >= max(0.01, snap_deg)]
+            if len(agreeing) == len(rotations) and rotations and (
+                max(rotations) - min(rotations)
+            ) <= 3.0:
+                rotation = _median(rotations)
+            else:
+                rotation = 0.0
         # Propagate the fidelity gate onto the block. A block is only as trustworthy as its
         # worst line: if any member line was flagged low_fidelity, the block must carry that
         # flag (and that line's fallback crop/reason) so downstream routing sees it — blocks,
@@ -1632,7 +2215,23 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
             "id": block_id,
             "type": "paragraph" if len(group) > 1 else "text",
             "line_ids": [line["id"] for line in group],
+            # Authored line breaks are part of the design: the block's text keeps
+            # one explicit "\n" per detected source line so no later stage can
+            # re-wrap the paragraph differently from the source.
             "text": "\n".join(line.get("text", "") for line in group),
+            # Per-line geometry rides along so downstream consumers can place or
+            # verify each authored line exactly, not just the union box.
+            "line_geometry": [
+                {
+                    "id": line["id"],
+                    "text": line.get("text", ""),
+                    "box": dict(line["box"]),
+                    "painted_box": dict(line["painted_box"]),
+                    "baseline": dict(line["baseline"]),
+                    "rotation_deg": float(line.get("rotation_deg", 0.0) or 0.0),
+                }
+                for line in group
+            ],
             "box": _union_boxes(line["box"] for line in group),
             "painted_box": _union_boxes(line["painted_box"] for line in group),
             "alignment": alignment,
@@ -1695,6 +2294,15 @@ def _style_key(style: dict) -> tuple:
 
 
 _DEFAULT_FIDELITY_MIN_CONFIDENCE = 0.30
+# Fidelity is a "will this render look right" signal, not "is this the exact
+# font".  A legible line set in a plausible SAME-CLASS face (any clean sans for a
+# sans line, any serif for a serif headline) stays editable text — its exact fit
+# IoU is floored above the raster bar so accurate styling, not font identity,
+# decides editability.  Only a wrong-CLASS render (a script/decorative face over
+# plain text — the case that actually looks broken) is capped below the bar, and
+# illegible ink still slices via the ink-confidence term.
+_DEFAULT_FIDELITY_SAME_CLASS_FLOOR = 0.50
+_DEFAULT_FIDELITY_WRONG_CLASS_CAP = 0.28
 
 
 def _save_fallback_crop(image, mask, painted_box: dict, run_dir: Optional[str], line_id: str) -> Optional[str]:
@@ -1801,9 +2409,13 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
     if isinstance(cfg, dict):
         run_dir = cfg.get("run_dir")
     fidelity_min_confidence = _num(config.get("fidelity_min_confidence"), _DEFAULT_FIDELITY_MIN_CONFIDENCE)
+    fidelity_same_class_floor = _num(config.get("fidelity_same_class_floor"), _DEFAULT_FIDELITY_SAME_CLASS_FLOOR)
+    fidelity_wrong_class_cap = _num(config.get("fidelity_wrong_class_cap"), _DEFAULT_FIDELITY_WRONG_CLASS_CAP)
 
     raw_lines = result.get("lines") or []
     max_match_lines = max(0, min(100, int(font_options.get("max_lines", 12))))
+    snap_deg = _num(config.get("rotation_snap_deg"), _DEFAULT_ROTATION_SNAP_DEG)
+    render_fit_options = _render_fit_options(config)
 
     # Pass 1: cheap per-line geometry (painted bounds, ink mask, paint/shear signals).
     # No font-file rendering happens here.
@@ -1813,11 +2425,16 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
         line = copy.deepcopy(raw)
         line.setdefault("id", f"L{index}")
         line["box"] = _clean_box(line.get("box"))
-        painted, baseline, colour, ink_confidence, mask, paint = _painted_geometry(image, line)
+        painted, baseline, colour, ink_confidence, mask, paint = _painted_geometry(
+            image, line, snap_deg=snap_deg,
+        )
         line["painted_box"] = painted
         line["baseline"] = baseline
-        line["rotation"] = _quad_rotation(line.get("quad"))
+        raw_rotation = _quad_rotation(line.get("quad"))
+        line["rotation"] = _snap_rotation(raw_rotation, snap_deg)
         line["rotation_deg"] = line["rotation"]
+        if line["rotation"] != raw_rotation:
+            line.setdefault("meta", {})["rotation_raw_deg"] = raw_rotation
         line["ink_confidence"] = ink_confidence
         masks[line["id"]] = mask
         decoration, decoration_evidence = _native_text_decoration(mask, line.get("text", ""))
@@ -1843,6 +2460,7 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
     # >max_lines-line ad still gets a real font on every same-style line, not
     # just the first `max_lines` lines encountered.
     preset_by_index: dict[int, list[dict]] = {}
+    match_evidence_by_index: dict[int, dict] = {}
     match_count = 0
     if font_options.get("enabled") and prepared:
         clusters: "OrderedDict[tuple, list[int]]" = OrderedDict()
@@ -1858,13 +2476,15 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
             rep_item = prepared[representative]
             if rep_item["ink_confidence"] < min_ink:
                 continue
-            candidates = _resolve_font_candidates(
+            candidates, match_evidence = _resolve_font_candidates(
                 rep_item["line"].get("text", ""), rep_item["font_mask"],
-                rep_item["geo"], font_options,
+                rep_item["geo"], font_options, render_fit=render_fit_options,
             )
             if candidates:
                 for i in idxs:
                     preset_by_index[i] = candidates
+                    if match_evidence:
+                        match_evidence_by_index[i] = match_evidence
 
     # Pass 3: assemble the final per-line style, and gate low-fidelity lines
     # (poor ink isolation or a poor font/effect match) to a masked-pixel
@@ -1882,7 +2502,29 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
         if decoration:
             line["style"]["textDecoration"] = decoration
             line.setdefault("meta", {})["text_decoration_evidence"] = decoration_evidence
+        match_evidence = match_evidence_by_index.get(i)
+        if match_evidence:
+            line.setdefault("meta", {})["font_match"] = copy.deepcopy(match_evidence)
+        item["line_fit"] = _apply_line_render_fit(line, item["font_mask"], item["painted"], render_fit_options)
         _enrich_word_styles(image, line, config)
+        enriched.append(line)
+
+    # Pass 3.5: document-level font consensus. Ads use one or two families, but
+    # per-line matching picks each line's own best shape/fit match, scattering a
+    # single-family ad across arbitrary system fonts (benchmark 009: Lucida,
+    # Candara, Calibri, Courier New, Cambria, Malgun on ONE Chirp-set post) —
+    # every mediocre match then fits at ~0.4, renders mismatched ink, and the
+    # raster-slice gate correctly converts it to pixels. Voting across lines and
+    # re-fitting outliers against the winning family both restores consistency
+    # and lifts fit scores, keeping text editable.
+    consensus_evidence = _apply_font_consensus(prepared, render_fit_options, font_options)
+    if consensus_evidence:
+        result["font_consensus"] = consensus_evidence
+
+    # Pass 3.6: fidelity gating (after consensus so adopted re-fits count).
+    for i, item in enumerate(prepared):
+        line = item["line"]
+        line_fit = item.get("line_fit")
 
         font_confidence = None
         candidates = line["style"].get("fontCandidates") or []
@@ -1890,10 +2532,56 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
             item for item in candidates
             if isinstance(item, dict) and item.get("source") in {"local-render", "google-cache"}
         ]
-        if render_candidates:
+        # Fitted-render scores are pixel evidence at the emitted size/tracking and
+        # therefore trump aspect-blind shape-match scores: a swash face that
+        # shape-matched at 0.85 but fits the ink at 0.2 must gate to the
+        # masked-pixel fallback, not ship as confident text.
+        fit_scores = [
+            float(candidate["fit"].get("score", 0.0) or 0.0)
+            for candidate in render_candidates
+            if isinstance(candidate.get("fit"), dict)
+        ]
+        if line_fit is not None:
+            fit_scores.append(float(line_fit.get("score", 0.0) or 0.0))
+        if fit_scores:
+            font_confidence = max(fit_scores)
+        elif render_candidates:
             font_confidence = max(float(item.get("score", 0.0) or 0.0) for item in render_candidates)
-        fidelity_confidence = item["ink_confidence"] if font_confidence is None else min(
-            item["ink_confidence"], font_confidence
+
+        # Reframe fidelity as "will the render look right", biased toward keeping
+        # text editable. A legible line in a plausible SAME-CLASS font clears the
+        # bar even when the exact typeface is unknown — accurate styling
+        # (size/weight/tracking/leading/colour, applied above) is what makes a
+        # substitute read correctly, so a modest fit IoU is floored rather than
+        # letting it rasterize editable copy. Only a wrong-CLASS render (a
+        # script/decorative face over plain text — the case that looks broken) is
+        # capped below the bar; illegible ink still slices via ink_confidence.
+        chosen_class = None
+        wrong_class = False
+        styled_font_confidence = font_confidence
+        if font_confidence is not None:
+            try:
+                from src import font_fit
+
+                chosen = render_candidates[0] if render_candidates else None
+                chosen_path = chosen.get("path") if isinstance(chosen, dict) else None
+                if chosen_path:
+                    chosen_class = font_fit.classify_font_file(chosen_path)
+                src_class = ((line.get("meta") or {}).get("font_match") or {}).get(
+                    "class_gate") or {}
+                src_is_script = src_class.get("class") == font_fit.SCRIPT
+                wrong_class = (
+                    chosen_class in (font_fit.SCRIPT, font_fit.DECORATIVE) and not src_is_script
+                )
+            except Exception:
+                wrong_class = False
+            if wrong_class:
+                styled_font_confidence = min(font_confidence, fidelity_wrong_class_cap)
+            else:
+                styled_font_confidence = max(font_confidence, fidelity_same_class_floor)
+
+        fidelity_confidence = item["ink_confidence"] if styled_font_confidence is None else min(
+            item["ink_confidence"], styled_font_confidence
         )
         low_fidelity = fidelity_confidence < fidelity_min_confidence
         meta = line.setdefault("meta", {})
@@ -1903,7 +2591,9 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
             reasons = []
             if item["ink_confidence"] < fidelity_min_confidence:
                 reasons.append(f"ink_confidence:{item['ink_confidence']:.2f}<{fidelity_min_confidence:.2f}")
-            if font_confidence is not None and font_confidence < fidelity_min_confidence:
+            if wrong_class:
+                reasons.append(f"wrong-font-class:{chosen_class}-for-plain-text")
+            elif font_confidence is not None and font_confidence < fidelity_min_confidence:
                 reasons.append(f"font_confidence:{font_confidence:.2f}<{fidelity_min_confidence:.2f}")
             reason = "; ".join(reasons) or "low-confidence font/effect match"
             meta["fidelity_reason"] = reason
@@ -1914,8 +2604,6 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
                 "from": "text", "to": "masked-pixel-fallback",
                 "reason": reason, "confidence": meta["fidelity_confidence"],
             }
-
-        enriched.append(line)
 
     _assign_roles(enriched, canvas)
     blocks = _make_blocks(enriched, canvas, config)
@@ -1967,4 +2655,4 @@ def run_text_analysis(img_path: str, ocr_result: dict, cfg: Optional[dict] = Non
 
 
 __all__ = ["analyze_text", "run_text_analysis", "needs_vlm_font_judge", "local_score_threshold",
-           "fit_text_box"]
+           "fit_text_box", "GOOGLE_FONTS_FAMILIES"]

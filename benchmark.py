@@ -27,6 +27,40 @@ VISUAL_FAILURE_RULES = frozenset({
     "layer-alpha-holes", "empty-layer-alpha", "low-element-recall",
 })
 
+# Codia construction CONTRACT pass bar (docs/CODIA-PARITY-SPEC.md): a per-run PASS requires
+# native text everywhere (no handwriting archetype exists, so 0.90 is universal), a clean
+# plate (zero unresolved glyph residue), and placement within tolerance. SSIM is NOT part of
+# the contract pass — it is a floor gate only.
+CONTRACT_NATIVE_TEXT_MIN = 0.90
+
+
+def contract_verdict(row: dict) -> dict:
+    """Per-run Codia-contract verdict for the --contract summary.
+
+    Prefers the qa.json contract block; recomputes from the row's fields when a run predates
+    it. native_text_ratio >= 0.90, zero glyph residue, placement within tolerance.
+    """
+    ntr = row.get("native_text_ratio")
+    native_ok = ntr is not None and float(ntr) >= CONTRACT_NATIVE_TEXT_MIN
+    residue_clean = row.get("glyph_residue_clean")
+    placement_ok = row.get("placement_ok")
+    reasons = []
+    if ntr is None:
+        reasons.append("native_text_ratio unknown")
+    elif not native_ok:
+        reasons.append(f"native text {float(ntr):.0%} < {CONTRACT_NATIVE_TEXT_MIN:.0%}")
+    if residue_clean is False:
+        reasons.append("unresolved glyph residue")
+    if placement_ok is False:
+        reasons.append("placement out of tolerance")
+    reported = row.get("contract_pass")
+    passed = bool(native_ok and residue_clean is not False and placement_ok is not False)
+    if reported is not None:
+        passed = bool(reported) and passed
+    return {"id": row.get("id"), "pass": passed, "native_text_ratio": ntr,
+            "glyph_residue_clean": residue_clean, "placement_ok": placement_ok,
+            "reasons": reasons}
+
 
 def requires_runtime_smoke(cfg: dict) -> bool:
     """Whether this config is making a real-model acceptance claim.
@@ -238,6 +272,13 @@ def _entry(run_dir: Path, result: dict) -> dict:
                  or reconstruction.get("archetype") or runtime.get("archetype"))
     preset = (qa.get("preset") or meta.get("preset")
               or reconstruction.get("preset") or runtime.get("preset"))
+    # F14: no stage writes archetype/preset into any of the sources above, so the columns
+    # were always "—". archetype.json IS produced for every run — consult it as a fallback.
+    # The archetype selects a preset of the same name, so it fills the preset column too.
+    if archetype is None or preset is None:
+        arch_decision = _read(run_dir / "archetype.json", {})
+        archetype = archetype or arch_decision.get("archetype")
+        preset = preset or arch_decision.get("archetype")
     inpaint = (reconstruction.get("stats") or {}).get("inpaint") or {}
     regions = inpaint.get("regions") or reconstruction.get("inpaint_regions") or []
     route_counts: dict[str, int] = {}
@@ -267,8 +308,31 @@ def _entry(run_dir: Path, result: dict) -> dict:
         "qa_evidence_complete": qa_evidence_complete,
         "visual_score": qa.get("visual_score"),
         "ssim": qa.get("ssim"),
+        # ── CODIA CONSTRUCTION CONTRACT (the objective — leads the benchmark) ─────────
+        # native text %, ghost-free (clean plate), and the contract score come FIRST; the
+        # visual/ssim columns follow as a report. See docs/CODIA-PARITY-SPEC.md.
+        "native_text_ratio": qa.get("native_text_ratio",
+                                    (qa.get("contract") or {}).get("native_text_ratio")),
+        "contract_score": qa.get("contract_score", (qa.get("contract") or {}).get("contract_score")),
+        "contract_pass": qa.get("contract_pass", (qa.get("contract") or {}).get("pass")),
+        "glyph_residue_clean": (qa.get("contract") or {}).get("glyph_residue_clean"),
+        "placement_ok": (qa.get("contract") or {}).get("placement_ok"),
+        "construction_score": (qa.get("construction") or (qa.get("contract") or {}).get("construction") or {}).get("score"),
         "text_recall": qa.get("text_recall"),
         "editable_text_recall": qa.get("editable_text_recall"),
+        # F-honesty: editable_text_recall's own denominator is only the text OCR detected,
+        # never the ad's full source text -- a run where OCR missed most of the copy can
+        # still read a perfect 1.0 if the sliver it did find is all editable (021: text_recall
+        # 0.17, editable_text_recall 1.0). true_text_coverage = text_recall *
+        # editable_text_recall is the honest share of ALL source text that ended up correct
+        # AND editable.
+        "true_text_coverage": qa.get("true_text_coverage", structure.get("true_text_coverage")),
+        # F4: detected text lines shipped as raster (slice / wordmark / foreground_raster)
+        # instead of editable TEXT. Surfaced so slices are visible, not hidden inside a 1.0.
+        "rasterized_text_count": qa.get("rasterized_text_count",
+                                        structure.get("rasterized_text_count")),
+        "rasterized_text_ratio": qa.get("rasterized_text_ratio",
+                                        structure.get("rasterized_text_ratio")),
         "archetype": archetype,
         "preset": preset,
         "edge_f1": qa.get("edge_f1"),
@@ -286,8 +350,11 @@ def _entry(run_dir: Path, result: dict) -> dict:
         "layer_alpha_holes": "layer-alpha-holes" in visual_failure_rules,
         "empty_layer_alpha": "empty-layer-alpha" in visual_failure_rules,
         "low_element_recall": "low-element-recall" in visual_failure_rules,
-        "element_recall": structure.get("element_recall"),
-        "element_survival": structure.get("element_survival"),
+        # F-honesty: prefer the top-level qa.json mirror (pixel_diff now hoists it there the
+        # same way editable_text_recall already is); fall back to the nested structural copy
+        # for older run artifacts written before that mirror existed.
+        "element_recall": qa.get("element_recall", structure.get("element_recall")),
+        "element_survival": qa.get("element_survival", structure.get("element_survival")),
         "background_audit": structure.get("background"),
         "layer_alpha_audit": structure.get("layer_alpha") or [],
         "missing_assets": structure.get("missing_assets") or [],
@@ -314,22 +381,44 @@ def _mean(rows, field):
 
 def _markdown(report: dict) -> str:
     summary = report["summary"]
+    contract_pass = summary.get("contract_passing")
     lines = [
         "# Image decompiler benchmark",
         "",
-        f"Images: {summary['images']}  |  QA passing: {summary['qa_passing']}  |  Runtime accepted: {summary.get('runtime_accepted', '—')}",
+        f"Images: {summary['images']}  |  Contract passing: {contract_pass if contract_pass is not None else '—'}  "
+        f"|  QA passing: {summary['qa_passing']}  |  Runtime accepted: {summary.get('runtime_accepted', '—')}",
         "",
-        "| image | archetype | preset | QA | evidence | runtime | seconds | visual | text | editable text | native leaves | raster clusters | edge | element recall | regional routes | hard fails |",
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "Columns lead with the Codia construction CONTRACT (native text %, ghost-free clean "
+        "plate, contract score) — the objective — then the visual/ssim REPORT. "
+        "See docs/CODIA-PARITY-SPEC.md.",
+        "",
+        "| image | archetype | native text | ghost-free | contract | contract score | construction | QA | visual | ssim | evidence | runtime | seconds | text | editable text | true text coverage | raster text | native leaves | raster clusters | edge | element recall | regional routes | hard fails |",
+        "| --- | --- | ---: | :---: | :---: | ---: | ---: | --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for row in report["runs"]:
         fails = ", ".join(item.get("rule", "unknown") for item in row["hard_fails"]) or "—"
         def metric(key):
             value = row.get(key)
             return "—" if value is None else f"{float(value):.3f}"
+        def pct(key):
+            value = row.get(key)
+            return "—" if value is None else f"{float(value):.0%}"
+        def flag(key):
+            value = row.get(key)
+            return "—" if value is None else ("yes" if value else "NO")
+        # raster text: how much detected copy shipped as pixels rather than editable TEXT —
+        # the column that keeps editable_text_recall honest instead of a hidden 1.0 (F4).
+        raster_text = "—"
+        if row.get("rasterized_text_count") is not None:
+            raster_text = str(int(row["rasterized_text_count"]))
+            if row.get("rasterized_text_ratio") is not None:
+                raster_text += f" ({float(row['rasterized_text_ratio']):.0%})"
+        construction = row.get("construction_score")
+        construction = "—" if construction is None else f"{float(construction):.0f}"
         lines.append(
-            f"| {row['id']} | {row.get('archetype') or '—'} | {row.get('preset') or '—'} | {'pass' if row['qa_ok'] else 'fail'} | {'complete' if row.get('qa_evidence_complete') else 'missing'} | {row.get('runtime_status') or ('ok' if row.get('runtime_ok') else 'unknown')} | {metric('duration_s')} | {metric('visual_score')} | "
-            f"{metric('text_recall')} | {metric('editable_text_recall')} | {metric('native_leaf_ratio')} | {row.get('intentional_raster_clusters', 0)} | {metric('edge_f1')} | {metric('element_recall')} | "
+            f"| {row['id']} | {row.get('archetype') or '—'} | {pct('native_text_ratio')} | {flag('glyph_residue_clean')} | {flag('contract_pass')} | {metric('contract_score')} | {construction} | "
+            f"{'pass' if row['qa_ok'] else 'fail'} | {metric('visual_score')} | {metric('ssim')} | {'complete' if row.get('qa_evidence_complete') else 'missing'} | {row.get('runtime_status') or ('ok' if row.get('runtime_ok') else 'unknown')} | {metric('duration_s')} | "
+            f"{metric('text_recall')} | {metric('editable_text_recall')} | {metric('true_text_coverage')} | {raster_text} | {metric('native_leaf_ratio')} | {row.get('intentional_raster_clusters', 0)} | {metric('edge_f1')} | {metric('element_recall')} | "
             f"{', '.join(f'{k}:{v}' for k, v in row.get('regional_inpaint_routes', {}).items()) or '—'} | {fails} |"
         )
     fixture_manifest = report.get("fixture_manifest") or {}
@@ -343,6 +432,20 @@ def _markdown(report: dict) -> str:
         "manual-cleanup time has been measured against the same inputs.",
     ])
     return "\n".join(lines) + "\n"
+
+
+def _emit_html_report(output: Path) -> None:
+    """Best-effort visual report.html hook; never fails the benchmark run."""
+    import sys
+    scripts_dir = Path(__file__).resolve().parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    try:
+        import report_html
+        path = report_html.generate_report(output)
+        print(f"HTML report: {path}")
+    except Exception as exc:  # pragma: no cover - reporting must not break a benchmark
+        print(f"report.html generation skipped: {exc}")
 
 
 def main():
@@ -371,6 +474,9 @@ def main():
                         help="final acceptance: require a fresh plugin export and compiler report for every image")
     parser.add_argument("--figma-wait-s", type=int, default=120,
                         help="seconds to wait per image for its Figma plugin export when --require-figma-export is set")
+    parser.add_argument("--contract", action="store_true",
+                        help="print the per-image Codia construction-contract verdict "
+                        "(native text >= 90%%, zero glyph residue, placement in tolerance)")
     args = parser.parse_args()
     source_dir = Path(args.input_dir)
     output = Path(args.output)
@@ -436,6 +542,10 @@ def main():
             "complete_runs": sum(1 for row in runs if row["complete"]),
             "pipeline_passing": sum(1 for row in runs if row["pipeline_ok"]),
             "qa_passing": sum(1 for row in runs if row["qa_ok"]),
+            # Codia contract: the objective, ahead of qa/runtime in the headline.
+            "contract_passing": sum(1 for row in runs if contract_verdict(row)["pass"]),
+            "mean_native_text_ratio": _mean(runs, "native_text_ratio"),
+            "mean_contract_score": _mean(runs, "contract_score"),
             "runtime_accepted": sum(1 for row in runs if row["runtime_ok"]),
             "degraded_runs": sum(1 for row in runs if row["runtime_degraded"]),
             "runtime_violation_runs": sum(1 for row in runs if row["runtime_violations"]),
@@ -443,6 +553,10 @@ def main():
             "mean_ssim": _mean(runs, "ssim"),
             "mean_text_recall": _mean(runs, "text_recall"),
             "mean_editable_text_recall": _mean(runs, "editable_text_recall"),
+            "mean_true_text_coverage": _mean(runs, "true_text_coverage"),
+            "rasterized_text_total": sum(
+                int(row.get("rasterized_text_count") or 0) for row in runs
+            ),
             "mean_native_leaf_ratio": _mean(runs, "native_leaf_ratio"),
             "intentional_raster_clusters_total": sum(
                 row.get("intentional_raster_clusters", 0) for row in runs
@@ -466,6 +580,20 @@ def main():
     }
     (output / "benchmark.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (output / "benchmark.md").write_text(_markdown(report), encoding="utf-8")
+    _emit_html_report(output)
+    # --contract: the Codia construction-contract verdict is the objective, printed ahead of
+    # the raw summary. Always emit the one-line roll-up; --contract adds the per-image detail.
+    verdicts = [contract_verdict(row) for row in runs]
+    passing = sum(1 for v in verdicts if v["pass"])
+    print(f"\nCONTRACT: {passing}/{len(runs)} pass "
+          f"(native text >= {CONTRACT_NATIVE_TEXT_MIN:.0%}, zero glyph residue, placement in tolerance)")
+    if args.contract:
+        for verdict in verdicts:
+            ntr = verdict["native_text_ratio"]
+            ntr_str = "—" if ntr is None else f"{float(ntr):.0%}"
+            status = "PASS" if verdict["pass"] else "fail"
+            why = "" if verdict["pass"] else "  <- " + "; ".join(verdict["reasons"])
+            print(f"  [{status}] {verdict['id']}  native_text={ntr_str}{why}")
     print(json.dumps(report["summary"], indent=2))
     passing = (report["summary"]["images"] > 0
                and report["summary"]["complete_runs"] == len(runs)

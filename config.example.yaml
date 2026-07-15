@@ -88,11 +88,24 @@ runtime:
     repair_iterations: 1              # one measured repair per round; never batch blind retries
     plateau_rounds: 1                 # stop after one round with no measurable QA gain
     epsilon: 0.005                     # changes smaller than this count as no progress
+    reward: phase2                    # phase2: metric-ladder round score (per-element local
+                                      # SSIM + LPIPS perceptual + text recall, per-archetype
+                                      # weights) + capped VLM critique as the repair driver;
+                                      # legacy: old composite (0.75*ssim + 0.25*text).
+                                      # Hard-fail acceptance semantics identical in both.
   auto_retry:
     sam_disable_compile: true         # one safe retry only when compile=true fails
   vram:
+    # 16 GB (RTX 5080) cannot hold the VLM (gemma-4-12b ~7.5 GB, resident in LM Studio) +
+    # SAM3 (~3 GB) + Flux Fill Q6 GGUF (9.2 GB) + t5xxl fp8 (4.5 GB) at once. gc.collect()
+    # + torch.cuda.empty_cache() run at every stage boundary; before the heavy ComfyUI Flux
+    # inpaint the VLM is unloaded (`lms unload`) and reloaded after (`lms load`, ~5 s).
     unload_ocr_before_sam: true       # drop OCR model caches before SAM loads
-    empty_cache_between_stages: true  # torch.cuda.empty_cache(); default true when device=cuda
+    empty_cache_between_stages: true  # gc + torch.cuda.empty_cache(); default true when device=cuda
+    evict_vlm_for_inpaint: true       # unload the LM Studio VLM for the Flux inpaint stage
+    reload_vlm_after_inpaint: true     # reload it once inpaint completes (default: = evict flag)
+    # vlm_reload_ttl_s: 0             # optional TTL passed to `lms load --ttl`
+    # lms_path: ""                    # optional explicit path to the LM Studio `lms` CLI
 
 ocr:
   # doctr is the working in-process GPU OCR on RTX 50-series (Blackwell / sm_120):
@@ -252,6 +265,12 @@ inpaint:
   multipass_fraction: 0.12             # coarse→fine when removal area exceeds this fraction
   regional:
     enabled: true                       # crop-local routing; preserves one canonical union/plate
+    # Route by local background complexity. Flat/low-entropy holes -> analytic plate model
+    # or Big-LaMa; only complex/photographic local backgrounds -> Flux Fill. Diffusion Fill
+    # hallucinates objects into large plain-background holes (RePainter, OmniPaint 2025-26)
+    # while LaMa interpolates flat/gradient plates cleanly at ~50x the speed. Text holes
+    # always stay on Big-LaMa. Set true to force every non-text hole to Flux.
+    force_flux: false
     min_context: 64
     max_context: 96
     # local keeps a bounded crop; expanded multiplies context_scale; global gives the
@@ -283,15 +302,35 @@ inpaint:
     base_url: http://127.0.0.1:8188
     api_key_env: COMFY_CLOUD_API_KEY
     workflow: workflows/flux_fill_inpaint_api.json
+    # Settings locked by A/B 2026-07-15 (runs/flux-settings-ab, fixtures 009/041/052):
+    # guidance 3.5 + steps 8 + empty prompt won on the photo/complex holes that route to
+    # Flux; steps 20 = no consistent gain at 2x latency; descriptive prompts hurt photo
+    # holes. Large plain-background holes hallucinate under EVERY setting — the fix is
+    # routing (regional.force_flux: false), not settings.
     steps: 8                            # native Flux Fill dev (no turbo LoRA)
     cfg: 1.0
-    guidance: 30.0
+    guidance: 3.5
     denoise: 1.0
     seed: 0
     attempts: 2                         # pick lowest seam score across seeds
     prompt: ""
     negative_prompt: ""
     required: false
+    # Pick the Flux Fill GGUF by whole-GPU free VRAM measured at inpaint time (after the VLM
+    # is evicted). Set false to always use models.unet_gguf below.
+    vram_adaptive_quant: true
+    quant_vram_thresholds:
+      high_min_free_mib: 10240          # >=10 GB free -> high; >=7.5 GB -> mid; else low
+      mid_min_free_mib: 7680
+    quant_ladder:
+      high: flux1-fill-dev-Q6_K.gguf
+      mid: flux1-fill-dev-Q5_K_S.gguf
+      low: flux1-fill-dev-Q4_K_S.gguf
+    # models:                           # explicit filenames (unet_gguf is the non-adaptive fallback)
+    #   unet_gguf: flux1-fill-dev-Q6_K.gguf
+    #   t5xxl: t5xxl_fp8_e4m3fn.safetensors
+    #   clip_l: clip_l.safetensors
+    #   vae: ae.safetensors
   # Optional user-provided PowerPaint bridge. No PowerPaint/CUDA package is bundled or
   # validated on this machine. The adapter contract is inpaint(rgb, mask, cfg) -> RGB.
   powerpaint:
@@ -325,6 +364,36 @@ figma:
 
 qa:
   visual_pass_ssim: 0.9               # shared gate for pixel_diff, repair, and qa.ok
+  # Phase-2 harness reward ladder (active when runtime.harness.reward: phase2).
+  # Component weights come from the archetype preset (archetype.apply_preset writes
+  # qa.reward_weights at runtime); qa.reward.weights here would override them, e.g.
+  #   weights: { local_ssim: 0.40, lpips: 0.30, text: 0.30 }
+  # The *_min floors below are conservative anti-degenerate acceptance-gate defaults —
+  # they only block runs whose perceptual/per-element evidence contradicts the global
+  # score. Archetype thresholds (lpips_similarity_min / reward_local_ssim_min) take
+  # precedence, and like every QA threshold they are never lowered mid-loop.
+  reward:
+    lpips:
+      enabled: true                   # LPIPS perceptual term (pip lpips; CPU-capable)
+      net: squeeze                    # squeeze (~5 MB, CPU-fast) | alex | vgg
+      max_edge: 256                   # downscale bound so CPU scoring stays cheap
+    lpips_similarity_min: 0.20        # gate floor on 1 - LPIPS distance
+    local_ssim_min: 0.30              # gate floor on the per-element local score
+    critique:
+      enabled: true                   # VLM diff critique (original vs preview) mapped to
+      max_items: 8                    # repair actions — the primary repair driver; falls
+      timeout_s: 45                   # back to tool-only repairs when LM Studio is
+      max_tokens: 900                 # unavailable or the model was evicted
 
 qa_ocr: true                          # OCR the render for text-recall QA
 export_wait_s: 0                      # >0 to poll for the plugin's figma_export.png
+peel:
+  enabled: false            # OPTIONAL occlusion-attributed decomposition (docs/PEEL-DECOMPOSITION.md), default-OFF.
+  min_overlap_area: 64
+  min_overlap_frac: 0.02
+  hole_dilate_px: 2
+  context_pad_px: 24
+  min_context_frac: 0.05
+  text_occluders: box
+  refine_alpha: false
+  refine_band_px: 3

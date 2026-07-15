@@ -43,6 +43,44 @@ def test_cache_expires_and_never_loads_models(tmp_path):
     assert status["reason"] == "expired"
 
 
+def test_readiness_rows_map_checks_to_models_footprints_and_actions():
+    report = {"checks": [
+        {"name": "ocr", "ok": True},
+        {"name": "sam3", "ok": True},
+        {"name": "vlm", "ok": False},
+        {"name": "lms_cli", "ok": True},
+        {"name": "flux_comfy", "ok": False},
+        {"name": "vectorization", "ok": True},
+        {"name": "figma_staging", "ok": True},
+        # tesseract check intentionally absent -> status "-"
+    ]}
+    cfg = {"vlm": {"model": "google/gemma-4-e4b"},
+           "inpaint": {"mode": "flux_comfy"},
+           "runtime": {"vram": {"evict_vlm_for_inpaint": True}}}
+
+    rows = rtx_self_test.readiness_rows(report, cfg)
+    by_model = {row["model"]: row for row in rows}
+
+    vlm = by_model["VLM - google/gemma-4-e4b"]
+    assert vlm["status"] == "MISSING"
+    assert vlm["vram_gb"] == "6.2"  # 6300 MiB (gemma-4-e4b)
+    assert "lms load google/gemma-4-e4b" in vlm["action"]
+
+    flux = by_model["Inpaint - Flux Fill (ComfyUI)"]
+    assert flux["status"] == "MISSING"
+    assert flux["vram_gb"] == "13.7"  # 14000 MiB
+    assert "setup_flux_inpaint.ps1" in flux["action"]
+
+    # A READY row surfaces no action; an absent check is neither READY nor MISSING.
+    assert by_model["SAM 3 detector"]["status"] == "READY"
+    assert by_model["SAM 3 detector"]["action"] == ""
+    assert by_model["OCR - Tesseract (fallback)"]["status"] == "-"
+
+    # Vectorization must not tell the user to install Potrace.
+    assert "Potrace not required" in by_model["Vectorize - VTracer + CairoSVG/resvg"]["action"] or \
+        by_model["Vectorize - VTracer + CairoSVG/resvg"]["status"] == "READY"
+
+
 def test_pipeline_evidence_requires_real_primary_ocr_and_sam_masks(tmp_path):
     (tmp_path / "ocr_raw.json").write_text(json.dumps({
         "lines": [{"text": "GPU SMOKE"}],

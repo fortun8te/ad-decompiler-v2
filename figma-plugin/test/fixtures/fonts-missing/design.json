@@ -1,0 +1,63 @@
+{
+  "id": "fonts-missing",
+  "name": "fonts-missing",
+  "canvas": {
+    "w": 1000,
+    "h": 800
+  },
+  "schema_version": 2,
+  "meta": {
+    "coordinate_space": "local"
+  },
+  "layers": [
+    {
+      "id": "bg",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "bg",
+      "box": {
+        "x": 0,
+        "y": 0,
+        "w": 1000,
+        "h": 800
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#ffffff"
+      }
+    },
+    {
+      "id": "t1",
+      "type": "text",
+      "name": "t1",
+      "box": {
+        "x": 100,
+        "y": 100,
+        "w": 400,
+        "h": 60
+      },
+      "text": "No fonts installed anywhere",
+      "style": {
+        "fontFamily": "Arial",
+        "fontSize": 18,
+        "color": "#111111"
+      }
+    },
+    {
+      "id": "r1",
+      "type": "shape",
+      "shape_kind": "rect",
+      "name": "r1",
+      "box": {
+        "x": 100,
+        "y": 300,
+        "w": 200,
+        "h": 100
+      },
+      "fill": {
+        "kind": "flat",
+        "color": "#cccccc"
+      }
+    }
+  ]
+}

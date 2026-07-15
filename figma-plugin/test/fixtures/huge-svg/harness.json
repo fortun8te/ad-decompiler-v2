@@ -1,0 +1,13 @@
+{
+  "installedFonts": "auto",
+  "expect": {
+    "ok": true,
+    "minCreated": 2,
+    "failedLayers": [
+      "bad"
+    ],
+    "errorsContain": [
+      "SVG import failed"
+    ]
+  }
+}

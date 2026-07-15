@@ -352,3 +352,95 @@ def test_convergence_config_keys_are_reportable():
 def test_default_harness_budget_is_bounded_to_two_measured_repairs():
     assert harness_loop.max_harness_rounds({}) == 2
     assert harness_loop.repair_iterations({}) == 1
+
+
+# ── regression: rollback must cover every artifact a report reads, not just qa.json ─────
+
+def test_regression_across_all_artifacts_ships_best_round_and_records_it(tmp_path, monkeypatch):
+    """Reproduces runs/benchmark-final/016_attached_ac1eeeabce759396: round 1 is the best
+    round and every later round degrades. The final on-disk state (and qa.json) must equal
+    round 1's snapshot for EVERY artifact a report treats as authoritative -- not just
+    design.json/qa.json/preview.png/layout.json -- and the harness must record which round
+    shipped (harness.json + harness_loop.json ``shipped_round``).
+
+    Before the fix, only design.json/qa.json/preview.png/layout.json/figma_export.png were
+    snapshotted and restored on rollback. reconstruction.json, fallback.json, and
+    runtime_report.json (which embeds its own qa_evidence/qa_ok mirror of qa.json) were left
+    holding whatever the last, regressed round's pipeline run had written -- a "mixed
+    rounds" state where the shipped qa.json disagreed with the shipped runtime_report.json.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+
+    # Seed a deliberately-worse "round 0" (pre-loop) state so round 1 becomes the new best.
+    (run_dir / "runtime_report.json").write_text(
+        json.dumps({"round": 0, "input": str(input_path)}), encoding="utf-8")
+    (run_dir / "design.json").write_text(
+        json.dumps({"marker": "ROUND0", "layers": []}), encoding="utf-8")
+    (run_dir / "reconstruction.json").write_text(json.dumps({"round": 0}), encoding="utf-8")
+    (run_dir / "fallback.json").write_text(json.dumps({"round": 0}), encoding="utf-8")
+    (run_dir / "qa.json").write_text(
+        json.dumps({"ok": False, "ssim": 0.10, "hard_fails": [], "repairs": [
+            {"stage": "ocr", "action": "rerun", "severity": "high"}]}), encoding="utf-8")
+
+    scores = {1: 0.90, 2: 0.50, 3: 0.30}  # round 1 is the best; every later round degrades
+    state = {"n": 0}
+
+    def run_one(path, rd, cfg, start_from="normalize"):
+        state["n"] += 1
+        round_num = state["n"]
+        ssim = scores[round_num]
+        with open(os.path.join(rd, "design.json"), "w", encoding="utf-8") as fh:
+            json.dump({"marker": f"ROUND{round_num}", "layers": []}, fh)
+        with open(os.path.join(rd, "qa.json"), "w", encoding="utf-8") as fh:
+            json.dump({"ok": False, "ssim": ssim, "hard_fails": [], "repairs": [
+                {"stage": "ocr", "action": "rerun", "severity": "high"}]}, fh)
+        with open(os.path.join(rd, "reconstruction.json"), "w", encoding="utf-8") as fh:
+            json.dump({"round": round_num}, fh)
+        with open(os.path.join(rd, "fallback.json"), "w", encoding="utf-8") as fh:
+            json.dump({"round": round_num}, fh)
+        with open(os.path.join(rd, "runtime_report.json"), "w", encoding="utf-8") as fh:
+            json.dump({"round": round_num, "input": str(input_path)}, fh)
+        return {"ok": True}
+
+    def exec_repairs(rd, cfg, max_iterations=2, run_one=None, blocked_repairs=None):
+        summary = {"run_dir": rd, "iterations": 1, "qa_ok": False, "stopped": "max_iterations",
+                   "attempts": [{"repair": {"stage": "ocr", "action": "rerun", "target_id": None},
+                                 "qa_improved": False, "pipeline_ok": True}]}
+        # execute_repairs (harness.py) writes harness.json on every call in production;
+        # reproduce that here so _patch_harness_report has a file to annotate.
+        with open(os.path.join(rd, "harness.json"), "w", encoding="utf-8") as fh:
+            json.dump(summary, fh)
+        return summary
+
+    monkeypatch.setattr(harness_loop, "_run_critic_pass",
+                        lambda rd, cfg: {"prioritized_issues": [], "suggested_fix_ids": [],
+                                         "blockers": [], "filtered_repairs": []})
+    monkeypatch.setattr(harness_loop, "_run_fixer_pass",
+                        lambda rd, cfg, c: {"cfg": cfg, "fixes": ["keep-going"]})
+
+    summary = harness_loop.run_until_acceptable(
+        str(input_path), str(run_dir), {}, max_rounds=3,
+        run_one=run_one, execute_repairs_fn=exec_repairs)
+
+    assert summary["convergence"]["best_round"] == 1
+    assert summary["convergence"]["rolled_back_rounds"] >= 1
+    assert summary["shipped_round"] == 1
+    assert summary["convergence"]["shipped_round"] == 1
+
+    design = json.loads((run_dir / "design.json").read_text())
+    qa = json.loads((run_dir / "qa.json").read_text())
+    reconstruction = json.loads((run_dir / "reconstruction.json").read_text())
+    fallback = json.loads((run_dir / "fallback.json").read_text())
+    runtime_report = json.loads((run_dir / "runtime_report.json").read_text())
+
+    assert design["marker"] == "ROUND1"
+    assert qa["ssim"] == 0.90
+    assert reconstruction["round"] == 1, "reconstruction.json must roll back with qa.json"
+    assert fallback["round"] == 1, "fallback.json must roll back with qa.json"
+    assert runtime_report["round"] == 1, "runtime_report.json must roll back with qa.json"
+
+    harness_report = json.loads((run_dir / "harness.json").read_text())
+    assert harness_report["shipped_round"] == 1
