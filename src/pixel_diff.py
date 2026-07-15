@@ -22,6 +22,13 @@ DEFAULT_THRESHOLDS = {
     "edge_f1_min": 0.68,
     "color_similarity_min": 0.82,
     "editable_ratio_min": 0.15,
+    # native_leaf_ratio is native_leaf_count / foreground_leaf_count (text/shape leaves only,
+    # background excluded). 0.30 is conservative on purpose: it only needs to catch the
+    # "almost everything got rasterized" failure mode (a wrapper frame around one raster
+    # image, or a page that gave up and rasterized nearly all foreground). Legitimate ads
+    # with a couple of photos plus real text/shape layers clear this easily; it is not meant
+    # to police photo-heavy-but-honest layouts, only near-total rasterization.
+    "native_leaf_ratio_min": 0.30,
     "editable_text_recall_min": 0.80,
     "background_exact_match_max": 0.995,
     "background_changed_min": 0.01,
@@ -893,6 +900,9 @@ def _structural_audit(
 
     reconstruction = _load_reconstruction(run_dir)
     element_survival = _element_survival_audit(run_dir, reconstruction)
+    reconstruction_stats = reconstruction.get("stats") or {}
+    degradations = design_meta.get("degradations")
+    degradations = degradations if isinstance(degradations, list) else []
 
     if background_path is None:
         candidate = os.path.join(run_dir, "background_clean.png")
@@ -956,6 +966,16 @@ def _structural_audit(
                 f"{unexplained} raster fallback(s) have no semantic or fidelity reason"
                 + (f": {ids}" if ids else ""),
             )
+        foreground_leaf_count = int(leaf_accounting.get("foreground_leaf_count", 0) or 0)
+        ratio = leaf_accounting.get("native_leaf_ratio")
+        ratio = native_leaf_ratio if ratio is None else float(ratio)
+        if (foreground_leaf_count > 1 and ratio is not None
+                and ratio < thresholds["native_leaf_ratio_min"]):
+            _add_fail(
+                fails, "low-native-leaf-ratio",
+                f"native leaf ratio {ratio:.2f} < {thresholds['native_leaf_ratio_min']:.2f} "
+                f"over {foreground_leaf_count} foreground leaf(ves) — almost everything was rasterized",
+            )
     if editable_text_recall is not None and editable_text_recall < thresholds["editable_text_recall_min"]:
         _add_fail(fails, "missing-editable-text",
                   f"editable text recall {editable_text_recall:.2f} < {thresholds['editable_text_recall_min']:.2f}")
@@ -1007,7 +1027,24 @@ def _structural_audit(
         if isinstance(item, dict) and item.get("rule"):
             _add_fail(fails, str(item["rule"]), str(item.get("detail", item["rule"])))
 
-    stats = reconstruction.get("stats") or {}
+    # Degradation propagation from upstream stages must only gate acceptance runs, never
+    # ordinary diagnostic compares -- both are gated behind require_native_accounting.
+    if require_native_accounting and reconstruction_stats.get("opencv_fallback_used"):
+        _add_fail(
+            fails, "inpaint-degraded-opencv",
+            "background plate used low-quality OpenCV fallback",
+        )
+    if require_native_accounting and degradations:
+        reasons = ", ".join(
+            str((item or {}).get("reason") or item) if isinstance(item, dict) else str(item)
+            for item in degradations[:4]
+        )
+        _add_fail(
+            fails, "pipeline-degraded",
+            f"{len(degradations)} pipeline degradation(s): {reasons}",
+        )
+
+    stats = reconstruction_stats
     return {
         "missing_assets": missing_assets,
         "missing_fonts": missing_fonts,

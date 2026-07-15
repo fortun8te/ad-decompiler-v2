@@ -97,7 +97,7 @@ def _probe_vlm(cfg: dict, work: Path) -> dict:
         "Return JSON only. The label must be exactly gpu-smoke.",
         base_url=str(vlm.get("base_url", "http://127.0.0.1:1234/v1")),
         model=str(vlm.get("model", "google/gemma-4-e4b")),
-        timeout_s=float(vlm.get("timeout_s", 45)), max_tokens=500,
+        timeout_s=float(vlm.get("timeout_s", 45)), max_tokens=800,
         response_schema=schema,
     )
     payload = json.loads(answer)

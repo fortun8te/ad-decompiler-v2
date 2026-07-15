@@ -99,6 +99,7 @@ def ask_vlm(
     timeout_s: float = _DEFAULT_TIMEOUT_S,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     response_schema: dict | None = None,
+    reasoning_effort: str | None = "none",
 ) -> str:
     b64 = base64.b64encode(image_bytes).decode()
     payload = {
@@ -113,6 +114,13 @@ def ask_vlm(
         "max_tokens": max(max_tokens, _MIN_MAX_TOKENS),
         "temperature": 0.0,
     }
+    if reasoning_effort is not None:
+        # gemma-4-e4b (and other reasoning-capable models served via LM Studio) emit a
+        # hidden reasoning_content block before the real answer. On structured/complex
+        # prompts that reasoning can consume the whole token budget, leaving content
+        # empty with finish_reason='length'. "none" disables reasoning entirely: no
+        # reasoning tokens, direct answer, much faster, finish_reason='stop'.
+        payload["reasoning_effort"] = reasoning_effort
     if response_schema:
         payload["response_format"] = {
             "type": "json_schema",
@@ -163,6 +171,7 @@ def multi_pass_answer(
     passes: int,
     response_schema: dict | None = None,
     crop_variants: list[bytes] | None = None,
+    reasoning_effort: str | None = "none",
 ) -> tuple[str | None, str | None]:
     """Run the VLM up to `passes` times. Returns (accepted_answer, note).
 
@@ -182,6 +191,7 @@ def multi_pass_answer(
                     timeout_s=timeout_s,
                     max_tokens=max_tokens,
                     response_schema=response_schema,
+                    reasoning_effort=reasoning_effort,
                 )
             )
         except Exception:

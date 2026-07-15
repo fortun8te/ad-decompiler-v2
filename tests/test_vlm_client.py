@@ -61,7 +61,8 @@ def test_ask_vlm_sends_only_known_fields(monkeypatch):
 
     assert result == "OK"
     body = captured["body"]
-    assert set(body.keys()) == {"model", "messages", "max_tokens", "temperature"}
+    assert set(body.keys()) == {"model", "messages", "max_tokens", "temperature", "reasoning_effort"}
+    assert body["reasoning_effort"] == "none"
     assert body["model"] == "google/gemma-4-e4b"
     assert body["temperature"] == 0.0
     assert len(body["messages"]) == 1
@@ -139,6 +140,39 @@ def test_ask_vlm_sends_strict_json_schema_when_requested(monkeypatch):
     assert fmt["type"] == "json_schema"
     assert fmt["json_schema"]["strict"] is True
     assert fmt["json_schema"]["schema"] == schema
+
+
+def test_ask_vlm_omits_reasoning_effort_when_none(monkeypatch):
+    captured = _capture_request(monkeypatch, {
+        "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+    })
+    vlm_client.ask_vlm(b"x", "prompt", reasoning_effort=None)
+    assert "reasoning_effort" not in captured["body"]
+
+
+def test_ask_vlm_reasoning_effort_override(monkeypatch):
+    captured = _capture_request(monkeypatch, {
+        "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+    })
+    vlm_client.ask_vlm(b"x", "prompt", reasoning_effort="low")
+    assert captured["body"]["reasoning_effort"] == "low"
+
+
+def test_multi_pass_answer_defaults_reasoning_effort_none(monkeypatch):
+    seen = {}
+
+    def fake_ask_vlm(crop, prompt, *, base_url, model, timeout_s, max_tokens,
+                      response_schema=None, reasoning_effort="none"):
+        seen["reasoning_effort"] = reasoning_effort
+        return "OK"
+
+    monkeypatch.setattr(vlm_client, "ask_vlm", fake_ask_vlm)
+    answer, note = vlm_client.multi_pass_answer(
+        b"crop", "prompt", base_url="x", model="m", timeout_s=1, max_tokens=500, passes=1,
+    )
+    assert note is None
+    assert answer == "OK"
+    assert seen["reasoning_effort"] == "none"
 
 
 def test_multi_pass_consensus_canonicalizes_json_and_code_fences(monkeypatch):

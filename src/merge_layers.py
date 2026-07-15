@@ -438,13 +438,15 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     # Ownership aggregation is cheap and deterministic. Recompute it at the merge
     # boundary so a routing-policy refinement can resume from merge without paying for
     # every VLM call again.
+    scene_text_propagation_failed = False
     if isinstance(ocr, dict) and ocr.get("lines") and ocr.get("blocks"):
         ocr = copy.deepcopy(ocr)
         try:
             from src.vlm_scene_text import _propagate_to_blocks
             _propagate_to_blocks(ocr["lines"], ocr["blocks"])
-        except Exception:
-            pass
+        except Exception as exc:  # never let scene-text ownership hints sink merge()
+            scene_text_propagation_failed = True
+            print(f"[merge] scene_text_propagation_failed: {exc}; continuing without VLM ownership hints")
     route, real = _load_routing()
     if run_dir is None:
         run_dir = cfg.get("run_dir")

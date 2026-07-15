@@ -561,3 +561,87 @@ def test_strict_acceptance_rejects_unexplained_raster_fallback(tmp_path):
     assert "unexplained-raster-fallback" in _rules(result)
     assert result["structural"]["native_leaf_ratio"] == 0.0
     assert result["structural"]["leaf_accounting"] == accounting
+
+
+def test_low_native_leaf_ratio_is_a_hard_fail_with_real_foreground(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (40, 30), "white")
+    image.save(source); image.save(render)
+    accounting = {
+        "foreground_leaf_count": 4, "native_leaf_count": 0, "raster_leaf_count": 4,
+        "intentional_raster_cluster_count": 0, "fallback_raster_count": 0,
+        "unexplained_raster_count": 0, "unexplained_raster_ids": [],
+        "native_leaf_ratio": 0.0,
+    }
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [], "meta": {"editable_ratio": 0, "leaf_accounting": accounting,
+                                            "native_leaf_ratio": 0.0}},
+        structural={"require_native_accounting": True},
+    )
+    assert "low-native-leaf-ratio" in _rules(result)
+
+
+def test_low_native_leaf_ratio_does_not_fire_with_single_foreground_leaf(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (40, 30), "white")
+    image.save(source); image.save(render)
+    accounting = {
+        "foreground_leaf_count": 1, "native_leaf_count": 0, "raster_leaf_count": 1,
+        "intentional_raster_cluster_count": 1, "fallback_raster_count": 0,
+        "unexplained_raster_count": 0, "unexplained_raster_ids": [],
+        "native_leaf_ratio": 0.0,
+    }
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [], "meta": {"editable_ratio": 0, "leaf_accounting": accounting,
+                                            "native_leaf_ratio": 0.0}},
+        structural={"require_native_accounting": True},
+    )
+    assert "low-native-leaf-ratio" not in _rules(result)
+
+
+def test_opencv_inpaint_fallback_is_a_hard_fail_under_acceptance(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (40, 30), "white")
+    image.save(source); image.save(render)
+    (tmp_path / "reconstruction.json").write_text(
+        json.dumps({"stats": {"opencv_fallback_used": True}}), encoding="utf-8")
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [], "meta": {"editable_ratio": 0}},
+        structural={"require_native_accounting": True},
+    )
+    assert "inpaint-degraded-opencv" in _rules(result)
+
+    # Same reconstruction.json must not fail an ordinary diagnostic (non-acceptance) run.
+    result2 = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [], "meta": {"editable_ratio": 0}},
+    )
+    assert "inpaint-degraded-opencv" not in _rules(result2)
+
+
+def test_pipeline_degradations_in_design_meta_are_a_hard_fail_under_acceptance(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (40, 30), "white")
+    image.save(source); image.save(render)
+    design = {
+        "layers": [],
+        "meta": {
+            "editable_ratio": 0,
+            "degradations": [{"stage": "vectorize", "reason": "gave up on complex path"}],
+        },
+    }
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path), design=design,
+        structural={"require_native_accounting": True},
+    )
+    assert "pipeline-degraded" in _rules(result)
+
+    result2 = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
+    assert "pipeline-degraded" not in _rules(result2)

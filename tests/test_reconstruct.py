@@ -3,7 +3,29 @@ import os
 
 import numpy as np
 
-from src.reconstruct import _is_background_plate
+from src.reconstruct import _is_background_plate, _inpaint_used_opencv
+
+
+def test_inpaint_used_opencv_detects_regional_fallback():
+    # Regional inpaint reports per-region backends; any opencv-* region is a fallback.
+    assert _inpaint_used_opencv({"backend_counts": {"flux-comfy": 2, "opencv-telea": 1}}) is True
+    assert _inpaint_used_opencv({"backend_counts": {"flux-comfy": 3, "big-lama": 1}}) is False
+
+
+def test_inpaint_used_opencv_detects_single_pass_fallback():
+    # Single-pass inpaint carries the explicit flag on diagnostics.backend_route.
+    assert _inpaint_used_opencv(
+        {"backend": "opencv-ns", "diagnostics": {"backend_route": {"opencv_fallback_used": True}}}
+    ) is True
+    assert _inpaint_used_opencv(
+        {"backend": "big-lama", "diagnostics": {"backend_route": {"opencv_fallback_used": False}}}
+    ) is False
+
+
+def test_inpaint_used_opencv_ignores_empty_and_malformed():
+    assert _inpaint_used_opencv({"backend": "none", "masked_fraction": 0.0}) is False
+    assert _inpaint_used_opencv(None) is False
+    assert _inpaint_used_opencv({}) is False
 
 
 def test_large_edge_touching_product_is_foreground_not_plate():

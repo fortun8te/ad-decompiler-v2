@@ -24,6 +24,31 @@ def _deps():
     return cv2, np, Image
 
 
+def _inpaint_used_opencv(inpaint_result) -> bool:
+    """True if any inpaint pass fell back to the low-quality OpenCV backend.
+
+    Defensive across the three inpaint result shapes: regional (``backend_counts``),
+    single-pass (``diagnostics.backend_route.opencv_fallback_used`` / ``backend``), and the
+    degenerate empty-mask ``backend: "none"`` case (which is not a fallback).
+    """
+    if not isinstance(inpaint_result, dict):
+        return False
+    # Regional: any region that used an opencv-* backend counts as a fallback.
+    counts = inpaint_result.get("backend_counts")
+    if isinstance(counts, dict) and any(str(k).startswith("opencv") for k in counts):
+        return True
+    # Single-pass diagnostics carry the explicit flag on the backend route.
+    diagnostics = inpaint_result.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        route = diagnostics.get("backend_route")
+        if isinstance(route, dict) and route.get("opencv_fallback_used"):
+            return True
+    # Fall back to the resolved backend name on either shape.
+    if str(inpaint_result.get("backend") or "").startswith("opencv"):
+        return True
+    return False
+
+
 # A "shape" region whose interior colour dispersion (max per-channel std) exceeds this is
 # photographic (a real photo/avatar), not a flat/gradient design fill, so it must stay a
 # swappable IMAGE clipped by its detected primitive instead of being flattened to a colour.
@@ -1633,6 +1658,11 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "vector_fallback": vector_fallback,
             "flattened_scene_artwork": flattened_scene_artwork,
             "mask_rejected": mask_rejected,
+            # Surface the low-quality OpenCV fallback at the top level so acceptance QA
+            # (pixel_diff._structural_audit) can hard-fail on it. The producer emits it
+            # nested (per-region backend_counts, or single-pass diagnostics.backend_route),
+            # so hoist it here rather than leaving the QA gate reading a key that never exists.
+            "opencv_fallback_used": _inpaint_used_opencv(inpaint_result),
             "inpaint": inpaint_result,
         },
     }

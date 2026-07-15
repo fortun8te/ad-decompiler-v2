@@ -189,6 +189,58 @@ def _proposal_signature(proposals: list[dict]) -> tuple:
     return tuple(sig)
 
 
+# The VLM is not byte-deterministic even at temperature=0 (structured JSON label choice can
+# vary between identical calls). Requiring an exact signature match between the two passes
+# would make consensus fail almost every time on a real model, so agreement is judged on
+# geometry instead: same element count, and every box in one pass has a positional match in
+# the other pass. Labels are allowed to differ.
+_BOX_MATCH_IOU = 0.6
+_BOX_MATCH_CENTER_FRACTION = 0.05  # of tile diagonal, as a center-distance tolerance
+
+
+def _box_center(frac: dict) -> tuple[float, float]:
+    return (frac["x"] + frac["w"] / 2.0, frac["y"] + frac["h"] / 2.0)
+
+
+def _fraction_box_iou(a: dict, b: dict) -> float:
+    ix = max(0, min(a["x"] + a["w"], b["x"] + b["w"]) - max(a["x"], b["x"]))
+    iy = max(0, min(a["y"] + a["h"], b["y"] + b["h"]) - max(a["y"], b["y"]))
+    inter = ix * iy
+    if inter <= 0:
+        return 0.0
+    union = a["w"] * a["h"] + b["w"] * b["h"] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _boxes_match(a: dict, b: dict) -> bool:
+    if _fraction_box_iou(a, b) >= _BOX_MATCH_IOU:
+        return True
+    ax, ay = _box_center(a)
+    bx, by = _box_center(b)
+    # Fraction boxes are 0-1 relative to the tile, so the tile diagonal is sqrt(2).
+    dist = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+    return dist <= _BOX_MATCH_CENTER_FRACTION * (2 ** 0.5)
+
+
+def _proposals_agree(a: list[dict], b: list[dict]) -> bool:
+    """True when both passes propose the same number of elements and each box in `a`
+    has an unmatched positional counterpart in `b` (IoU or center-distance tolerance).
+    Labels need not match."""
+    if len(a) != len(b):
+        return False
+    remaining = list(b)
+    for item in a:
+        match_idx = next(
+            (idx for idx, other in enumerate(remaining)
+             if _boxes_match(item["approx_box_fraction"], other["approx_box_fraction"])),
+            None,
+        )
+        if match_idx is None:
+            return False
+        remaining.pop(match_idx)
+    return True
+
+
 def _two_pass_proposals(
     crop: bytes,
     *,
@@ -216,11 +268,11 @@ def _two_pass_proposals(
         if parsed is None:
             return None, "vlm_parse_error"
         parsed_passes.append(parsed)
-    if len({len(p) for p in parsed_passes}) != 1:
-        return None, "vlm_disagreement"
-    if len({_proposal_signature(p) for p in parsed_passes}) != 1:
-        return None, "vlm_disagreement"
-    return parsed_passes[0], None
+    first = parsed_passes[0]
+    for other in parsed_passes[1:]:
+        if not _proposals_agree(first, other):
+            return None, "vlm_disagreement"
+    return first, None
 
 
 def _grid_tiles(width: int, height: int, grid: int, overlap: float) -> list[dict]:
@@ -321,6 +373,36 @@ def _effective_ep_cfg(ep: dict, sam_element_count: int | None) -> dict:
     return {**ep, **lightweight}
 
 
+class _ResidualWithNotice(list):
+    """A residual list that also carries a `vlm_degraded` notice.
+
+    Subclassing list keeps every existing caller/test working unmodified
+    (`out == residual`, iteration, indexing, len() all behave like a plain
+    list), while a caller that wants to observe the degradation can read
+    `.vlm_degraded` off the returned object instead of it being silently
+    dropped."""
+
+    vlm_degraded: dict | None = None
+
+
+def _degraded_residual(residual: list[dict], stats: dict) -> list[dict]:
+    """Return `residual` unchanged, but loudly annotated when tiles degraded.
+
+    Historically enrich_residual "never raised" and silently returned the
+    unchanged residual on vlm_error/vlm_disagreement, which made LM Studio
+    outages or persistent disagreement invisible to callers. This keeps the
+    non-raising contract but makes the degradation observable."""
+    notes = stats.get("notes") or []
+    if not notes:
+        return residual
+    out = _ResidualWithNotice(residual)
+    out.vlm_degraded = {
+        "reason": notes[0] if len(notes) == 1 else ",".join(notes),
+        "tile_count": stats.get("tiles", 0),
+    }
+    return out
+
+
 def enrich_residual(
     image_path: str,
     residual: list[dict],
@@ -404,7 +486,7 @@ def enrich_residual(
             raw_proposals.append({"label": proposal["label"], "box": box, "tile": tile_idx})
 
     if not raw_proposals:
-        return residual
+        return _degraded_residual(residual, stats)
 
     existing_boxes = [item["box"] for item in base_residual if item.get("box")]
     filtered: list[dict] = []
@@ -416,7 +498,7 @@ def enrich_residual(
     if max_proposals > 0:
         filtered = filtered[:max_proposals]
     if not filtered:
-        return residual
+        return _degraded_residual(residual, stats)
 
     out = copy.deepcopy(base_residual)
     used_ids = {str(item.get("id", "")) for item in out}

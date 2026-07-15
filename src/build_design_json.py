@@ -341,17 +341,22 @@ def _leaf_accounting(layers):
         intentional = bool(meta.get("intentional_raster_cluster")) or is_intentional_raster_cluster(role)
         if intentional:
             out["intentional_raster_cluster_count"] += 1
+        # "fallback" flags (fallback/raster_fallback/vector_fallback/substitution/low_fidelity)
+        # are set by routing/vectorize exactly when they GIVE UP on producing a native layer.
+        # They are therefore NOT a legitimate reason on their own -- treating them as
+        # self-justifying let every give-up silently launder itself into "explained" and
+        # never increment unexplained_raster_count. A raster leaf only counts as explained
+        # when it has an INDEPENDENT legitimate reason: a genuine legitimate role (photo,
+        # product, person, logo, ...), an intentional raster cluster, or a wordmark. A bare
+        # semantic_name is a label, not a reason, and does not grant a free pass either.
         fallback = bool(
             meta.get("fallback") or meta.get("raster_fallback") or meta.get("vector_fallback")
             or meta.get("substitution") or meta.get("low_fidelity")
         )
         if fallback:
             out["fallback_raster_count"] += 1
-        explained = bool(
-            intentional or role in _LEGITIMATE_RASTER_ROLES or meta.get("wordmark")
-            or meta.get("substitution") or meta.get("raster_fallback")
-            or meta.get("vector_fallback") or meta.get("semantic_name")
-        )
+        legitimate = bool(intentional or role in _LEGITIMATE_RASTER_ROLES or meta.get("wordmark"))
+        explained = legitimate
         if fallback and not explained:
             out["unexplained_raster_count"] += 1
             out["unexplained_raster_ids"].append(str(layer.id))
@@ -416,6 +421,10 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
         meta={
             "layer_count": total,
             "root_layer_count": len(layers),
+            # Legacy metric, kept only for back-compat: it counts every FRAME/GROUP as
+            # "editable", so a wrapper frame around a single raster image inflates this
+            # number even though nothing inside is actually editable. `native_leaf_ratio`
+            # below (leaf-only, no wrapper credit) is the honest metric acceptance gates on.
             "editable_ratio": round(editable / max(1, total), 4),
             "native_leaf_ratio": leaf_accounting["native_leaf_ratio"],
             "leaf_accounting": leaf_accounting,
