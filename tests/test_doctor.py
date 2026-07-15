@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from doctor import inspect, ocr_ready_summary
+from doctor import _powerpaint_adapter_importable, inspect, ocr_ready_summary
 
 
 def test_doctor_marks_active_missing_sam_and_primary_ocr_as_blockers(tmp_path, monkeypatch):
@@ -140,6 +140,74 @@ def test_doctor_reports_inpaint_stack_blocked_when_lama_missing(tmp_path, monkey
     stack = next(item for item in report["checks"] if item["name"] == "inpaint stack (Big-LaMa)")
     assert stack["ok"] is False
     assert any(item["name"] == "inpaint stack (Big-LaMa)" for item in report["blockers"])
+
+
+def test_strict_flux_selection_blocks_unverifiable_local_weights(tmp_path, monkeypatch):
+    workflow = tmp_path / "flux.json"
+    workflow.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("doctor._module", lambda _name: True)
+    monkeypatch.setattr("doctor._torch", lambda device: {
+        "name": "torch", "ok": True, "required": False, "detail": "cpu",
+    })
+    monkeypatch.setattr("doctor._http", lambda _url: True)
+
+    report = inspect({
+        "device": "cpu", "ocr": {"primary": "doctr"}, "qwen": {"enabled": False},
+        "inpaint": {"mode": "flux_comfy", "strict_acceptance": True,
+                    "comfy": {"enabled": True, "workflow": str(workflow)}},
+    }, tmp_path)
+
+    flux_models = next(item for item in report["checks"] if item["name"] == "flux inpaint models")
+    assert flux_models["ok"] is False
+    assert flux_models["required"] is True
+    assert any(item["name"] == "flux inpaint models" for item in report["blockers"])
+    assert report["policy"]["inpaint_selected"] == "flux_comfy"
+    assert report["policy"]["inpaint_strict_acceptance"] is True
+
+
+def test_strict_powerpaint_selection_blocks_missing_adapter(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda _name: True)
+    monkeypatch.setattr("doctor._torch", lambda device: {
+        "name": "torch", "ok": True, "required": False, "detail": "cpu",
+    })
+
+    report = inspect({
+        "device": "cpu", "ocr": {"primary": "doctr"}, "qwen": {"enabled": False},
+        "inpaint": {"mode": "powerpaint", "strict_acceptance": True, "powerpaint": {}},
+    }, tmp_path)
+
+    adapter = next(item for item in report["checks"] if item["name"] == "PowerPaint adapter configuration")
+    assert adapter["ok"] is False
+    assert adapter["required"] is True
+    assert any(item["name"] == "PowerPaint adapter configuration" for item in report["blockers"])
+    assert report["policy"]["inpaint_selected"] == "powerpaint"
+
+
+def test_strict_powerpaint_accepts_only_an_enabled_importable_adapter(tmp_path, monkeypatch):
+    monkeypatch.setattr("doctor._module", lambda name: name != "missing_powerpaint_adapter")
+    monkeypatch.setattr("doctor._torch", lambda device: {
+        "name": "torch", "ok": True, "required": False, "detail": "cpu",
+    })
+
+    report = inspect({
+        "device": "cpu", "ocr": {"primary": "doctr"}, "qwen": {"enabled": False},
+        "inpaint": {"mode": "powerpaint", "strict_acceptance": True, "powerpaint": {
+            "enabled": True, "adapter_module": "missing_powerpaint_adapter", "callable": "inpaint",
+        }},
+    }, tmp_path)
+
+    imported = next(item for item in report["checks"] if item["name"] == "PowerPaint adapter import")
+    assert imported["ok"] is False
+    assert imported["required"] is True
+    assert "not importable" in imported["detail"]
+
+
+def test_powerpaint_adapter_probe_checks_callable_but_does_not_run_a_model():
+    ok, detail = _powerpaint_adapter_importable("math", "sqrt")
+
+    assert ok is True
+    assert "callable" in detail
+    assert "not executed" in detail
 
 
 def test_ocr_ready_summary_flags_primary_blockers(tmp_path, monkeypatch):

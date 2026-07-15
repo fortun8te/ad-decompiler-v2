@@ -479,7 +479,7 @@ def harness_enabled(cfg: Optional[dict]) -> bool:
 
 
 def harness_max_rounds(cfg: Optional[dict]) -> int:
-    """Max repair rounds from config (default 3)."""
+    """Max repair rounds from config (default 2)."""
     runtime = (cfg or {}).get("runtime") or {}
     harness = runtime.get("harness") or {}
     if harness.get("max_rounds") is not None:
@@ -488,7 +488,7 @@ def harness_max_rounds(cfg: Optional[dict]) -> int:
         return max(0, int(runtime["harness_max_iterations"]))
     if runtime.get("auto_repair_max_iterations") is not None:
         return max(0, int(runtime["auto_repair_max_iterations"]))
-    return 3
+    return 2
 
 
 def harness_should_repair(

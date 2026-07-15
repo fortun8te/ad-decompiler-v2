@@ -58,20 +58,27 @@ if ($Remote) {
   Write-Host "Remote mode: binding only to the Tailscale address $BridgeHost."
 }
 
-# Updating is explicit: an automatic pull can fail on local edits and makes a
-# double-click launcher unexpectedly change code.
+# Updating is explicit. The shared updater refuses dirty/diverged worktrees and only
+# fast-forwards a clean checkout, then reports its decision in this terminal.
 if ($Update -and (Test-Path (Join-Path $Root ".git"))) {
-  try {
-    Write-Host "Updating the app..."
-    & git -C $Root pull --ff-only
-    if ($LASTEXITCODE -ne 0) { throw "git pull failed" }
-    if (Test-Path $Python) {
-      & $Python "$Root\scripts\stamp_plugin_build.py" --quiet
+  Write-Host "Checking for a safe update..."
+  $updateText = (& $Python "$Root\scripts\sync_update.py" --repo $Root --update --notify --json | Out-String)
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "WARNING: update check failed — continuing with the current checkout."
+  } else {
+    try {
+      $updateResult = $updateText | ConvertFrom-Json
+      if ($updateResult.action -eq "updated") {
+        # Setup is versioned by a stamp. A pulled requirements/model-adapter change must
+        # invalidate that old stamp before the bridge starts, or the new code can run in
+        # a stale environment despite a successful fast-forward.
+        Remove-Item -Force $SetupStamp -ErrorAction SilentlyContinue
+        Write-Host "Code updated — refreshing the local RTX environment before startup..."
+        Ensure-Venv
+      }
+    } catch {
+      Write-Host "WARNING: update status could not be read — continuing with the current environment."
     }
-    $head = (& git -C $Root rev-parse --short HEAD).Trim()
-    Write-Host "Repo at $head"
-  } catch {
-    Write-Host "WARNING: git pull failed — continuing with current checkout: $_"
   }
 }
 

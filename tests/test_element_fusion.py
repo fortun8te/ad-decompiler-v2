@@ -59,6 +59,36 @@ def test_same_instance_from_three_sources_becomes_one_canonical_element(tmp_path
     assert Image.open(element["mask_path"]).size == (30, 30)
 
 
+def test_agreed_structural_group_metadata_survives_fusion():
+    mask = _mask(20, 20, 30, 30)
+    sam = {"id": "S0", "box": _box(20, 20, 30, 30), "role": "panel",
+           "kind": "photo-fragment", "score": .94, "_mask": mask,
+           "grid_group_id": "features", "row_index": 0, "column_index": 1}
+    residual = {"id": "R0", "box": _box(20, 20, 30, 30), "role": "panel",
+                "kind": "photo-fragment", "_mask": mask,
+                "grid_group_id": "features", "row_index": 0, "column_index": 1}
+
+    fused = element_fusion.fuse({"elements": [sam]}, [residual], [], CANVAS)
+
+    assert fused[0]["grid_group_id"] == "features"
+    assert fused[0]["row_index"] == 0
+    assert fused[0]["column_index"] == 1
+
+
+def test_conflicting_structural_group_metadata_is_discarded():
+    mask = _mask(20, 20, 30, 30)
+    sam = {"id": "S0", "box": _box(20, 20, 30, 30), "role": "panel",
+           "kind": "photo-fragment", "score": .94, "_mask": mask,
+           "grid_group_id": "left"}
+    residual = {"id": "R0", "box": _box(20, 20, 30, 30), "role": "panel",
+                "kind": "photo-fragment", "_mask": mask,
+                "grid_group_id": "right"}
+
+    fused = element_fusion.fuse({"elements": [sam]}, [residual], [], CANVAS)
+
+    assert "grid_group_id" not in fused[0]
+
+
 def test_meaningful_nested_icon_is_preserved_as_child(tmp_path):
     container = _mask(10, 10, 70, 50)
     icon = _mask(25, 22, 12, 12)
@@ -193,6 +223,22 @@ def test_raster_role_parent_links_nested_product_child(tmp_path):
     child = next(e for e in fused if e["role"] == "product")
     assert child["parent_id"] == parent["id"]
     assert child["relationships"][0]["type"] == "nested-in"
+
+
+def test_underscore_cluster_role_normalizes_before_parent_linking(tmp_path):
+    parent_mask = _mask(8, 8, 64, 48)
+    child_mask = _mask(20, 20, 18, 14)
+    fused = element_fusion.fuse({"elements": [
+        {"id": "panel", "box": _box(8, 8, 64, 48), "role": "ui_panel",
+         "kind": "photo-fragment", "score": .95, "_mask": parent_mask,
+         "provenance": {"mode": "text-prompt"}},
+        {"id": "icon", "box": _box(20, 20, 18, 14), "role": "icon",
+         "kind": "icon", "score": .95, "_mask": child_mask,
+         "provenance": {"mode": "text-prompt"}},
+    ]}, [], [], CANVAS, run_dir=str(tmp_path))
+    parent = next(item for item in fused if item["role"] == "ui-panel")
+    child = next(item for item in fused if item["role"] == "icon")
+    assert child["parent_id"] == parent["id"]
 
 
 def test_overlapping_but_semantically_distinct_masks_survive():

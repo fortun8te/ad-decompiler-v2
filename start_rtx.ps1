@@ -1,6 +1,9 @@
 param(
   [string]$InputDir,
   [string]$Output = "runs\benchmark",
+  [string[]]$Ids,
+  [switch]$RequireFigma,
+  [int]$FigmaWaitS = 120,
   [switch]$NoBridge,
   [switch]$SkipDoctor
 )
@@ -22,6 +25,25 @@ if (-not (Test-Path $Python)) {
 if (-not $SkipDoctor) {
   & $Python doctor.py --config config.yaml
   if ($LASTEXITCODE -ne 0) { throw "The machine is not ready. Fix the doctor output first." }
+
+  # An acceptance benchmark must have actual model-execution evidence, not merely static
+  # dependencies. This covers the default active OCR/SAM/Gemma/Big-LaMa route as well as
+  # strict Flux/PowerPaint. rtx_self_test is cached, so normal restarts stay cheap.
+  $doctorJsonText = (& $Python doctor.py --config config.yaml --json | Out-String)
+  try {
+    $doctorReport = $doctorJsonText | ConvertFrom-Json
+    $needsRuntimeEvidence = $doctorReport.policy.require_active_models -or $doctorReport.policy.inpaint_strict_acceptance
+    if ($needsRuntimeEvidence) {
+      Write-Host "Acceptance benchmark: checking cached real-model runtime evidence..."
+      & $Python rtx_self_test.py --config config.yaml
+      if ($LASTEXITCODE -ne 0) {
+        throw "The acceptance runtime self-test failed. Fix its evidence before running a benchmark."
+      }
+    }
+  } catch {
+    if ($_.Exception.Message -like "*acceptance runtime self-test failed*") { throw }
+    throw "Could not read doctor policy for acceptance runtime evidence: $_"
+  }
 }
 
 $bridgeProcess = $null
@@ -55,8 +77,19 @@ function Stop-Bridge {
 }
 
 if ($InputDir) {
+  if ($RequireFigma -and $NoBridge) {
+    throw "Figma acceptance needs the bridge. Remove -NoBridge so the plugin can fetch the staged run and post its export."
+  }
   Write-Host "Running the benchmark..."
   $benchmarkArgs = @("benchmark.py", "--input-dir", $InputDir, "--output", $Output, "--config", "config.yaml")
+  # Name fixtures instead of relying on directory ordering. This makes the Codia-parity
+  # corpus repeatable and lets a small representative batch run before the full library.
+  foreach ($id in @($Ids)) {
+    if ($null -ne $id -and "$id".Trim()) { $benchmarkArgs += @("--ids", "$id") }
+  }
+  if ($RequireFigma) {
+    $benchmarkArgs += @("--require-figma-export", "--figma-wait-s", "$FigmaWaitS")
+  }
   # Only skip the benchmark's own doctor check (and its doctor.json evidence) when the caller
   # explicitly asked to via -SkipDoctor. Acceptance runs must keep it so doctor.json is written.
   if ($SkipDoctor) { $benchmarkArgs += "--skip-doctor" }

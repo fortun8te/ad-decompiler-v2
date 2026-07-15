@@ -1,10 +1,10 @@
-# Sync ad-decompiler on the Windows RTX box (git pull + stamp build).
-# Can run locally or be fetched over HTTPS from the Mac:
-#   irm https://raw.githubusercontent.com/fortun8te/ad-decompiler-v2/main/scripts/windows_sync.ps1 | iex
+# Safely sync ad-decompiler on the Windows RTX box.
+# The Python helper refuses dirty/diverged worktrees and only uses git pull --ff-only.
 param(
-  [string]$Repo = $(if ($env:AD_DECOMPILER_ROOT) { $env:AD_DECOMPILER_ROOT } else { "$HOME\ad-decompiler" }),
-  [string]$Remote = "newrepo",
-  [string]$Branch = "main"
+  [string]$Repo = $(if ($env:AD_DECOMPILER_ROOT) { $env:AD_DECOMPILER_ROOT } else { (Split-Path -Parent $PSScriptRoot) }),
+  [string]$Remote = "origin",
+  [string]$Branch = "main",
+  [switch]$CheckOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,20 +15,15 @@ if (-not (Test-Path (Join-Path $Repo ".git"))) {
 }
 
 Set-Location $Repo
-Write-Host "==> $Repo"
-Write-Host "==> git fetch $Remote $Branch"
-& git fetch $Remote $Branch
-Write-Host "==> git pull $Remote $Branch"
-& git pull $Remote $Branch
-
 $Python = Join-Path $Repo ".venv\Scripts\python.exe"
-if (Test-Path $Python) {
-  & $Python (Join-Path $Repo "scripts\stamp_plugin_build.py") --quiet
-  Write-Host "==> plugin build stamped"
-} else {
-  Write-Host "==> skip stamp (no .venv yet)"
+if (-not (Test-Path $Python)) {
+  if (Get-Command py -ErrorAction SilentlyContinue) { $Python = "py" }
+  elseif (Get-Command python -ErrorAction SilentlyContinue) { $Python = "python" }
+  else { throw "No Python found. Install Python 3.12 or run setup_rtx.ps1 first." }
 }
 
-$head = (& git rev-parse --short HEAD).Trim()
-Write-Host "==> now at $head"
-Write-Host "Restart Start Bridge.bat if the bridge is already running."
+$syncArgs = @((Join-Path $Repo "scripts\sync_update.py"), "--repo", $Repo, "--remote", $Remote, "--branch", $Branch, "--notify")
+if (-not $CheckOnly) { $syncArgs += "--update" }
+& $Python @syncArgs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "Restart Start Bridge.bat if an update was applied and the bridge is already running."

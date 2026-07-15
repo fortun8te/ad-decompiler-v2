@@ -122,7 +122,7 @@ _STAGE_PROGRESS_IN_STAGE = 0.35  # assume ~35% through the active stage for ETA/
 
 
 def _empty_history():
-    return {"durations_s": [], "runs": []}
+    return {"version": 2, "durations_s": [], "runs": []}
 
 
 def _read_history(inbox):
@@ -152,9 +152,24 @@ def _read_history(inbox):
                 str(k): float(v) for k, v in fracs.items()
                 if k in STAGE_ORDER and isinstance(v, (int, float)) and v >= 0
             }
+        # Keep only the small, user-facing identity fields needed by the plugin
+        # history.  In particular, never expose a bridge host's run_dir here.
+        for key in ("job_id", "filename", "doc_id"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                row[key] = value.strip()[:200]
+        finished_at = entry.get("finished_at")
+        if isinstance(finished_at, (int, float)) and finished_at > 0:
+            row["finished_at"] = float(finished_at)
+        if isinstance(entry.get("qa_ok"), bool):
+            row["qa_ok"] = entry["qa_ok"]
+        layer_count = entry.get("layer_count")
+        if isinstance(layer_count, int) and layer_count >= 0:
+            row["layer_count"] = layer_count
         cleaned.append(row)
     cleaned = cleaned[-_HISTORY_MAX:]
     return {
+        "version": 2,
         "durations_s": [row["duration_s"] for row in cleaned],
         "runs": cleaned,
     }
@@ -258,15 +273,29 @@ def _estimate_eta(inbox, elapsed_s, stage=None):
     return round(eta_s, 1), len(durations), progress_pct
 
 
-def _record_history(inbox, duration_s, run_dir=None):
+def _record_history(inbox, duration_s, run_dir=None, *, job_id=None, filename=None,
+                    doc_id=None, finished_at=None, qa_ok=None, layer_count=None):
     history = _read_history(inbox)
     entry = {"duration_s": float(duration_s)}
     fracs = _parse_stage_fractions(run_dir, duration_s)
     if fracs:
         entry["stage_fractions"] = fracs
+    if job_id:
+        entry["job_id"] = str(job_id)
+    if filename:
+        entry["filename"] = os.path.basename(str(filename))
+    if doc_id:
+        entry["doc_id"] = str(doc_id)
+    if finished_at:
+        entry["finished_at"] = float(finished_at)
+    if isinstance(qa_ok, bool):
+        entry["qa_ok"] = qa_ok
+    if isinstance(layer_count, int) and layer_count >= 0:
+        entry["layer_count"] = layer_count
     runs = (history.get("runs") or []) + [entry]
     runs = runs[-_HISTORY_MAX:]
     payload = {
+        "version": 2,
         "durations_s": [row["duration_s"] for row in runs],
         "runs": runs,
     }
@@ -663,6 +692,26 @@ def _stage_job_output(inbox, run_dir, cfg):
     }
 
 
+def _roundtrip_matches(manifest, doc_id, token):
+    """Reject a delayed plugin callback once another run has been staged.
+
+    Older hand-written manifests have no token and remain readable for migration. Every
+    manifest produced by ``figma_import`` has one, so normal plugin round trips are bound
+    to an exact staged design instead of the mutable top-level ``inbox.json`` pointer.
+    """
+    manifest = manifest or {}
+    expected = str(manifest.get("roundtrip_token") or "")
+    if not expected:
+        return True, None
+    supplied_doc = str(doc_id or "")
+    supplied_token = str(token or "")
+    if supplied_doc != str(manifest.get("doc_id") or ""):
+        return False, "stale Figma callback: a different design is now staged"
+    if supplied_token != expected:
+        return False, "stale Figma callback: this import is no longer the staged revision"
+    return True, None
+
+
 def _rerun_qa_for_run(run_dir, config_path=None):
     """Re-score QA after the Figma plugin posts export/report."""
     run_dir = os.path.abspath(str(run_dir or ""))
@@ -943,13 +992,22 @@ def make_handler(inbox, config_path=None):
                             harness_summary, run_dir=run_dir, pipeline_result=result,
                         ))
                 if job_success:
-                    _record_history(inbox, time.time() - started, run_dir)
+                    finished_at = time.time()
+                    _record_history(
+                        inbox, finished_at - started, run_dir,
+                        job_id=job_id,
+                        filename=os.path.basename(image_path),
+                        doc_id=(staging or {}).get("doc_id"),
+                        finished_at=finished_at,
+                        qa_ok=qa_passed,
+                        layer_count=(staging or {}).get("layer_count"),
+                    )
                     _append_plugin_logs(inbox, [{
                         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "level": "info",
                         "title": "Pipeline complete",
                         "detail": job_id,
-                        "extra": {"job_id": job_id, "run_dir": run_dir, "duration_s": round(time.time() - started, 2)},
+                        "extra": {"job_id": job_id, "run_dir": run_dir, "duration_s": round(finished_at - started, 2)},
                     }], manifest)
                 else:
                     _append_plugin_logs(inbox, [{
@@ -1057,6 +1115,17 @@ def make_handler(inbox, config_path=None):
                 if manifest:
                     payload["schema_version"] = manifest.get("schema_version")
                 return self._send(200, json.dumps(payload, default=str).encode(), "application/json")
+            if u.path == "/history":
+                # Recent completed conversions are intentionally read-only.  The
+                # endpoint omits local run paths; the plugin only needs enough
+                # context to distinguish an older conversion from the staged one.
+                history = _read_history(inbox)
+                payload = {
+                    "ok": True,
+                    "version": history.get("version", 2),
+                    "runs": list(reversed(history.get("runs") or [])),
+                }
+                return self._send(200, json.dumps(payload).encode(), "application/json")
             if u.path == "/inbox.json":
                 p = os.path.join(inbox, "inbox.json")
                 return self._send(200, open(p, "rb").read(), "application/json") if os.path.exists(p) else self._send(404)
@@ -1239,6 +1308,14 @@ def make_handler(inbox, config_path=None):
                                        "application/json")
                 data = self.rfile.read(n)
                 man = self._manifest() or {}
+                query = parse_qs(urlparse(self.path).query)
+                roundtrip_ok, roundtrip_error = _roundtrip_matches(
+                    man, (query.get("doc_id") or [""])[0],
+                    (query.get("roundtrip_token") or [""])[0],
+                )
+                if not roundtrip_ok:
+                    return self._send(409, json.dumps({"ok": False, "error": roundtrip_error}).encode(),
+                                      "application/json")
                 out = man.get("export_to") or os.path.join(inbox, "figma_export.png")
                 os.makedirs(os.path.dirname(out), exist_ok=True)
                 fd, temp_path = tempfile.mkstemp(prefix=".figma-export-", suffix=".png",
@@ -1271,6 +1348,12 @@ def make_handler(inbox, config_path=None):
                 if isinstance(plugin_build, dict):
                     _save_plugin_client(inbox, plugin_build)
                 man = self._manifest() or {}
+                roundtrip_ok, roundtrip_error = _roundtrip_matches(
+                    man, report.get("doc_id"), report.get("roundtrip_token"),
+                )
+                if not roundtrip_ok:
+                    return self._send(409, json.dumps({"ok": False, "error": roundtrip_error}).encode(),
+                                      "application/json")
                 outputs = []
                 run_dir = man.get("run_dir")
                 if run_dir:

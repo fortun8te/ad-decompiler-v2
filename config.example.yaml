@@ -84,8 +84,10 @@ runtime:
   auto_repair: true                   # re-run mapped repair stages after QA failure
   harness:
     enabled: true                     # failure-proof repair loop after QA/staging issues
-    max_rounds: 3                     # pipeline + repair + critic + fixer cycles
-    repair_iterations: 2              # execute_repairs attempts per harness round
+    max_rounds: 2                     # bounded pipeline + repair + critic + fixer cycles
+    repair_iterations: 1              # one measured repair per round; never batch blind retries
+    plateau_rounds: 1                 # stop after one round with no measurable QA gain
+    epsilon: 0.005                     # changes smaller than this count as no progress
   auto_retry:
     sam_disable_compile: true         # one safe retry only when compile=true fails
   vram:
@@ -142,6 +144,7 @@ sam3:
     - {prompt: icon, role: icon, kind: icon}
     - {prompt: app icon, role: icon, kind: icon}
     - {prompt: arrow, role: arrow, kind: icon}
+    - {prompt: callout leader line, role: callout_leader, kind: icon}
     - {prompt: badge, role: badge, kind: icon}
     - {prompt: price badge, role: badge, kind: icon}
     - {prompt: sale badge, role: badge, kind: icon}
@@ -151,6 +154,14 @@ sam3:
     - {prompt: card, role: card, kind: shape}
     - {prompt: offer card, role: card, kind: shape}
     - {prompt: illustration, role: illustration, kind: photo-fragment}
+    # Structured artwork preserved as one named, swappable source crop.
+    - {prompt: screenshot, role: screenshot, kind: photo-fragment}
+    - {prompt: UI panel, role: ui-panel, kind: photo-fragment}
+    - {prompt: receipt, role: receipt, kind: photo-fragment}
+    - {prompt: chart or graph, role: chart, kind: photo-fragment}
+    - {prompt: table or nutrition facts panel, role: nutrition-panel, kind: photo-fragment}
+    - {prompt: diagram or infographic, role: diagram, kind: photo-fragment}
+    - {prompt: inseparable product cluster, role: product-cluster, kind: photo-fragment}
 
 element_fusion:
   mask_iou: 0.68
@@ -211,6 +222,11 @@ vectorize:
 reconstruct:
   dedup_iou: 0.86
   mask_dilate: 2
+  # Sparse OCR glyphs stay ink-shaped. Full text rectangles are never removed unless
+  # explicitly opted in; a flat opaque label can still be proven from source contrast.
+  allow_text_box_fallback: false
+  allow_opaque_text_region_fallback: true
+  text_box_promote_max_fraction: 0.0
   # Conservative primitive paint extraction for semantic shapes only.  It preserves
   # source-provided paint facts and falls back to a plain fill for uncertain masks.
   style_extraction:
@@ -220,16 +236,30 @@ reconstruct:
     detect_shadows: true
 
 inpaint:
-  mode: auto                           # Big-LaMa when ComfyUI+package healthy, OpenCV fallback
+  mode: auto                           # Big-LaMa when installed; OpenCV is a deterministic fallback
   allow_fallback: true
+  # Acceptance runs can block automatic degradation to OpenCV. An explicitly configured
+  # `mode: opencv` remains available for local debugging/tests, but it is recorded as such.
+  strict_acceptance: false
   opencv_radius: 5
-  opencv_method: auto                  # auto picks the lower-seam Telea/NS fallback
+  opencv_method: auto                  # auto ranks Telea/NS by seam, texture, structure and residue
+  quality:                              # deterministic CPU-only candidate ranking weights
+    seam_weight: 1.0
+    texture_weight: 0.35
+    structure_weight: 0.20
+    residue_weight: 0.80
   mask_feather: 1                      # minimal edge soften on the union mask (0 = off)
   multipass_fraction: 0.12             # coarse→fine when removal area exceeds this fraction
   regional:
     enabled: true                       # crop-local routing; preserves one canonical union/plate
     min_context: 64
     max_context: 96
+    # local keeps a bounded crop; expanded multiplies context_scale; global gives the
+    # backend the full original source canvas. Every regional call still sees source-only
+    # context, never pixels generated for an earlier region.
+    context_mode: local                 # local | expanded | global
+    context_scale: 1.0
+    expanded_context_scale: 2.0
     min_crop: 256
     alignment: 16
     ring_radius: 24
@@ -262,6 +292,13 @@ inpaint:
     prompt: ""
     negative_prompt: ""
     required: false
+  # Optional user-provided PowerPaint bridge. No PowerPaint/CUDA package is bundled or
+  # validated on this machine. The adapter contract is inpaint(rgb, mask, cfg) -> RGB.
+  powerpaint:
+    enabled: false
+    adapter_module: ""                  # e.g. local_powerpaint_adapter on a GPU worker
+    callable: inpaint
+    required: false
   # Per-target removal-mask dilation (pixels). Buttons need more bleed so anti-aliased
   # shells and re-edits do not leave halos; photos stay tight to protect surroundings.
   mask_dilate:
@@ -281,10 +318,10 @@ preview: true                         # composite design.json -> preview.png + l
 
 figma:
   enabled: false                      # Figma export is OPTIONAL and can come later; preview is the default output
-  mode: plugin                        # plugin | clipboard
+  require_export: false               # acceptance runs: reject a local-preview-only result; require a fresh plugin export + report
+  mode: plugin                        # the production path; creates native nodes through the plugin
   inbox: ~/figma-inbox                # plugin mode staging folder
   bridge_port: 8790
-  # studio_path: C:/…/NEUEGEN/studio  # only for clipboard mode (reuses the kiwi encoder)
 
 qa:
   visual_pass_ssim: 0.9               # shared gate for pixel_diff, repair, and qa.ok

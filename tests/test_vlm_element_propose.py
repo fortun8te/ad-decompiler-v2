@@ -88,6 +88,26 @@ def test_fraction_to_pixel_helpers():
     assert box == {"x": 150, "y": 100, "w": 100, "h": 25}
 
 
+def test_intentional_raster_cluster_labels_are_accepted_as_photo_proposals():
+    parsed = vlm_element_propose._parse_proposals(json.dumps([{
+        "label": "nutrition_panel",
+        "approx_box_fraction": {"x": .1, "y": .2, "w": .5, "h": .4},
+    }]))
+    assert parsed == [{"label": "nutrition_panel",
+                       "approx_box_fraction": {"x": .1, "y": .2, "w": .5, "h": .4}}]
+    assert vlm_element_propose._LABEL_TO_KIND[parsed[0]["label"]] == "photo-fragment"
+
+
+def test_multi_panel_labels_are_accepted_as_photo_proposals():
+    parsed = vlm_element_propose._parse_proposals(json.dumps([
+        {"label": "panel", "approx_box_fraction": {"x": .0, "y": .1, "w": .3, "h": .8}},
+        {"label": "comparison_panel", "approx_box_fraction": {"x": .5, "y": .1, "w": .5, "h": .8}},
+    ]))
+    assert [item["label"] for item in parsed] == ["panel", "comparison_panel"]
+    assert all(vlm_element_propose._LABEL_TO_KIND[item["label"]] == "photo-fragment"
+               for item in parsed)
+
+
 def test_lightweight_grid_when_sam_count_below_threshold(tmp_path, monkeypatch):
     payload = json.dumps([{
         "label": "icon",

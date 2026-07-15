@@ -16,7 +16,26 @@ import time
 from pathlib import Path
 
 
-PROBES = ("ocr", "sam3", "vlm", "big_lama", "flux_comfy", "vectorization", "figma_staging")
+BASE_PROBES = ("ocr", "sam3", "vlm", "vectorization", "figma_staging")
+# All known probes. ``selected_probes`` chooses the route that the active config actually
+# requests, so an ordinary Big-LaMa setup is not falsely failed for an uninstalled Flux stack.
+PROBES = (*BASE_PROBES, "big_lama", "flux_comfy", "powerpaint")
+
+
+def selected_probes(cfg: dict) -> tuple[str, ...]:
+    """Return bounded probes for the configured inpaint route, not every optional model."""
+    inpaint = cfg.get("inpaint") or {}
+    mode = str(inpaint.get("mode", "auto")).lower()
+    if mode in ("flux_comfy", "flux-comfy", "flux"):
+        inpaint_probes = ("flux_comfy",)
+    elif mode in ("powerpaint", "power-paint"):
+        inpaint_probes = ("powerpaint",)
+    elif mode in ("opencv", "cv2"):
+        # Explicit OpenCV is useful for diagnosis, but it is not an RTX model claim.
+        inpaint_probes = ()
+    else:
+        inpaint_probes = ("big_lama",)
+    return ("ocr", "sam3", "vlm", *inpaint_probes, "vectorization", "figma_staging")
 
 
 def _fixture(directory: Path) -> tuple[Path, Path]:
@@ -137,6 +156,41 @@ def _probe_flux_comfy(cfg: dict, work: Path) -> dict:
     }
 
 
+def _probe_powerpaint(cfg: dict, work: Path) -> dict:
+    """Execute the configured optional adapter; importability alone is not proof."""
+    import numpy as np
+    from PIL import Image
+    from src import inpaint
+
+    image, mask = _fixture(work)
+    output = work / "powerpaint-inpainted.png"
+    probe_cfg = copy.deepcopy(cfg)
+    inpaint_cfg = probe_cfg.setdefault("inpaint", {})
+    inpaint_cfg["mode"] = "powerpaint"
+    inpaint_cfg["allow_fallback"] = False
+    inpaint_cfg["strict_acceptance"] = True
+    powerpaint = inpaint_cfg.setdefault("powerpaint", {})
+    powerpaint["enabled"] = True
+    powerpaint["required"] = True
+    result = inpaint.inpaint_once(str(image), str(mask), str(output), probe_cfg)
+    before = np.asarray(Image.open(image).convert("RGB"))
+    after = np.asarray(Image.open(output).convert("RGB"))
+    region = np.asarray(Image.open(mask).convert("L")) > 0
+    outside_identical = bool(np.array_equal(before[~region], after[~region]))
+    masked_mae = float(np.abs(before.astype(float) - after.astype(float))[region].mean())
+    same_shape = before.shape == after.shape
+    backend = str(result.get("backend") or "")
+    ok = backend == "powerpaint" and same_shape and outside_identical and masked_mae > 1
+    return {
+        "ok": ok,
+        "detail": (f"backend={backend}; shape_ok={same_shape}; "
+                   f"outside_identical={outside_identical}; masked_mae={masked_mae:.2f}"),
+        "evidence": {"backend": backend, "shape_ok": same_shape,
+                     "outside_identical": outside_identical,
+                     "masked_mae": round(masked_mae, 3)},
+    }
+
+
 def _probe_vectorization(cfg: dict, work: Path) -> dict:
     import numpy as np
     from PIL import Image, ImageDraw
@@ -178,6 +232,7 @@ def _probe_figma_staging(cfg: dict, work: Path) -> dict:
 
 _IMPLEMENTATIONS = {"ocr": _probe_ocr, "sam3": _probe_sam3, "vlm": _probe_vlm,
                     "big_lama": _probe_big_lama, "flux_comfy": _probe_flux_comfy,
+                    "powerpaint": _probe_powerpaint,
                     "vectorization": _probe_vectorization,
                     "figma_staging": _probe_figma_staging}
 
@@ -213,16 +268,17 @@ def _run_bounded(name: str, cfg: dict, work: Path, timeout_s: float) -> dict:
                 "detail": f"probe process exited {process.exitcode} without evidence"}
 
 
-def run_all(cfg: dict, output_dir: str | Path, *, probes=PROBES, timeout_s: float = 120) -> dict:
+def run_all(cfg: dict, output_dir: str | Path, *, probes=None, timeout_s: float = 120) -> dict:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    probes = tuple(probes) if probes is not None else selected_probes(cfg)
     checks = []
     for name in probes:
         if name not in _IMPLEMENTATIONS:
             checks.append({"name": name, "ok": False, "detail": "unknown probe"})
             continue
         checks.append(_run_bounded(name, cfg, output_dir / name, timeout_s))
-    report = {"version": 1, "ok": all(item.get("ok") for item in checks),
-              "checks": checks, "timeout_s": timeout_s}
+    report = {"version": 2, "ok": all(item.get("ok") for item in checks),
+              "checks": checks, "probes": list(probes), "timeout_s": timeout_s}
     (output_dir / "runtime_smoke.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report

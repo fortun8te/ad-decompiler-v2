@@ -3,10 +3,27 @@ import pytest
 
 from benchmark import (
     _entry, _harness_telemetry, _markdown, _source_manifest,
-    configure_auto_repair, parse_fixture_ids, select_images,
+    configure_auto_repair, configure_figma_acceptance, parse_fixture_ids,
+    requires_runtime_smoke, select_images,
 )
 from src import harness
 from src.harness import harness_enabled
+
+
+def test_real_model_configs_cannot_skip_benchmark_runtime_smoke():
+    assert requires_runtime_smoke({"runtime": {"require_active_models": True}}) is True
+    assert requires_runtime_smoke({"inpaint": {"strict_acceptance": True}}) is True
+    assert requires_runtime_smoke({"runtime": {"require_active_models": False},
+                                   "inpaint": {"strict_acceptance": False}}) is False
+
+
+def test_figma_acceptance_forces_fresh_plugin_evidence_and_a_nonzero_wait():
+    cfg = {"figma": {"enabled": False, "require_export": False}, "export_wait_s": 0}
+
+    configure_figma_acceptance(cfg, 0)
+
+    assert cfg["figma"] == {"enabled": True, "require_export": True}
+    assert cfg["export_wait_s"] == 1
 
 
 def _fixture_run(tmp_path, *, qa=None, harness_loop=None, harness_legacy=None, critic=None, fixer=None):
@@ -130,8 +147,8 @@ def test_no_auto_repair_forces_legacy_and_harness_switches_off():
     assert harness_enabled(cfg) is False
 
 
-def test_harness_max_rounds_defaults_to_three():
-    assert harness.harness_max_rounds({}) == 3
+def test_harness_max_rounds_defaults_to_two():
+    assert harness.harness_max_rounds({}) == 2
     assert harness.harness_max_rounds({"runtime": {"harness": {"max_rounds": 5}}}) == 5
 
 
@@ -221,7 +238,14 @@ def test_benchmark_scorecard_surfaces_each_visual_failure_rule(tmp_path):
 def test_entry_surfaces_existing_archetype_preset_and_regional_dispositions(tmp_path):
     run = _fixture_run(tmp_path)
     design = json.loads((run / "design.json").read_text())
-    design["meta"].update({"archetype": "social_screenshot", "preset": "instagram_caption"})
+    design["meta"].update({
+        "archetype": "social_screenshot", "preset": "instagram_caption",
+        "native_leaf_ratio": 0.625,
+        "leaf_accounting": {
+            "intentional_raster_cluster_count": 2,
+            "unexplained_raster_count": 0,
+        },
+    })
     (run / "design.json").write_text(json.dumps(design), encoding="utf-8")
     reconstruction = json.loads((run / "reconstruction.json").read_text())
     reconstruction["stats"]["inpaint"] = {
@@ -241,5 +265,8 @@ def test_entry_surfaces_existing_archetype_preset_and_regional_dispositions(tmp_
     assert row["archetype"] == "social_screenshot"
     assert row["preset"] == "instagram_caption"
     assert row["editable_text_recall"] == 0.875
+    assert row["native_leaf_ratio"] == 0.625
+    assert row["intentional_raster_clusters"] == 2
+    assert row["unexplained_raster_fallbacks"] == 0
     assert row["regional_inpaint_routes"] == {"flux-comfy": 1, "big-lama": 1}
     assert row["fallback_dispositions"][0]["fallback_reason"] == "flat-large-hole"

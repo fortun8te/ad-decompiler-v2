@@ -615,6 +615,63 @@ def _painted_geometry(image, line: dict) -> tuple[dict, dict, str, float, Any, d
     return painted, baseline, colour, confidence, tight_mask, paint
 
 
+def _native_text_decoration(mask, text: str) -> tuple[Optional[str], Optional[dict]]:
+    """Recognize only an unmistakable continuous underline/strike rule.
+
+    Short glyph bars (E, T, hyphens) must not turn into Figma text decoration.  We
+    therefore require a nearly continuous run spanning most of the painted text width.
+    Anything ambiguous remains part of the exact text fallback/plate pixels.
+    """
+    if mask is None or not str(text or "").strip() or "_" in str(text):
+        return None, None
+    try:
+        import numpy as np
+
+        ink = np.asarray(mask, dtype=bool)
+        if ink.ndim != 2 or min(ink.shape) < 3:
+            return None, None
+        h, w = ink.shape
+        if w < 12:
+            return None, None
+        longest = []
+        for row in ink:
+            padded = np.pad(row.astype(np.int8), (1, 1))
+            edges = np.diff(padded)
+            starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+            longest.append(int(np.max(ends - starts)) if len(starts) else 0)
+        longest = np.asarray(longest)
+        strong = longest >= max(10, int(round(w * 0.72)))
+        runs = []
+        start = None
+        for idx, value in enumerate(np.r_[strong, False]):
+            if value and start is None:
+                start = idx
+            elif not value and start is not None:
+                runs.append((start, idx - 1))
+                start = None
+        if not runs:
+            return None, None
+        y0, y1 = max(runs, key=lambda pair: longest[pair[0]:pair[1] + 1].max())
+        thickness = y1 - y0 + 1
+        if thickness > max(3, int(round(h * 0.13))):
+            return None, None
+        centre = (y0 + y1) / 2.0 / max(1.0, h - 1)
+        if centre >= 0.80:
+            kind = "UNDERLINE"
+        elif 0.34 <= centre <= 0.66:
+            kind = "STRIKETHROUGH"
+        else:
+            return None, None
+        confidence = min(1.0, float(longest[y0:y1 + 1].max()) / max(1.0, w))
+        return kind, {
+            "source": "continuous-source-rule", "confidence": round(confidence, 4),
+            "relative_y": round(centre, 4), "thickness_px": thickness,
+            "mask_rows": [int(y0), int(y1)],
+        }
+    except Exception:
+        return None, None
+
+
 # ---------------------------------------------------------------------------
 # Typography estimates and optional font matching
 
@@ -1323,6 +1380,75 @@ def _base_style(line: dict, painted: dict, colour: str, ink_confidence: float,
     }
 
 
+def _enrich_word_styles(image, line: dict, config: dict) -> None:
+    """Attach conservative, pixel-evidenced style overrides to OCR words.
+
+    A single OCR line can contain e.g. ``ONLY $19`` where the price changes colour,
+    size or weight.  Treating the whole line as one style loses that design.  We do
+    *not* independently guess a font for every word: the proven line family remains
+    the base and only large, measurable paint/geometry differences become overrides.
+    No image (or weak/ambiguous evidence) means no word runs downstream.
+    """
+    if image is None or not line.get("words") or not line.get("style"):
+        return
+    base = line["style"]
+    base_size = max(1.0, _num(base.get("fontSize"), 16.0))
+    base_weight = int(round(_num(base.get("fontWeight"), 400)))
+    base_colour = str(base.get("color") or "#000000")
+    min_conf = _num(config.get("word_style_min_ink_confidence"), 0.42)
+    colour_delta = _num(config.get("word_style_color_distance"), 58.0)
+    size_ratio_gate = _num(config.get("word_style_size_ratio"), 1.16)
+    weight_delta = int(_num(config.get("word_style_weight_delta"), 180))
+
+    for raw_word in line.get("words") or []:
+        if not isinstance(raw_word, dict) or not str(raw_word.get("text") or "").strip():
+            continue
+        word = raw_word
+        word["box"] = _clean_box(word.get("box"))
+        painted, _baseline, colour, ink_conf, mask, paint = _painted_geometry(image, word)
+        if ink_conf < min_conf:
+            continue
+        geo = _pre_font_signals(word, painted, mask, config)
+        measured_size = max(1.0, _num(geo.get("font_size"), base_size))
+        measured_weight = int(round(_num(geo.get("weight"), base_weight)))
+        ratio = max(measured_size, base_size) / max(1.0, min(measured_size, base_size))
+        colour_changed = _colour_distance(colour, base_colour) >= colour_delta
+        size_changed = ratio >= size_ratio_gate
+        weight_changed = abs(measured_weight - base_weight) >= weight_delta
+        shear = geo.get("shear_angle")
+        italic_changed = bool(shear is not None and abs(shear) >= _num(config.get("italic_shear_deg"), 6.0)) \
+            != ("italic" in str(base.get("fontStyle") or "").lower())
+        if not any((colour_changed, size_changed, weight_changed, italic_changed)):
+            continue
+        style = copy.deepcopy(base)
+        # Keep the line's matched family/candidates. Only promote signals that passed
+        # their own strong gate, avoiding anti-aliasing noise becoming Figma runs.
+        if colour_changed:
+            style["color"] = colour
+            style["colorRGB"] = list(_hex_rgb(colour))
+            style["fill"] = (paint or {}).get("fill") or {"kind": "flat", "color": colour}
+            style["stroke"] = (paint or {}).get("stroke")
+        if size_changed:
+            style["fontSize"] = round(measured_size, 2)
+            style["lineHeight"] = round(max(measured_size * 1.15, painted["h"]), 2)
+        if weight_changed:
+            style["fontWeight"] = measured_weight
+            style["fontStyle"] = _style_name(
+                measured_weight, italic="italic" in str(style.get("fontStyle") or "").lower()
+            )
+        if italic_changed:
+            italic = bool(shear is not None and abs(shear) >= _num(config.get("italic_shear_deg"), 6.0))
+            style["fontStyle"] = _style_name(int(style.get("fontWeight", base_weight)), italic=italic)
+        word["style"] = style
+        word["style_evidence"] = {
+            "source": "word-pixels", "confidence": round(float(ink_conf), 4),
+            "changed": [name for name, changed in (
+                ("color", colour_changed), ("size", size_changed),
+                ("weight", weight_changed), ("italic", italic_changed),
+            ) if changed],
+        }
+
+
 # ---------------------------------------------------------------------------
 # Roles, paragraph grouping, alignment, hierarchy and repeated styles
 
@@ -1694,10 +1820,21 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
         line["rotation_deg"] = line["rotation"]
         line["ink_confidence"] = ink_confidence
         masks[line["id"]] = mask
-        geo = _pre_font_signals(line, painted, mask, config)
+        decoration, decoration_evidence = _native_text_decoration(mask, line.get("text", ""))
+        font_mask = mask
+        if decoration_evidence and mask is not None:
+            try:
+                font_mask = mask.copy()
+                row0, row1 = decoration_evidence["mask_rows"]
+                font_mask[row0:row1 + 1, :] = False
+            except Exception:
+                font_mask = mask
+        geo = _pre_font_signals(line, painted, font_mask, config)
         prepared.append({
             "line": line, "painted": painted, "colour": colour,
-            "ink_confidence": ink_confidence, "mask": mask, "paint": paint, "geo": geo,
+            "ink_confidence": ink_confidence, "mask": mask, "font_mask": font_mask,
+            "paint": paint, "geo": geo, "decoration": decoration,
+            "decoration_evidence": decoration_evidence,
         })
 
     # Pass 2: font matching by style-cluster representative. Lines that share a
@@ -1722,7 +1859,7 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
             if rep_item["ink_confidence"] < min_ink:
                 continue
             candidates = _resolve_font_candidates(
-                rep_item["line"].get("text", ""), rep_item["mask"],
+                rep_item["line"].get("text", ""), rep_item["font_mask"],
                 rep_item["geo"], font_options,
             )
             if candidates:
@@ -1737,9 +1874,15 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
         line = item["line"]
         preset = preset_by_index.get(i)
         line["style"] = _base_style(
-            line, item["painted"], item["colour"], item["ink_confidence"], item["mask"],
+            line, item["painted"], item["colour"], item["ink_confidence"], item["font_mask"],
             config, font_options, item["geo"], preset_candidates=preset, paint=item["paint"],
         )
+        decoration = item["decoration"]
+        decoration_evidence = item["decoration_evidence"]
+        if decoration:
+            line["style"]["textDecoration"] = decoration
+            line.setdefault("meta", {})["text_decoration_evidence"] = decoration_evidence
+        _enrich_word_styles(image, line, config)
 
         font_confidence = None
         candidates = line["style"].get("fontCandidates") or []

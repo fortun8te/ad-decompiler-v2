@@ -14,11 +14,12 @@ run_pipeline.py --input ad.png --output ./runs/run_001
   6 sam3_detect.detect(normalized, residual, cfg)    -> sam3.json + sam3_masks/*.png
   7 element_fusion.fuse(sam3,residual,qwen,...)      -> fused_elements.json + canonical masks
   8 merge_layers.merge(...) + routing.route(...)     -> merged.json
-  9 reconstruct.reconstruct(...)                     -> ownership/removal/background/assets
- 10 layout.infer(...)                                -> layout.json (nested scene graph)
- 11 build_design_json.build(...)                     -> design.json v2 [SOURCE OF TRUTH]
- 12 figma_import/import plugin                       -> native Figma nodes + figma_export.png
- 13 pixel_diff + structural QA                       -> diff.png + qa.json
+  9 scene_intent.plan(merged,...)                    -> scene_intent.json (frozen hierarchy/layout)
+ 10 reconstruct.reconstruct(merged,...)              -> ownership/removal/background/assets
+ 11 scene_intent.hydrate(intent,reconstruction)      -> layout.json (nested scene graph)
+ 12 build_design_json.build(...)                     -> design.json v2 [SOURCE OF TRUTH]
+ 13 figma_import/import plugin                       -> native Figma nodes + figma_export.png
+ 14 pixel_diff + structural QA                       -> diff.png + qa.json
 ```
 
 ## Routing rules (routing.py — the crown jewel, ported from the validated Node harness)
@@ -45,6 +46,17 @@ run_pipeline.py --input ad.png --output ./runs/run_001
    Canonical entities create one union removal mask and one inpainted background plate.
 6. Raw model observations never become Figma layers directly. Mask-aware fusion assigns each
    observation to one canonical entity before assets, inpainting, or grouping.
+7. Hierarchy, parentage, and Auto Layout are planned from canonical merged entities before
+   reconstruction. Reconstruction may attach paint/assets to that plan, but may not silently
+   replace it; an unreconciled run uses legacy layout only as a recorded degradation. Explicit
+   replacement assets (such as before/after splits) may occupy their planned source leaf only
+   when they declare that source and remain inside its frozen bounds.
+8. A complex gradient, texture, illustration, or photographic background stays a raster clean
+   plate. Pixels outside the removal union are byte-identical to the source; only genuinely
+   hidden pixels inside that union are synthesized. Do not force an abstract background through
+   a vector tracer. A simple, strongly proven gradient surface may still become a native shape.
+9. Straight divider/rule geometry stays a native thin Figma bar. Arrows and decorative lines may
+   become vectors only when the SVG render-back gate passes; otherwise keep the exact alpha raster.
 
 ## Config keys (config.yaml) the modules read
 ```yaml
@@ -63,5 +75,5 @@ vectorize:
 upscale:
   enabled: true                    # Real-ESRGAN for compressed Meta Library assets
 figma:
-  mode: plugin                     # plugin | clipboard
+  mode: plugin                     # native-node Figma plugin (the only supported import path)
 ```

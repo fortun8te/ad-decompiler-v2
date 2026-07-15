@@ -26,6 +26,15 @@ The scripts create the environment, install the dependencies, check CUDA/OCR/SAM
 local Figma bridge, and run the benchmark. Use the longer commands below only when you need to
 change the installation manually.
 
+To make setup execute the backend currently selected in `config.yaml`, rather than only checking
+files and ports, use:
+
+```powershell
+.\setup_rtx.ps1 -DeepDoctor
+```
+
+This is an RTX-only operation. It is deliberately not treated as having run on the Mac.
+
 Use Python 3.12 and current Blackwell-compatible CUDA wheels:
 
 ```powershell
@@ -64,6 +73,59 @@ Run `.\.venv\Scripts\python.exe doctor.py`. Every failed item now includes a dir
 PaddleOCR and Surya are attempted separately because their Windows packages can conflict with
 Blackwell. Either may warn and skip without breaking the working docTR OCR path.
 
+## Choose and prove the inpaint backend
+
+`inpaint.mode` is the model claim for an acceptance run. `strict_acceptance: true` makes
+`doctor.py` reject a missing selected Flux or PowerPaint route instead of accepting a later
+fallback as equivalent evidence.
+
+For local Flux Fill, install the weights into the actual ComfyUI installation, then expose that
+directory in the config so doctor can inspect it:
+
+```powershell
+.\scripts\setup_flux_inpaint.ps1 -ComfyDir "C:\ComfyUI"
+```
+
+```yaml
+inpaint:
+  mode: flux_comfy
+  strict_acceptance: true
+  comfy:
+    enabled: true
+    required: true
+    comfy_dir: C:\ComfyUI
+```
+
+Flux readiness means the workflow file exists, ComfyUI answers, and the local GGUF/encoder/VAE
+files are visible. It still is not proof of an actual inpaint. Run `doctor.py --deep` or
+`Start Bridge.bat -SelfTest`; those submit a small masked image and require the result to report
+`flux-comfy` with untouched pixels outside the mask.
+
+PowerPaint is intentionally **not** downloaded or named by this repository. Supply your own
+RTX-side adapter, then configure its import path and callable:
+
+```yaml
+inpaint:
+  mode: powerpaint
+  strict_acceptance: true
+  allow_fallback: false
+  powerpaint:
+    enabled: true
+    required: true
+    adapter_module: your_powerpaint_adapter
+    callable: inpaint
+```
+
+The adapter contract is `inpaint(rgb_uint8, mask_uint8, cfg) -> RGB image | None`. Doctor only
+checks that this explicit adapter is configured and importable; it does not claim the weights or
+CUDA model are ready. The selected PowerPaint runtime smoke is the proof: it invokes that adapter
+with fallback disabled and records `backend=powerpaint`, mask-local change, and unchanged pixels
+outside the hole. Keep the resulting `runtime_smoke.json` / `self_test.json` with the benchmark.
+When `runtime.require_active_models: true` (the default acceptance config) or
+`strict_acceptance` is enabled, `start_rtx.ps1` checks this cached self-test automatically before
+it starts a benchmark. If the config or code changed, it reruns the real OCR/SAM/Gemma/selected-
+inpaint probes rather than treating dependency checks as quality evidence.
+
 ## Prove the models actually run
 
 `doctor.py` checks dependency readiness. It is not runtime proof. Once it says READY, run:
@@ -72,8 +134,22 @@ Blackwell. Either may warn and skip without breaking the working docTR OCR path.
 Start Bridge.bat -SelfTest
 ```
 
-This executes bounded real OCR, SAM 3, Gemma vision, Big-LaMa, VTracer and Figma staging probes,
-then one integrated synthetic pipeline. It writes `runs\rtx-self-test\latest.json`, the input,
+For a final Codia-parity benchmark, use the explicit Figma-acceptance launcher flag. It prevents
+a local preview from being counted as a Figma result: each screen must receive a fresh plugin
+export and report from Figma Desktop.
+
+Use named fixture IDs for a repeatable, reviewable subset instead of trusting directory order:
+
+```powershell
+.\start_rtx.ps1 -InputDir "C:\images\IMAGE AD INSPO" -Ids 002,010,017,020 -Output runs\codia-parity -RequireFigma -FigmaWaitS 120
+```
+
+Keep the plugin open. The benchmark pauses for each image until its matching Figma import posts
+the export/report; it fails rather than silently using the local preview if that proof is missing
+or stale. Do not combine `-RequireFigma` with `-NoBridge`.
+
+This executes bounded real OCR, SAM 3, Gemma vision, the inpaint backend selected in config,
+VTracer and Figma staging probes, then one integrated synthetic pipeline. It writes `runs\rtx-self-test\latest.json`, the input,
 model artifacts, `runtime_report.json`, and a fingerprinted `self_test.json`. A normal bridge
 restart only reads that cache. It asks for another test after relevant code/config changes or
 seven days. Use `Start Bridge.bat -ForceSelfTest` after changing drivers, CUDA, or model files.
@@ -93,13 +169,16 @@ OCR engine, or SAM's local image checkpoint is missing; optional fallbacks are s
 Run `pytest -q` after cloning only if you are changing code.
 
 The benchmark runs the same preflight itself and writes `doctor.json` beside the scorecard.
+With the supplied acceptance config it also runs the bounded real-model smoke automatically,
+even when you call `python benchmark.py` directly instead of the launcher.
 Every run also writes `runtime_report.json`: `ok` means no model degraded, `degraded` means an
 advisory path (normally Qwen) fell back, and a listed `violation` means a required OCR/SAM model
 did not run and the benchmark is invalid. Do not use `--skip-doctor` for acceptance evidence.
 
 VTracer, Big-LaMa, and the SVG render-back checker are installed by setup. Potrace on `PATH` is
-an optional monochrome backup. OpenCV inpainting remains available for diagnosis, but an
-acceptance benchmark will fail until Big-LaMa is working.
+an optional monochrome backup. OpenCV inpainting remains available for diagnosis, but strict
+acceptance must use and smoke-prove the selected active route; it cannot represent Flux or
+PowerPaint evidence.
 
 ## First real run
 

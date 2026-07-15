@@ -347,3 +347,8 @@ def test_convergence_config_keys_are_reportable():
     assert harness_loop.plateau_round_limit(cfg) == 3
     assert harness_loop.convergence_epsilon({}) == harness_loop._DEFAULT_EPSILON
     assert harness_loop.plateau_round_limit({}) == harness_loop._DEFAULT_PLATEAU_ROUNDS
+
+
+def test_default_harness_budget_is_bounded_to_two_measured_repairs():
+    assert harness_loop.max_harness_rounds({}) == 2
+    assert harness_loop.repair_iterations({}) == 1

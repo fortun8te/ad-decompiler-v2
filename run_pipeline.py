@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from src.console_io import configure_stdio, safe_print
 from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  element_fusion, qwen_worker, merge_layers, reconstruct, layout,
+                 scene_intent,
                  build_design_json, figma_import, pixel_diff, repair, render_preview,
                  vlm_proofread, vlm_ocr_judge, vlm_font_judge, vlm_scene_text,
                  vlm_segment_filter, vlm_element_propose, vram)
@@ -29,7 +30,7 @@ from src.qa_config import pixel_diff_thresholds, visual_pass_ssim
 configure_stdio()
 
 STAGES = ["normalize", "ocr", "text", "residual", "qwen", "sam", "elements",
-          "merge", "reconstruct", "layout", "design", "preview", "figma",
+          "merge", "structure", "reconstruct", "layout", "design", "preview", "figma",
           "export", "diff", "qa"]
 
 
@@ -144,13 +145,18 @@ def _artifact_ready(path: str) -> bool:
             if name in ("residual.json", "qwen.json", "fused_elements.json",
                         "elements.json", "merged.json", "layout.json"):
                 return isinstance(value, list)
+            if name == "scene_intent.json":
+                return (isinstance(value, dict)
+                        and value.get("schema_version") == scene_intent.SCHEMA_VERSION
+                        and isinstance(value.get("tree"), list)
+                        and isinstance(value.get("planned_source_ids"), list))
             if name == "sam3.json":
                 return isinstance(value, dict) and isinstance(value.get("elements", []), list)
             if name == "reconstruction.json":
                 if not (isinstance(value, dict) and isinstance(value.get("candidates"), list)
                         and isinstance(value.get("stats"), dict)):
                     return False
-                for key in ("background", "removal_mask", "ownership"):
+                for key in ("background", "removal_mask", "ownership", "removal_ownership"):
                     asset = value.get(key)
                     if not asset or not _artifact_ready(os.path.join(os.path.dirname(path), asset)):
                         return False
@@ -217,6 +223,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
     current_stage = "normalize"
     dirty = False
     design_updated = False
+    structure_degraded = False
     try:
         # 1 normalize
         if stage("normalize") or dirty or not exists("normalized.png"):
@@ -381,13 +388,35 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             _log(run_dir, f"element fusion → {len(fused)} canonical → {len(els)} after filter")
         els = load(A("elements.json")) if exists("elements.json") else load(A("fused_elements.json"))
 
-        # 6 merge/routing creates semantic candidates; reconstruction gives pixels one owner.
+        # 6 merge/routing creates semantic candidates.  Freeze the hierarchy before
+        # reconstruction changes asset material or removes pixels for the clean plate.
         if stage("merge") or dirty or not exists("merged.json"):
             current_stage = "merge"
             dirty = True
             merged = merge_layers.merge(ocr_res, els, qwen, canvas, cfg, run_dir=run_dir)
             dump(merged, A("merged.json")); _log(run_dir, f"merge → {len(merged)} candidates")
         merged = load(A("merged.json"))
+
+        intent = load(A("scene_intent.json")) if exists("scene_intent.json") else None
+        intent_stale = not scene_intent.is_current(intent, merged, canvas, cfg)
+        if stage("structure") or dirty or intent_stale:
+            current_stage = "structure"
+            dirty = True
+            try:
+                intent = scene_intent.plan(merged, canvas, cfg)
+                dump(intent, A("scene_intent.json"))
+                report.stage("structure", "ok", artifacts=["scene_intent.json"])
+                _log(run_dir, f"structure → {len(intent.get('tree') or [])} root layers")
+            except Exception as exc:
+                # Reconstructing and compiling the canonical leaves is still safer than
+                # aborting a run.  The later legacy-layout fallback is deliberately a
+                # required degradation, never a hidden substitute for structure-first.
+                detail = f"scene intent planning failed; legacy layout required: {exc}"
+                report.stage("structure", "fallback", detail=detail, artifacts=["merged.json"])
+                report.degraded("structure", detail, required=True)
+                runtime_violations = report.violations
+                structure_degraded = True
+                _log(run_dir, f"structure fallback → {detail}")
 
         if stage("reconstruct") or dirty or not exists("reconstruction.json"):
             current_stage = "reconstruct"
@@ -431,24 +460,40 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             current_stage = "layout"
             dirty = True
             try:
-                tree = layout.infer(reconstruction.get("candidates", []), canvas, cfg)
+                tree = scene_intent.hydrate(intent, reconstruction)
+                _log(run_dir, f"layout → hydrated {len(tree)} structure-first root layers")
             except Exception as exc:
-                # Layout is an optimization, not the source of visual pixels. Preserve the
-                # canonical flat scene and mark it failed instead of losing the whole design.
-                tree = []
-                for candidate in reconstruction.get("candidates", []):
-                    if not isinstance(candidate, dict) or candidate.get("target") == "drop":
-                        continue
-                    item = copy.deepcopy(candidate)
-                    item.setdefault("constraints", {"horizontal": "LEFT", "vertical": "TOP"})
-                    item.setdefault("meta", {})["layout_fallback"] = True
-                    tree.append(item)
-                detail = f"layout inference failed; preserved {len(tree)} flat layer(s): {exc}"
-                report.stage("layout", "fallback", detail=detail, artifacts=["layout.json"])
-                report.degraded("layout", detail, required=True)
-                runtime_violations = report.violations
+                # A mismatch means reconstruction made a structural decision that the
+                # frozen intent cannot safely explain.  Retain the old path for this run,
+                # but make the loss of structure-first evidence an acceptance failure.
+                detail = f"scene intent hydration failed; used legacy layout: {exc}"
+                if not structure_degraded:
+                    report.stage("structure", "fallback", detail=detail,
+                                 artifacts=["scene_intent.json", "reconstruction.json"])
+                    report.degraded("structure", detail, required=True)
+                    runtime_violations = report.violations
+                    structure_degraded = True
+                try:
+                    tree = layout.infer(reconstruction.get("candidates", []), canvas, cfg)
+                    _log(run_dir, f"layout legacy fallback → {len(tree)} root layers")
+                except Exception as layout_exc:
+                    # Layout is an optimization, not the source of visual pixels. Preserve
+                    # the canonical flat scene rather than losing the whole design.
+                    tree = []
+                    for candidate in reconstruction.get("candidates", []):
+                        if not isinstance(candidate, dict) or candidate.get("target") == "drop":
+                            continue
+                        item = copy.deepcopy(candidate)
+                        item.setdefault("constraints", {"horizontal": "LEFT", "vertical": "TOP"})
+                        item.setdefault("meta", {})["layout_fallback"] = True
+                        tree.append(item)
+                    detail = (f"legacy layout inference failed; preserved {len(tree)} flat "
+                              f"layer(s): {layout_exc}")
+                    report.stage("layout", "fallback", detail=detail, artifacts=["layout.json"])
+                    report.degraded("layout", detail, required=True)
+                    runtime_violations = report.violations
             dump(tree, A("layout.json"))
-            _log(run_dir, f"layout → {len(tree)} root layers")
+            _log(run_dir, f"layout.json → {len(tree)} root layers")
         tree = load(A("layout.json"))
 
         # 8 schema-v2 Figma scene graph (source of truth)
@@ -494,6 +539,10 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         use_figma_export = _artifact_at_least_as_fresh(
             A("figma_export.png"), A("design.json")
         )
+        # A local preview is valuable while developing, but it is not evidence that Figma
+        # interpreted the generated document correctly.  Parity/acceptance runs opt into
+        # this strict gate and must supply a fresh export plus the plugin report.
+        require_figma_export = bool((cfg.get("figma") or {}).get("require_export", False))
         qa_render = A("figma_export.png") if use_figma_export else \
             (A("preview.png") if exists("preview.png") else None)
         if (stage("diff") or stage("qa")) and qa_render:
@@ -523,8 +572,15 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                                                 thresholds=pixel_diff_thresholds(cfg),
                                                 structural={
                                                     "require_figma_report": bool(
-                                                        use_figma_export and cfg.get("figma", {}).get("enabled")
+                                                        require_figma_export or (
+                                                            use_figma_export and cfg.get("figma", {}).get("enabled")
+                                                        )
                                                     ),
+                                                    # A real Figma acceptance run must account
+                                                    # for raster safety separately from native
+                                                    # editability. Wrapper frames are not proof
+                                                    # that their image-only contents are editable.
+                                                    "require_native_accounting": require_figma_export,
                                                 })
             except Exception as exc:
                 # A minimal independent pixel judge keeps the run inspectable, but can never
@@ -558,6 +614,11 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 structural_fails.append({"rule": "unclean-background", "detail": "background is not the reconstructed plate"})
             if (design_data.get("meta") or {}).get("editable_ratio", 0) <= 0 and ocr_res.get("lines"):
                 structural_fails.append({"rule": "no-editable-content", "detail": "source text exists but output has no editable nodes"})
+            if require_figma_export and not use_figma_export:
+                structural_fails.append({
+                    "rule": "figma-export-missing",
+                    "detail": "acceptance requires a fresh Figma plugin export; local preview is not sufficient",
+                })
             combined_fails = list(qa_partial.get("hard_fails") or [])
             # Required model fallback is an acceptance failure.  The full reason is persisted
             # in runtime_report.json even where a render is unavailable.

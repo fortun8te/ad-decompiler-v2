@@ -170,6 +170,37 @@ def test_photo_card_suppresses_contained_scene_ocr_but_preserves_overlay_copy(tm
     assert by_id["caption"]["target"] == "text"
 
 
+def test_intentional_raster_cluster_uses_full_source_crop_and_keeps_only_positive_overlay(tmp_path):
+    source = tmp_path / "receipt-source.png"
+    image = Image.new("RGB", (140, 100), (230, 230, 230))
+    ImageDraw.Draw(image).rectangle((20, 20, 119, 79), fill=(40, 120, 190))
+    image.save(source)
+    # A loose circular SAM matte must not erase source-crop corners for a receipt/UI/table.
+    matte = Image.new("L", (100, 60), 0)
+    ImageDraw.Draw(matte).ellipse((12, 2, 87, 57), fill=255)
+    matte.save(tmp_path / "loose-mask.png")
+    candidates = [
+        {"id": "receipt", "target": "image", "box": {"x": 20, "y": 20, "w": 100, "h": 60},
+         "mask": {"kind": "rrect", "radius": 0, "src": "loose-mask.png"},
+         "meta": {"role": "receipt", "intentional_raster_cluster": True}},
+        {"id": "printed", "target": "text", "text": "subtotal",
+         "box": {"x": 35, "y": 44, "w": 45, "h": 10}, "meta": {"source": "ocr"}},
+        {"id": "offer", "target": "text", "text": "External sale",
+         "box": {"x": 30, "y": 26, "w": 70, "h": 10},
+         "meta": {"source": "ocr", "overlay_text": True, "parent_id": "receipt"}},
+    ]
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates, str(tmp_path),
+                                     {"inpaint": {"mode": "opencv", "mask_dilate": 0}})
+    by_id = {item["id"]: item for item in result["candidates"]}
+    receipt = Image.open(tmp_path / by_id["receipt"]["src"]).convert("RGBA")
+    assert receipt.getpixel((0, 0))[3] == 255
+    assert receipt.getpixel((99, 59))[3] == 255
+    assert by_id["receipt"]["mask"]["kind"] == "rrect"
+    assert by_id["printed"]["target"] == "drop"
+    assert by_id["printed"]["meta"]["baked_owner_id"] == "receipt"
+    assert by_id["offer"]["target"] == "text"
+
+
 def test_comparison_policy_keeps_contained_column_copy_editable(tmp_path):
     source = tmp_path / "comparison-text.png"
     Image.new("RGB", (200, 120), (80, 90, 100)).save(source)
@@ -570,6 +601,43 @@ def test_shape_style_extracts_gradient_and_keeps_native_paint_fields(tmp_path):
     assert shape["meta"]["style_extraction"]["gradient"]["r2"] > .95
 
 
+def test_shape_style_extracts_only_strong_centered_radial_gradient(tmp_path):
+    source = tmp_path / "radial-gradient.png"
+    h, w = 140, 180
+    yy, xx = np.mgrid[0:h, 0:w]
+    cx, cy = (w - 1) / 2, (h - 1) / 2
+    radius = np.hypot(xx - cx, yy - cy) / np.hypot(cx, cy)
+    start = np.array([250, 220, 80], dtype=float)
+    end = np.array([35, 55, 180], dtype=float)
+    pixels = np.clip(start[None, None, :] + radius[:, :, None] * (end - start), 0, 255).astype(np.uint8)
+    Image.fromarray(pixels).save(source)
+    mask = Image.new("L", (w, h), 255)
+
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []},
+        [_shape_candidate(tmp_path, "radial", {"x": 0, "y": 0, "w": w, "h": h}, mask)],
+        str(tmp_path), {"inpaint": {"mode": "opencv"}},
+    )
+
+    shape = result["candidates"][0]
+    assert shape["fill"]["kind"] == "radial"
+    assert shape["meta"]["style_extraction"]["gradient"]["r2"] > .98
+    assert shape["meta"]["style_extraction"]["gradient"]["center"] == [0.5, 0.5]
+
+
+def test_off_center_fuzzy_field_is_not_claimed_as_native_radial():
+    h, w = 100, 140
+    yy, xx = np.mgrid[0:h, 0:w]
+    radius = np.hypot(xx - 15, yy - 20) / np.hypot(w, h)
+    # Add an angular component: this is a soft lighting/texture field, not the exact
+    # centered circular paint supported by the compiler.
+    values = 220 - 100 * radius + 28 * np.sin(xx / 9) * np.cos(yy / 11)
+    rgb = np.stack((values, values * .8, 255 - values * .45), axis=2).clip(0, 255).astype(np.uint8)
+    radial = reconstruct._radial_gradient_fill(rgb, np.ones((h, w), dtype=bool))
+
+    assert radial is None
+
+
 def test_shape_style_extracts_stroke_and_real_corner_radius(tmp_path):
     source = tmp_path / "rounded-stroke.png"
     image = Image.new("RGB", (140, 110), "white")
@@ -779,3 +847,60 @@ def test_soft_product_alpha_is_solidified_before_inpaint(tmp_path):
 
 def test_list_provenance_is_not_treated_as_verified_sam_evidence():
     assert reconstruct._verified_semantic_mask({"provenance": []}) is False
+
+
+def test_text_mask_stays_ink_shaped_by_default():
+    image = np.full((200, 300, 3), 230, dtype=np.uint8)
+    image[80:96, 120:125] = 20
+    candidate = {
+        "id": "thin-copy", "target": "text", "text": "I",
+        "box": {"x": 110, "y": 75, "w": 50, "h": 25},
+        "meta": {"role": "body"},
+    }
+
+    mask = reconstruct._candidate_mask(candidate, image, None, cfg={})
+    box_area = candidate["box"]["w"] * candidate["box"]["h"]
+
+    assert 0 < np.count_nonzero(mask) < box_area * 0.35
+
+
+def test_text_box_promotion_is_explicit_opt_in():
+    image = np.full((200, 300, 3), 230, dtype=np.uint8)
+    image[80:96, 120:125] = 20
+    candidate = {
+        "id": "thin-copy", "target": "text", "text": "I",
+        "box": {"x": 110, "y": 75, "w": 50, "h": 25},
+        "meta": {"role": "body"},
+    }
+
+    mask = reconstruct._candidate_mask(
+        candidate, image, None,
+        cfg={"reconstruct": {"text_box_promote_max_fraction": 0.06}},
+    )
+
+    assert np.count_nonzero(mask) > candidate["box"]["w"] * candidate["box"]["h"]
+
+
+def test_removal_ledger_makes_overlapping_regions_exclusive():
+    left = np.zeros((50, 80), dtype=np.uint8)
+    right = np.zeros_like(left)
+    left[10:35, 10:45] = 255
+    right[20:45, 30:70] = 255
+    observations = [
+        {"id": "back", "target": "image", "role": "product", "z": 1,
+         "box": {"x": 10, "y": 10, "w": 35, "h": 25},
+         "mask_array": left, "dilate": 0},
+        {"id": "front", "target": "text", "role": "headline", "z": 2,
+         "box": {"x": 30, "y": 20, "w": 40, "h": 25},
+         "mask_array": right, "dilate": 0},
+    ]
+
+    records, union, ledger, owner_index = reconstruct._build_removal_ledger(
+        observations, (80, 50),
+    )
+
+    assert len(records) == 2
+    assert set(owner_index.values()) == {"front", "back"}
+    assert np.array_equal(union > 0, (left > 0) | (right > 0))
+    assert set(np.unique(ledger)) == {0, 1, 2}
+    assert not np.any((records[0]["mask_array"] > 0) & (records[1]["mask_array"] > 0))

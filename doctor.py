@@ -8,6 +8,7 @@ and look like a model run.  This command makes every active dependency explicit.
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import json
 import os
@@ -66,7 +67,11 @@ def _fix_for(check: dict) -> str | None:
     if name == "flux inpaint workflow":
         return "Ensure workflows/flux_fill_inpaint_api.json exists (path from inpaint.comfy.workflow)."
     if name == "flux inpaint models":
-        return "Run scripts/setup_flux_inpaint.ps1 -ComfyDir <ComfyUI> to fetch the Flux Fill GGUF + LoRA + encoders + VAE."
+        return "Run scripts/setup_flux_inpaint.ps1 -ComfyDir <ComfyUI> to fetch the Flux Fill GGUF + encoders + VAE."
+    if name == "powerpaint adapter configuration":
+        return "On the RTX worker, set inpaint.powerpaint.enabled: true plus adapter_module and callable in config.yaml."
+    if name == "powerpaint adapter import":
+        return "Install the configured PowerPaint adapter in this RTX Python environment, then run doctor.py --deep."
     if name.startswith("big-lama") or name.startswith("inpaint stack"):
         return "Run: .venv\\Scripts\\python.exe -m pip install simple-lama-inpainting"
     if name == "vectorize:vtracer":
@@ -82,6 +87,56 @@ def _fix_for(check: dict) -> str | None:
 
 def _module(name):
     return importlib.util.find_spec(name) is not None
+
+
+_FLUX_INPAINT_MODES = {"flux_comfy", "flux-comfy", "flux"}
+_POWERPAINT_MODES = {"powerpaint", "power-paint"}
+
+
+def _inpaint_policy(cfg: dict) -> dict:
+    """Describe the configured inpaint route without importing or loading a model.
+
+    Strict acceptance deliberately means *the requested route* has to be ready on the RTX
+    worker.  It is stronger than the production fallback policy in ``src.inpaint`` and avoids
+    presenting a benchmark as Flux/PowerPaint evidence after a quiet route downgrade.
+    """
+    inpaint = cfg.get("inpaint") or {}
+    runtime = cfg.get("runtime") or {}
+    mode = str(inpaint.get("mode", "auto")).lower()
+    strict = bool(inpaint.get("strict_acceptance", False))
+    active_models = bool(runtime.get("require_active_models", False))
+    if mode in _FLUX_INPAINT_MODES:
+        selected = "flux_comfy"
+    elif mode in _POWERPAINT_MODES:
+        selected = "powerpaint"
+    elif mode in ("opencv", "cv2"):
+        selected = "opencv"
+    else:
+        selected = "big_lama"
+    requested_required = bool(selected != "opencv" and (strict or active_models))
+    return {
+        "mode": mode,
+        "selected": selected,
+        "strict_acceptance": strict,
+        "require_active_models": active_models,
+        "requested_model_required": requested_required,
+    }
+
+
+def _powerpaint_adapter_importable(module_name: str, callable_name: str) -> tuple[bool, str]:
+    """Check the adapter boundary only; never load or infer with its model here."""
+    if not module_name:
+        return False, "adapter_module is not set"
+    if not _module(module_name):
+        return False, f"{module_name} is not importable"
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:
+        return False, f"{module_name} import failed ({type(exc).__name__}: {exc})"
+    adapter = getattr(module, callable_name, None)
+    if not callable(adapter):
+        return False, f"{module_name}.{callable_name} is not callable"
+    return True, f"{module_name}.{callable_name} is callable; model/weights not executed"
 
 
 def _torch(device):
@@ -281,6 +336,7 @@ def inspect(cfg, root: Path) -> dict:
         checks.append(_check(f"ocr fallback:{item}", ok, detail))
 
     runtime = cfg.get("runtime") or {}
+    inpaint_policy = _inpaint_policy(cfg)
     sam = cfg.get("sam3") or {}
     if sam.get("enabled", False):
         checkpoint = os.path.expandvars(os.path.expanduser(str(sam.get("checkpoint", ""))))
@@ -317,17 +373,22 @@ def inspect(cfg, root: Path) -> dict:
             checks.append(_check("Qwen layered pipeline", _module("diffusers"), "git diffusers build",
                                  required=_required_qwen(cfg)))
 
-    # Flux Fill inpaint backend (ComfyUI GGUF). Advisory unless inpaint.comfy.required.
+    # Flux Fill inpaint backend (ComfyUI GGUF). It is advisory for ordinary auto mode,
+    # but a specifically selected Flux route is a blocker for strict/active acceptance.
     # Reports ComfyUI reachability, the workflow file, and (when comfy_dir is known) the
     # presence of the GGUF/CLIP/VAE model files used by the checked-in workflow.
     # A generic Flux-dev turbo LoRA is intentionally not required: Flux Fill has a
     # different mask-concatenated input shape and that LoRA makes the workflow fail.
     inpaint_cfg_flux = cfg.get("inpaint") or {}
     comfy_inpaint = inpaint_cfg_flux.get("comfy") or {}
-    inpaint_mode_flux = str(inpaint_cfg_flux.get("mode", "auto")).lower()
-    flux_enabled = bool(comfy_inpaint.get("enabled")) or inpaint_mode_flux in ("flux_comfy", "flux-comfy", "flux")
+    inpaint_mode_flux = inpaint_policy["mode"]
+    flux_selected = inpaint_policy["selected"] == "flux_comfy"
+    flux_enabled = bool(comfy_inpaint.get("enabled")) or flux_selected
     if flux_enabled:
-        flux_required = bool(comfy_inpaint.get("required"))
+        flux_required = bool(
+            comfy_inpaint.get("required")
+            or (flux_selected and inpaint_policy["requested_model_required"])
+        )
         flux_wf = Path(str(comfy_inpaint.get("workflow", "workflows/flux_fill_inpaint_api.json")))
         if not flux_wf.is_absolute():
             flux_wf = root / flux_wf
@@ -367,10 +428,38 @@ def inspect(cfg, root: Path) -> dict:
             ))
         else:
             checks.append(_check(
-                "flux inpaint models", True,
-                "set inpaint.comfy.comfy_dir to verify the GGUF/CLIP/VAE files",
-                required=False,
+                "flux inpaint models", not flux_required,
+                ("set inpaint.comfy.comfy_dir to verify the GGUF/CLIP/VAE files"
+                 if not flux_required else
+                 "cannot verify Flux Fill weights without inpaint.comfy.comfy_dir; "
+                 "a strict Flux acceptance run must expose the local ComfyUI model directory"),
+                required=flux_required,
             ))
+
+    # PowerPaint stays an explicitly user-supplied adapter: this project neither installs
+    # nor guesses a model package. Doctor can honestly verify configuration/importability;
+    # runtime_smoke is the separate proof that the adapter and its model actually execute.
+    powerpaint = inpaint_cfg_flux.get("powerpaint") or {}
+    powerpaint_selected = inpaint_policy["selected"] == "powerpaint"
+    powerpaint_enabled = bool(powerpaint.get("enabled", False))
+    adapter_module = str(powerpaint.get("adapter_module") or "").strip()
+    powerpaint_required = bool(
+        powerpaint.get("required")
+        or (powerpaint_selected and inpaint_policy["requested_model_required"])
+    )
+    if powerpaint_selected or powerpaint_enabled or adapter_module:
+        configured = powerpaint_enabled and bool(adapter_module)
+        checks.append(_check(
+            "PowerPaint adapter configuration", configured,
+            (f"enabled={powerpaint_enabled}; adapter_module={adapter_module or '<unset>'}; "
+             "runtime not yet proven"),
+            required=powerpaint_required,
+        ))
+        importable, adapter_detail = _powerpaint_adapter_importable(
+            adapter_module, str(powerpaint.get("callable") or "inpaint").strip(),
+        )
+        checks.append(_check("PowerPaint adapter import", importable, adapter_detail,
+                             required=powerpaint_required))
 
     vlm = cfg.get("vlm") or {}
     if _vlm_feature_enabled(cfg):
@@ -440,13 +529,12 @@ def inspect(cfg, root: Path) -> dict:
             "vectorization probe unavailable; install VTracer or Potrace and CairoSVG",
             required=vector_required,
         ))
-    # Big-LaMa quality directly determines the clean background plate. Under
-    # require_active_models it must be a real acceptance condition like SAM/OCR,
-    # not silently optional — an OpenCV fallback degrades plate quality (see
-    # src/run_report.py::_required, run_pipeline.py inpaint stage).
-    inpaint_cfg = cfg.get("inpaint") or {}
-    inpaint_mode = str(inpaint_cfg.get("mode", "auto")).lower()
-    inpaint_required = bool(runtime.get("require_active_models", False) and inpaint_mode != "opencv")
+    # Big-LaMa is the selected route for auto/LaMa configurations. It is not a blocker
+    # for a strict Flux or PowerPaint selection: those runs must prove their requested
+    # backend rather than silently requiring an unrelated fallback model as well.
+    inpaint_mode = inpaint_policy["mode"]
+    lama_selected = inpaint_policy["selected"] == "big_lama"
+    lama_required = bool(lama_selected and inpaint_policy["requested_model_required"])
     lama_ok = _module("simple_lama_inpainting")
     comfy_ok = True
     comfy_detail = "not required (qwen disabled or non-comfyui mode)"
@@ -456,9 +544,9 @@ def inspect(cfg, root: Path) -> dict:
         comfy_ok = _comfy_probe(base)
         comfy_detail = base if comfy_ok else f"{base} unreachable"
     checks.append(_check("Big-LaMa", lama_ok,
-                          "optional; OpenCV fallback exists" if not inpaint_required
-                          else "required by runtime.require_active_models; OpenCV fallback degrades background plate",
-                          required=inpaint_required))
+                          "optional; OpenCV fallback exists" if not lama_required
+                          else "required by strict/active acceptance; OpenCV fallback degrades background plate",
+                          required=lama_required))
     if inpaint_mode in ("auto", "big-lama", "lama", "simple-lama"):
         # Background inpainting (Big-LaMa) and Qwen's layered decomposition (ComfyUI) are
         # unrelated capabilities -- Qwen is advisory (see run_report._required's comment:
@@ -474,7 +562,7 @@ def inspect(cfg, root: Path) -> dict:
             "inpaint stack (Big-LaMa)",
             stack_ok,
             stack_detail,
-            required=inpaint_required and inpaint_mode == "auto",
+            required=lama_required,
         ))
     checks.append(_check("Figma bridge", _module("requests"), "required only for plugin staging"))
 
@@ -491,6 +579,9 @@ def inspect(cfg, root: Path) -> dict:
             "require_active_models": bool(runtime.get("require_active_models", False)),
             "qwen_required": _required_qwen(cfg),
             "vectorization_required": vector_required,
+            "inpaint_selected": inpaint_policy["selected"],
+            "inpaint_strict_acceptance": inpaint_policy["strict_acceptance"],
+            "inpaint_requested_model_required": inpaint_policy["requested_model_required"],
         },
         "ocr_fallback": fallback,
         "checks": checks,

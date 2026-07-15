@@ -28,6 +28,18 @@ VISUAL_FAILURE_RULES = frozenset({
 })
 
 
+def requires_runtime_smoke(cfg: dict) -> bool:
+    """Whether this config is making a real-model acceptance claim.
+
+    A direct ``python benchmark.py`` invocation must not be weaker than the Windows
+    launcher. Development configs can still opt out by leaving both settings false.
+    """
+    runtime = cfg.get("runtime") or {}
+    inpaint = cfg.get("inpaint") or {}
+    return bool(runtime.get("require_active_models", False) or
+                inpaint.get("strict_acceptance", False))
+
+
 def _normalize_fixture_id(value: str) -> str:
     """Normalize a requested fixture prefix (``26`` and ``026`` both become ``026``)."""
     value = str(value).strip()
@@ -103,6 +115,19 @@ def configure_auto_repair(cfg: dict, enabled: bool) -> None:
     runtime = cfg.setdefault("runtime", {})
     runtime["auto_repair"] = bool(enabled)
     runtime.setdefault("harness", {})["enabled"] = bool(enabled)
+
+
+def configure_figma_acceptance(cfg: dict, wait_s: int) -> None:
+    """Turn a benchmark into a real Figma round-trip acceptance run.
+
+    Preview QA remains useful for local iteration. This explicit switch is for final
+    evidence: it stages the design, waits for the plugin's fresh export, and rejects a
+    local-preview-only result or a missing compiler report.
+    """
+    figma = cfg.setdefault("figma", {})
+    figma["enabled"] = True
+    figma["require_export"] = True
+    cfg["export_wait_s"] = max(1, int(wait_s))
 
 
 def _read(path: Path, fallback):
@@ -208,6 +233,7 @@ def _entry(run_dir: Path, result: dict) -> dict:
         if isinstance(item, dict) and item.get("rule") in VISUAL_FAILURE_RULES
     ]
     meta = design.get("meta") or {}
+    leaf_accounting = meta.get("leaf_accounting") or structure.get("leaf_accounting") or {}
     archetype = (qa.get("archetype") or meta.get("archetype")
                  or reconstruction.get("archetype") or runtime.get("archetype"))
     preset = (qa.get("preset") or meta.get("preset")
@@ -268,6 +294,14 @@ def _entry(run_dir: Path, result: dict) -> dict:
         "missing_fonts": structure.get("missing_fonts") or [],
         "font_substitutions": structure.get("font_substitutions") or [],
         "editable_ratio": (design.get("meta") or {}).get("editable_ratio"),
+        "native_leaf_ratio": meta.get("native_leaf_ratio", structure.get("native_leaf_ratio")),
+        "leaf_accounting": leaf_accounting,
+        "intentional_raster_clusters": int(
+            leaf_accounting.get("intentional_raster_cluster_count", 0) or 0
+        ),
+        "unexplained_raster_fallbacks": int(
+            leaf_accounting.get("unexplained_raster_count", 0) or 0
+        ),
         "run_dir": str(run_dir),
         **_harness_telemetry(run_dir),
     }
@@ -285,8 +319,8 @@ def _markdown(report: dict) -> str:
         "",
         f"Images: {summary['images']}  |  QA passing: {summary['qa_passing']}  |  Runtime accepted: {summary.get('runtime_accepted', '—')}",
         "",
-        "| image | archetype | preset | QA | evidence | runtime | seconds | visual | text | editable text | edge | element recall | regional routes | hard fails |",
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| image | archetype | preset | QA | evidence | runtime | seconds | visual | text | editable text | native leaves | raster clusters | edge | element recall | regional routes | hard fails |",
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for row in report["runs"]:
         fails = ", ".join(item.get("rule", "unknown") for item in row["hard_fails"]) or "—"
@@ -295,7 +329,7 @@ def _markdown(report: dict) -> str:
             return "—" if value is None else f"{float(value):.3f}"
         lines.append(
             f"| {row['id']} | {row.get('archetype') or '—'} | {row.get('preset') or '—'} | {'pass' if row['qa_ok'] else 'fail'} | {'complete' if row.get('qa_evidence_complete') else 'missing'} | {row.get('runtime_status') or ('ok' if row.get('runtime_ok') else 'unknown')} | {metric('duration_s')} | {metric('visual_score')} | "
-            f"{metric('text_recall')} | {metric('editable_text_recall')} | {metric('edge_f1')} | {metric('element_recall')} | "
+            f"{metric('text_recall')} | {metric('editable_text_recall')} | {metric('native_leaf_ratio')} | {row.get('intentional_raster_clusters', 0)} | {metric('edge_f1')} | {metric('element_recall')} | "
             f"{', '.join(f'{k}:{v}' for k, v in row.get('regional_inpaint_routes', {}).items()) or '—'} | {fails} |"
         )
     fixture_manifest = report.get("fixture_manifest") or {}
@@ -333,11 +367,18 @@ def main():
                         help="run bounded actual OCR/SAM/VLM/Big-LaMa/vector/Figma probes before images")
     parser.add_argument("--probe-timeout", type=float, default=120,
                         help="maximum seconds for each isolated deep-smoke probe")
+    parser.add_argument("--require-figma-export", action="store_true",
+                        help="final acceptance: require a fresh plugin export and compiler report for every image")
+    parser.add_argument("--figma-wait-s", type=int, default=120,
+                        help="seconds to wait per image for its Figma plugin export when --require-figma-export is set")
     args = parser.parse_args()
     source_dir = Path(args.input_dir)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     cfg = load_cfg(args.config)
+    if args.require_figma_export:
+        configure_figma_acceptance(cfg, args.figma_wait_s)
+        print(f"Figma acceptance: waiting up to {cfg['export_wait_s']}s per image for a fresh plugin export.")
     auto_repair = args.auto_repair if args.auto_repair is not None else harness_enabled(cfg)
     configure_auto_repair(cfg, auto_repair)
     from src.runtime_bootstrap import ensure_services
@@ -352,7 +393,10 @@ def main():
         if not preflight.get("ok"):
             print(json.dumps({"benchmark": "blocked", "doctor": preflight.get("blockers")}, indent=2))
             raise SystemExit(2)
-    if args.deep_smoke:
+    acceptance_smoke = requires_runtime_smoke(cfg)
+    if args.deep_smoke or acceptance_smoke:
+        if acceptance_smoke and not args.deep_smoke:
+            print("Acceptance config: running required real-model smoke before images.")
         from runtime_smoke import run_all
         smoke = run_all(cfg, output / "runtime-smoke", timeout_s=args.probe_timeout)
         if not smoke.get("ok"):
@@ -399,6 +443,13 @@ def main():
             "mean_ssim": _mean(runs, "ssim"),
             "mean_text_recall": _mean(runs, "text_recall"),
             "mean_editable_text_recall": _mean(runs, "editable_text_recall"),
+            "mean_native_leaf_ratio": _mean(runs, "native_leaf_ratio"),
+            "intentional_raster_clusters_total": sum(
+                row.get("intentional_raster_clusters", 0) for row in runs
+            ),
+            "unexplained_raster_fallbacks_total": sum(
+                row.get("unexplained_raster_fallbacks", 0) for row in runs
+            ),
             "mean_edge_f1": _mean(runs, "edge_f1"),
             "background_leakage_runs": sum(1 for row in runs if row["background_leakage"]),
             "inpaint_outside_mask_runs": sum(1 for row in runs if row["inpaint_outside_mask"]),

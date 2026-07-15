@@ -36,6 +36,20 @@ def test_preprocess_upscales_tiny_icons(tmp_path):
             os.unlink(out)
 
 
+def test_trace_colour_count_ignores_transparent_matte_rgb(tmp_path):
+    rng = np.random.default_rng(4)
+    rgba = rng.integers(0, 255, size=(20, 20, 4), dtype=np.uint8)
+    rgba[:, :, 3] = 0
+    rgba[5:15, 5:15] = (12, 90, 200, 255)
+    source = tmp_path / "icon.png"
+    Image.fromarray(rgba).save(source)
+
+    count, strategy = vectorize._trace_color_count(str(source))
+
+    assert count == 1
+    assert strategy == "alpha"
+
+
 def test_normalize_trace_size_restores_original_crop_coordinates(tmp_path):
     source = tmp_path / "source.png"
     traced = tmp_path / "traced.png"
@@ -193,6 +207,19 @@ def test_evaluate_trace_applies_role_gate(monkeypatch):
     assert result["gate"]["score_min"] == 0.80
 
 
+def test_evaluate_trace_rejects_lost_transparent_logo_counter(monkeypatch):
+    svg = '<svg><path d="M0 0 L10 0 L10 10 Z" fill="#ff0000"/></svg>'
+    monkeypatch.setattr(vectorize, "_score_render", lambda _s, _p: 0.99)
+    monkeypatch.setattr(vectorize, "_transparent_hole_recall", lambda _s, _p: {
+        "source_hole_pixels": 16, "trace_hole_pixels": 0, "recall": 0.0,
+    })
+
+    result, _ = vectorize._evaluate_trace(svg, "x.png", "vtracer", {}, "logo", 1)
+
+    assert result["ok"] is False
+    assert result["gate"]["hole_recall"]["recall"] == 0.0
+
+
 def test_vtracer_tries_multiple_presets(tmp_path, monkeypatch):
     src = tmp_path / "icon.png"
     Image.new("RGBA", (32, 32), (0, 128, 255, 255)).save(src)
@@ -309,6 +336,22 @@ def test_contour_fallback_builds_paths(tmp_path, monkeypatch):
         assert result["paths"]
     else:
         assert result.get("note")
+
+
+def test_contour_fallback_keeps_transparent_holes_with_evenodd_fill(tmp_path):
+    source = tmp_path / "ring.png"
+    icon = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(icon)
+    draw.ellipse((3, 3, 28, 28), fill=(10, 20, 30, 255))
+    draw.ellipse((10, 10, 21, 21), fill=(0, 0, 0, 0))
+    icon.save(source)
+
+    svg, error = vectorize._run_contour_simplify(str(source), {})
+
+    assert error is None
+    assert 'fill-rule="evenodd"' in svg
+    paths = vectorize._parse_svg_paths(svg)
+    assert paths[0]["windingRule"] == "EVENODD"
 
 
 def test_parse_svg_paths_applies_enclosing_g_transform_to_path_coordinates():
@@ -428,3 +471,27 @@ def test_potrace_uses_transparency_as_the_silhouette_and_recolors_white_icons(tm
     assert observed == {"transparent": 255, "foreground": 0}
     recolored = vectorize._recolor_potrace_svg(svg, vectorize._opaque_fill(str(source)))
     assert vectorize._parse_svg_paths(recolored)[0]["fill"] == "#f8f8f8"
+
+
+def test_analytic_rule_becomes_one_stroked_path(tmp_path):
+    source = tmp_path / "rule.png"
+    rgba = np.zeros((40, 160, 4), dtype=np.uint8)
+    rgba[19:22, 5:155] = (20, 30, 40, 255)
+    Image.fromarray(rgba).save(source)
+    paths = vectorize._parse_svg_paths(
+        vectorize._analytic_straight_line_svg(str(source), "divider")
+    )
+    assert len(paths) == 1
+    assert paths[0]["fill"] == "none"
+    assert paths[0]["stroke"]["color"] == "#141e28"
+    assert paths[0]["stroke"]["width"] == 3.0
+
+
+def test_arrowhead_is_not_simplified_to_a_plain_line(tmp_path):
+    source = tmp_path / "arrow.png"
+    image = Image.new("RGBA", (120, 50), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.line((5, 25, 105, 25), fill=(0, 0, 0, 255), width=3)
+    draw.polygon([(105, 12), (119, 25), (105, 38)], fill=(0, 0, 0, 255))
+    image.save(source)
+    assert vectorize._analytic_straight_line_svg(str(source), "arrow") is None

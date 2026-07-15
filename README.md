@@ -39,6 +39,9 @@ image
 
 GPU model quality still needs to be benchmarked on the target RTX workstation. The Mac can run
 the deterministic stages and full test suite, but it cannot prove SAM/OCR/inpainting quality.
+The complete 128-image reference audit and universal native/vector/raster ownership rule are in
+[`docs/IMAGE-AD-INSPO-COVERAGE.md`](docs/IMAGE-AD-INSPO-COVERAGE.md); the exact RTX/Figma release
+prompt is in [`docs/PC-FINAL-CHECK.md`](docs/PC-FINAL-CHECK.md).
 
 ## Run
 
@@ -85,6 +88,9 @@ Double-click it. On the first run it installs the RTX environment, creates and a
 `config.yaml`, reports any model file still needed, then starts the bridge. Later launches are
 immediate and safely reuse an already-running bridge. It never updates the repo unless you run
 `Start Bridge.bat -Update`.
+
+Optional per-user login/hourly safe sync is available for both Windows and macOS. It only
+fast-forwards a clean checkout and never overwrites local edits; see `docs/UPDATE-SYNC.md`.
 
 Figma Desktop needs `figma-plugin\manifest.json` imported once. For a full benchmark, run
 `.\start_rtx.ps1 -InputDir C:\images\benchmark` after the bridge reports the machine ready.

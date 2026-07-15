@@ -33,6 +33,8 @@ def test_overlay_copy_remains_native_text():
         CANVAS,
     )
     assert out["target"] == "text"
+    assert out["meta"]["overlay_text"] is True
+    assert out["meta"]["removal_required"] is True
 
 
 def test_scene_origin_still_wins_over_overlay_like_role():
@@ -53,6 +55,44 @@ def test_flat_button_stays_native_primitive_instead_of_being_traced():
     )
     assert out["target"] == "shape"
     assert out["meta"]["button_shell"] is True
+
+
+def test_thin_divider_stays_a_native_bar_instead_of_vector_tracing():
+    out = routing.route(
+        {"id": "rule", "kind": "divider", "box": {"x": 10, "y": 10, "w": 180, "h": 2},
+         "meta": {"role": "divider"}},
+        CANVAS,
+    )
+    assert out["target"] == "shape"
+    assert out["shape_kind"] == "rect"
+    assert out["meta"]["native_divider"] is True
+
+
+def test_diagonal_callout_line_keeps_gated_vector_route_not_divider_rectangle():
+    out = routing.route(
+        {"id": "leader", "kind": "line", "rotation": -18,
+         "box": {"x": 30, "y": 42, "w": 92, "h": 3},
+         "meta": {"role": "callout_leader"}},
+        CANVAS,
+    )
+    assert out["target"] == "icon"
+    assert "shape_kind" not in out
+    assert out["meta"].get("native_divider") is not True
+
+
+def test_intentional_raster_cluster_roles_stay_named_swappable_source_crops():
+    for role in ("screenshot", "ui_panel", "receipt", "chart", "graph", "table",
+                 "nutrition_panel", "diagram", "infographic", "product_cluster"):
+        out = routing.route(
+            {"id": role, "kind": "photo-fragment", "box": {"x": 10, "y": 10, "w": 220, "h": 140},
+             "meta": {"role": role}},
+            CANVAS,
+        )
+        assert out["target"] == "image"
+        assert out["mask"]["kind"] == "rrect"
+        assert out["meta"]["intentional_raster_cluster"] is True
+        assert out["meta"]["swappable"] is True
+        assert out["meta"]["semantic_name"]
 
 
 def test_explicit_small_nonprimitive_graphic_is_vectorized():
@@ -109,6 +149,18 @@ def test_wordmark_logo_routes_to_image_with_path_mask():
     assert out["mask"]["kind"] == "path"
 
 
+def test_wordmark_defaults_to_exact_raster_when_config_is_empty():
+    out = routing.route(
+        {"id": "W-default", "text": "UpfrontFood", "kind": "text",
+         "box": {"x": 185, "y": 198, "w": 226, "h": 30},
+         "meta": {"scene_text_role": "wordmark"}},
+        CANVAS,
+        {},
+    )
+    assert out["target"] == "image"
+    assert out["mask"]["kind"] == "path"
+
+
 def test_explicit_upstream_mask_shape_is_not_downgraded():
     out = routing.route(
         {"id": "M0", "kind": "photo-fragment", "box": {"x": 0, "y": 0, "w": 80, "h": 80},
@@ -148,3 +200,23 @@ def test_plate_disposition_is_never_materialized_as_an_independent_layer():
     )
     assert out["target"] == "drop"
     assert out["meta"]["keep_in_background"] is True
+
+
+def test_large_ad_arrow_and_burst_reach_vector_gate_not_fake_rectangle():
+    for role in ("arrow", "callout_leader", "price_burst", "sale_burst"):
+        out = routing.route(
+            {"id": role, "kind": "icon", "box": {"x": 20, "y": 20, "w": 360, "h": 300},
+             "meta": {"role": role, "flat_fill": True}},
+            CANVAS,
+        )
+        assert out["target"] == "icon"
+
+
+def test_oversized_burst_uses_exact_raster_instead_of_rectangle():
+    out = routing.route(
+        {"id": "burst", "kind": "icon", "box": {"x": 0, "y": 0, "w": 700, "h": 700},
+         "meta": {"role": "price_burst", "flat_fill": True}},
+        CANVAS,
+    )
+    assert out["target"] == "image"
+    assert out["meta"]["vector_fallback"] is True

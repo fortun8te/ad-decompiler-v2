@@ -459,6 +459,15 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
         elif rule == "invalid-schema":
             out.append({"stage": "design", "action": "rebuild-schema", "reason": detail,
                         "severity": "high"})
+        elif rule == "native-accounting-missing":
+            out.append({"stage": "design", "action": "rebuild-schema", "reason": detail,
+                        "severity": "high"})
+        elif rule == "unexplained-raster-fallback":
+            out.append({
+                "stage": "sam3", "action": "rerun-detection", "reason": detail,
+                "params": {"lower_confidence": False, "enable_element_propose": True},
+                "severity": "high",
+            })
         elif rule.endswith("-unavailable"):
             component = rule[: -len("-unavailable")]
             if component == "sam3":

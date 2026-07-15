@@ -140,3 +140,34 @@ def test_rounded_card_cutout_gets_rounded_rect_mask(tmp_path):
     out = _run(source, [candidate], tmp_path)["candidates"][0]
     assert out["mask"]["kind"] == "rrect"
     assert isinstance(out["mask"]["radius"], (int, float))
+
+
+def test_rounded_photo_frame_extracts_only_a_uniform_inside_stroke(tmp_path):
+    box = {"x": 30, "y": 25, "w": 120, "h": 74}
+    source = tmp_path / "framed-photo.png"
+    image = Image.new("RGB", (180, 130), (226, 226, 226))
+    # Deliberately varied image content: only the white border ring is stable enough
+    # to become native paint.
+    noise = np.random.default_rng(3).integers(35, 210, (box["h"], box["w"], 3), dtype=np.uint8)
+    image.paste(Image.fromarray(noise), (box["x"], box["y"]))
+    ImageDraw.Draw(image).rounded_rectangle(
+        (box["x"], box["y"], box["x"] + box["w"] - 1, box["y"] + box["h"] - 1),
+        radius=16, outline=(248, 248, 248), width=2,
+    )
+    image.save(source)
+    masks = tmp_path / "m"; masks.mkdir()
+    matte = Image.new("L", (box["w"], box["h"]), 0)
+    ImageDraw.Draw(matte).rounded_rectangle((0, 0, box["w"] - 1, box["h"] - 1), radius=16, fill=255)
+    matte.save(masks / "frame.png")
+
+    out = _run(source, [{
+        "id": "frame", "target": "image", "box": box,
+        "mask": {"kind": "rrect", "src": "m/frame.png", "radius": 16},
+        "meta": {"role": "card", "source": "element", "confidence": 0.9},
+    }], tmp_path)["candidates"][0]
+
+    assert out["target"] == "image"
+    assert out["mask"]["kind"] == "rrect"
+    assert out["stroke"]["color"] == "#f8f8f8"
+    assert out["stroke"]["align"] == "INSIDE"
+    assert out["meta"]["image_frame_stroke"]["source"] == "uniform-border-ring"

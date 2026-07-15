@@ -252,3 +252,39 @@ def test_stale_figma_export_is_not_fresh_for_new_design(tmp_path):
     old = design.stat().st_mtime - 10
     os.utime(export, (old, old))
     assert run_pipeline._artifact_at_least_as_fresh(str(export), str(design)) is False
+
+
+def test_figma_acceptance_rejects_a_local_preview_without_fresh_plugin_export(monkeypatch, tmp_path):
+    source = tmp_path / "input.png"
+    Image.new("RGB", (120, 80), "white").save(source)
+
+    monkeypatch.setattr(
+        run_pipeline.ocr, "run_ocr",
+        lambda path, cfg, run_dir=None: {
+            "engine": "fixture", "source": {"path": path, "w": 120, "h": 80}, "ms": 1,
+            "lines": [],
+        },
+    )
+    monkeypatch.setattr(
+        run_pipeline.pixel_diff, "compare",
+        lambda *args, **kwargs: {
+            "ssim": 0.99, "visual_score": 0.99, "text_recall": None,
+            "hard_fails": [], "structural": {},
+        },
+    )
+
+    run_dir = tmp_path / "run"
+    result = run_pipeline.run_one(
+        str(source), str(run_dir),
+        {
+            "device": "cpu", "qwen": {"enabled": False}, "sam3": {"enabled": False},
+            "inpaint": {"mode": "opencv"}, "qa_ocr": False,
+            "text_analysis": {"font_matching": {"enabled": False}},
+            "figma": {"enabled": False, "require_export": True},
+        },
+    )
+
+    assert result["ok"] is True
+    qa = json.loads((run_dir / "qa.json").read_text(encoding="utf-8"))
+    assert qa["ok"] is False
+    assert "figma-export-missing" in {item["rule"] for item in qa["hard_fails"]}

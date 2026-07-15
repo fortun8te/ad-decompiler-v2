@@ -526,3 +526,38 @@ def test_repair_consumes_nested_structural_failures_and_new_metrics():
         "refit-colors-effects",
     } <= actions
     assert repairs[0]["severity"] == "high"
+
+
+def test_strict_acceptance_requires_native_leaf_accounting(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (40, 30), "white")
+    image.save(source); image.save(render)
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [], "meta": {"editable_ratio": 0}},
+        structural={"require_native_accounting": True},
+    )
+    assert "native-accounting-missing" in _rules(result)
+
+
+def test_strict_acceptance_rejects_unexplained_raster_fallback(tmp_path):
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (40, 30), "white")
+    image.save(source); image.save(render)
+    accounting = {
+        "foreground_leaf_count": 1, "native_leaf_count": 0, "raster_leaf_count": 1,
+        "intentional_raster_cluster_count": 0, "fallback_raster_count": 1,
+        "unexplained_raster_count": 1, "unexplained_raster_ids": ["mystery"],
+        "native_leaf_ratio": 0.0,
+    }
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [], "meta": {"editable_ratio": 0, "leaf_accounting": accounting,
+                                            "native_leaf_ratio": 0.0}},
+        structural={"require_native_accounting": True},
+    )
+    assert "unexplained-raster-fallback" in _rules(result)
+    assert result["structural"]["native_leaf_ratio"] == 0.0
+    assert result["structural"]["leaf_accounting"] == accounting

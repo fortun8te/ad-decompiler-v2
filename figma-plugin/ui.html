@@ -246,8 +246,7 @@
       font-size: 10.5px;
     }
 
-    .source-empty .empty-glyph,
-    .source-empty .empty-copy { display: none; }
+    .source-empty .empty-glyph { display: none; }
 
     .empty-glyph {
       display: grid;
@@ -349,6 +348,70 @@
     }
 
     .metric-label { display: inline; margin-left: 3px; color: var(--text-tertiary); font-size: 9px; white-space: nowrap; }
+
+    .import-identity {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 2px 7px;
+      margin-top: 8px;
+      padding-top: 7px;
+      border-top: 1px solid var(--border);
+      font-size: 9.5px;
+      line-height: 1.35;
+    }
+
+    .import-identity-label {
+      color: var(--text-tertiary);
+      font-size: 8px;
+      font-weight: 650;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .import-identity-value,
+    .import-identity-detail {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .import-identity-value { color: var(--text); }
+    .import-identity-detail { grid-column: 2; color: var(--text-secondary); }
+
+    .history-panel {
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--bg-secondary);
+    }
+
+    .history-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 11px 7px;
+    }
+
+    .history-title { font-size: 11px; font-weight: 650; }
+    .history-note { color: var(--text-tertiary); font-size: 9.5px; }
+    .history-list { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--border); }
+    .history-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 3px 8px;
+      padding: 8px 11px;
+      border-bottom: 1px solid var(--border);
+    }
+    .history-item:last-child { border-bottom: 0; }
+    .history-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10.5px; font-weight: 550; }
+    .history-time { color: var(--text-tertiary); font: 9px/1.3 "SFMono-Regular", Consolas, monospace; white-space: nowrap; }
+    .history-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font: 9px/1.3 "SFMono-Regular", Consolas, monospace; }
+    .history-state { align-self: end; color: var(--text-success); font-size: 9px; }
+    .history-state[data-state="unknown"] { color: var(--text-tertiary); }
 
     .mode-switch {
       display: grid;
@@ -847,7 +910,11 @@
     }
 
     .scan-segments {
-      display: none;
+      display: grid;
+      grid-template-columns: repeat(15, minmax(0, 1fr));
+      gap: 3px;
+      width: 100%;
+      margin-bottom: 7px;
     }
 
     .scan-segment {
@@ -934,6 +1001,42 @@
       font-size: 10px;
       text-align: center;
       line-height: 1.4;
+    }
+
+    .scan-activity {
+      display: grid;
+      gap: 4px;
+      width: 100%;
+      padding: 8px 9px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: color-mix(in srgb, var(--bg) 55%, transparent);
+      text-align: left;
+    }
+
+    .activity-line {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      min-width: 0;
+      color: var(--text-secondary);
+      font-size: 9.5px;
+      line-height: 1.35;
+    }
+
+    .activity-dot {
+      width: 5px;
+      height: 5px;
+      flex: 0 0 auto;
+      margin-top: 4px;
+      border-radius: 50%;
+      background: var(--brand);
+      box-shadow: 0 0 6px var(--brand-glow);
+    }
+
+    .activity-line:last-child .activity-dot {
+      background: var(--text-tertiary);
+      box-shadow: none;
     }
 
     .upload-title {
@@ -1069,6 +1172,10 @@
                 <span class="timing-remaining" id="processRemaining">—</span>
                 <span class="timing-total hidden" id="processTotal">—</span>
               </div>
+              <div class="scan-activity" aria-live="polite">
+                <div class="activity-line"><span class="activity-dot" aria-hidden="true"></span><span id="processActivityStage">Preparing the local pipeline</span></div>
+                <div class="activity-line"><span class="activity-dot" aria-hidden="true"></span><span id="processActivityDetail">ETA appears after the bridge has a completed run to compare.</span></div>
+              </div>
               <div class="scan-meta upload-copy" id="uploadBusyCopy">Starting pipeline…</div>
               <button class="cancel-button" id="cancelProcess" type="button">Cancel</button>
             </div>
@@ -1111,8 +1218,18 @@
         </div>
       </section>
 
-      <details class="settings">
-        <summary>Settings</summary>
+      <section class="section hidden" id="historySection" aria-label="Recent conversions">
+        <div class="history-panel">
+          <div class="history-header">
+            <div class="history-title">Recent conversions</div>
+            <div class="history-note">Stored on this bridge</div>
+          </div>
+          <ol class="history-list" id="historyList"></ol>
+        </div>
+      </section>
+
+      <details class="settings" open>
+        <summary>Import details &amp; settings</summary>
         <div class="settings-body">
           <div>
             <span class="settings-label">Bridge</span>
@@ -1151,6 +1268,11 @@
                   <div><span class="metric-value" id="metricImages">0</span><span class="metric-label">img</span></div>
                   <div><span class="metric-value" id="metricGroups">0</span><span class="metric-label">grp</span></div>
                 </div>
+                <div class="import-identity hidden" id="importIdentity">
+                  <span class="import-identity-label">Import target</span>
+                  <span class="import-identity-value" id="importIdentityValue">—</span>
+                  <span class="import-identity-detail" id="importIdentityDetail">—</span>
+                </div>
               </div>
             </div>
           </div>
@@ -1183,7 +1305,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.0.0","build":46,"commit":"f46f2ac","dirty":true,"built_at":"2026-07-13T21:20:08Z","label":"v2.0.0+b46.f46f2ac-dirty","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.1.0","build":47,"commit":"fc8feec","dirty":true,"built_at":"2026-07-15T13:45:06Z","label":"v2.1.0+b47.fc8feec-dirty","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -1201,7 +1323,10 @@
       pluginBuild: PLUGIN_BUILD,
       bridgeHealth: null,
       lastProcessStatus: null,
+      lastCompletedJob: null,
+      history: [],
       pollFailures: 0,
+      roundtripReport: null,
     };
 
     let DEBUG_SESSION = null;
@@ -1334,6 +1459,7 @@
     function setEmpty(title, copy, loading) {
       $("sourceEmpty").classList.remove("hidden");
       $("sourceLoaded").classList.add("hidden");
+      $("importButton").textContent = "Import into Figma";
       $("emptyTitle").textContent = title;
       $("emptyCopy").textContent = copy;
       $("emptyTitle").classList.toggle("skeleton", Boolean(loading));
@@ -1494,6 +1620,94 @@
       $("previewImage").onerror = function () { $("preview").classList.remove("has-image"); };
     }
 
+    function displayDateTime(seconds) {
+      const value = Number(seconds || 0);
+      if (!value) return "Earlier";
+      const date = new Date(value * 1000);
+      if (Number.isNaN(date.getTime())) return "Earlier";
+      try {
+        return date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      } catch (_) {
+        return date.toLocaleString();
+      }
+    }
+
+    function rowForCurrentDoc(docId) {
+      const completed = state.lastCompletedJob || {};
+      if (docId && completed.doc_id === docId) return completed;
+      return (state.history || []).find(function (row) { return row && row.doc_id === docId; }) || null;
+    }
+
+    function renderImportIdentity(doc) {
+      const root = $("importIdentity");
+      const value = $("importIdentityValue");
+      const detail = $("importIdentityDetail");
+      if (!root || !value || !detail) return;
+      const manifest = state.manifest || {};
+      const docId = String(manifest.doc_id || doc && (doc.id || doc.name) || "");
+      const row = rowForCurrentDoc(docId);
+      if (state.source === "files") {
+        const localName = String(doc && (doc.name || doc.id) || "local design.json");
+        value.textContent = "Local file set · " + localName;
+        detail.textContent = docId ? "Document " + docId : "No bridge job attached";
+        value.title = value.textContent;
+        detail.title = detail.textContent;
+        root.classList.remove("hidden");
+        return;
+      }
+      const filename = row && row.filename;
+      const jobId = row && row.job_id;
+      const stagedAt = manifest.staged_at || row && row.finished_at;
+      value.textContent = filename || (docId ? "Document " + docId : "Staged bridge design");
+      detail.textContent = [
+        jobId ? "Job " + jobId : "Job unavailable",
+        docId ? "Doc " + docId : "Document unavailable",
+        stagedAt ? "Staged " + displayDateTime(stagedAt) : null,
+      ].filter(Boolean).join(" · ");
+      value.title = value.textContent;
+      detail.title = detail.textContent;
+      root.classList.remove("hidden");
+    }
+
+    function renderHistory(runs) {
+      state.history = Array.isArray(runs) ? runs.slice(0, 10) : [];
+      const section = $("historySection");
+      const list = $("historyList");
+      if (!section || !list) return;
+      list.innerHTML = "";
+      if (!state.history.length) {
+        section.classList.add("hidden");
+        return;
+      }
+      state.history.slice(0, 5).forEach(function (row) {
+        const item = document.createElement("li");
+        item.className = "history-item";
+        const name = document.createElement("div");
+        name.className = "history-name";
+        name.textContent = row.filename || row.doc_id || "Earlier conversion";
+        name.title = name.textContent;
+        const time = document.createElement("div");
+        time.className = "history-time";
+        const duration = typeof row.duration_s === "number" ? formatElapsed(row.duration_s * 1000) : "";
+        time.textContent = [displayDateTime(row.finished_at), duration].filter(Boolean).join(" · ");
+        const detail = document.createElement("div");
+        detail.className = "history-detail";
+        detail.textContent = [row.job_id ? "Job " + row.job_id : null, row.doc_id ? "Doc " + row.doc_id : null]
+          .filter(Boolean).join(" · ") || "Older bridge record";
+        detail.title = detail.textContent;
+        const stateLabel = document.createElement("div");
+        stateLabel.className = "history-state";
+        stateLabel.dataset.state = row.qa_ok === true ? "ready" : "unknown";
+        stateLabel.textContent = row.qa_ok === true ? "QA ready" : "Completed";
+        item.appendChild(name);
+        item.appendChild(time);
+        item.appendChild(detail);
+        item.appendChild(stateLabel);
+        list.appendChild(item);
+      });
+      section.classList.remove("hidden");
+    }
+
     function renderDoc(doc, sourceLabel) {
       state.doc = doc;
       const summary = summarize(doc);
@@ -1510,6 +1724,8 @@
       $("metricGraphics").textContent = summary.graphics;
       $("metricImages").textContent = summary.images;
       $("metricGroups").textContent = summary.groups;
+      renderImportIdentity(doc);
+      $("importButton").textContent = state.source === "bridge" ? "Import this staged design" : "Import into Figma";
       $("importButton").disabled = false;
       setFooter(summary.total + " source layers ready");
       setPreview(doc);
@@ -1625,6 +1841,9 @@
         renderBridgeHealth(health);
         setConnection("connected", health.machine_ready === true ? "Bridge ready" : "Setup needed");
         resumeActiveProcess(base, health.active_job);
+        // Ask for history alongside the staged design; it must never delay loading a
+        // usable import when an older bridge does not implement this endpoint.
+        const historyRequest = fetchJson(base + "/history", 3500).catch(function () { return null; });
         try {
         const manifest = await fetchJson(base + "/inbox.json", 5000);
         const doc = await fetchJson(base + "/design.json", 7000);
@@ -1633,7 +1852,12 @@
         state.source = "bridge";
         state.fileMap = new Map();
         renderDoc(doc, "local bridge");
+        const history = await historyRequest;
+        renderHistory(history && history.runs);
+        renderImportIdentity(doc);
         } catch (stagedError) {
+          const history = await historyRequest;
+          renderHistory(history && history.runs);
           if (state.source === "bridge") {
             state.doc = null;
             state.manifest = null;
@@ -1693,6 +1917,8 @@
         state.fileMap = map;
         state.source = "files";
         state.manifest = null;
+        state.lastCompletedJob = null;
+        renderHistory([]);
         setConnection("idle", "Files loaded");
         renderDoc(doc, "local files");
         const refs = assetReferences(doc);
@@ -1846,11 +2072,11 @@
         totalEl.className = "timing-total";
         totalEl.classList.remove("hidden");
       } else if (status.status === "running" && status.stage) {
-        remainingEl.textContent = "Calibrating…";
+        remainingEl.textContent = "No ETA yet";
         remainingEl.classList.remove("hidden");
         totalEl.classList.add("hidden");
       } else {
-        remainingEl.textContent = "Estimating…";
+        remainingEl.textContent = "No ETA yet";
         remainingEl.classList.remove("hidden");
         totalEl.classList.add("hidden");
       }
@@ -1863,16 +2089,55 @@
       if (status.status === "queued") return "Job queued — pipeline will start shortly";
       if (status.status === "done") return "Pipeline finished";
       if (!status.eta_sample_size) {
-        return "First runs calibrate ETA · check bridge logs for full detail";
+        return "No ETA yet — the bridge needs a completed run to compare";
       }
       if (status.eta_sample_size < 3) {
-        return "ETA based on " + status.eta_sample_size + " recent run" + (status.eta_sample_size === 1 ? "" : "s");
+        return "ETA based on " + status.eta_sample_size + " completed run" + (status.eta_sample_size === 1 ? "" : "s");
       }
-      return "ETA based on recent runs on this machine";
+      return "ETA based on completed runs on this bridge";
     }
 
     function etaLine(status) {
       return statusFootnote(status);
+    }
+
+    function renderProcessActivity(status) {
+      const stage = $("processActivityStage");
+      const detail = $("processActivityDetail");
+      if (!stage || !detail) return;
+      if (status.reconnecting) {
+        stage.textContent = "Connection interrupted; retrying the same job";
+        detail.textContent = "The bridge keeps the job running while this panel reconnects.";
+        return;
+      }
+      if (status.phase === "upload") {
+        stage.textContent = "Sending the selected image to the local bridge";
+        detail.textContent = "Processing has not started yet.";
+        return;
+      }
+      if (status.status === "queued") {
+        stage.textContent = "Queued locally; waiting for the bridge to start";
+        detail.textContent = "No ETA is shown until processing begins.";
+        return;
+      }
+      if (status.harness_running) {
+        stage.textContent = "Repairing the staged design after its first quality check";
+        detail.textContent = "The estimate remains tied to completed bridge runs.";
+        return;
+      }
+      if (status.status === "done") {
+        stage.textContent = "Pipeline complete; loading the exact staged design";
+        detail.textContent = "The import card below will show the document and job.";
+        return;
+      }
+      stage.textContent = "Active: " + (STAGE_LABELS[status.stage] || "Starting pipeline");
+      if (typeof status.eta_s === "number" && status.eta_sample_size) {
+        const samples = status.eta_sample_size;
+        detail.textContent = "~" + formatElapsed(status.eta_s * 1000) + " remaining from "
+          + samples + " completed run" + (samples === 1 ? "" : "s") + ".";
+      } else {
+        detail.textContent = "No ETA yet — this bridge needs a completed run to compare.";
+      }
     }
 
     function renderProcessStatus(status) {
@@ -1896,6 +2161,7 @@
       updateProcessSegments(status);
       updateWorkPreviewStage(status);
       timingRows(status);
+      renderProcessActivity(status);
       setFooter(stageLabel + " · " + percent + "%");
       // #region agent log
       agentDebugLog("ui.html:renderProcessStatus", "process status rendered", Object.assign(progressVisibilitySnapshot("renderProcessStatus"), {
@@ -2075,6 +2341,13 @@
         try {
           summary = await fetchJson(base + "/run-summary?job_id=" + encodeURIComponent(jobId), 5000);
         } catch (_) { /* older bridges may not have /run-summary yet */ }
+        state.lastCompletedJob = {
+          job_id: jobId,
+          filename: filename,
+          doc_id: (summary && summary.doc_id) || status.doc_id || "",
+          finished_at: Date.now() / 1000,
+          qa_ok: Boolean(summary && summary.final_qa_ok),
+        };
         const staged = summary ? summary.staged : status.staged;
         const stagingError = (summary && summary.staging_error) || status.staging_error;
         const runDir = (summary && summary.run_dir) || status.run_dir;
@@ -2344,6 +2617,8 @@
           design: state.doc,
           assets: gathered.assets,
           export_to: state.manifest && state.manifest.export_to || null,
+          manifest_doc_id: state.manifest && state.manifest.doc_id || null,
+          roundtrip_token: state.manifest && state.manifest.roundtrip_token || null,
           import_mode: state.settings.importMode,
         });
       } catch (error) {
@@ -2359,8 +2634,25 @@
         : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 7v6"/><path d="M12 17.2v.1"/><circle cx="12" cy="12" r="9"/></svg>';
     }
 
+    function fidelityNotice(report) {
+      const fidelity = report && report.fidelity || {};
+      const kinds = [
+        ["unsupported_paint", "paint"],
+        ["unsupported_stroke", "stroke"],
+        ["unsupported_effect", "effect"],
+      ].filter(function (entry) { return Number(fidelity[entry[0]] || 0) > 0; });
+      const total = kinds.reduce(function (sum, entry) {
+        return sum + Math.max(0, Number(fidelity[entry[0]] || 0));
+      }, 0);
+      if (!total) return "";
+      const labels = kinds.map(function (entry) { return entry[1]; }).join(", ");
+      return total + " " + (total === 1 ? "style" : "styles") + " could not be recreated natively"
+        + " (" + labels + "). Review the imported layers.";
+    }
+
     function renderResult(report) {
       const ok = Boolean(report && report.ok);
+      const fidelityMessage = fidelityNotice(report);
       recordLog(ok ? "info" : "error", ok ? "Import complete" : "Import failed", "", {
         ok: ok,
         created: report.created,
@@ -2380,9 +2672,11 @@
       });
       $("resultPanel").dataset.tone = ok ? "success" : "error";
       $("resultIcon").innerHTML = resultIcon(ok);
-      $("resultTitle").textContent = ok ? "Done" : (report.cancelled ? "Cancelled" : "Failed");
+      $("resultTitle").textContent = ok
+        ? (fidelityMessage ? "Imported with review notes" : "Done")
+        : (report.cancelled ? "Cancelled" : "Failed");
       $("resultCopy").textContent = ok
-        ? "Ready on canvas."
+        ? (fidelityMessage || "Ready on canvas.")
         : (report.cancelled ? "Nothing changed." : "Try again.");
       $("resultSection").classList.remove("hidden");
       const errors = report.errors || [];
@@ -2402,11 +2696,12 @@
       if (state.source !== "bridge") return;
       const payload = {
         version: 1,
-        doc_id: String(state.doc && (state.doc.id || state.doc.name) || report.docId || "unknown"),
+        doc_id: String(report.manifest_doc_id || state.manifest && state.manifest.doc_id || state.doc && (state.doc.id || state.doc.name) || report.docId || "unknown"),
         run_id: String(state.manifest && (state.manifest.run_id || state.manifest.run_dir) || state.doc && (state.doc.id || state.doc.name) || "unknown"),
         schema_version: Number(state.doc && (state.doc.schema_version || state.doc.schemaVersion) || 1),
         reported_at: new Date().toISOString(),
         plugin_build: state.pluginBuild || PLUGIN_BUILD,
+        roundtrip_token: String(report.roundtrip_token || state.manifest && state.manifest.roundtrip_token || ""),
         report: report,
         plugin_events: state.log.slice(-500),
       };
@@ -2417,10 +2712,13 @@
           body: JSON.stringify(payload),
         });
         if (!response.ok) throw new Error(response.status + " " + response.statusText);
-        recordLog("info", "Report saved", cleanBase() + "/report");
+        const responseBody = await response.json().catch(function () { return {}; });
+        recordLog("info", "Report saved", cleanBase() + "/report", responseBody);
+        return responseBody;
       } catch (error) {
         recordLog("error", "Report not saved", String(error && error.message || error));
         await flushLogs(true);
+        return { ok: false, error: String(error && error.message || error) };
       }
     }
 
@@ -2430,14 +2728,21 @@
       const shouldPost = state.source === "bridge" || message.export_to;
       if (shouldPost) {
         try {
-          const response = await fetch(cleanBase() + "/export", {
+          const query = new URLSearchParams({
+            doc_id: String(message.manifest_doc_id || state.manifest && state.manifest.doc_id || ""),
+            roundtrip_token: String(message.roundtrip_token || state.manifest && state.manifest.roundtrip_token || ""),
+          });
+          const response = await fetch(cleanBase() + "/export?" + query.toString(), {
             method: "POST",
             headers: { "Content-Type": "application/octet-stream" },
             body: bytes,
           });
           if (!response.ok) throw new Error(response.status + " " + response.statusText);
-          recordLog("info", "Export posted", cleanBase() + "/export");
-          setFooter("Imported and sent to QA");
+          const responseBody = await response.json().catch(function () { return {}; });
+          recordLog("info", "Export posted", cleanBase() + "/export", responseBody);
+          if (responseBody.qa_rerun && responseBody.qa_rerun.ok) setFooter("Figma import accepted by QA");
+          else if (responseBody.qa_rerun) setFooter("Figma imported — QA needs attention");
+          else setFooter("Imported and sent to QA");
           return;
         } catch (error) {
           recordLog("error", "Export failed", String(error && error.message || error));
@@ -2545,9 +2850,13 @@
         setBuilding(false);
         $("cancelImport").disabled = false;
         renderResult(message.report || {});
-        postBuildReport(message.report || {});
+        // The bridge reruns Figma QA only when it has both the compiler report and PNG.
+        // Keep this promise so the immediately following exported event cannot race ahead.
+        state.roundtripReport = postBuildReport(message.report || {});
       } else if (message.type === "exported") {
-        handleExport(message);
+        Promise.resolve(state.roundtripReport).catch(function () {}).then(function () {
+          return handleExport(message);
+        });
       }
     };
 

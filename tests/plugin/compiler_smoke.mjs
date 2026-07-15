@@ -103,6 +103,7 @@ class TextNode extends BaseNode {
     this._characters = "";
     this._fontSize = 12;
     this._rangeStyled = false;
+    this.rangeFills = [];
     this.fontName = { family: "Inter", style: "Regular" };
     this.textAutoResize = "WIDTH_AND_HEIGHT";
     this.lineHeight = { unit: "AUTO" };
@@ -160,7 +161,7 @@ class TextNode extends BaseNode {
 
   setRangeFontName() { this._rangeStyled = true; }
   setRangeFontSize() { this._rangeStyled = true; }
-  setRangeFills() {}
+  setRangeFills(start, end, paints) { this.rangeFills.push({ start, end, paints }); }
   setRangeLetterSpacing() {}
   setRangeLineHeight() {}
   setRangeTextDecoration() {}
@@ -395,7 +396,10 @@ const sceneV2 = {
       text: "Mixed emphasis",
       text_runs: [
         { start: 0, end: 5, style: { fontFamily: "Inter", fontStyle: "Bold", fontSize: 18 } },
-        { start: 5, end: 14, style: { fontFamily: "Inter", fontStyle: "Regular", fontSize: 18 } },
+        { start: 5, end: 14, style: {
+          fontFamily: "Inter", fontStyle: "Regular", fontSize: 18,
+          fill: { kind: "linear", angle: 0, stops: [{ offset: 0, color: "#ff3366" }, { offset: 1, color: "#6633ff" }] },
+        } },
       ],
       style: { fontFamily: "Inter", fontSize: 18, lineHeight: 24, align: "right", verticalAlign: "bottom" },
       constraints: { horizontal: "stretch", vertical: "stretch" },
@@ -419,7 +423,8 @@ const sceneV2 = {
       meta: { role: "button" },
       component: {},
       children: [
-        { id: "pill", type: "shape", name: "Pill", box: { x: 0, y: 0, w: 160, h: 60 }, fill: "#111111", radius: 30 },
+        { id: "pill", type: "shape", name: "Pill", box: { x: 0, y: 0, w: 160, h: 60 }, fill: "#111111", radius: 30,
+          effects: [{ type: "drop-shadow", color: "#00000066", x: 0, y: 3, blur: 8 }] },
         { id: "label", type: "text", name: "Label", box: { x: 20, y: 14, w: 120, h: 28 }, text: "BUY NOW", meta: { role: "cta" }, style: { fontFamily: "Inter", fontSize: 18, color: "#ffffff", align: "center" } },
       ],
     },
@@ -481,6 +486,7 @@ const sceneV2 = {
       box: { x: 300, y: 490, w: 200, h: 90 },
       src: "assets/photo.png",
       mask: { kind: "rounded-rect", box: { x: 324, y: 500, w: 140, h: 70 }, radius: 14 },
+      style: { strokes: [{ color: "#ffffff", width: 2, align: "inside" }] },
       z_index: 6,
     },
     {
@@ -635,6 +641,7 @@ assert.equal(badge.counterAxisSizingMode, "AUTO", "buttons hug content on the cr
 assert.equal(badge.paddingTop, 14);
 assert.equal(badge.paddingLeft, 20);
 assert.equal(badge.cornerRadius, 30);
+assert.equal(badge.effects[0].type, "DROP_SHADOW", "hoisted button shells retain their shadow");
 assert.equal(nodeForLayer(firstRoot, "pill"), null, "button background shape is hoisted onto the frame");
 const badgeLabel = nodeForLayer(firstRoot, "label");
 assert.equal(badgeLabel.layoutAlign, "CENTER");
@@ -670,6 +677,8 @@ assert.equal(maskedImage.type, "RECTANGLE", "rounded masked image lives inside t
 assert.equal(maskedImage.width, 140, "mask geometry does not inherit full image width");
 assert.equal(maskedImage.height, 70, "mask geometry does not inherit full image height");
 assert.equal(maskedImage.cornerRadius, 14);
+assert.equal(maskedImage.strokes[0].type, "SOLID", "rounded image frames preserve native inner strokes");
+assert.equal(maskedImage.strokeAlign, "INSIDE");
 assert.equal(masked.clipsContent, true);
 const generated = nodeForLayer(firstRoot, "generated-vector");
 assert.match(generated.svg, /stroke-linecap="round"/);
@@ -731,6 +740,11 @@ assert.equal(mixedCopy.constraints.horizontal, "LEFT_RIGHT");
 assert.equal(mixedCopy.constraints.vertical, "TOP_BOTTOM");
 assert.equal(JSON.parse(mixedCopy.getPluginData("adDecompilerBaseline")).y0, 259,
   "OCR baseline evidence survives into the compiled text node");
+assert.equal(
+  mixedCopy.rangeFills.find((entry) => entry.start === 5 && entry.end === 14).paints[0].type,
+  "GRADIENT_LINEAR",
+  "a mixed text range preserves its own gradient instead of flattening to a solid fill"
+);
 
 function approxEqual(actual, expected, label) {
   assert.ok(Math.abs(actual - expected) < 1e-6, `${label}: expected ${expected}, got ${actual}`);
@@ -916,6 +930,24 @@ assert.ok(!("version" in manifest) && !("build" in manifest), "manifest.json has
   assert.ok(script[1].includes("function qaIssuesFromSummary("), "UI renders QA and runtime failure evidence");
   assert.ok(script[1].includes("Connection interrupted · retrying automatically"), "polling exposes reconnect state");
   assert.ok(script[1].includes("state.processJobId !== jobId"), "stale poll callbacks cannot mutate a newer job");
+  ["processSegments", "processActivityStage", "processActivityDetail", "historySection",
+    "historyList", "importIdentity", "importIdentityValue", "importIdentityDetail"].forEach((id) => {
+    assert.ok(html.includes(`id="${id}"`), `ui.html defines #${id}`);
+  });
+  assert.ok(script[1].includes('base + "/history"'), "UI asks the bridge for real stored conversion history");
+  assert.ok(script[1].includes("function renderHistory("), "UI renders bridge conversion history");
+  assert.ok(script[1].includes("function renderImportIdentity("), "UI identifies the exact staged import");
+  assert.ok(script[1].includes("function renderProcessActivity("), "UI renders active pipeline detail lines");
+  assert.ok(script[1].includes("No ETA yet — this bridge needs a completed run to compare."),
+    "UI does not invent an ETA before the bridge has comparable completed runs");
+  const fidelityMatch = script[1].match(/function fidelityNotice\(report\)[\s\S]*?\n {4}\}/);
+  assert.ok(fidelityMatch, "ui.html explains native-style fallbacks after import");
+  const fidelityNotice = new Function(fidelityMatch[0] + "\nreturn fidelityNotice;")();
+  assert.equal(fidelityNotice({ fidelity: {} }), "");
+  assert.equal(
+    fidelityNotice({ fidelity: { unsupported_paint: 1, unsupported_stroke: 2, unsupported_effect: 0 } }),
+    "3 styles could not be recreated natively (paint, stroke). Review the imported layers."
+  );
 
   const feMatch = script[1].match(/function formatElapsed\(ms\)[\s\S]*?\n {4}\}/);
   assert.ok(feMatch, "ui.html defines formatElapsed()");

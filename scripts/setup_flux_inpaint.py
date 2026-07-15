@@ -3,17 +3,16 @@
 
 Fetches, via huggingface_hub, the models needed by workflows/flux_fill_inpaint_api.json:
 
-  * FLUX.1 Fill dev, quantized GGUF   -> models/unet/       (Q4_K_M ~6.8GB by default)
+  * FLUX.1 Fill dev, quantized GGUF   -> models/unet/       (Q6_K by default)
   * t5xxl_fp8_e4m3fn text encoder     -> models/clip/       (~4.9GB, fp8 = 16GB-VRAM safe)
   * clip_l text encoder               -> models/clip/       (~246MB)
   * Flux VAE (ae.safetensors)         -> models/vae/        (~335MB)
-  * FLUX.1 Turbo-Alpha LoRA (8-step)  -> models/loras/      (~694MB)
 
 No tokens are embedded: huggingface_hub uses your cached login (`huggingface-cli login`)
 only if a repo is gated.  All defaults below are ungated public repos.
 
 Usage:
-    python scripts/setup_flux_inpaint.py --comfy-dir "C:/ComfyUI" [--quant Q4_K_M]
+    python scripts/setup_flux_inpaint.py --comfy-dir "C:/ComfyUI" [--quant Q6_K]
     python scripts/setup_flux_inpaint.py --list        # print the plan, download nothing
 
 If --comfy-dir is omitted the script prints the exact target subfolders and exits so you
@@ -38,7 +37,7 @@ MODELS = [
         "subdir": "unet",
         "alt_subdir": "diffusion_models",
         "local": "flux1-fill-dev-{quant}.gguf",
-        "size": "~6.8 GB (Q4_K_M) / ~8.4 GB (Q5_K_M)",
+        "size": "varies by quant (Q6_K is the checked-in quality default)",
         "gated": False,
     },
     {
@@ -70,16 +69,6 @@ MODELS = [
         "alt_subdir": None,
         "local": "ae.safetensors",
         "size": "~335 MB",
-        "gated": False,
-    },
-    {
-        "key": "lora",
-        "repo": "alimama-creative/FLUX.1-Turbo-Alpha",
-        "remote": "diffusion_pytorch_model.safetensors",
-        "subdir": "loras",
-        "alt_subdir": None,
-        "local": "flux1-turbo-alpha.safetensors",
-        "size": "~694 MB",
         "gated": False,
     },
 ]
@@ -120,7 +109,6 @@ def print_plan(quant: str, comfy_dir: str | None):
         print("    <ComfyUI>/models/unet   (GGUF; models/diffusion_models also works)")
         print("    <ComfyUI>/models/clip   (t5xxl + clip_l; models/text_encoders also works)")
         print("    <ComfyUI>/models/vae")
-        print("    <ComfyUI>/models/loras")
 
 
 def download(comfy_dir: str, quant: str) -> int:

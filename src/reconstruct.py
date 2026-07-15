@@ -14,6 +14,7 @@ from typing import Optional
 
 from . import inpaint, vectorize
 from .schema import dump
+from .raster_clusters import INTENTIONAL_RASTER_CLUSTER_ROLES, is_intentional_raster_cluster
 
 
 def _deps():
@@ -167,7 +168,7 @@ def _suppress_baked_raster_text(candidates: list, threshold: float = .90) -> lis
     raster_roles = {
         "photo", "product", "person", "foreground", "cutout", "avatar",
         "profile", "profile_photo", "thumbnail", "photo_card", "image",
-    }
+    } | set(INTENTIONAL_RASTER_CLUSTER_ROLES)
     rasters = []
     for candidate in candidates:
         meta = candidate.get("meta") or {}
@@ -257,8 +258,9 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
         "product", "person", "foreground", "cutout", "avatar", "profile",
         "profile_photo", "card", "thumbnail", "photo_card", "logo", "brand",
         "wordmark", "platform-logo", "icon", "badge", "button", "chip", "callout_leader",
-        "text_backplate",
-    }
+        "text_backplate", "panel", "image-panel", "photo-panel", "triptych-panel",
+        "comparison-panel", "comparison-column",
+    } | set(INTENTIONAL_RASTER_CLUSTER_ROLES)
     min_photo_fraction = float(photo_policy.get("min_separate_photo_fraction", 0.012))
     max_photo_fraction = float(photo_policy.get("max_separate_photo_fraction", 0.62))
     min_shape_fraction = float(photo_policy.get("min_separate_shape_fraction", 0.001))
@@ -281,7 +283,9 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
         meta = item.get("meta") or {}
         box = item.get("visible_box") or item.get("box") or {}
         fraction = (float(box.get("w") or 0) * float(box.get("h") or 0)) / canvas_area
-        if (item.get("target") == "image" and str(meta.get("role") or "").lower() in {"photo", "image"}
+        role = str(meta.get("role") or "").lower()
+        if (item.get("target") == "image" and (role in {"photo", "image"}
+                                                  or is_intentional_raster_cluster(role))
                 and fraction >= 0.15 and min(float(box.get("w") or 0), float(box.get("h") or 0)) >= 250):
             photo_roots.append(item)
     for candidate in candidates:
@@ -373,7 +377,8 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
             continue
         promoted = bool(meta.get("promote_element") or meta.get("editable_element")
                         or meta.get("verified_mask") or exact_text_fallback)
-        is_semantic = role in separate_roles or target == "icon"
+        is_semantic = (role in separate_roles or is_intentional_raster_cluster(role)
+                       or target == "icon")
         is_photo_frame = role in {"photo", "image"} and (
             not box or min_photo_fraction <= area_fraction <= max_photo_fraction
         )
@@ -435,25 +440,47 @@ def _mask_path(candidate):
     return candidate.get("mask_path")
 
 
-def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None):
+def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None, cfg: Optional[dict] = None):
     _, np, _ = _deps()
     h, w = rgb.shape[:2]
     meta = candidate.get("meta") or {}
+    rcfg = (cfg or {}).get("reconstruct") or {}
     substitution = meta.get("substitution") if isinstance(meta.get("substitution"), dict) else {}
     exact_text_fallback = bool(
         candidate.get("text") and meta.get("fallback") and substitution.get("from") == "text"
     )
+    removal_text = bool(candidate.get("text") and meta.get("removal_required"))
     if (candidate.get("target") == "text" or exact_text_fallback
-            or (candidate.get("text") and meta.get("wordmark"))):
+            or removal_text or (candidate.get("text") and meta.get("wordmark"))):
         # line_ids are provenance only: merge/reordering can leave them stale or point
         # at an unrelated OCR line. The merged candidate geometry is canonical.
         box = candidate.get("visible_box") or candidate.get("ink_box") or candidate.get("box", {})
+        allow_box_fallback = bool(
+            rcfg.get("allow_text_box_fallback", False)
+            or meta.get("force_box_removal")
+        ) and not bool(meta.get("overlay_text"))
         mask = inpaint.text_ink_mask(
             rgb,
             box,
             candidate.get("quad") or meta.get("quad"),
-            allow_box_fallback=not bool(meta.get("overlay_text")),
+            allow_box_fallback=allow_box_fallback,
         )
+        # A crop that is itself a flat, opaque overlay (rather than sparse glyphs on the
+        # plate) legitimately owns its complete rectangle. Detect that from source pixels
+        # and the immediate outside ring instead of using an unconditional box fallback.
+        if (not np.any(mask)
+                and bool(rcfg.get("allow_opaque_text_region_fallback", True))):
+            exact = inpaint.box_fill_mask((h, w), box, pad=0)
+            ring = (inpaint.box_fill_mask((h, w), box, pad=3) > 0) & (exact == 0)
+            inside_pixels = rgb[exact > 0].astype(np.float32)
+            outside_pixels = rgb[ring].astype(np.float32)
+            if inside_pixels.size and outside_pixels.size:
+                flatness = float(np.max(np.std(inside_pixels, axis=0)))
+                contrast = float(np.linalg.norm(
+                    np.median(inside_pixels, axis=0) - np.median(outside_pixels, axis=0)
+                ))
+                if flatness <= 8.0 and contrast >= 24.0:
+                    mask = exact
         if candidate.get("target") == "text":
             solid = inpaint.box_fill_mask((h, w), box, pad=5)
             coverage = float(np.count_nonzero(mask & solid)) / max(1, np.count_nonzero(solid))
@@ -462,9 +489,16 @@ def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None):
             # plates (notably photo ads like 041). Only promote to the full box when the
             # box is small enough that this can't become a destructive slab.
             solid_fraction = float(np.count_nonzero(solid)) / max(1, h * w)
-            if coverage < 0.92 and solid_fraction <= 0.02:
+            promote_limit = float(rcfg.get("text_box_promote_max_fraction", 0.0))
+            if (promote_limit > 0 and coverage < 0.92
+                    and solid_fraction <= promote_limit):
                 mask = np.maximum(mask, solid)
         return mask
+    # A recognised screenshot/receipt/chart/table/diagram/product cluster is defined by
+    # its complete rectangular crop, not a sparse SAM matte. This keeps every internal
+    # pixel (including UI chrome and overlaps) inside the swappable source asset.
+    if is_intentional_raster_cluster(meta.get("role")) or meta.get("intentional_raster_cluster"):
+        return inpaint.box_fill_mask((h, w), candidate.get("box") or {}, pad=0)
     mask = inpaint.mask_on_canvas(_mask_path(candidate), candidate.get("box", {}), (w, h), run_dir)
     if candidate.get("target") in ("shape", "icon", "image"):
         mask = inpaint.solidify_mask(mask)
@@ -475,6 +509,53 @@ def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None):
     if candidate.get("target") == "image" and role in {"product", "person", "people", "portrait", "cutout"}:
         mask = inpaint.fill_enclosed_mask_holes(mask)
     return mask
+
+
+def _build_removal_ledger(observations: list, canvas: tuple[int, int]):
+    """Assign every final removal pixel to exactly one accepted observation.
+
+    Asset alpha ownership is solved earlier from canonical masks.  This second, final ledger
+    starts only from observations that survived routing and mask approval, expands their halo
+    once, and makes overlaps exclusive before any inpaint backend sees them.  Consequently a
+    dropped/retained observation cannot silently punch a hole and regional inpainting cannot
+    process the same pixel twice.
+    """
+    cv2, np, _ = _deps()
+    width, height = canvas
+
+    def priority(item):
+        target = str(item.get("target") or "")
+        role = str(item.get("role") or "").lower()
+        target_rank = {"text": 40, "icon": 30, "shape": 20, "image": 10}.get(target, 0)
+        if role in {"product", "person", "foreground", "cutout"}:
+            target_rank += 5
+        box = item.get("box") or {}
+        area = float(box.get("w", 0)) * float(box.get("h", 0))
+        return target_rank, float(item.get("z", 0)), -area, str(item.get("id") or "")
+
+    ledger = np.zeros((height, width), dtype=np.uint16)
+    records = []
+    owner_index = {}
+    for number, item in enumerate(sorted(observations, key=priority, reverse=True), start=1):
+        mask = item.get("mask_array")
+        if mask is None:
+            continue
+        mask = inpaint.solidify_mask(mask)
+        radius = max(0, int(item.get("dilate", 0)))
+        if radius:
+            mask = cv2.dilate(mask, np.ones((2 * radius + 1, 2 * radius + 1), np.uint8))
+        available = (mask > 0) & (ledger == 0)
+        if not np.any(available):
+            continue
+        ledger[available] = number
+        owned = dict(item)
+        owned["mask_array"] = available.astype(np.uint8) * 255
+        owned["dilate"] = 0
+        owned["removal_owner"] = number
+        records.append(owned)
+        owner_index[str(number)] = item.get("id")
+    union = (ledger > 0).astype(np.uint8) * 255
+    return records, union, ledger, owner_index
 
 
 def _crop_rgba(rgb, mask, box):
@@ -493,6 +574,12 @@ def _crop_rgba(rgb, mask, box):
 def _source_rgba(candidate, rgb, mask, run_dir):
     """Prefer a model-provided clean RGBA layer, correctly cropped to its tight box."""
     _, np, Image = _deps()
+    cluster_meta = candidate.get("meta") or {}
+    if (is_intentional_raster_cluster(cluster_meta.get("role"))
+            or cluster_meta.get("intentional_raster_cluster")):
+        # Do not use a transparent Qwen/SAM crop here: the original full crop is the
+        # fidelity contract for an inseparable cluster.
+        return _crop_rgba(rgb, mask, candidate.get("box", {}))
     path = inpaint.resolve_path(candidate.get("src"), run_dir)
     box = candidate.get("box", {})
     if path:
@@ -803,6 +890,52 @@ def _gradient_fill(local_rgb, interior, min_range=18.0, min_r2=.86):
     }
 
 
+def _radial_gradient_fill(local_rgb, interior, min_range=18.0, min_r2=.91):
+    """Fit the centered circular radial paint supported identically by preview/Figma.
+
+    Off-centre, elliptical, noisy, or multi-lobed fields intentionally fail this model and
+    remain raster. A high R² alone is not enough: the colour range must be meaningful and
+    the fitted colour slope must change strongly from centre to edge.
+    """
+    _, np, _ = _deps()
+    ys, xs = np.nonzero(interior)
+    if len(xs) < 120:
+        return None
+    h, w = interior.shape
+    cx, cy = (w - 1) / 2, (h - 1) / 2
+    normalizer = max(1.0, float(np.hypot(cx, cy)))
+    radius = np.hypot(xs.astype(np.float32) - cx, ys.astype(np.float32) - cy) / normalizer
+    colors = local_rgb[ys, xs].astype(np.float32)
+    if len(colors) > 12000:
+        pick = np.linspace(0, len(colors) - 1, 12000).astype(int)
+        radius, colors = radius[pick], colors[pick]
+    spread = np.percentile(colors, 95, axis=0) - np.percentile(colors, 5, axis=0)
+    if float(np.linalg.norm(spread)) < min_range:
+        return None
+    design = np.column_stack((np.ones(len(radius)), radius))
+    coefficients, _, _, _ = np.linalg.lstsq(design, colors, rcond=None)
+    prediction = design @ coefficients
+    total = float(np.square(colors - colors.mean(axis=0)).sum())
+    if total <= 1e-6:
+        return None
+    r2 = 1 - float(np.square(colors - prediction).sum()) / total
+    if r2 < min_r2 or float(np.linalg.norm(coefficients[1])) < min_range * .55:
+        return None
+    low, high = np.percentile(radius, (2, 98))
+    if high - low < .35:
+        return None
+    endpoint = lambda value: coefficients[0] + coefficients[1] * value
+    return {
+        "kind": "radial",
+        "stops": [
+            {"position": 0, "color": _hex(endpoint(0))},
+            {"position": 1, "color": _hex(endpoint(1))},
+        ],
+        "meta": {"r2": round(r2, 4), "range": round(float(np.linalg.norm(spread)), 2),
+                 "center": [0.5, 0.5]},
+    }
+
+
 def _stroke_and_interior(local_rgb, local_mask, max_width=8):
     """Detect a coherent inset stroke and return (stroke, safe_fill_pixels_mask).
 
@@ -914,11 +1047,23 @@ def _extract_shape_style(rgb, mask, box, cfg):
     stroke, interior = _stroke_and_interior(
         local_rgb, local_mask, int(style_cfg.get("max_stroke_width", 8))
     )
-    gradient = _gradient_fill(
+    linear = _gradient_fill(
         local_rgb, interior,
         float(style_cfg.get("gradient_min_range", 18)),
         float(style_cfg.get("gradient_min_r2", .86)),
     )
+    radial = _radial_gradient_fill(
+        local_rgb, interior,
+        float(style_cfg.get("gradient_min_range", 18)),
+        float(style_cfg.get("radial_gradient_min_r2", .91)),
+    )
+    # Prefer radial only when it explains materially more variance. Near-ties use the
+    # simpler established linear path, preventing soft photographic lighting from being
+    # mislabeled as an editable radial gradient.
+    radial_margin = float(style_cfg.get("radial_gradient_r2_margin", .035))
+    linear_r2 = float(((linear or {}).get("meta") or {}).get("r2", -1))
+    radial_r2 = float(((radial or {}).get("meta") or {}).get("r2", -1))
+    gradient = radial if radial and radial_r2 >= linear_r2 + radial_margin else linear
     fill_color = _robust_color(local_rgb[interior])
     fill = gradient or {"kind": "flat", "color": _hex(fill_color)}
     radius = _corner_radius(local_mask) if geometry == "rect" else None
@@ -936,6 +1081,27 @@ def _extract_shape_style(rgb, mask, box, cfg):
             "shadow_detected": bool(effect),
         },
     }
+
+
+def _image_frame_stroke(rgb, mask, box, mask_spec, cfg):
+    """Return a proven inside border for a rounded/elliptical raster frame.
+
+    Image layers intentionally keep their source pixels, so this never edits their
+    alpha or crop.  It merely promotes a uniform source-evidenced rim into the
+    native Figma stroke that sits over those same edge pixels.  Plain photo edges
+    fail the coherence gate in ``_stroke_and_interior`` and remain raster-only.
+    """
+    style_cfg = ((cfg.get("reconstruct") or {}).get("style_extraction") or {})
+    if style_cfg.get("detect_image_frame_strokes", True) is False:
+        return None
+    kind = str((mask_spec or {}).get("kind") or "").lower()
+    if kind not in {"ellipse", "circle", "rrect", "rounded_rect"}:
+        return None
+    local_rgb, local_mask = _local_shape_pixels(rgb, mask, box)
+    stroke, _ = _stroke_and_interior(
+        local_rgb, local_mask, int(style_cfg.get("max_stroke_width", 8))
+    )
+    return stroke
 
 
 def _infer_shape(mask, box):
@@ -1117,8 +1283,11 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     ocr_lines = {line.get("id"): line for line in (ocr.get("lines") or [])}
     masks = {}
     for candidate in canonical:
-        if candidate.get("target") != "drop":
-            masks[candidate.get("id")] = _candidate_mask(candidate, rgb, run_dir, ocr_lines)
+        if (candidate.get("target") != "drop"
+                or (candidate.get("meta") or {}).get("removal_required")):
+            masks[candidate.get("id")] = _candidate_mask(
+                candidate, rgb, run_dir, ocr_lines, cfg,
+            )
 
     # Front-to-back ownership is diagnostic and makes overlapping raster assets exclusive.
     # Text/icons are frontmost; smaller nested layers win over broad photo regions.
@@ -1223,6 +1392,8 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             # a swappable IMAGE clipped by the detected primitive, not a flattened solid fill.
             if extracted and extracted.get("effects") and not c.get("effects"):
                 c["effects"] = extracted["effects"]
+            if extracted and extracted.get("stroke") and not c.get("stroke"):
+                c["stroke"] = extracted["stroke"]
             if extracted:
                 c["meta"]["style_extraction"] = extracted["meta"]
             c["meta"]["reclassified"] = "shape->image"
@@ -1314,12 +1485,18 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         c["src"] = raster_src
         # Swappable mask shape: ellipse for round avatars, rounded-rect for cards, path for
         # a clean logo silhouette; irregular cutouts keep their own alpha.
-        c["mask"] = _image_mask_spec(c, mask, c.get("box", {}))
+        final_mask = _image_mask_spec(c, mask, c.get("box", {}))
+        if target == "image" and not c.get("stroke"):
+            frame_stroke = _image_frame_stroke(rgb, mask, c.get("box", {}), final_mask, cfg)
+            if frame_stroke:
+                c["stroke"] = frame_stroke
+                c["meta"]["image_frame_stroke"] = {
+                    "source": "uniform-border-ring", "width": frame_stroke["width"],
+                }
+        c["mask"] = final_mask
         updated.append(c)
 
     removal = []
-    text_removal = []
-    large_removal = []
     mask_rejected = 0
     scene_vlm_required = bool((((cfg.get("vlm") or {}).get("scene_text") or {}).get("enabled")))
     max_text_mask_fraction = float(rcfg.get("max_text_mask_canvas_fraction", 0.035))
@@ -1385,6 +1562,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "target": c.get("target"),
             "role": (c.get("meta") or {}).get("role"),
             "parent_id": (c.get("meta") or {}).get("parent_id"),
+            "z": c.get("z", 0),
             "meta": c.get("meta") or {},
             "box": box,
             "mask_array": candidate_mask,
@@ -1392,15 +1570,22 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "dilate": dilate,
         }
         removal.append(observation)
-        if c.get("target") == "text" or (c.get("target") == "drop" and (c.get("meta") or {}).get("removal_required")):
-            text_removal.append(observation)
-        else:
-            large_removal.append(observation)
-    union = inpaint.build_union_mask(
-        (w, h), removal, run_dir, default_dilate=inpaint.default_mask_dilate(cfg), cfg=cfg,
+    removal, union, removal_ownership, removal_owner_index = _build_removal_ledger(
+        removal, (w, h),
     )
+    def _is_text_removal(item):
+        return item.get("target") == "text" or (
+            item.get("target") == "drop" and (item.get("meta") or {}).get("removal_required")
+        )
+    text_removal = [item for item in removal if _is_text_removal(item)]
+    large_removal = [item for item in removal if not _is_text_removal(item)]
     mask_path = os.path.join(run_dir, "removal_mask.png")
     Image.fromarray(union).save(mask_path)
+    removal_ownership_path = os.path.join(run_dir, "removal_ownership.png")
+    removal_scale = max(1, 65535 // max(1, len(removal_owner_index)))
+    Image.fromarray((removal_ownership * removal_scale).astype(np.uint16)).save(
+        removal_ownership_path
+    )
     background_path = os.path.join(run_dir, "background_clean.png")
     regional_enabled = bool(((cfg.get("inpaint") or {}).get("regional") or {}).get("enabled", False))
     if regional_enabled:
@@ -1437,6 +1622,8 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         "removal_mask": "removal_mask.png",
         "ownership": "ownership.png",
         "owner_index": owner_index,
+        "removal_ownership": "removal_ownership.png",
+        "removal_owner_index": removal_owner_index,
         "candidates": updated,
         "stats": {
             "input_candidates": len(candidates),

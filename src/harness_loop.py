@@ -161,12 +161,12 @@ def _actionable_signatures(run_dir: str, cfg: dict, blocked: set) -> list:
     return out
 
 
-def max_harness_rounds(cfg: Optional[dict] = None, default: int = 3) -> int:
+def max_harness_rounds(cfg: Optional[dict] = None, default: int = 2) -> int:
     rounds = harness_max_rounds(cfg or {})
     return max(1, rounds if rounds else default)
 
 
-def repair_iterations(cfg: Optional[dict] = None, default: int = 2) -> int:
+def repair_iterations(cfg: Optional[dict] = None, default: int = 1) -> int:
     harness = ((cfg or {}).get("runtime") or {}).get("harness") or {}
     return max(1, int(harness.get("repair_iterations", default)))
 
@@ -417,7 +417,7 @@ def run_until_acceptable(
     image_path: str,
     run_dir: str,
     cfg: Optional[dict] = None,
-    max_rounds: int = 3,
+    max_rounds: int = 2,
     *,
     start_from: str = "normalize",
     pipeline_already_ran: bool = False,

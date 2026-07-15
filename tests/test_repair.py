@@ -82,6 +82,8 @@ def test_repair_hard_fails_map_to_actionable_repairs():
             {"rule": "low-element-recall", "detail": "0.40 < 0.75"},
             {"rule": "vlm-rejected", "detail": "2 junk segments marked"},
             {"rule": "invalid-schema", "detail": "layers[0] missing id"},
+            {"rule": "native-accounting-missing", "detail": "old design compiler"},
+            {"rule": "unexplained-raster-fallback", "detail": "mystery"},
             {"rule": "sam3-unavailable", "detail": "checkpoint missing"},
         ],
     }

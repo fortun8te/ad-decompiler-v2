@@ -17,6 +17,11 @@ import shutil
 import time
 from typing import Iterable, Optional
 
+try:  # Supports both ``src.inpaint`` and the legacy bare ``inpaint`` import.
+    from .inpaint_quality import candidate_metrics
+except ImportError:  # pragma: no cover - exercised only by direct module invocation
+    from inpaint_quality import candidate_metrics
+
 
 def _deps():
     try:
@@ -50,6 +55,59 @@ def _flux_comfy_inpaint(rgb, mask, cfg: Optional[dict] = None):
     if worker is None or not hasattr(worker, "flux_inpaint"):
         return None
     return worker.flux_inpaint(rgb, mask, cfg)
+
+
+def _powerpaint_adapter_status(cfg: Optional[dict] = None) -> dict:
+    """Report only whether an optional user-supplied PowerPaint adapter is importable.
+
+    Importability is deliberately *not* reported as model readiness: the adapter may still
+    need model weights, a CUDA runtime, or its own server.  The first actual inpaint call is
+    the only honest runtime validation available without adding a GPU package to this project.
+    """
+    import importlib.util
+
+    powerpaint = ((cfg or {}).get("inpaint") or {}).get("powerpaint") or {}
+    module = str(powerpaint.get("adapter_module") or "").strip()
+    callable_name = str(powerpaint.get("callable") or "inpaint").strip()
+    enabled = bool(powerpaint.get("enabled", False))
+    if not module:
+        return {
+            "configured": False, "importable": False, "runtime_validated": False,
+            "detail": "adapter_module not configured", "adapter_module": "", "callable": callable_name,
+        }
+    try:
+        importable = importlib.util.find_spec(module) is not None
+        detail = ("adapter importable; model/device not validated" if importable
+                  else "adapter module not installed")
+    except (ImportError, AttributeError, ModuleNotFoundError, ValueError) as exc:
+        importable, detail = False, str(exc)
+    return {
+        "configured": enabled, "importable": importable, "runtime_validated": False,
+        "detail": detail, "adapter_module": module, "callable": callable_name,
+    }
+
+
+def _powerpaint_inpaint(rgb, mask, cfg: Optional[dict] = None):
+    """Call an optional local PowerPaint adapter without importing GPU dependencies here.
+
+    The adapter contract is ``callable(rgb_uint8, mask_uint8, cfg) -> RGB image | None``.
+    This intentionally provides a thin seam only; it neither vendors PowerPaint nor pretends
+    that a Mac has validated a CUDA/model install.
+    """
+    import importlib
+
+    status = _powerpaint_adapter_status(cfg)
+    if not status["configured"]:
+        return None
+    if not status["importable"]:
+        return None
+    module = importlib.import_module(status["adapter_module"])
+    adapter = getattr(module, status["callable"], None)
+    if not callable(adapter):
+        raise RuntimeError(
+            f"PowerPaint adapter {status['adapter_module']!r} has no callable {status['callable']!r}"
+        )
+    return adapter(rgb, mask, cfg or {})
 
 
 def resolve_path(path: Optional[str], run_dir: Optional[str] = None) -> Optional[str]:
@@ -269,20 +327,34 @@ def check_backends(cfg: Optional[dict] = None) -> dict:
     while ``fallback_ready`` describes the deterministic OpenCV alternative.
     """
     cfg = cfg or {}
-    mode = str((cfg.get("inpaint") or {}).get("mode", "auto")).lower()
+    icfg = cfg.get("inpaint") or {}
+    mode = str(icfg.get("mode", "auto")).lower()
+    strict_acceptance = bool(icfg.get("strict_acceptance", False))
     try:
         import cv2  # noqa: F401
         opencv_ok, opencv_detail = True, "opencv-python importable"
     except Exception as exc:
         opencv_ok, opencv_detail = False, str(exc)
     lama_ok = _big_lama_available()
-    active = lama_ok if mode in ("auto", "lama", "big-lama", "simple-lama") else opencv_ok
+    powerpaint = _powerpaint_adapter_status(cfg)
+    if mode in ("auto", "lama", "big-lama", "simple-lama"):
+        active = lama_ok
+    elif mode in ("opencv", "cv2"):
+        active = opencv_ok
+    elif mode in ("powerpaint", "power-paint"):
+        # An adapter can be importable while its GPU/weights are unavailable.  Do not lie.
+        active = False
+    else:
+        active = False
     return {
         "mode": mode,
+        "strict_acceptance": strict_acceptance,
         "big_lama": {"ok": lama_ok, "detail": "simple-lama-inpainting importable" if lama_ok else "not installed"},
         "opencv": {"ok": opencv_ok, "detail": opencv_detail},
+        "powerpaint": powerpaint,
         "ready": active,
         "fallback_ready": opencv_ok,
+        "fallback_permitted": opencv_ok and (not strict_acceptance or mode in ("opencv", "cv2")),
     }
 
 
@@ -519,7 +591,13 @@ def build_inpaint_regions(canvas: tuple[int, int], observations: Iterable[dict],
 
 
 def _regional_crop(mask, cfg: Optional[dict] = None):
-    """Mask-derived crop with adaptive context; returns bounds and model padding."""
+    """Mask-derived crop with configurable source context and model padding.
+
+    ``context_mode`` may be ``local`` (default), ``expanded`` (a larger local window),
+    or ``global`` (the complete source canvas).  The caller always supplies original
+    source pixels, never earlier generated pixels, so larger context cannot propagate a
+    previous region's hallucination into a later regional inpaint call.
+    """
     bbox = _mask_bbox(mask)
     if bbox is None:
         return None
@@ -529,9 +607,21 @@ def _regional_crop(mask, cfg: Optional[dict] = None):
     max_context = int(regional.get("max_context", 96))
     min_crop = int(regional.get("min_crop", 256))
     alignment = max(1, int(regional.get("alignment", 16)))
+    context_mode = str(regional.get("context_mode", "local")).lower()
+    if context_mode not in ("local", "expanded", "global"):
+        context_mode = "local"
+    if context_mode == "global":
+        crop_w, crop_h = w, h
+        pad_right = (-crop_w) % alignment
+        pad_bottom = (-crop_h) % alignment
+        return (0, 0, w, h), (0, 0, pad_right, pad_bottom), max(w, h)
     x0, y0, x1, y1 = bbox
     span = max(x1 - x0, y1 - y0)
-    context = min(max_context, max(min_context, int(round(span * .18))))
+    scale = float(regional.get("context_scale", 1.0))
+    if context_mode == "expanded":
+        scale *= float(regional.get("expanded_context_scale", 2.0))
+    scale = max(0.1, scale)
+    context = int(round(min(max_context * scale, max(min_context * scale, span * .18 * scale))))
     x0, y0 = max(0, x0 - context), max(0, y0 - context)
     x1, y1 = min(w, x1 + context), min(h, y1 + context)
     if x1 - x0 < min_crop:
@@ -684,14 +774,66 @@ def _boundary_color_match(source, generated, mask, radius: int = 5, max_shift: f
 
 
 def _opencv_auto(rgb, mask, radius):
-    """Pick the less seam-prone deterministic OpenCV fill for the fallback path."""
+    """Pick the best deterministic OpenCV candidate using continuity and residue signals."""
     telea = _opencv_inpaint(rgb, mask, radius, "telea")
     ns = _opencv_inpaint(rgb, mask, radius, "ns")
-    telea_score = _seam_energy(telea, mask)
-    ns_score = _seam_energy(ns, mask)
-    if ns_score + 1e-6 < telea_score:
-        return ns, "opencv-ns", {"telea_seam": round(telea_score, 4), "ns_seam": round(ns_score, 4)}
-    return telea, "opencv-telea", {"telea_seam": round(telea_score, 4), "ns_seam": round(ns_score, 4)}
+    telea_quality = _candidate_quality(rgb, telea, mask)
+    ns_quality = _candidate_quality(rgb, ns, mask)
+    if ns_quality["total"] + 1e-6 < telea_quality["total"]:
+        return ns, "opencv-ns", {
+            "telea_seam": telea_quality["seam"], "ns_seam": ns_quality["seam"],
+            "telea_quality": telea_quality, "ns_quality": ns_quality,
+        }
+    return telea, "opencv-telea", {
+        "telea_seam": telea_quality["seam"], "ns_seam": ns_quality["seam"],
+        "telea_quality": telea_quality, "ns_quality": ns_quality,
+    }
+
+
+def _candidate_quality(source, candidate, mask, cfg: Optional[dict] = None) -> dict:
+    """Rank a filled candidate without requiring a learned evaluator.
+
+    Seam energy remains available as the established signal.  Texture continuity,
+    structural continuity, and compact high-frequency residue provide deterministic
+    counterweights when two candidates have similarly clean seams.
+    """
+    cv2, np, _ = _deps()
+    icfg = (cfg or {}).get("inpaint") or {}
+    quality_cfg = icfg.get("quality") or {}
+    # Preserve the direct call for compatibility with existing seam probes/tests.
+    seam = float(_seam_energy(candidate, mask))
+    composed = np.asarray(source, dtype=np.uint8).copy()
+    selected = np.asarray(mask) > 0
+    metric_candidate = np.asarray(candidate, dtype=np.uint8)
+    # A defensive resize is needed for permissive third-party/test backends that return
+    # a padded or full-resolution image during a coarse pass. The seam probe above still
+    # receives the untouched candidate for legacy diagnostics.
+    if metric_candidate.shape[:2] != composed.shape[:2]:
+        metric_candidate = cv2.resize(
+            metric_candidate, (composed.shape[1], composed.shape[0]), interpolation=cv2.INTER_LINEAR,
+        )
+    composed[selected] = metric_candidate[selected]
+    metrics = candidate_metrics(source, composed, mask)
+    weights = {
+        "seam": float(quality_cfg.get("seam_weight", 1.0)),
+        "texture": float(quality_cfg.get("texture_weight", 0.35)),
+        "structure": float(quality_cfg.get("structure_weight", 0.20)),
+        "residue": float(quality_cfg.get("residue_weight", 0.80)),
+    }
+    total = (
+        seam * weights["seam"]
+        + float(metrics["texture"]) * weights["texture"]
+        + float(metrics["structure"]) * weights["structure"]
+        + float(metrics["residue"]) * weights["residue"]
+    )
+    return {
+        "seam": round(seam, 6),
+        "texture": round(float(metrics["texture"]), 6),
+        "structure": round(float(metrics["structure"]), 6),
+        "residue": round(float(metrics["residue"]), 6),
+        "total": round(float(total), 6),
+        "weights": weights,
+    }
 
 
 def _simple_lama(rgb, mask):
@@ -723,17 +865,20 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
     cfg = cfg or {}
     icfg = cfg.get("inpaint") or {}
     mode = str(icfg.get("mode", "auto")).lower()
+    strict_acceptance = bool(icfg.get("strict_acceptance", False))
     comfy_ok = comfyui_healthy(cfg, probe=icfg.get("_comfyui_probe"))
     lama_ok = _big_lama_available()
     diagnostics: dict = {
         "comfyui_healthy": comfy_ok,
         "big_lama_installed": lama_ok,
+        "strict_acceptance": strict_acceptance,
     }
 
     generated = None
     used = mode
+    fallback_reason = None
 
-    # Flux Fill via ComfyUI (real GPU inpaint, quantized GGUF + ~8-step turbo LoRA).
+    # Flux Fill via ComfyUI (real GPU inpaint, quantized GGUF, native Fill workflow).
     # Attempted first when explicitly selected (inpaint.mode: flux_comfy) or opted into
     # under auto mode (inpaint.comfy.enabled: true). When the GPU box is offline the seam
     # returns None and we degrade to Big-LaMa/OpenCV below, so the pipeline never crashes
@@ -754,6 +899,7 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
             diagnostics["flux_comfy"] = "ok"
         else:
             diagnostics["flux_comfy"] = "unavailable"
+            fallback_reason = "flux_comfy_unavailable"
             worker = _load_qwen_worker()
             last_error = ""
             try:
@@ -771,6 +917,27 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
                     "flux_comfy inpaint required but ComfyUI/Flux Fill is unavailable"
                 )
 
+    # Optional PowerPaint seam. The adapter is user-provided and deliberately has no
+    # bundled GPU dependency. An importable adapter is not treated as model validation.
+    powerpaint_modes = ("powerpaint", "power-paint")
+    if generated is None and mode in powerpaint_modes:
+        try:
+            powerpaint_out = _powerpaint_inpaint(np.asarray(rgb, dtype=np.uint8), mask, cfg)
+        except Exception as exc:
+            powerpaint_out = None
+            diagnostics["powerpaint_error"] = str(exc)
+        if powerpaint_out is not None:
+            generated = np.asarray(powerpaint_out, dtype=np.uint8)
+            used = "powerpaint"
+            diagnostics["powerpaint"] = "ok"
+            diagnostics["backend_choice"] = used
+        else:
+            diagnostics["powerpaint"] = "unavailable"
+            fallback_reason = fallback_reason or "powerpaint_unavailable"
+            powerpaint_cfg = icfg.get("powerpaint") or {}
+            if bool(powerpaint_cfg.get("required", False)) and not icfg.get("allow_fallback", True):
+                raise RuntimeError("PowerPaint inpaint required but its adapter is unavailable")
+
     try_lama = mode in ("lama", "big-lama", "simple-lama")
     if mode == "auto":
         # Big-LaMa is a local pip package; whether it can run has nothing to do with
@@ -781,8 +948,11 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
         try_lama = lama_ok
         if not lama_ok:
             diagnostics["auto_skip_reason"] = "big_lama_missing"
+            fallback_reason = fallback_reason or "big_lama_missing"
     # A downed Flux ComfyUI degrades to Big-LaMa (higher quality than OpenCV) before OpenCV.
     if generated is None and mode in flux_modes and lama_ok:
+        try_lama = True
+    if generated is None and mode in powerpaint_modes and lama_ok:
         try_lama = True
 
     if generated is None and try_lama:
@@ -792,13 +962,23 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
             diagnostics["backend_choice"] = "big-lama"
         except Exception as exc:
             diagnostics["big_lama_error"] = str(exc)
+            fallback_reason = fallback_reason or "big_lama_error"
             require_active = bool((cfg.get("runtime") or {}).get("require_active_models"))
-            if (mode != "auto" and not icfg.get("allow_fallback", True)) or require_active:
+            if ((mode != "auto" and not icfg.get("allow_fallback", True))
+                    or require_active or strict_acceptance):
                 diagnostics["active_model_required"] = require_active
                 raise
             print(f"[inpaint] Big-LaMa unavailable ({exc}); using OpenCV fallback")
 
     if generated is None:
+        explicit_opencv = mode in ("opencv", "cv2")
+        if strict_acceptance and not explicit_opencv:
+            reason = fallback_reason or "no_active_inpaint_backend"
+            diagnostics["opencv_fallback_blocked"] = reason
+            raise RuntimeError(
+                "strict inpaint acceptance blocks the OpenCV fallback "
+                f"(requested={mode}, reason={reason})"
+            )
         radius = int(icfg.get("opencv_radius", 5))
         auto_default = "auto" if mode in ("auto", *flux_modes) else "telea"
         fallback_method = str(icfg.get("opencv_method", auto_default)).lower()
@@ -809,6 +989,18 @@ def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
             generated = _opencv_inpaint(np.asarray(rgb, dtype=np.uint8), mask, radius, fallback_method)
             used = "opencv-ns" if fallback_method in ("ns", "navier-stokes", "navier_stokes") else "opencv-telea"
         diagnostics["backend_choice"] = used
+
+    opencv_fallback = used.startswith("opencv") and mode not in ("opencv", "cv2")
+    selected_class = "deterministic-fallback" if used.startswith("opencv") else "active-model"
+    diagnostics["backend_route"] = {
+        "requested": mode,
+        "selected": used,
+        "selected_class": selected_class,
+        "strict_acceptance": strict_acceptance,
+        "opencv_fallback_used": opencv_fallback,
+        "fallback_reason": fallback_reason,
+    }
+    diagnostics["backend_class"] = "fallback" if used.startswith("opencv") else "active"
 
     return generated, used, diagnostics
 
@@ -852,7 +1044,15 @@ def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: boo
     cfg = cfg or {}
     composite_mask = solidify_mask(mask)
     if not np.any(composite_mask):
-        result = (np.asarray(rgb, dtype=np.uint8).copy(), "none", {})
+        requested = str((cfg.get("inpaint") or {}).get("mode", "auto")).lower()
+        result = (np.asarray(rgb, dtype=np.uint8).copy(), "none", {
+            "backend_class": "none",
+            "backend_route": {
+                "requested": requested, "selected": "none", "selected_class": "none",
+                "strict_acceptance": bool((cfg.get("inpaint") or {}).get("strict_acceptance", False)),
+                "opencv_fallback_used": False, "fallback_reason": "empty_mask",
+            },
+        })
         return result if return_diagnostics else result[:2]
 
     generated, used, diagnostics = _multipass_inpaint(
@@ -927,6 +1127,9 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
     regions = build_inpaint_regions(
         (source.shape[1], source.shape[0]), observations, union, cfg, run_dir,
     )
+    # Each region sees immutable source pixels as context.  The composited working plate
+    # is only the destination, never input to a later backend/model call; otherwise a
+    # bad earlier completion can influence the next region's texture or structure.
     working = source.copy()
     regional_cfg = ((cfg.get("inpaint") or {}).get("regional") or {})
     flat_residual = float(regional_cfg.get("flat_residual_p90", 10.0))
@@ -958,7 +1161,7 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             continue
         (x0, y0, x1, y1), padding, context = crop_spec
         _, _, pad_right, pad_bottom = padding
-        crop_rgb = working[y0:y1, x0:x1].copy()
+        crop_rgb = source[y0:y1, x0:x1].copy()
         crop_mask = mask[y0:y1, x0:x1].copy()
         crop_union = union[y0:y1, x0:x1]
         if pad_right or pad_bottom:
@@ -1027,6 +1230,12 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             generated = _render_background_model(crop_rgb.shape, coeff)
             used = "analytic-affine"
             backend_diagnostics["backend_choice"] = used
+            backend_diagnostics["backend_class"] = "analytic"
+            backend_diagnostics["backend_route"] = {
+                "requested": requested, "selected": used, "selected_class": "analytic",
+                "strict_acceptance": bool((cfg.get("inpaint") or {}).get("strict_acceptance", False)),
+                "opencv_fallback_used": False, "fallback_reason": None,
+            }
         else:
             region_cfg = dict(cfg)
             region_cfg["inpaint"] = dict(cfg.get("inpaint") or {})
@@ -1071,18 +1280,20 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
                     matched, shift = candidate, [0.0, 0.0, 0.0]
                 preview_candidate = crop_rgb.copy()
                 preview_candidate[crop_mask > 0] = matched[crop_mask > 0]
-                seam_score = _seam_energy(preview_candidate, crop_mask)
-                candidates.append((seam_score, matched, candidate_backend, candidate_diag,
+                quality = _candidate_quality(crop_rgb, preview_candidate, crop_mask, attempt_cfg)
+                candidates.append((quality, matched, candidate_backend, candidate_diag,
                                    shift, base_seed + attempt))
-            seam_score, generated, used, backend_diagnostics, shift, chosen_seed = min(
-                candidates, key=lambda row: row[0]
+            quality, generated, used, backend_diagnostics, shift, chosen_seed = min(
+                candidates, key=lambda row: row[0]["total"]
             )
             backend_diagnostics = dict(backend_diagnostics)
             backend_diagnostics.update({
                 "attempts": attempts,
                 "chosen_seed": chosen_seed,
-                "seam_score": round(float(seam_score), 4),
-                "candidate_seam_scores": [round(float(row[0]), 4) for row in candidates],
+                "seam_score": round(float(quality["seam"]), 4),
+                "candidate_quality": quality,
+                "candidate_quality_scores": [row[0] for row in candidates],
+                "candidate_seam_scores": [round(float(row[0]["seam"]), 4) for row in candidates],
                 "boundary_color_shift": shift,
             })
             if generated.shape[:2] != crop_rgb.shape[:2]:
@@ -1102,6 +1313,8 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             "bbox": {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0},
             "model_size": {"w": crop_rgb.shape[1], "h": crop_rgb.shape[0]},
             "context": context,
+            "context_mode": str(regional_cfg.get("context_mode", "local")).lower(),
+            "context_source": "original-source-only",
             "masked_fraction_canvas": round(region_fraction, 6),
             "masked_fraction_crop": round(float(np.count_nonzero(crop_mask)) / crop_mask.size, 6),
             "complexity": complexity, "route": requested, "backend": used,

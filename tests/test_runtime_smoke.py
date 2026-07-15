@@ -53,6 +53,55 @@ def test_flux_probe_requires_real_backend_and_outside_identity(monkeypatch, tmp_
     assert result["evidence"]["outside_identical"] is True
 
 
+def test_powerpaint_probe_requires_exact_backend_and_disables_fallback(monkeypatch, tmp_path):
+    import numpy as np
+    seen = {}
+
+    def fake_once(image_path, mask_path, output_path, cfg):
+        seen["cfg"] = cfg
+        before = np.asarray(Image.open(image_path).convert("RGB")).copy()
+        mask = np.asarray(Image.open(mask_path).convert("L")) > 0
+        before[mask] = (12, 34, 56)
+        Image.fromarray(before).save(output_path)
+        return {"backend": "powerpaint"}
+
+    monkeypatch.setattr("src.inpaint.inpaint_once", fake_once)
+    result = runtime_smoke._probe_powerpaint(
+        {"inpaint": {"powerpaint": {"adapter_module": "local_powerpaint_adapter"}}}, tmp_path,
+    )
+
+    assert result["ok"] is True
+    assert result["evidence"]["backend"] == "powerpaint"
+    assert seen["cfg"]["inpaint"]["allow_fallback"] is False
+    assert seen["cfg"]["inpaint"]["powerpaint"]["required"] is True
+
+
+def test_default_probe_selection_follows_requested_inpaint_backend():
+    assert "flux_comfy" in runtime_smoke.selected_probes({"inpaint": {"mode": "flux_comfy"}})
+    assert "big_lama" not in runtime_smoke.selected_probes({"inpaint": {"mode": "flux_comfy"}})
+    assert "powerpaint" in runtime_smoke.selected_probes({"inpaint": {"mode": "powerpaint"}})
+    assert "big_lama" in runtime_smoke.selected_probes({"inpaint": {"mode": "auto"}})
+    assert not ({"big_lama", "flux_comfy", "powerpaint"} & set(
+        runtime_smoke.selected_probes({"inpaint": {"mode": "opencv"}})
+    ))
+
+
+def test_run_all_uses_selected_inpaint_probe_when_unspecified(monkeypatch, tmp_path):
+    calls = []
+
+    def fake(name, cfg, work, timeout):
+        calls.append(name)
+        return {"name": name, "ok": True, "detail": "fixture"}
+
+    monkeypatch.setattr(runtime_smoke, "_run_bounded", fake)
+    report = runtime_smoke.run_all({"inpaint": {"mode": "powerpaint"}}, tmp_path, timeout_s=3)
+
+    assert "powerpaint" in calls
+    assert "big_lama" not in calls
+    assert "flux_comfy" not in calls
+    assert report["probes"] == calls
+
+
 def test_worker_turns_probe_exception_into_evidence(monkeypatch, tmp_path):
     monkeypatch.setitem(runtime_smoke._IMPLEMENTATIONS, "ocr",
                         lambda cfg, work: (_ for _ in ()).throw(RuntimeError("boom")))

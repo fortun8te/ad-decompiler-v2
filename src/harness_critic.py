@@ -48,6 +48,8 @@ RULE_TO_CATEGORY = {
     "low-editable-ratio": "staging",
     "no-editable-content": "staging",
     "missing-editable-text": "text",
+    "native-accounting-missing": "staging",
+    "unexplained-raster-fallback": "sam",
     "duplicate-ownership": "staging",
     "local-ssim": "layout",
     "edge-fidelity": "layout",

@@ -224,6 +224,40 @@ def _surface_from(node):
     return None
 
 
+def _hoist_surface_material(host, shell):
+    """Move a folded full-bleed shell's complete paint contract onto its frame.
+
+    A card/button shell is intentionally removed once its parent becomes the native
+    Figma frame.  Copying only the first fill made multi-paint cards and shadows
+    disappear at that structural boundary.
+    """
+    shell_style = shell.get("style") or {}
+    host_style = dict(host.get("style") or {})
+
+    # Preserve all style-provided paints instead of reducing them to _surface_from's
+    # first fill.  A top-level fill remains authoritative when upstream supplied one.
+    if host.get("fill") is None and shell.get("fill") is not None:
+        host["fill"] = deepcopy(shell["fill"])
+    for key in ("fills", "paints", "fill", "background", "color"):
+        if key in shell_style and key not in host_style:
+            host_style[key] = deepcopy(shell_style[key])
+
+    if host.get("stroke") is None and shell.get("stroke") is not None:
+        host["stroke"] = deepcopy(shell["stroke"])
+    for key in ("strokes", "stroke"):
+        if key in shell_style and key not in host_style:
+            host_style[key] = deepcopy(shell_style[key])
+
+    if host_style:
+        host["style"] = host_style
+    if not host.get("effects"):
+        effects = shell.get("effects")
+        if not isinstance(effects, list):
+            effects = shell_style.get("effects")
+        if isinstance(effects, list) and effects:
+            host["effects"] = deepcopy(effects)
+
+
 def _normalize_group_surface(node):
     """Promote style-only fills onto groups so the Figma compiler can frame-promote cards."""
     if node.get("target") != "group" or _has_surface(node):
@@ -256,11 +290,9 @@ def _hoist_background_surface(group):
             best = child
     if not best:
         return
-    group["fill"] = _surface_from(best)
+    _hoist_surface_material(group, best)
     if group.get("radius") is None:
         group["radius"] = best.get("radius") or (best.get("style") or {}).get("radius")
-    if group.get("stroke") is None and best.get("stroke") is not None:
-        group["stroke"] = best.get("stroke")
     shell_id = best.get("id")
     if shell_id:
         group["children"] = [child for child in children if child.get("id") != shell_id]
@@ -370,6 +402,190 @@ def _wrap_repeated_card_grids(roots):
     return out
 
 
+_STRUCTURE_GROUP_KEYS = (
+    "structure_group_id", "repeat_group_id", "panel_set_id", "grid_group_id",
+    "comparison_group_id", "chart_group_id",
+)
+_IMPLICIT_STRUCTURE_ROLES = {
+    "panel", "image-panel", "photo-panel", "comparison-panel", "comparison-column", "triptych-panel",
+    "repeated-row", "stat-row", "table-row", "data-row",
+}
+_CHART_PRIMITIVE_ROLES = {
+    "axis", "axis-line", "gridline", "divider", "bar", "chart-bar",
+    "plot-line", "data-line", "data-point", "marker", "data-label", "axis-label",
+}
+
+
+def _structure_key(node):
+    meta = node.get("meta") or {}
+    for field in _STRUCTURE_GROUP_KEYS:
+        value = meta.get(field)
+        if value not in (None, ""):
+            return field, str(value)
+    role = str(meta.get("role") or "").strip().lower().replace("_", "-")
+    if role in _IMPLICIT_STRUCTURE_ROLES:
+        # Implicit grouping is deliberately role-scoped. It still has to pass the
+        # strict deterministic geometry gate below, so two unrelated panels do not
+        # become a made-up responsive layout.
+        return "role", role
+    return None
+
+
+def _axis_layout(members):
+    box = _union([member.get("box") or {} for member in members])
+    layout = infer_auto_layout({"box": box, "meta": {"role": "structural-set"}}, members)
+    if layout.get("mode") not in ("HORIZONTAL", "VERTICAL"):
+        return None
+    if float(layout.get("confidence", 0) or 0) < .82:
+        return None
+    widths = [max(1.0, (member.get("box") or {}).get("w", 1)) for member in members]
+    heights = [max(1.0, (member.get("box") or {}).get("h", 1)) for member in members]
+    cross_sizes = heights if layout["mode"] == "HORIZONTAL" else widths
+    if not _consistent(cross_sizes, max_cv=.16):
+        return None
+    return box, layout
+
+
+def _grid_rows(members):
+    """Return deterministic equal-column rows, or None for artistic/uneven geometry."""
+    if len(members) < 4:
+        return None
+    ordered = sorted(members, key=lambda node: (
+        (node.get("box") or {}).get("y", 0) + (node.get("box") or {}).get("h", 0) / 2,
+        (node.get("box") or {}).get("x", 0), node.get("id", ""),
+    ))
+    typical_h = median([max(1.0, (node.get("box") or {}).get("h", 1)) for node in ordered])
+    rows = []
+    for node in ordered:
+        cy = (node.get("box") or {}).get("y", 0) + (node.get("box") or {}).get("h", 0) / 2
+        if not rows:
+            rows.append([node])
+            continue
+        prior_centers = [
+            (item.get("box") or {}).get("y", 0) + (item.get("box") or {}).get("h", 0) / 2
+            for item in rows[-1]
+        ]
+        if abs(cy - median(prior_centers)) <= typical_h * .22:
+            rows[-1].append(node)
+        else:
+            rows.append([node])
+    if len(rows) < 2 or min(len(row) for row in rows) < 2:
+        return None
+    if len({len(row) for row in rows}) != 1:
+        return None
+    normalized = []
+    reference_centers = None
+    for row in rows:
+        row = sorted(row, key=lambda node: ((node.get("box") or {}).get("x", 0), node.get("id", "")))
+        axis = _axis_layout(row)
+        if not axis or axis[1]["mode"] != "HORIZONTAL":
+            return None
+        centers = [
+            (node.get("box") or {}).get("x", 0) + (node.get("box") or {}).get("w", 0) / 2
+            for node in row
+        ]
+        if reference_centers is None:
+            reference_centers = centers
+        elif any(abs(a - b) > max(4.0, typical_h * .12)
+                 for a, b in zip(reference_centers, centers)):
+            return None
+        normalized.append((row, axis))
+    return normalized
+
+
+def _chart_is_deterministic(members):
+    roles = {
+        str((member.get("meta") or {}).get("role") or "").lower().replace("_", "-")
+        for member in members
+    }
+    if any(member.get("target") not in {"shape", "text", "icon"} for member in members):
+        return False
+    if any(role not in _CHART_PRIMITIVE_ROLES for role in roles):
+        return False
+    axes = roles & {"axis", "axis-line"}
+    marks = sum(role in {"bar", "chart-bar", "plot-line", "data-line", "data-point", "marker"}
+                for role in [str((member.get("meta") or {}).get("role") or "").lower().replace("_", "-")
+                             for member in members])
+    return bool(axes) and marks >= 2
+
+
+def _wrap_structural_sets(roots):
+    """Preserve proven panels, comparisons, repeated rows, grids, and simple charts.
+
+    This pass never performs visual guessing. Explicit detector/VLM group IDs are accepted;
+    implicit panel roles additionally require strict equal-size/alignment evidence. Complex
+    charts remain intentional raster clusters upstream, while a chart made entirely from
+    positively identified native primitives may be grouped without changing its geometry.
+    """
+    sets = {}
+    for node in roots:
+        key = _structure_key(node)
+        if key:
+            sets.setdefault(key, []).append(node)
+    wrappers, consumed = [], set()
+    for (field, value), members in sorted(sets.items(), key=lambda item: item[0]):
+        if len(members) < 2:
+            continue
+        if field == "role" and value in {"panel", "image-panel", "photo-panel", "triptych-panel"} \
+                and len(members) < 3:
+            continue
+        is_chart = field == "chart_group_id"
+        if is_chart:
+            if not _chart_is_deterministic(members):
+                continue
+            box = _union([member.get("box") or {} for member in members])
+            layout = {"mode": "NONE", "confidence": 1.0}
+            children = sorted(members, key=lambda node: (_node_z(node), node.get("id", "")))
+            role = "native-chart"
+        else:
+            axis = _axis_layout(members)
+            grid = None if axis else _grid_rows(members)
+            if not axis and not grid:
+                continue
+            if axis:
+                box, layout = axis
+                reverse = layout["mode"] == "VERTICAL"
+                key_name = "y" if reverse else "x"
+                children = sorted(members, key=lambda node: (
+                    (node.get("box") or {}).get(key_name, 0), node.get("id", "")))
+                role = "panel-set" if "panel" in value or "comparison" in value else "repeated-set"
+            else:
+                row_nodes = []
+                for index, (row, (row_box, row_layout)) in enumerate(grid):
+                    row_nodes.append({
+                        "id": f"struct-row-{value}-{index}", "target": "group",
+                        "box": row_box, "z": min(_node_z(node) for node in row),
+                        "children": row, "layout": row_layout,
+                        "meta": {"role": "grid-row", "layout_confidence": row_layout["confidence"]},
+                    })
+                    _annotate_stack_children(row_nodes[-1], row)
+                box = _union([node["box"] for node in row_nodes])
+                layout = infer_auto_layout({"box": box, "meta": {"role": "structural-grid"}}, row_nodes)
+                if layout.get("mode") != "VERTICAL" or layout.get("confidence", 0) < .82:
+                    continue
+                children, role = row_nodes, "structural-grid"
+        stable = hashlib.sha1(f"{field}:{value}".encode()).hexdigest()[:10]
+        wrapper = {
+            "id": f"struct-{role}-{stable}", "target": "group", "box": box,
+            "z": min(_node_z(node) for node in members), "children": children,
+            "layout": layout,
+            "meta": {
+                "role": role, "structure_source": field, "structure_value": value,
+                "layout_confidence": layout.get("confidence"),
+                "deterministic_geometry": True,
+            },
+        }
+        _annotate_stack_children(wrapper, children)
+        wrappers.append(wrapper)
+        consumed.update(node.get("id") for node in members)
+    if not wrappers:
+        return roots
+    out = [node for node in roots if node.get("id") not in consumed]
+    out.extend(wrappers)
+    out.sort(key=lambda node: (_node_z(node), node.get("id", "")))
+    return out
+
+
 def _order_button_children(children):
     """Keep editable labels above painted shells in the frame tree."""
     def _rank(child):
@@ -470,12 +686,25 @@ def _text_alignment(a, b):
 def _node_z(node):
     raw = node.get("z_index", node.get("z"))
     target = node.get("target")
+    meta = node.get("meta") or {}
+    # Match reconstruction's ownership contract: a VLM/SAM layer band is more
+    # trustworthy than the common placeholder z=0, but never replaces a real
+    # upstream paint order.
+    if raw in (None, 0, "0", "0.0"):
+        band = str(meta.get("z_band") or "").lower()
+        band_z = {
+            "background": -1_000_000.0, "plate": -1_000_000.0,
+            "content": 20.0, "scene": 20.0, "foreground": 30.0,
+            "overlay": 40.0, "chrome": 50.0, "ui": 50.0,
+        }.get(band)
+        if band_z is not None:
+            return band_z
     # Fusion assigns OCR z=1 to distinguish shell vs label — not final paint order.
     if target == "text" and raw in (None, 0, 1, "0", "0.0", "1", "1.0"):
         return 40.0
     if raw not in (None, 0, "0", "0.0"):
         return float(raw)
-    role = str((node.get("meta") or {}).get("role") or node.get("role") or "").lower()
+    role = str(meta.get("role") or node.get("role") or "").lower()
     if role in {"background", "plate", "clean plate"}:
         return -1_000_000.0
     return {"text": 40.0, "icon": 35.0, "image": 25.0}.get(target, 20.0)
@@ -635,11 +864,9 @@ def _merge_card_shells(nodes, containers):
         if len(backdrops) != 1:
             continue
         backdrop = backdrops[0]
-        host["fill"] = _surface_from(backdrop)
+        _hoist_surface_material(host, backdrop)
         if host.get("radius") is None:
             host["radius"] = backdrop.get("radius") or (backdrop.get("style") or {}).get("radius")
-        if host.get("stroke") is None and backdrop.get("stroke") is not None:
-            host["stroke"] = backdrop.get("stroke")
         dropped.add(backdrop["id"])
         if id(backdrop) in container_set:
             containers.remove(backdrop)
@@ -722,6 +949,9 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
     # This stops a UI label over a screenshot/avatar from being split back into a
     # distant top-level layer merely because its owner is an IMAGE rather than a RECT.
     roots = _semantic_asset_groups(roots)
+    # Detector/VLM group IDs plus strict geometry preserve real panel and data
+    # structures before the generic text-stack pass can absorb their labels.
+    roots = _wrap_structural_sets(roots)
     roots = _semantic_text_stacks(roots)
     for node in nodes:
         if node.get("children"):

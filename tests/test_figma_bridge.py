@@ -75,6 +75,74 @@ def test_bridge_serves_staged_run_and_persists_plugin_report(tmp_path):
         server.server_close()
 
 
+def test_roundtrip_callbacks_cannot_attach_to_a_newer_staged_run(tmp_path):
+    """A Figma import can finish after the user has uploaded another image.
+
+    The late PNG/report must fail clearly instead of silently writing into the newer run
+    selected by the mutable top-level inbox manifest.
+    """
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    old_run = tmp_path / "old-run"
+    new_run = tmp_path / "new-run"
+    old_run.mkdir()
+    new_run.mkdir()
+    staged = inbox / "runs" / "new-doc"
+    staged.mkdir(parents=True)
+    manifest = {
+        "schema_version": 2,
+        "doc_id": "new-doc",
+        "roundtrip_token": "new-token",
+        "design": "design.json",
+        "staged_dir": "runs/new-doc",
+        "run_dir": str(new_run),
+        "export_to": str(new_run / "figma_export.png"),
+    }
+    (inbox / "inbox.json").write_text(json.dumps(manifest), encoding="utf-8")
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        old_report = {
+            "doc_id": "old-doc", "roundtrip_token": "old-token",
+            "report": {"ok": True},
+        }
+        try:
+            urlopen(Request(base + "/report", data=json.dumps(old_report).encode(), method="POST",
+                            headers={"Content-Type": "application/json"}), timeout=2)
+            assert False, "stale compiler report should be rejected"
+        except HTTPError as error:
+            assert error.code == 409
+            assert "stale Figma callback" in json.loads(error.read())["error"]
+        try:
+            urlopen(Request(base + "/export?doc_id=old-doc&roundtrip_token=old-token",
+                            data=b"old-png", method="POST"), timeout=2)
+            assert False, "stale Figma PNG should be rejected"
+        except HTTPError as error:
+            assert error.code == 409
+        assert not (new_run / "figma_export.png").exists()
+        assert not (new_run / "figma_report.json").exists()
+
+        current_report = {
+            "doc_id": "new-doc", "roundtrip_token": "new-token",
+            "report": {"ok": True},
+        }
+        report_response = json.loads(urlopen(Request(
+            base + "/report", data=json.dumps(current_report).encode(), method="POST",
+            headers={"Content-Type": "application/json"},
+        ), timeout=2).read())
+        assert report_response["ok"] is True
+        export_response = json.loads(urlopen(Request(
+            base + "/export?doc_id=new-doc&roundtrip_token=new-token",
+            data=b"new-png", method="POST",
+        ), timeout=2).read())
+        assert export_response["ok"] is True
+        assert (new_run / "figma_report.json").exists()
+        assert (new_run / "figma_export.png").read_bytes() == b"new-png"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def _start_server(inbox, config_path=None):
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(str(inbox), config_path))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -782,9 +850,42 @@ def test_history_records_stage_fractions_from_pipeline_log(tmp_path):
     assert fracs is not None
     assert fracs["normalize"] > 0
     assert fracs["ocr"] > fracs["normalize"]
-    _record_history(str(inbox), 90.0, str(run_dir))
+    _record_history(
+        str(inbox), 90.0, str(run_dir),
+        job_id="job-123", filename="/tmp/offer.png", doc_id="offer-doc",
+        finished_at=1234.5, qa_ok=True, layer_count=18,
+    )
     history = _read_history(str(inbox))
     assert history["runs"][0]["stage_fractions"]["ocr"] > 0
+    assert history["runs"][0]["filename"] == "offer.png"
+    assert history["runs"][0]["doc_id"] == "offer-doc"
+    assert history["runs"][0]["qa_ok"] is True
+
+
+def test_history_endpoint_exposes_recent_conversion_identity_without_run_paths(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _record_history(
+        str(inbox), 24.0,
+        job_id="job-new", filename="new-ad.png", doc_id="new-doc",
+        finished_at=200.0, qa_ok=True, layer_count=12,
+    )
+    _record_history(
+        str(inbox), 18.0,
+        job_id="job-old", filename="old-ad.png", doc_id="old-doc",
+        finished_at=100.0, qa_ok=True, layer_count=9,
+    )
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        payload = json.loads(urlopen(base + "/history", timeout=2).read())
+        assert payload["ok"] is True
+        assert [row["job_id"] for row in payload["runs"]] == ["job-old", "job-new"]
+        assert payload["runs"][0]["filename"] == "old-ad.png"
+        assert "run_dir" not in payload["runs"][0]
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_estimate_eta_uses_stage_weighted_progress(tmp_path):

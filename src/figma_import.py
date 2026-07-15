@@ -4,19 +4,13 @@ Figma has no fully-headless "create arbitrary nodes" API (REST is read-only for 
 creation). The reliable path is the companion plugin in figma-plugin/, which reads a
 design.json + assets from a shared inbox folder and builds real, editable nodes.
 
-Two modes (cfg.figma.mode):
-  'plugin'    — stage design.json + assets into FIGMA_INBOX; the plugin's "Import latest"
-                builds nodes and writes figma_export.png back to the run dir (one click in
-                Figma desktop). This is the recommended, highest-fidelity path.
-  'clipboard' — reuse the Mac harness's proven kiwi clipboard encoder
-                (studio/src/components/design/figmaClipboard.ts, 80/80 roundtrip) via a
-                small Node bridge to produce a paste payload. ⌘V into Figma. No plugin needed.
-
-export_screenshot() collects the PNG the plugin exported (plugin mode), or is a no-op the
-agent flags for a manual export (clipboard mode).
+The supported mode is ``plugin``: stage design.json + assets into FIGMA_INBOX; the
+plugin's Import action builds nodes and writes figma_export.png back to the run dir.
+The old clipboard mode depended on an unshipped kiwi bridge and has been removed rather
+than advertised as a path that cannot run.
 """
 from __future__ import annotations
-import hashlib, os, shutil, json, time, tempfile
+import hashlib, os, shutil, json, time, tempfile, uuid
 
 DEFAULT_INBOX = os.environ.get("FIGMA_INBOX", os.path.expanduser("~/figma-inbox"))
 
@@ -25,8 +19,6 @@ def import_design(design_path: str, run_dir: str, cfg: dict | None = None) -> di
     cfg = cfg or {}
     mode = (cfg.get("figma") or {}).get("mode", "plugin")
     try:
-        if mode == "clipboard":
-            return _clipboard(design_path, run_dir, cfg)
         if mode != "plugin":
             return {"ok": False, "mode": mode, "error": f"unsupported Figma mode: {mode}"}
         return _stage_for_plugin(design_path, run_dir, cfg)
@@ -77,6 +69,10 @@ def _stage_for_plugin(design_path, run_dir, cfg) -> dict:
     manifest = {
         "schema_version": design.get("schema_version", design.get("schemaVersion", 1)),
         "doc_id": doc_id,
+        # The plugin returns both its compiler report and Figma PNG through the bridge.
+        # Scope those callbacks to this exact staged revision so a late callback from an
+        # older import can never overwrite the newest run after another upload finishes.
+        "roundtrip_token": uuid.uuid4().hex,
         "design": "design.json",
         "staged_dir": os.path.relpath(staged_root, inbox).replace(os.sep, "/"),
         "assets": "assets",
@@ -103,27 +99,11 @@ def _stage_for_plugin(design_path, run_dir, cfg) -> dict:
             "action": "In Figma desktop: run the ad-decompiler plugin → Import latest."}
 
 
-def _clipboard(design_path, run_dir, cfg) -> dict:
-    """Convert design.json → Figma kiwi clipboard payload via the Node bridge in the Mac
-    harness. Requires node + the studio repo path (cfg.figma.studio_path)."""
-    import subprocess
-    studio = (cfg.get("figma") or {}).get("studio_path")
-    bridge = os.path.join(os.path.dirname(__file__), "..", "figma-plugin", "kiwi_bridge.mjs")
-    if not studio or not os.path.exists(bridge):
-        return {"ok": False, "mode": "clipboard",
-                "error": "set cfg.figma.studio_path to the NEUEGEN/studio repo and ensure figma-plugin/kiwi_bridge.mjs exists"}
-    out = os.path.join(run_dir, "figma_clipboard.bin")
-    try:
-        subprocess.run(["node", bridge, design_path, out, studio], check=True, timeout=120)
-        return {"ok": True, "mode": "clipboard", "payload": out,
-                "action": "Load the payload into the clipboard helper, then ⌘V/Ctrl+V into Figma."}
-    except Exception as e:
-        return {"ok": False, "mode": "clipboard", "error": str(e)}
-
-
 def export_screenshot(run_dir: str, cfg: dict | None = None, wait_s: int = 0) -> dict:
-    """Return path to figma_export.png once the plugin has written it. In plugin mode this may
-    poll briefly; the pipeline can also run --resume after the manual import click."""
+    """Return path to figma_export.png once the plugin has written it.
+
+    This may poll briefly; the pipeline can also run --resume after the manual import click.
+    """
     target = os.path.join(run_dir, "figma_export.png")
     deadline = time.time() + wait_s
     while True:

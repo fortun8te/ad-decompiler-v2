@@ -875,6 +875,15 @@ def _structural_audit(
         editable_ratio = editable / len(layers)
     editable_ratio = None if editable_ratio is None else float(editable_ratio)
     editable_text_recall = _editable_text_recall(source_ocr, design, layers)
+    design_meta = (design or {}).get("meta") or {}
+    leaf_accounting = design_meta.get("leaf_accounting")
+    if not isinstance(leaf_accounting, dict):
+        leaf_accounting = None
+    native_leaf_ratio = design_meta.get("native_leaf_ratio")
+    if native_leaf_ratio is None and leaf_accounting:
+        native_leaf_ratio = leaf_accounting.get("native_leaf_ratio")
+    native_leaf_ratio = None if native_leaf_ratio is None else float(native_leaf_ratio)
+    require_native_accounting = bool(supplied.get("require_native_accounting"))
 
     duplicate_ownership = _duplicate_ownership(layers)
     duplicate_ownership.extend(
@@ -932,6 +941,21 @@ def _structural_audit(
     if source_lines and editable_ratio is not None and editable_ratio < thresholds["editable_ratio_min"]:
         _add_fail(fails, "low-editable-ratio",
                   f"editable ratio {editable_ratio:.2f} < {thresholds['editable_ratio_min']:.2f}")
+    if require_native_accounting and leaf_accounting is None:
+        _add_fail(
+            fails, "native-accounting-missing",
+            "acceptance requires foreground leaf accounting; rebuild design.json with the current compiler",
+        )
+    if require_native_accounting and leaf_accounting:
+        unexplained = int(leaf_accounting.get("unexplained_raster_count", 0) or 0)
+        if unexplained:
+            ids = ", ".join(str(value) for value in
+                            (leaf_accounting.get("unexplained_raster_ids") or [])[:4])
+            _add_fail(
+                fails, "unexplained-raster-fallback",
+                f"{unexplained} raster fallback(s) have no semantic or fidelity reason"
+                + (f": {ids}" if ids else ""),
+            )
     if editable_text_recall is not None and editable_text_recall < thresholds["editable_text_recall_min"]:
         _add_fail(fails, "missing-editable-text",
                   f"editable text recall {editable_text_recall:.2f} < {thresholds['editable_text_recall_min']:.2f}")
@@ -994,6 +1018,8 @@ def _structural_audit(
             "skipped": figma_report.get("skipped") if figma_report else None,
         },
         "editable_ratio": None if editable_ratio is None else round(editable_ratio, 4),
+        "native_leaf_ratio": None if native_leaf_ratio is None else round(native_leaf_ratio, 4),
+        "leaf_accounting": leaf_accounting,
         "editable_text_recall": None if editable_text_recall is None else round(editable_text_recall, 4),
         "duplicate_ownership": duplicate_ownership,
         "duplicates_removed": int(stats.get("duplicates_removed", supplied.get("duplicates_removed", 0)) or 0),

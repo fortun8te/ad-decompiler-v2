@@ -13,6 +13,7 @@ route(candidate, canvas, cfg) -> candidate with `target` set to one of:
 """
 from __future__ import annotations
 from .wordmark import is_wordmark_candidate
+from .raster_clusters import cluster_label, is_intentional_raster_cluster
 
 # Simple-graphic size ceiling: only small cropped elements are eligible for vectorization.
 ICON_MAX_AREA_FRAC = 0.06
@@ -21,6 +22,12 @@ EMOJI_RE_HINT = ("emoji", "pictograph")
 # Roles that should attempt vector tracing when small enough.
 VECTORIZE_ROLES = (
     "icon", "badge", "logo", "arrow", "symbol", "pictogram", "chip", "divider", "chrome",
+    # Callout leaders are thin but frequently diagonal.  They need the normal
+    # vector-render gate (with an exact raster fallback), never a rectangular
+    # divider shortcut that would lose their direction/endpoint.
+    "callout_leader", "leader", "leader_line", "connector",
+    "starburst", "price_burst", "sale_burst", "burst", "splat", "sticker_burst",
+    "underline", "strikethrough", "strike_through",
 )
 # Flat UI chrome shapes that are often simple enough to trace instead of primitive-fit.
 PRIMITIVE_SHAPE_ROLES = ("badge", "chip", "button", "divider", "card")
@@ -40,6 +47,12 @@ AVATAR_ROLES = ("avatar", "profile", "profile_picture", "profile_photo", "pfp",
                 "headshot", "user_photo")
 CARD_ROLES = ("card", "badge", "thumbnail", "tile")
 LOGO_ROLES = ("logo", "wordmark", "brand", "logotype")
+EXTENDED_VECTOR_ROLES = {
+    # These are commonly much larger than a small UI icon in advertising.  They still
+    # enter the render-back gate; the larger ceiling only prevents premature flattening.
+    "arrow", "callout_leader", "leader", "leader_line", "connector",
+    "starburst", "price_burst", "sale_burst", "burst", "splat", "sticker_burst",
+}
 
 
 def _image_mask(candidate: dict, canvas: dict) -> dict:
@@ -60,6 +73,15 @@ def _image_mask(candidate: dict, canvas: dict) -> dict:
     meta = candidate.get("meta") or {}
     role = str(meta.get("role") or "").lower()
     mask = dict(candidate.get("mask")) if isinstance(candidate.get("mask"), dict) else {}
+    # A recognised UI/receipt/diagram/product cluster keeps its full source crop. A loose
+    # SAM alpha can find the region, but it is not the intended visual boundary.
+    if is_intentional_raster_cluster(role):
+        radius = candidate.get("radius")
+        if radius is None:
+            radius = (candidate.get("style") or {}).get("radius", 0)
+        mask["kind"] = "rrect"
+        mask["radius"] = radius if isinstance(radius, (int, float)) else 0
+        return mask
     # A shape already decided upstream (or by an earlier pass) is authoritative.
     if mask.get("kind") and str(mask.get("kind")).lower() != "alpha":
         return mask
@@ -89,6 +111,11 @@ def _num(value, default):
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _wordmark_as_raster(cfg: dict | None) -> bool:
+    """Raster is the conservative default when brand artwork has no explicit override."""
+    return bool((cfg or {}).get("wordmark_as_raster", True))
 
 
 def _text_fidelity_fallback(c: dict, meta: dict, cfg: dict | None) -> dict | None:
@@ -152,14 +179,22 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
             # lettering. Keep an exact cropped asset rather than risking a lossy
             # trace or treating the lettering as UI text.
             force_raster = bool(meta.get("platform_lockup"))
-            c["target"] = "image" if force_raster or (cfg and cfg.get("wordmark_as_raster", True)) else "icon"
+            c["target"] = "image" if force_raster or _wordmark_as_raster(cfg) else "icon"
             meta["wordmark"] = True
             meta["role"] = meta.get("role") or "logo"
             if c["target"] == "image":
                 c["mask"] = _image_mask(c, canvas)
             return c
+        # ``overlay_copy`` is a positive ownership decision, not merely a hint that
+        # the text should remain a TEXT node.  It must also be removed from the clean
+        # plate before that editable node is painted back on top.  Without this flag,
+        # a body-style overlay inside a photo can be mistaken for printed packaging
+        # text by reconstruction and quietly remain baked into the image.
+        if meta.get("scene_text_role") == "overlay_copy":
+            meta["overlay_text"] = True
+            meta["removal_required"] = True
         if is_wordmark_candidate({"text": c.get("text"), "box": c.get("box"), "id": c.get("id")}, canvas):
-            c["target"] = "image" if cfg and cfg.get("wordmark_as_raster", True) else "icon"
+            c["target"] = "image" if _wordmark_as_raster(cfg) else "icon"
             meta["wordmark"] = True
             meta["role"] = meta.get("role") or "logo"
             if c["target"] == "image":
@@ -172,6 +207,22 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
             return fallback
         # emoji → keep as character in the text run, never vectorize (handled in build step)
         c["target"] = "text"
+        return c
+
+    # Structured but inseparable artwork is one exact source-backed image, not many
+    # guessed layers. merge_layers permits contained text back out only with positive
+    # external-overlay evidence and layout keeps that overlay grouped with this owner.
+    if is_intentional_raster_cluster(meta.get("role")):
+        c["target"] = "image"
+        c["mask"] = _image_mask(c, canvas)
+        meta["intentional_raster_cluster"] = True
+        meta["swappable"] = True
+        meta["contains_scene_text"] = True
+        meta.setdefault("semantic_name", cluster_label(meta.get("role")))
+        meta.setdefault("layer_disposition", "foreground_raster")
+        meta.setdefault("z_band", "chrome" if str(meta.get("role") or "").lower() in {
+            "screenshot", "ui-panel"
+        } else "content")
         return c
 
     # A VLM/SAM ownership pass may already have made the materialization decision.
@@ -208,13 +259,28 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
         c["mask"] = _image_mask(c, canvas)
         return c
 
+    # A true divider is already a native Figma primitive.  Do *not* include every
+    # ``kind: line`` here: annotation leaders are often diagonal (e.g. product
+    # explainer ads) and a rectangle would erase their direction and endpoint.
+    # Those remain on the gated vector/raster route below.
+    if kind == "divider" or str(meta.get("role") or "").lower() in {"divider", "rule", "separator"}:
+        c["target"] = "shape"
+        c["shape_kind"] = "rect"  # preserves the observed horizontal/vertical bar thickness.
+        meta["native_divider"] = True
+        return c
+
     # 4. Icons / badges / simple graphics → vectorize (small only) ------------------
-    if kind == "icon" or meta.get("role") in VECTORIZE_ROLES:
-        if _area_frac(c.get("box", {}), canvas) <= ICON_MAX_AREA_FRAC:
+    if kind in {"icon", "line"} or meta.get("role") in VECTORIZE_ROLES:
+        role = str(meta.get("role") or "").lower().replace("-", "_")
+        max_fraction = 0.20 if role in EXTENDED_VECTOR_ROLES else ICON_MAX_AREA_FRAC
+        if _area_frac(c.get("box", {}), canvas) <= max_fraction:
             c["target"] = "icon"
         else:
-            # too big to be a simple graphic → treat as shape or raster
-            c["target"] = "shape" if meta.get("flat_fill") else "image"
+            # Never approximate a detailed burst/arrow as a rectangle. Oversized
+            # decorative graphics keep their exact source crop.
+            c["target"] = "image"
+            meta["vector_fallback"] = True
+            c["mask"] = _image_mask(c, canvas)
         return c
 
     # 5. Shapes / cards / buttons → primitive when fill is solid/gradient -----------

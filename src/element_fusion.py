@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Optional
+from .raster_clusters import INTENTIONAL_RASTER_CLUSTER_ROLES, normalized_role
 
 
 DEFAULTS = {
@@ -55,9 +56,13 @@ _RASTER_ROLES = {
     "object",
     "illustration",
     "package",
-}
+} | set(INTENTIONAL_RASTER_CLUSTER_ROLES)
 _SHAPE_ROLES = {"shape", "button", "card", "container", "background", "frame"}
 _CONTAINER_ROLES = {"shape", "button", "card", "container", "badge", "frame", "background"}
+_STRUCTURAL_FIELDS = (
+    "structure_group_id", "repeat_group_id", "panel_set_id", "grid_group_id",
+    "comparison_group_id", "chart_group_id", "row_index", "column_index",
+)
 
 
 def _np():
@@ -136,7 +141,7 @@ def _mask_metrics(a, b) -> dict:
 def _role(item: dict, source: str, canvas: dict) -> str:
     role = item.get("role") or (item.get("meta") or {}).get("role")
     if role:
-        role = str(role).strip().lower().replace(" ", "-")
+        role = normalized_role(role)
     if not role and source == "qwen":
         hint = str(item.get("kind_hint") or "").strip().lower()
         role = None if hint in ("", "unknown", "object") else hint
@@ -350,6 +355,11 @@ def _normalize(item: dict, source: str, canvas: dict, base_dirs: list[str], ordi
     if source == "sam3" and str(item.get("source", "")).startswith("residual"):
         # It still belongs to the SAM observation stream, but should not outrank real SAM.
         mode = mode or "residual-fallback"
+    structural = {
+        key: item.get(key, prov.get(key))
+        for key in _STRUCTURAL_FIELDS
+        if item.get(key, prov.get(key)) not in (None, "")
+    }
     return {
         "key": f"{source}:{source_id}",
         "source": actual_source,
@@ -364,6 +374,7 @@ def _normalize(item: dict, source: str, canvas: dict, base_dirs: list[str], ordi
         "prompt": prov.get("prompt"),
         "raw_provenance": prov,
         "asset": item.get("png") or item.get("src") or item.get("asset_src"),
+        "structural": structural,
     }
 
 
@@ -408,8 +419,10 @@ def _meaningful_parent(parent: dict, child: dict) -> bool:
     # valid parents. Without the raster branch, a photo containing a nested product mask
     # could pass the containment/area-ratio gate above but never actually get linked,
     # shipping as two unrelated overlapping top-level elements.
-    if parent["role"] in _CONTAINER_ROLES or parent["role"] in _RASTER_ROLES or parent["kind"] == "photo-fragment":
-        return parent["role"] != child["role"] or parent["kind"] != child["kind"]
+    parent_role = normalized_role(parent["role"])
+    child_role = normalized_role(child["role"])
+    if parent_role in _CONTAINER_ROLES or parent_role in _RASTER_ROLES or parent["kind"] == "photo-fragment":
+        return parent_role != child_role or parent["kind"] != child["kind"]
     return parent["kind"] == "shape" and child["kind"] != "shape"
 
 
@@ -527,6 +540,18 @@ def fuse(
         for member in cluster["members"]:
             if member.get("asset") and member["asset"] not in assets:
                 assets.append(member["asset"])
+        # Structural IDs are useful only when every observation that supplied a value
+        # agrees. A detector disagreement must fall back to absolute/raster fidelity,
+        # never silently manufacture a shared panel or chart relationship.
+        structural = {}
+        for field in _STRUCTURAL_FIELDS:
+            values = {
+                member.get("structural", {}).get(field)
+                for member in cluster["members"]
+                if member.get("structural", {}).get(field) not in (None, "")
+            }
+            if len(values) == 1:
+                structural[field] = values.pop()
         rel = os.path.join("fused_elements", f"{cid}.png")
         path = os.path.join(run_dir, rel) if run_dir else None
         if path:
@@ -548,6 +573,7 @@ def fuse(
                 "asset_candidates": assets,
                 "parent_id": None,
                 "relationships": [],
+                **structural,
                 "provenance": {
                     "sources": sources,
                     "observations": descriptors,

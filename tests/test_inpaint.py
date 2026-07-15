@@ -606,3 +606,152 @@ def test_regional_mixed_text_and_icon_routes_to_lama_not_flux(tmp_path, monkeypa
     )
     assert calls == ["big-lama"]
     assert result["regions"][0]["route"] == "big-lama"
+
+
+def test_opencv_candidate_ranking_uses_residue_when_seams_tie(monkeypatch):
+    source = np.full((16, 16, 3), 120, dtype=np.uint8)
+    mask = np.zeros((16, 16), dtype=np.uint8); mask[4:12, 4:12] = 255
+    telea = np.full_like(source, 90)
+    ns = np.full_like(source, 150)
+
+    monkeypatch.setattr(
+        inpaint, "_opencv_inpaint",
+        lambda _rgb, _mask, _radius, method: telea if method == "telea" else ns,
+    )
+    monkeypatch.setattr(inpaint, "_seam_energy", lambda *_args: 1.0)
+
+    def fake_metrics(_source, candidate, _mask):
+        # Same seam, but Telea leaves a text/object-like high-frequency residue.
+        return {"texture": 0.0, "structure": 0.0,
+                "residue": 10.0 if candidate[6, 6, 0] == 90 else 0.0}
+
+    monkeypatch.setattr(inpaint, "candidate_metrics", fake_metrics)
+    _out, backend, diagnostics = inpaint.inpaint_array(
+        source, mask, {"inpaint": {"mode": "opencv", "opencv_method": "auto"}},
+        return_diagnostics=True,
+    )
+
+    assert backend == "opencv-ns"
+    assert diagnostics["telea_quality"]["seam"] == diagnostics["ns_quality"]["seam"]
+    assert diagnostics["telea_quality"]["residue"] > diagnostics["ns_quality"]["residue"]
+
+
+def test_cpu_quality_metrics_penalize_compact_high_frequency_residue():
+    source = np.full((24, 24, 3), 120, dtype=np.uint8)
+    mask = np.zeros((24, 24), dtype=np.uint8); mask[5:19, 5:19] = 255
+    clean = source.copy()
+    noisy = source.copy()
+    yy, xx = np.mgrid[5:19, 5:19]
+    noisy[5:19, 5:19] = np.where(((xx + yy) % 2)[..., None] > 0, 20, 220)
+
+    clean_metrics = inpaint.candidate_metrics(source, clean, mask)
+    noisy_metrics = inpaint.candidate_metrics(source, noisy, mask)
+
+    assert noisy_metrics["residue"] > clean_metrics["residue"]
+    assert noisy_metrics["texture"] > clean_metrics["texture"]
+
+
+def test_strict_acceptance_blocks_automatic_opencv_fallback(monkeypatch):
+    source = np.full((12, 12, 3), 100, dtype=np.uint8)
+    mask = np.zeros((12, 12), dtype=np.uint8); mask[3:9, 3:9] = 255
+    monkeypatch.setattr(inpaint, "_big_lama_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="blocks the OpenCV fallback"):
+        inpaint.inpaint_array(
+            source, mask,
+            {"inpaint": {"mode": "auto", "strict_acceptance": True,
+                         "multipass_fraction": 1.0}},
+        )
+
+
+def test_explicit_opencv_has_clear_routing_metadata_even_in_strict_mode():
+    source = np.full((12, 12, 3), 100, dtype=np.uint8)
+    mask = np.zeros((12, 12), dtype=np.uint8); mask[3:9, 3:9] = 255
+
+    _out, backend, diagnostics = inpaint.inpaint_array(
+        source, mask,
+        {"inpaint": {"mode": "opencv", "strict_acceptance": True,
+                     "opencv_method": "telea", "multipass_fraction": 1.0}},
+        return_diagnostics=True,
+    )
+
+    assert backend == "opencv-telea"
+    assert diagnostics["backend_class"] == "fallback"
+    assert diagnostics["backend_route"] == {
+        "requested": "opencv", "selected": "opencv-telea",
+        "selected_class": "deterministic-fallback", "strict_acceptance": True,
+        "opencv_fallback_used": False, "fallback_reason": None,
+    }
+
+
+def test_powerpaint_status_is_honest_about_unvalidated_runtime():
+    status = inpaint.check_backends({"inpaint": {"mode": "powerpaint"}})
+
+    assert status["ready"] is False
+    assert status["powerpaint"]["runtime_validated"] is False
+    assert status["powerpaint"]["importable"] is False
+
+
+def test_powerpaint_adapter_seam_routes_and_records_backend(monkeypatch):
+    source = np.full((12, 12, 3), 100, dtype=np.uint8)
+    mask = np.zeros((12, 12), dtype=np.uint8); mask[3:9, 3:9] = 255
+    monkeypatch.setattr(inpaint, "_powerpaint_inpaint", lambda rgb, _mask, _cfg: np.full_like(rgb, 17))
+
+    out, backend, diagnostics = inpaint.inpaint_array(
+        source, mask,
+        {"inpaint": {"mode": "powerpaint", "multipass_fraction": 1.0}},
+        return_diagnostics=True,
+    )
+
+    assert backend == "powerpaint"
+    assert diagnostics["backend_route"]["selected_class"] == "active-model"
+    assert np.all(out[mask > 0] == 17)
+    assert np.all(out[mask == 0] == source[mask == 0])
+
+
+def test_regional_later_region_uses_original_source_not_previous_generated_plate(tmp_path, monkeypatch):
+    from PIL import Image
+
+    source = np.full((96, 96, 3), 100, dtype=np.uint8)
+    first = np.zeros((96, 96), dtype=np.uint8); first[10:34, 10:34] = 255
+    second = np.zeros((96, 96), dtype=np.uint8); second[56:70, 56:70] = 255
+    source[first > 0] = (220, 40, 30)
+    source[second > 0] = (30, 40, 220)
+    Image.fromarray(source).save(tmp_path / "source.png")
+    calls = []
+
+    def fake_single(rgb, inner_mask, _cfg):
+        calls.append(rgb.copy())
+        return np.full_like(rgb, 7), "fake-active", {
+            "backend_route": {"selected": "fake-active"}, "backend_class": "active",
+        }
+
+    monkeypatch.setattr(inpaint, "_inpaint_single_pass", fake_single)
+    cfg = {"inpaint": {"mode": "lama", "regional": {
+        "enabled": True, "min_context": 1, "max_context": 1, "min_crop": 96,
+        "flat_residual_p90": -1, "flat_gradient_p90": -1,
+    }}}
+    union = np.maximum(first, second)
+    result = inpaint.inpaint_regional(
+        str(tmp_path / "source.png"), [
+            {"id": "first", "target": "shape", "mask_array": first},
+            {"id": "second", "target": "shape", "mask_array": second},
+        ], union, str(tmp_path / "out.png"), cfg,
+    )
+
+    assert len(calls) == 2
+    # The first region has already been composited to 7 in the destination plate. The
+    # second backend input must still contain the original red first region.
+    assert np.all(calls[1][first > 0] == np.array([220, 40, 30]))
+    assert all(record["context_source"] == "original-source-only" for record in result["regions"])
+
+
+def test_regional_global_context_uses_full_original_canvas():
+    mask = np.zeros((60, 80), dtype=np.uint8); mask[20:30, 35:45] = 255
+
+    bounds, _padding, context = inpaint._regional_crop(
+        mask, {"inpaint": {"regional": {"context_mode": "global", "alignment": 16}}},
+    )
+
+    assert bounds == (0, 0, 80, 60)
+    assert context == 80

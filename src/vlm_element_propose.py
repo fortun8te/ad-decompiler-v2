@@ -27,20 +27,39 @@ _DEFAULT_LIGHTWEIGHT_MAX_TILES = 8
 _DEFAULT_LIGHTWEIGHT_OVERLAP = 0.15
 _DEFAULT_LIGHTWEIGHT_BELOW_SAM = 3
 
-_LABELS = frozenset({"product", "icon", "button", "badge", "person"})
+_LABELS = frozenset({
+    "product", "icon", "button", "badge", "person", "panel", "comparison_panel",
+    "screenshot", "ui_panel", "receipt", "chart", "graph", "table",
+    "nutrition_panel", "diagram", "infographic", "product_cluster",
+})
 _LABEL_TO_KIND = {
     "product": "photo-fragment",
     "person": "photo-fragment",
     "icon": "icon",
     "button": "shape",
     "badge": "icon",
+    "screenshot": "photo-fragment",
+    "ui_panel": "photo-fragment",
+    "receipt": "photo-fragment",
+    "chart": "photo-fragment",
+    "graph": "photo-fragment",
+    "table": "photo-fragment",
+    "nutrition_panel": "photo-fragment",
+    "diagram": "photo-fragment",
+    "infographic": "photo-fragment",
+    "product_cluster": "photo-fragment",
+    "panel": "photo-fragment",
+    "comparison_panel": "photo-fragment",
 }
 
 _PROMPT = (
     "This crop is from a digital advertisement. List every distinct non-text visual element "
-    "you can see (product, person, icon, button, badge). Ignore background and typography.\n\n"
+    "you can see (product, person, icon, button, badge, image panel in a multi-panel layout, "
+    "before/after comparison panel, screenshot, UI panel, receipt, chart, "
+    "graph, table, nutrition panel, diagram, infographic, inseparable product cluster). "
+    "Ignore ordinary background and typography.\n\n"
     "Reply with ONLY valid JSON — a JSON array, no markdown, no explanation:\n"
-    '[{"label": "product|icon|button|badge|person", '
+    '[{"label": "product|icon|button|badge|person|panel|comparison_panel|screenshot|ui_panel|receipt|chart|graph|table|nutrition_panel|diagram|infographic|product_cluster", '
     '"approx_box_fraction": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}}]\n\n'
     "approx_box_fraction uses 0-1 coordinates relative to THIS crop (x,y = top-left, w,h = size). "
     "Use an empty array [] when no elements are visible."

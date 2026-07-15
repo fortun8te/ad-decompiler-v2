@@ -212,7 +212,13 @@ def test_clip_box_off_canvas_origin_does_not_inflate_size():
 def test_default_prompts_include_ui_ad_roles():
     roles = {spec["role"] for spec in sam3_detect._prompt_specs(None)}
     assert {"badge", "button", "card", "logo", "product", "icon",
-            "avatar", "verified"} <= roles
+            "avatar", "verified", "callout_leader", "panel", "comparison-panel"} <= roles
+
+
+def test_default_prompts_include_intentional_raster_cluster_roles():
+    roles = {spec["role"] for spec in sam3_detect._prompt_specs(None)}
+    assert {"screenshot", "ui-panel", "receipt", "chart", "nutrition-panel",
+            "diagram", "product-cluster"} <= roles
 
 
 def test_small_square_icon_accepted_below_generic_min_score(tmp_path):

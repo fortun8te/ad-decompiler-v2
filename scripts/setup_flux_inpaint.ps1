@@ -12,8 +12,8 @@
   prints the plan and the exact target subfolders, then exits without downloading.
 
 .PARAMETER Quant
-  GGUF quant of Flux Fill. Q4_K_M (default, ~6.8GB) is safe on 16GB VRAM; Q5_K_M (~8.4GB)
-  is a bit higher quality and still fits with the fp8 T5 encoder.
+  GGUF quant of Flux Fill. Q6_K is the checked-in workflow/doctor default. Choose a smaller
+  quant only when you also point inpaint.comfy.models.unet_gguf at that exact filename.
 
 .PARAMETER List
   Print the download plan and exit.
@@ -21,12 +21,15 @@
 .EXAMPLE
   .\scripts\setup_flux_inpaint.ps1 -ComfyDir "C:\ComfyUI"
 
+  # After setting inpaint.mode: flux_comfy and inpaint.comfy.comfy_dir in config.yaml:
+  .\.venv\Scripts\python.exe doctor.py --config config.yaml --deep
+
 .EXAMPLE
   .\scripts\setup_flux_inpaint.ps1 -List
 #>
 param(
   [string]$ComfyDir = "",
-  [string]$Quant = "Q4_K_M",
+  [string]$Quant = "Q6_K",
   [switch]$List
 )
 

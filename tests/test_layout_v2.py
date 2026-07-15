@@ -127,6 +127,97 @@ def test_repeated_cards_wrap_into_horizontal_grid():
     assert all(child.get("component") for child in grid["children"])
 
 
+def test_implicit_triptych_panels_form_one_proven_panel_set():
+    tree = layout.infer([
+        {"id": f"panel-{index}", "target": "image",
+         "box": {"x": 20 + index * 110, "y": 30, "w": 100, "h": 180},
+         "src": f"panel-{index}.png", "meta": {"role": "triptych-panel"}}
+        for index in range(3)
+    ], {"w": 360, "h": 240})
+
+    assert len(tree) == 1
+    panel_set = tree[0]
+    assert panel_set["meta"]["role"] == "panel-set"
+    assert panel_set["meta"]["deterministic_geometry"] is True
+    assert panel_set["layout"]["mode"] == "HORIZONTAL"
+    assert [child["id"] for child in panel_set["children"]] == ["panel-0", "panel-1", "panel-2"]
+
+
+def test_explicit_two_dimensional_card_grid_builds_native_rows():
+    candidates = []
+    for row in range(2):
+        for col in range(3):
+            candidates.append({
+                "id": f"cell-{row}-{col}", "target": "image",
+                "box": {"x": 20 + col * 96, "y": 30 + row * 86, "w": 84, "h": 72},
+                "src": f"cell-{row}-{col}.png",
+                "meta": {"role": "panel", "grid_group_id": "benefits"},
+            })
+    tree = layout.infer(candidates, {"w": 340, "h": 230})
+
+    assert len(tree) == 1
+    grid = tree[0]
+    assert grid["meta"]["role"] == "structural-grid"
+    assert grid["layout"]["mode"] == "VERTICAL"
+    assert len(grid["children"]) == 2
+    assert all(row["meta"]["role"] == "grid-row" for row in grid["children"])
+    assert all(row["layout"]["mode"] == "HORIZONTAL" for row in grid["children"])
+    assert [[cell["id"] for cell in row["children"]] for row in grid["children"]] == [
+        ["cell-0-0", "cell-0-1", "cell-0-2"],
+        ["cell-1-0", "cell-1-1", "cell-1-2"],
+    ]
+
+
+def test_simple_chart_primitives_group_without_changing_absolute_geometry():
+    candidates = [
+        {"id": "axis", "target": "shape", "box": {"x": 20, "y": 190, "w": 260, "h": 2},
+         "meta": {"role": "axis", "chart_group_id": "sales"}},
+        {"id": "bar-a", "target": "shape", "box": {"x": 50, "y": 110, "w": 36, "h": 80},
+         "meta": {"role": "chart-bar", "chart_group_id": "sales"}},
+        {"id": "bar-b", "target": "shape", "box": {"x": 120, "y": 70, "w": 36, "h": 120},
+         "meta": {"role": "chart-bar", "chart_group_id": "sales"}},
+        {"id": "label", "target": "text", "text": "Sales",
+         "box": {"x": 20, "y": 20, "w": 80, "h": 20},
+         "meta": {"role": "data-label", "chart_group_id": "sales"}},
+    ]
+    tree = layout.infer(candidates, {"w": 320, "h": 240})
+
+    assert len(tree) == 1
+    chart = tree[0]
+    assert chart["meta"]["role"] == "native-chart"
+    assert chart["layout"]["mode"] == "NONE"
+    assert chart["meta"]["deterministic_geometry"] is True
+    by_id = {child["id"]: child for child in chart["children"]}
+    assert by_id["bar-a"]["box"] == {"x": 30, "y": 90, "w": 36, "h": 80}
+    assert by_id["bar-b"]["box"] == {"x": 100, "y": 50, "w": 36, "h": 120}
+
+
+def test_chart_with_raster_or_unknown_parts_is_not_invented_as_native_chart():
+    candidates = [
+        {"id": "axis", "target": "shape", "box": {"x": 10, "y": 100, "w": 180, "h": 2},
+         "meta": {"role": "axis", "chart_group_id": "ambiguous"}},
+        {"id": "plot", "target": "image", "box": {"x": 10, "y": 10, "w": 180, "h": 90},
+         "src": "plot.png", "meta": {"role": "chart", "chart_group_id": "ambiguous",
+                                         "intentional_raster_cluster": True}},
+    ]
+    tree = layout.infer(candidates, {"w": 220, "h": 130})
+
+    assert not any(node.get("meta", {}).get("role") == "native-chart" for node in tree)
+    assert any(node["id"] == "plot" for node in tree)
+
+
+def test_uneven_panel_geometry_stays_absolute_instead_of_fake_auto_layout():
+    tree = layout.infer([
+        {"id": "one", "target": "image", "box": {"x": 10, "y": 20, "w": 90, "h": 180},
+         "src": "one.png", "meta": {"role": "panel"}},
+        {"id": "two", "target": "image", "box": {"x": 130, "y": 45, "w": 150, "h": 90},
+         "src": "two.png", "meta": {"role": "panel"}},
+    ], {"w": 320, "h": 240})
+
+    assert len(tree) == 2
+    assert not any(node.get("meta", {}).get("role") == "panel-set" for node in tree)
+
+
 def test_card_panel_hoists_inner_background_fill():
     candidates = [
         {"id": "card", "target": "shape", "box": {"x": 0, "y": 0, "w": 200, "h": 160}, "meta": {"role": "card"}},
@@ -139,6 +230,27 @@ def test_card_panel_hoists_inner_background_fill():
     frame = tree[0]
     assert frame["fill"]["color"] == "#eeeeee"
     assert frame["radius"] == 12
+
+
+def test_card_panel_hoist_preserves_multi_paint_and_shadow():
+    fills = [
+        {"kind": "linear", "angle": 90, "stops": [{"color": "#ff2200", "offset": 0}, {"color": "#0044ff", "offset": 1}]},
+        {"kind": "flat", "color": "#ffffff", "opacity": 0.12},
+    ]
+    effects = [{"type": "drop-shadow", "color": "#00000066", "x": 0, "y": 3, "blur": 8}]
+    tree = layout.infer([
+        {"id": "card", "target": "shape", "box": {"x": 0, "y": 0, "w": 200, "h": 160}, "meta": {"role": "card"}},
+        {"id": "panel", "target": "shape", "box": {"x": 0, "y": 0, "w": 200, "h": 160},
+         "style": {"fills": fills, "effects": effects, "radius": 12}, "z": 0},
+        {"id": "label", "target": "text", "box": {"x": 20, "y": 60, "w": 160, "h": 24},
+         "text": "Card", "meta": {"role": "title"}, "z": 1},
+    ], {"w": 300, "h": 220}, {})
+
+    frame = tree[0]
+    assert frame.get("fill") is None
+    assert frame["style"]["fills"] == fills
+    assert frame["effects"] == effects
+    assert all(child["id"] != "panel" for child in frame["children"])
 
 
 def test_group_hoist_drops_inner_button_shell():
@@ -174,6 +286,19 @@ def test_zero_placeholder_z_keeps_text_above_plate_and_cutout():
     assert [node["id"] for node in tree] == ["plate", "cutout", "copy"]
 
 
+def test_semantic_z_band_orders_placeholder_layers_before_geometry_fallbacks():
+    tree = layout.infer([
+        {"id": "content", "target": "image", "box": {"x": 0, "y": 0, "w": 80, "h": 80}, "z": 0,
+         "meta": {"z_band": "content"}},
+        {"id": "overlay", "target": "image", "box": {"x": 10, "y": 10, "w": 40, "h": 40}, "z": 0,
+         "meta": {"z_band": "overlay"}},
+        {"id": "chrome", "target": "image", "box": {"x": 20, "y": 20, "w": 20, "h": 20}, "z": 0,
+         "meta": {"z_band": "chrome"}},
+    ], {"w": 100, "h": 100})
+
+    assert [node["id"] for node in tree] == ["content", "overlay", "chrome"]
+
+
 def test_paragraph_lines_with_shared_block_id_form_one_editable_group():
     tree = layout.infer([
         {"id": "line1", "target": "text", "box": {"x": 20, "y": 20, "w": 100, "h": 12}, "text": "First", "meta": {"role": "body", "block_id": "p1"}},
@@ -200,3 +325,18 @@ def test_semantic_image_owner_keeps_overlay_in_named_asset_group():
     assert [child["id"] for child in group["children"]] == ["avatar", "online"]
     assert group["children"][0]["box"]["x"] == 0
     assert group["children"][1]["box"]["x"] == 92
+
+
+def test_intentional_raster_cluster_keeps_positive_overlay_in_named_asset_group():
+    tree = layout.infer([
+        {"id": "receipt", "target": "image", "box": {"x": 40, "y": 30, "w": 220, "h": 300},
+         "meta": {"role": "receipt", "semantic_name": "Receipt", "intentional_raster_cluster": True}},
+        {"id": "offer", "target": "text", "text": "Save 20%",
+         "box": {"x": 70, "y": 50, "w": 120, "h": 24},
+         "meta": {"role": "headline", "overlay_text": True, "external_overlay": True,
+                  "parent_id": "receipt"}},
+    ], {"w": 300, "h": 380})
+    assert len(tree) == 1
+    group = tree[0]
+    assert group["id"] == "asset-group-receipt"
+    assert [child["id"] for child in group["children"]] == ["receipt", "offer"]

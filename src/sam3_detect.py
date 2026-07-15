@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Optional
+from .raster_clusters import is_intentional_raster_cluster, normalized_role
 
 
 DEFAULT_PROMPTS = [
@@ -55,6 +56,13 @@ DEFAULT_PROMPTS = [
     {"prompt": "profile photo", "role": "avatar", "kind": "icon"},
     {"prompt": "avatar", "role": "avatar", "kind": "icon"},
     {"prompt": "arrow", "role": "arrow", "kind": "icon"},
+    # Annotation leaders are a distinct visual primitive from arrows: the inspiration
+    # corpus uses straight/orthogonal callout lines with circular endpoints (041, 044),
+    # which an ``arrow``-only prompt does not reliably propose.  Routing already gives
+    # this role the gated vector path with an exact alpha-raster fallback.
+    {"prompt": "callout leader line", "role": "callout_leader", "kind": "icon"},
+    {"prompt": "starburst price badge", "role": "price_burst", "kind": "icon"},
+    {"prompt": "sale burst sticker", "role": "sale_burst", "kind": "icon"},
     {"prompt": "badge", "role": "badge", "kind": "icon"},
     {"prompt": "verified badge", "role": "verified", "kind": "icon"},
     {"prompt": "verified checkmark", "role": "verified", "kind": "icon"},
@@ -66,7 +74,20 @@ DEFAULT_PROMPTS = [
     {"prompt": "call to action", "role": "button", "kind": "shape"},
     {"prompt": "card", "role": "card", "kind": "shape"},
     {"prompt": "offer card", "role": "card", "kind": "shape"},
+    # Repeated image panels are requested separately so strict downstream geometry can
+    # preserve real triptychs/comparisons. A lone or uneven proposal remains an ordinary
+    # absolute raster asset; the prompt alone never authorizes invented Auto Layout.
+    {"prompt": "image panel in a multi-panel layout", "role": "panel", "kind": "photo-fragment"},
+    {"prompt": "before or after comparison image panel", "role": "comparison-panel", "kind": "photo-fragment"},
     {"prompt": "illustration", "role": "illustration", "kind": "photo-fragment"},
+    # Structured but inseparable regions remain one exact, swappable source crop.
+    {"prompt": "screenshot", "role": "screenshot", "kind": "photo-fragment"},
+    {"prompt": "UI panel", "role": "ui-panel", "kind": "photo-fragment"},
+    {"prompt": "receipt", "role": "receipt", "kind": "photo-fragment"},
+    {"prompt": "chart or graph", "role": "chart", "kind": "photo-fragment"},
+    {"prompt": "table or nutrition facts panel", "role": "nutrition-panel", "kind": "photo-fragment"},
+    {"prompt": "diagram or infographic", "role": "diagram", "kind": "photo-fragment"},
+    {"prompt": "inseparable product cluster", "role": "product-cluster", "kind": "photo-fragment"},
 ]
 
 _BACKEND_CACHE = {}
@@ -110,7 +131,9 @@ def _prompt_specs(raw) -> list[dict]:
 
 
 def _kind_for_role(role: str) -> str:
-    role = str(role or "").lower()
+    role = normalized_role(role)
+    if is_intentional_raster_cluster(role):
+        return "photo-fragment"
     if role in {"logo", "icon", "arrow", "badge", "symbol", "pictogram",
                 "avatar", "profile", "profile-picture", "verified",
                 "verified-badge", "checkmark"}:

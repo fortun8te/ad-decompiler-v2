@@ -140,6 +140,9 @@ def test_pipeline_order_applies_vlm_stages_when_enabled(monkeypatch, tmp_path):
     assert order.index("fusion") < order.index("vlm-segment-filter") < order.index("merge")
     assert (run_dir / "fused_elements.json").exists()
     assert (run_dir / "elements.json").exists()
+    intent = json.loads((run_dir / "scene_intent.json").read_text(encoding="utf-8"))
+    assert intent["kind"] == "scene-intent"
+    assert intent["planned_source_ids"] == ["T0"]
     assert json.loads((run_dir / "elements.json").read_text(encoding="utf-8")) == []
     assert "vram:ocr->vlm-ocr-judge" in order
     assert "vram:ocr->vlm-proofread" in order

@@ -2,7 +2,8 @@ param(
   [string]$SamPath = "C:\src\sam3",
   [switch]$SkipSamClone,
   [switch]$SkipGpuPackages,
-  [switch]$SkipDoctor
+  [switch]$SkipDoctor,
+  [switch]$DeepDoctor
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,7 +67,12 @@ New-Item -ItemType File -Force -Path ".venv\.rtx-setup-v4" | Out-Null
 if (-not $SkipDoctor) {
   Write-Host ""
   Write-Host "Setup finished. Checking the machine..."
-  & $Python doctor.py --config config.yaml
+  $doctorArgs = @("doctor.py", "--config", "config.yaml")
+  if ($DeepDoctor) {
+    Write-Host "Running selected inpaint backend smoke too (this executes real RTX models)..."
+    $doctorArgs += @("--deep", "--deep-output", "runs\runtime-smoke")
+  }
+  & $Python @doctorArgs
   if ($LASTEXITCODE -ne 0) {
     Write-Host ""
     Write-Host "The software is installed, but model files/services still need attention."
@@ -75,4 +81,6 @@ if (-not $SkipDoctor) {
   }
 }
 Write-Host ""
+Write-Host "Flux Fill weights are installed separately with scripts\setup_flux_inpaint.ps1."
+Write-Host "PowerPaint is an optional external adapter: this setup does not install or claim a PowerPaint model."
 Write-Host "Setup finished. Next: double-click Start Bridge.bat."

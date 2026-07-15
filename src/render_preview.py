@@ -102,6 +102,18 @@ def _fill_tile(size, fill):
     return _rgba(size, fill.get("color", "#cccccc"), opacity)
 
 
+def _layer_fill(layer):
+    """Match the Figma compiler's paint precedence for style-only native layers."""
+    fill = layer.get("fill")
+    if fill is not None:
+        return fill
+    style = layer.get("style") or {}
+    fills = style.get("fills") or style.get("paints")
+    if isinstance(fills, list) and fills:
+        return fills[0]
+    return style.get("fill", style.get("background", style.get("color")))
+
+
 def _radius_mask(size, radius=0, ellipse=False):
     from PIL import Image, ImageDraw
     width, height = size
@@ -171,6 +183,10 @@ def _stroke_spec(layer):
     if not stroke:
         strokes = layer.get("strokes") or []
         stroke = strokes[0] if strokes else None
+    if not stroke:
+        style = layer.get("style") or {}
+        strokes = style.get("strokes") or []
+        stroke = strokes[0] if strokes else style.get("stroke")
     if isinstance(stroke, str):
         return stroke, 1
     if isinstance(stroke, dict):
@@ -187,7 +203,7 @@ def _shape_tile(layer, size, run_dir=None):
     if is_vector_path:
         mask = _svg_or_path_mask(layer, size)
         if mask is not None and mask.getbbox() is not None:
-            tile = _fill_tile(size, layer.get("fill"))
+            tile = _fill_tile(size, _layer_fill(layer))
             tile.putalpha(_multiply_alpha(tile, mask).getchannel("A"))
             return tile
         # SVG is the editable representation, but it is not a reliable preview
@@ -200,7 +216,7 @@ def _shape_tile(layer, size, run_dir=None):
                 return Image.open(path).convert("RGBA").resize(size, Image.Resampling.LANCZOS)
         # No source pixels exist: omission is safer than inventing an opaque shape.
         return Image.new("RGBA", size, (0, 0, 0, 0))
-    tile = _fill_tile(size, layer.get("fill"))
+    tile = _fill_tile(size, _layer_fill(layer))
     kind = str(layer.get("shape_kind", "rect")).lower()
     ellipse = kind in ("ellipse", "circle")
     mask = _radius_mask(size, layer.get("radius", 0), ellipse)
@@ -438,7 +454,7 @@ def _render_tile(layer, run_dir):
     text_offset = (0.0, 0.0)
     if kind == "group":
         tile = Image.new("RGBA", size, (0, 0, 0, 0))
-        if layer.get("fill"):
+        if _layer_fill(layer) is not None:
             base = _shape_tile({**layer, "shape_kind": "rect"}, size, run_dir)
             tile.alpha_composite(base)
         for child in sorted(layer.get("children") or [], key=lambda entry: _number(entry.get("z_index", entry.get("z", 0)))):

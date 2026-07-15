@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Cached, evidence-producing runtime smoke test for the Windows RTX worker.
 
-doctor.py proves that dependencies appear ready.  This command goes further: it runs CUDA,
-Gemma vision, OCR, SAM 3, Big-LaMa and VTracer, then runs one synthetic image through the
-integrated pipeline.  Evidence is kept under runs/rtx-self-test and can be checked cheaply on
-every bridge start without loading any model again.
+doctor.py proves that dependencies appear ready. This command goes further: it runs CUDA,
+Gemma vision, OCR, SAM 3, the inpaint backend selected by config, and VTracer, then runs one
+synthetic image through the integrated pipeline. Evidence is kept under runs/rtx-self-test and
+can be checked cheaply on every bridge start without loading any model again.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = 1
+VERSION = 2
 DEFAULT_OUTPUT = Path("runs/rtx-self-test")
 CACHE_MAX_AGE_S = 7 * 24 * 60 * 60
 
@@ -47,7 +47,7 @@ def fingerprint(config_path: Path) -> str:
     root = Path(__file__).resolve().parent
     for name in ("rtx_self_test.py", "runtime_smoke.py", "run_pipeline.py", "doctor.py",
                  "src/ocr.py", "src/sam3_detect.py",
-                 "src/inpaint.py", "src/vectorize.py", "src/vlm_client.py"):
+                 "src/inpaint.py", "src/inpaint_quality.py", "src/vectorize.py", "src/vlm_client.py"):
         path = root / name
         if path.is_file():
             digest.update(name.encode())

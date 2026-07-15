@@ -298,14 +298,45 @@ def _parse_svg_paths(svg_text):
                 fm2 = re.search(r"fill:\s*([^;]+)", style.group(1))
                 if fm2:
                     fill = fm2.group(1).strip()
-            if fill.lower() in ("none",):
+            stroke_match = re.search(r'\bstroke\s*=\s*"([^"]*)"', attrs)
+            stroke = stroke_match.group(1) if stroke_match else None
+            if fill.lower() in ("none",) and (not stroke or stroke.lower() == "none"):
                 continue
+            rule = None
+            rm = re.search(r'\bfill-rule\s*=\s*"([^"]*)"', attrs)
+            if rm:
+                rule = rm.group(1).strip().lower()
+            if style and "fill-rule:" in style.group(1):
+                rm2 = re.search(r"fill-rule:\s*([^;]+)", style.group(1))
+                if rm2:
+                    rule = rm2.group(1).strip().lower()
             try:
                 d_abs = _abs_path(dm.group(1), stack[-1])
             except Exception:
                 d_abs = dm.group(1)
             if d_abs:
-                paths.append({"d": d_abs, "fill": fill})
+                item = {"d": d_abs, "fill": fill}
+                if stroke and stroke.lower() != "none":
+                    width_match = re.search(r'\bstroke-width\s*=\s*"([^"]*)"', attrs)
+                    cap_match = re.search(r'\bstroke-linecap\s*=\s*"([^"]*)"', attrs)
+                    opacity_match = re.search(r'\bstroke-opacity\s*=\s*"([^"]*)"', attrs)
+                    stroke_spec = {"color": stroke}
+                    if width_match:
+                        try:
+                            stroke_spec["width"] = float(width_match.group(1))
+                        except ValueError:
+                            pass
+                    if cap_match:
+                        stroke_spec["cap"] = cap_match.group(1).upper()
+                    if opacity_match:
+                        try:
+                            stroke_spec["opacity"] = float(opacity_match.group(1))
+                        except ValueError:
+                            pass
+                    item["stroke"] = stroke_spec
+                if rule == "evenodd":
+                    item["windingRule"] = "EVENODD"
+                paths.append(item)
             continue
         # <g ...> open tag (possibly self-closing, in which case it has no children/effect).
         tm = re.search(r'\btransform\s*=\s*"([^"]*)"', g_attrs or "")
@@ -480,7 +511,7 @@ def _preprocess_crop(png_path, cfg, role=None):
             arr = np.array(rgba, dtype=np.uint8, copy=True)
             h, w = arr.shape[:2]
 
-        # Remove anti-alias fringe: tighten alpha then restore RGB at hard edge.
+        # Remove weak anti-alias fringe while preserving meaningful edge coverage.
         if pre.get("denoise_fringe", True):
             alpha = arr[:, :, 3].astype(np.float32)
             hard = np.where(alpha >= 200, 255, np.where(alpha <= 40, 0, alpha)).astype(np.uint8)
@@ -503,15 +534,114 @@ def _preprocess_crop(png_path, cfg, role=None):
                     quant = (arr[:, :, :3].astype(np.uint16) // step) * step
                     arr[:, :, :3] = quant.astype(np.uint8)
 
+        # Fully transparent RGB is often a matte/background colour. Keeping it lets
+        # VTracer invent fringe paths even though it is visually absent.
+        arr[arr[:, :, 3] == 0, :3] = 0
         if np.array_equal(arr, original_arr):
             return png_path, False
 
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        Image.fromarray(arr, mode="RGBA").save(tmp.name)
+        Image.fromarray(arr).save(tmp.name)
         return tmp.name, True
 
 
 # ── engines ──────────────────────────────────────────────────────────────────────────
+def _foreground_mask(rgba, alpha_threshold=8, lum_threshold=128):
+    """Choose a binary foreground from a transparent icon or an opaque logo crop.
+
+    A preprocessed RGB crop is often saved as RGBA with alpha=255 everywhere.
+    Treating that alpha as a silhouette makes Potrace trace the entire crop.  Use
+    true transparency when it exists; otherwise isolate colour contrast against
+    the border and only then fall back to a luminance bitmap.
+    """
+    np = _require_np()
+    alpha = rgba[:, :, 3]
+    visible = alpha > alpha_threshold
+    if bool(visible.any()) and bool((~visible).any()):
+        return visible, "alpha"
+    rgb = rgba[:, :, :3].astype(np.int16)
+    border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]), axis=0)
+    reference = np.median(border, axis=0)
+    contrast = np.max(np.abs(rgb - reference), axis=2) >= 16
+    fraction = float(contrast.mean())
+    if 0.002 <= fraction <= 0.98:
+        return contrast, "border-contrast"
+    luminance = (299 * rgb[:, :, 0] + 587 * rgb[:, :, 1] + 114 * rgb[:, :, 2]) / 1000.0
+    return luminance <= lum_threshold, "luminance"
+
+
+def _analytic_straight_line_svg(png_path, role):
+    """Fit a single authored rule/leader as stroke geometry.
+
+    This is intentionally stricter than tracing.  Arrowheads, dots, elbows, handwriting,
+    and decorative endpoints increase the perpendicular residual and are rejected; the
+    ordinary render-back gate then lets VTracer/Potrace preserve those details instead.
+    """
+    role_key = str(role or "").lower().replace("-", "_")
+    if role_key not in {
+        "line", "divider", "rule", "separator", "underline", "strikethrough",
+        "strike_through", "callout_leader", "leader", "leader_line", "connector",
+    }:
+        return None
+    try:
+        import numpy as np
+        from PIL import Image
+
+        rgba = np.asarray(Image.open(png_path).convert("RGBA"), dtype=np.uint8)
+        h, w = rgba.shape[:2]
+        if min(w, h) < 1 or max(w, h) < 6:
+            return None
+        mask, _ = _foreground_mask(rgba)
+        ys, xs = np.nonzero(mask)
+        if len(xs) < 6:
+            return None
+        points = np.column_stack((xs, ys)).astype(np.float64)
+        centre = points.mean(axis=0)
+        _, _, axes = np.linalg.svd(points - centre, full_matrices=False)
+        major, minor = axes[0], axes[1]
+        along = (points - centre) @ major
+        across = np.abs((points - centre) @ minor)
+        length = float(np.percentile(along, 99) - np.percentile(along, 1))
+        half_width = float(np.percentile(across, 92))
+        thickness = max(1.0, 2.0 * half_width + 1.0)
+        # A true rule is strongly one-dimensional. Endpoint ornaments and arrowheads
+        # deliberately fail this test and continue to the exact gated tracer.
+        if length < 4.0 * thickness or float(np.percentile(across, 98)) > thickness * 0.78:
+            return None
+        lo, hi = float(np.percentile(along, 1)), float(np.percentile(along, 99))
+        p0, p1 = centre + major * lo, centre + major * hi
+        visible = rgba[mask]
+        colour = np.median(visible[:, :3], axis=0).astype(int)
+        alpha = float(np.median(visible[:, 3])) / 255.0
+        cap = "round" if role_key in {"callout_leader", "leader", "leader_line", "connector"} else "butt"
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">'
+            f'<path d="M{p0[0]:.3f} {p0[1]:.3f} L{p1[0]:.3f} {p1[1]:.3f}" '
+            f'fill="none" stroke="#{colour[0]:02x}{colour[1]:02x}{colour[2]:02x}" '
+            f'stroke-width="{thickness:.3f}" stroke-linecap="{cap}" '
+            f'stroke-opacity="{alpha:.4f}"/></svg>'
+        )
+    except Exception:
+        return None
+
+
+def _trace_color_count(png_path):
+    """Count quantized foreground colours, ignoring transparent matte RGB."""
+    np = _require_np()
+    try:
+        from PIL import Image
+        with Image.open(png_path) as image:
+            rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+        mask, strategy = _foreground_mask(rgba)
+        pixels = rgba[:, :, :3][mask]
+        if not len(pixels):
+            return 0, strategy
+        quantized = (pixels.astype(np.uint16) // 16) * 16
+        return int(len(np.unique(quantized.reshape(-1, 3), axis=0))), strategy
+    except Exception:
+        return 100000, "unknown"
+
+
 def _run_vtracer(png_path, cfg, preset=None):
     exe = _resolve_binary(cfg, "color_engine", "vtracer")
     preset = preset or {}
@@ -572,18 +702,9 @@ def _run_potrace(png_path, cfg, alpha_threshold=8, lum_threshold=128):
             import numpy as np
             from PIL import Image
             with Image.open(png_path) as image:
-                has_alpha = "A" in image.getbands() or (
-                    image.mode == "P" and "transparency" in image.info
-                )
-                if has_alpha:
-                    alpha = np.asarray(image.convert("RGBA"), dtype=np.uint8)[:, :, 3]
-                    bitmap = Image.fromarray(
-                        np.where(alpha > alpha_threshold, 0, 255).astype(np.uint8)
-                    )
-                else:
-                    bitmap = image.convert("L").point(
-                        lambda p, t=lum_threshold: 255 if p > t else 0
-                    )
+                rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+                foreground, _ = _foreground_mask(rgba, alpha_threshold, lum_threshold)
+                bitmap = Image.fromarray(np.where(foreground, 0, 255).astype(np.uint8))
             fd, pbm = tempfile.mkstemp(suffix=".pbm")
             os.close(fd)
             bitmap.convert("1").save(pbm)
@@ -614,7 +735,8 @@ def _contour_paths_to_svg(paths, w, h):
         f'viewBox="0 0 {w} {h}">'
     ]
     for item in paths:
-        lines.append(f'<path d="{item["d"]}" fill="{item["fill"]}"/>')
+        rule = ' fill-rule="evenodd"' if item.get("windingRule") == "EVENODD" else ""
+        lines.append(f'<path d="{item["d"]}" fill="{item["fill"]}"{rule}/>')
     lines.append("</svg>")
     return "".join(lines)
 
@@ -636,7 +758,7 @@ def _normalize_trace_size(svg_text, traced_png, source_png):
         matrix = (sw / float(tw), 0.0, 0.0, sh / float(th), 0.0, 0.0)
         paths = _parse_svg_paths(svg_text)
         scaled = [
-            {"d": _abs_path(item["d"], matrix), "fill": item.get("fill", "#000000")}
+            {**item, "d": _abs_path(item["d"], matrix), "fill": item.get("fill", "#000000")}
             for item in paths
         ]
         return _contour_paths_to_svg(scaled, sw, sh) if scaled else svg_text
@@ -658,18 +780,18 @@ def _run_contour_simplify(png_path, cfg):
         with Image.open(png_path) as im:
             rgba = np.asarray(im.convert("RGBA"), dtype=np.uint8)
         h, w = rgba.shape[:2]
-        alpha = rgba[:, :, 3]
-        mask = (alpha > 32).astype(np.uint8) * 255
+        foreground, _ = _foreground_mask(rgba, alpha_threshold=32)
+        mask = foreground.astype(np.uint8) * 255
         if not mask.any():
             return None, "contour: empty mask"
         fill = _opaque_fill(png_path)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None, "contour: no contours"
         epsilon_frac = float(_vz_cfg(cfg).get("contour_epsilon", 0.02))
-        paths = []
+        subpaths = []
         for cnt in contours:
-            if cv2.contourArea(cnt) < 4:
+            if cv2.contourArea(cnt) < 2:
                 continue
             eps = epsilon_frac * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, eps, True)
@@ -680,10 +802,14 @@ def _run_contour_simplify(png_path, cfg):
             for x, y in pts[1:]:
                 d_parts.append(f"L{x:.1f} {y:.1f}")
             d_parts.append("Z")
-            paths.append({"d": "".join(d_parts), "fill": fill})
-        if not paths:
+            subpaths.append("".join(d_parts))
+        if not subpaths:
             return None, "contour: no simplified paths"
-        return _contour_paths_to_svg(paths, w, h), None
+        # One even-odd path keeps counters (camera lenses, ring logos, letters) as
+        # transparent holes rather than filling them as RETR_EXTERNAL did.
+        return _contour_paths_to_svg(
+            [{"d": "".join(subpaths), "fill": fill, "windingRule": "EVENODD"}], w, h
+        ), None
     except Exception as e:
         return None, f"contour failed: {e}"
 
@@ -695,10 +821,8 @@ def _opaque_fill(png_path):
         from PIL import Image
         with Image.open(png_path) as image:
             rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
-            has_alpha = "A" in image.getbands() or (
-                image.mode == "P" and "transparency" in image.info
-            )
-        pixels = rgba[:, :, :3][rgba[:, :, 3] > 8] if has_alpha else rgba[:, :, :3].reshape(-1, 3)
+        foreground, _ = _foreground_mask(rgba)
+        pixels = rgba[:, :, :3][foreground]
         if not len(pixels):
             return "#000000"
         # Ignore a near-white opaque background when an actual darker foreground exists.
@@ -727,13 +851,7 @@ def _recolor_potrace_svg(svg_text, fill):
 
 # ── quality gate ─────────────────────────────────────────────────────────────────────
 def _count_colors(png_path):
-    try:
-        from PIL import Image
-        im = Image.open(png_path).convert("RGB")
-        colors = im.getcolors(maxcolors=100000)
-        return len(colors) if colors else 100000
-    except Exception:
-        return 100000
+    return _trace_color_count(png_path)[0]
 
 
 def _render_resvg_bytes(svg_text, width, height):
@@ -776,6 +894,74 @@ def _render_resvg_bytes(svg_text, width, height):
                     pass
 
 
+def _rasterize_svg(svg_text, width, height):
+    """Return an RGBA PIL rendering, or ``None`` when no safe renderer is available."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        import cairosvg
+        png_bytes = cairosvg.svg2png(
+            bytestring=svg_text.encode("utf-8"), output_width=width, output_height=height
+        )
+        import io
+        return Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    except Exception:
+        try:
+            png_bytes, _renderer = _render_resvg_bytes(svg_text, width, height)
+            if not png_bytes:
+                return None
+            import io
+            return Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+        except Exception:
+            return None
+
+
+def _enclosed_transparent_holes(alpha):
+    """Find meaningful transparent counters, excluding the outer canvas background."""
+    np = _require_np()
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover - contour fallback itself needs OpenCV
+        return np.zeros_like(alpha, dtype=bool)
+    background = (~np.asarray(alpha, dtype=bool)).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(background, connectivity=8)
+    holes = np.zeros_like(background, dtype=bool)
+    height, width = background.shape
+    for label in range(1, count):
+        x, y, w, h, area = stats[label]
+        if x == 0 or y == 0 or x + w >= width or y + h >= height or area < 2:
+            continue
+        holes |= labels == label
+    return holes
+
+
+def _transparent_hole_recall(svg_text, png_path):
+    """Return counter preservation for source icons that actually have counters."""
+    np = _require_np()
+    try:
+        from PIL import Image
+        with Image.open(png_path) as image:
+            source = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    except Exception:
+        return None
+    source_holes = _enclosed_transparent_holes(source[:, :, 3] > 8)
+    source_count = int(source_holes.sum())
+    if not source_count:
+        return None
+    rendered = _rasterize_svg(svg_text, source.shape[1], source.shape[0])
+    if rendered is None:
+        return {"source_hole_pixels": source_count, "trace_hole_pixels": 0, "recall": 0.0}
+    traced_holes = _enclosed_transparent_holes(np.asarray(rendered, dtype=np.uint8)[:, :, 3] > 8)
+    overlap = int(np.logical_and(source_holes, traced_holes).sum())
+    return {
+        "source_hole_pixels": source_count,
+        "trace_hole_pixels": int(traced_holes.sum()),
+        "recall": round(float(overlap / source_count), 4),
+    }
+
+
 def _score_render(svg_text, png_path):
     """Rasterize the trace and score both silhouette and colour fidelity."""
     np = _require_np()
@@ -788,23 +974,9 @@ def _score_render(svg_text, png_path):
         src = im.convert("RGBA")
     src_arr = np.asarray(src).astype(np.float32)
     src_a = src_arr[:, :, 3] > 8
-    ras = None
-    try:
-        import cairosvg
-        png_bytes = cairosvg.svg2png(
-            bytestring=svg_text.encode("utf-8"), output_width=w, output_height=h
-        )
-        import io
-        ras = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-    except Exception:
-        try:
-            png_bytes, _renderer = _render_resvg_bytes(svg_text, w, h)
-            if not png_bytes:
-                raise RuntimeError(_renderer)
-            import io
-            ras = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-        except Exception:
-            return 0.0  # no rasterizer -> caller treats as ungated (score 0 -> not ok)
+    ras = _rasterize_svg(svg_text, w, h)
+    if ras is None:
+        return 0.0  # no rasterizer -> caller treats as ungated (score 0 -> not ok)
     ras_arr = np.asarray(ras.resize((w, h))).astype(np.float32)
     ras_a = ras_arr[:, :, 3] > 8
     union = np.logical_or(src_a, ras_a)
@@ -828,14 +1000,21 @@ def _evaluate_trace(svg, png_path, engine, cfg, role, n_colors, preset_note=""):
     note = f"paths={len(paths)} colors={n_colors}"
     if preset_note:
         note = f"{preset_note} {note}"
+    hole = _transparent_hole_recall(svg, png_path)
+    hole_min = float(_vz_cfg(cfg).get("hole_recall_min", 0.75))
+    holes_ok = hole is None or hole["recall"] >= hole_min
+    if hole is not None:
+        note += f" hole_recall={hole['recall']:.3f}"
     return {
-        "ok": score >= score_min and len(paths) <= max_paths,
+        "ok": score >= score_min and len(paths) <= max_paths and holes_ok,
         "paths": paths,
         "svg": svg,
         "engine": engine,
         "score": score,
         "note": note,
-        "gate": {"score_min": score_min, "max_paths": max_paths},
+        "gate": {"score_min": score_min, "max_paths": max_paths,
+                 "hole_recall_min": hole_min if hole is not None else None,
+                 "hole_recall": hole},
     }, None
 
 
@@ -856,7 +1035,9 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
         pre_path, pre_cleanup = _preprocess_crop(png_path, cfg, role)
         work_path = pre_path
         n_colors = _count_colors(work_path)
-        prefer_potrace = n_colors <= 2
+        # Potrace is a silhouette tracer: use it first only for a genuinely
+        # monochrome mark. Two-colour logos need VTracer to preserve their paint.
+        prefer_potrace = n_colors <= 1
 
         best = None
         note = "no engine produced output"
@@ -871,6 +1052,18 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
             if best is None or result["score"] > best["score"]:
                 best = result
             return False
+
+        # Prefer compact, deterministic stroke geometry only when it independently
+        # passes the same raster comparison as every traced vector. A detailed endpoint
+        # or arrowhead therefore cannot be simplified away by this optimization.
+        analytic_svg = _analytic_straight_line_svg(png_path, role)
+        if analytic_svg:
+            result, _ = _evaluate_trace(
+                analytic_svg, png_path, "analytic-line", cfg, role, n_colors,
+                preset_note="single-stroke",
+            )
+            if result and consider(result):
+                return result
 
         def try_vtracer():
             nonlocal note
@@ -916,14 +1109,17 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
             if try_potrace():
                 return best
 
-        svg, err = _run_contour_simplify(work_path, cfg)
-        if svg:
-            svg = _normalize_trace_size(svg, work_path, png_path)
-            result, _ = _evaluate_trace(svg, png_path, "contour", cfg, role, n_colors)
-            if result and consider(result):
-                return result
+        if n_colors <= 1:
+            svg, err = _run_contour_simplify(work_path, cfg)
+            if svg:
+                svg = _normalize_trace_size(svg, work_path, png_path)
+                result, _ = _evaluate_trace(svg, png_path, "contour", cfg, role, n_colors)
+                if result and consider(result):
+                    return result
+            else:
+                note = err or note
         else:
-            note = err or note
+            note = f"{note}; contour skipped for {n_colors}-colour crop"
 
         result = best or _fail("none", note)
         if not result.get("ok") and bool((cfg.get("runtime") or {}).get("require_active_models")):

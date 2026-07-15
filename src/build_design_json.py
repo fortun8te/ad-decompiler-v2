@@ -7,6 +7,7 @@ from typing import Optional
 
 from .schema import DesignDoc, Layer, SCHEMA_VERSION, dump, validate_design
 from .text_analysis import fit_text_box
+from .raster_clusters import is_intentional_raster_cluster
 
 # Candidate keys that ``_compile`` already routes to a concrete Layer field.  Anything
 # else on a reconstruct entity (e.g. an image ``ref`` or a future mask spec another
@@ -123,6 +124,14 @@ def _semantic_z(candidate, target):
     role = str(meta.get("role") or candidate.get("role") or "").lower()
     if role in {"background", "plate", "clean plate"} or meta.get("source") == "inpaint":
         return -1_000_000
+    band = str(meta.get("z_band") or "").lower()
+    band_z = {
+        "background": -1_000_000, "plate": -1_000_000,
+        "content": 20, "scene": 20, "foreground": 30,
+        "overlay": 40, "chrome": 50, "ui": 50,
+    }.get(band)
+    if band_z is not None:
+        return band_z
     if target == "text":
         return 40
     if target == "icon":
@@ -139,7 +148,13 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
     layer_id = str(candidate.get("id") or "layer")
     box = dict(candidate.get("box") or {"x": 0, "y": 0, "w": 1, "h": 1})
     meta = dict(candidate.get("meta") or {})
-    default_z = {"image": 10, "shape": 20, "group": 20, "icon": 30, "text": 40}
+    # The Figma importer understands the complete style object (multiple paints,
+    # strokes and effects).  Keep it intact for every editable layer instead of
+    # reducing non-text layers to their first fill before export.
+    source_style = dict(candidate.get("style") or {})
+    source_effects = candidate.get("effects")
+    if source_effects is None:
+        source_effects = source_style.get("effects")
     if candidate.get("z_index") is not None:
         z_raw = candidate.get("z_index")
     elif candidate.get("z") is not None:
@@ -147,7 +162,11 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
     elif meta.get("z") is not None:
         z_raw = meta.get("z")
     else:
-        z_raw = default_z.get(target, 10)
+        # Missing z is not an explicit paint-order instruction.  Route it through the
+        # semantic stack below so a gradient/background shape stays behind its image,
+        # and icons/text stay above that image.  The old image default (10) silently
+        # put unannotated photos behind native gradient surfaces.
+        z_raw = None
     # Fusion assigns OCR a small ``z=1`` merely to distinguish it from its
     # detected shell.  It is not a final paint order: native button/card shapes
     # receive semantic z=20 and would otherwise cover their own CTA. Preserve
@@ -166,7 +185,7 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         "rotation": float(candidate.get("rotation", 0) or 0),
         "opacity": float(candidate.get("opacity", 1) if candidate.get("opacity") is not None else 1),
         "blend_mode": str(candidate.get("blend_mode") or "NORMAL"),
-        "effects": list(candidate.get("effects") or []),
+        "effects": list(source_effects) if isinstance(source_effects, list) else [],
         "meta": {**meta, "z": z_index, "source_id": layer_id},
         "constraints": dict(candidate.get("constraints") or {}),
         "component": dict(candidate.get("component") or {}),
@@ -191,15 +210,16 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         return Layer(
             type="group",
             children=children,
-            fill=_surface_fill(candidate),
+            fill=candidate.get("fill"),
             stroke=candidate.get("stroke"),
-            radius=candidate.get("radius") or (candidate.get("style") or {}).get("radius"),
+            radius=candidate.get("radius") or source_style.get("radius"),
+            style=source_style,
             shape_kind="frame",
             **common,
         )
 
     if target == "text":
-        style = dict(candidate.get("style") or {})
+        style = source_style
         fill = candidate.get("fill") or style.pop("fill", None)
         stroke = candidate.get("stroke") or style.pop("stroke", None)
         text_value = str(candidate.get("text") or "")
@@ -234,7 +254,8 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
                 if candidate.get("src") else None,
             fill=candidate.get("fill"),
             stroke=candidate.get("stroke"),
-            radius=candidate.get("radius") or (candidate.get("style") or {}).get("radius"),
+            radius=candidate.get("radius") or source_style.get("radius"),
+            style=source_style,
             **common,
         )
 
@@ -251,6 +272,7 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
                 if candidate.get("src") else None,
             fill=candidate.get("fill"),
             stroke=candidate.get("stroke"),
+            style=source_style,
             meta={**common.pop("meta"), "vector_paths": paths},
             **common,
         )
@@ -263,7 +285,7 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
     mask = dict(candidate.get("mask") or {}) if isinstance(candidate.get("mask"), dict) else None
     if mask and mask.get("src"):
         mask["src"] = _stage_asset(mask.get("src"), f"{layer_id}_mask", run_dir, warnings)
-    return Layer(type="image", src=src, mask=mask, meta=layer_meta, **common)
+    return Layer(type="image", src=src, mask=mask, style=source_style, meta=layer_meta, **common)
 
 
 def _count_layers(layers):
@@ -273,6 +295,73 @@ def _count_layers(layers):
 def _count_editable(layers):
     return sum((1 if layer.type in ("text", "shape", "group") else 0) +
                _count_editable(layer.children) for layer in layers)
+
+
+_LEGITIMATE_RASTER_ROLES = frozenset({
+    "background", "photo", "image", "product", "product-cluster", "person",
+    "people", "face", "hand", "avatar", "profile", "profile-photo", "thumbnail",
+    "illustration", "package", "logo", "wordmark", "brand", "logotype",
+})
+
+
+def _leaf_accounting(layers):
+    """Describe real foreground material without letting wrapper groups inflate editability.
+
+    The historical editable ratio counted every FRAME/GROUP as editable, even when that frame
+    contained only one raster screenshot. Keep the old metric for compatibility, but publish a
+    leaf-only accounting contract that acceptance QA can audit honestly.
+    """
+    out = {
+        "foreground_leaf_count": 0,
+        "native_leaf_count": 0,
+        "raster_leaf_count": 0,
+        "intentional_raster_cluster_count": 0,
+        "fallback_raster_count": 0,
+        "unexplained_raster_count": 0,
+        "unexplained_raster_ids": [],
+    }
+
+    def visit(layer):
+        children = list(layer.children or [])
+        if children:
+            for child in children:
+                visit(child)
+            return
+        meta = layer.meta or {}
+        role = str(meta.get("role") or "").strip().lower().replace("_", "-")
+        if role == "background":
+            return
+        out["foreground_leaf_count"] += 1
+        if layer.type in ("text", "shape"):
+            out["native_leaf_count"] += 1
+            return
+        if layer.type != "image":
+            return
+        out["raster_leaf_count"] += 1
+        intentional = bool(meta.get("intentional_raster_cluster")) or is_intentional_raster_cluster(role)
+        if intentional:
+            out["intentional_raster_cluster_count"] += 1
+        fallback = bool(
+            meta.get("fallback") or meta.get("raster_fallback") or meta.get("vector_fallback")
+            or meta.get("substitution") or meta.get("low_fidelity")
+        )
+        if fallback:
+            out["fallback_raster_count"] += 1
+        explained = bool(
+            intentional or role in _LEGITIMATE_RASTER_ROLES or meta.get("wordmark")
+            or meta.get("substitution") or meta.get("raster_fallback")
+            or meta.get("vector_fallback") or meta.get("semantic_name")
+        )
+        if fallback and not explained:
+            out["unexplained_raster_count"] += 1
+            out["unexplained_raster_ids"].append(str(layer.id))
+
+    for root in layers:
+        visit(root)
+    denominator = max(1, out["foreground_leaf_count"])
+    out["native_leaf_ratio"] = round(out["native_leaf_count"] / denominator, 4)
+    out["unexplained_raster_ids"] = sorted(out["unexplained_raster_ids"])
+    return out
 
 
 def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = None,
@@ -316,6 +405,7 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
     layers.sort(key=lambda layer: layer.z_index)
     total = _count_layers(layers)
     editable = _count_editable(layers)
+    leaf_accounting = _leaf_accounting(layers)
     doc = DesignDoc(
         id=doc_id,
         name=name,
@@ -327,6 +417,8 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
             "layer_count": total,
             "root_layer_count": len(layers),
             "editable_ratio": round(editable / max(1, total), 4),
+            "native_leaf_ratio": leaf_accounting["native_leaf_ratio"],
+            "leaf_accounting": leaf_accounting,
             "warnings": warnings,
             "compiler": "scene-graph-v2",
             "coordinate_space": "local",

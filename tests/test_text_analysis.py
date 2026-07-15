@@ -643,3 +643,49 @@ def test_design_json_preserves_font_candidates(tmp_path):
     style = design["layers"][0]["style"]
     assert style["fontCandidates"][0]["family"] == "Inter"
     assert style["fontSizeCandidates"][0]["value"] == 28
+
+
+def test_word_style_enrichment_uses_strong_pixel_difference_without_guessing_family(monkeypatch):
+    base = {
+        "fontFamily": "Matched Family", "fontSize": 30, "fontWeight": 400,
+        "fontStyle": "Regular", "color": "#111111",
+    }
+    line = {
+        "text": "SAVE 30%", "style": base,
+        "words": [{"text": "30%", "box": {"x": 60, "y": 5, "w": 35, "h": 30}}],
+    }
+    monkeypatch.setattr(text_analysis, "_painted_geometry", lambda image, word: (
+        {"x": 60, "y": 5, "w": 35, "h": 30}, 28, "#ff2244", .91,
+        np.ones((30, 35), dtype=bool), {"fill": {"kind": "flat", "color": "#ff2244"}},
+    ))
+    monkeypatch.setattr(text_analysis, "_pre_font_signals", lambda *args, **kwargs: {
+        "font_size": 42, "weight": 700, "shear_angle": 0,
+    })
+    text_analysis._enrich_word_styles(np.zeros((40, 120, 3), dtype=np.uint8), line, {})
+    word = line["words"][0]
+    assert word["style"]["fontFamily"] == "Matched Family"
+    assert word["style"]["color"] == "#ff2244"
+    assert word["style"]["fontSize"] == 42
+    assert word["style_evidence"]["source"] == "word-pixels"
+
+
+def test_continuous_source_rules_become_native_text_decoration():
+    underline = np.zeros((20, 100), dtype=bool)
+    underline[3:14, 5:95:8] = True
+    underline[17:19, 4:96] = True
+    kind, evidence = text_analysis._native_text_decoration(underline, "BUY NOW")
+    assert kind == "UNDERLINE"
+    assert evidence["source"] == "continuous-source-rule"
+
+    strike = np.zeros((20, 100), dtype=bool)
+    strike[3:17, 5:95:8] = True
+    strike[9:11, 4:96] = True
+    kind, _ = text_analysis._native_text_decoration(strike, "$99")
+    assert kind == "STRIKETHROUGH"
+
+
+def test_glyph_bars_do_not_invent_text_decoration():
+    glyphs = np.zeros((20, 100), dtype=bool)
+    glyphs[4:16, 5:95:10] = True
+    glyphs[8:10, 5:55] = True
+    assert text_analysis._native_text_decoration(glyphs, "EXAMPLE") == (None, None)

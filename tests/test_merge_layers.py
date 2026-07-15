@@ -62,6 +62,21 @@ def test_targets_assigned():
     assert m["c_E1"]["meta"]["qwen_id"] == "Q0"
 
 
+def test_structural_detector_ids_survive_merge_for_layout_planning():
+    elements = [{
+        "id": "P0", "box": {"x": 20, "y": 20, "w": 120, "h": 180},
+        "kind": "photo-fragment", "role": "panel", "area": 21_600,
+        "score": .91, "grid_group_id": "comparison", "row_index": 0,
+        "column_index": 0,
+    }]
+
+    candidate = _by_id(merge_layers.merge({"lines": []}, elements, [], CANVAS, {}))["c_P0"]
+
+    assert candidate["meta"]["grid_group_id"] == "comparison"
+    assert candidate["meta"]["row_index"] == 0
+    assert candidate["meta"]["column_index"] == 0
+
+
 def test_scene_text_dropped():
     cands = merge_layers.merge(_ocr(), _elements(), _qwen(), CANVAS, {})
     m = _by_id(cands)
@@ -69,6 +84,29 @@ def test_scene_text_dropped():
     assert m["c_L1"]["meta"].get("kept_in_photo") is True
     assert m["c_L1"]["target"] == "drop"
     assert m["c_L1"]["meta"]["role"] == "scene-text"
+
+
+def test_vlm_overlay_copy_inside_a_product_is_rebuilt_while_printed_copy_stays_baked():
+    elements = [{
+        "id": "product", "box": {"x": 100, "y": 100, "w": 260, "h": 260},
+        "kind": "photo-fragment", "area": 67_600, "coverage": .2, "role": "product",
+    }]
+    ocr = {"lines": [
+        {"id": "overlay", "text": "Real overlay", "conf": .98, "role": "body",
+         "box": {"x": 130, "y": 130, "w": 110, "h": 18},
+         "meta": {"scene_text_role": "overlay_copy"}},
+        {"id": "printed", "text": "PACKAGING", "conf": .98, "role": "body",
+         "box": {"x": 150, "y": 190, "w": 100, "h": 18},
+         "meta": {"scene_text_role": "printed_on_product"}},
+    ]}
+
+    merged = _by_id(merge_layers.merge(ocr, elements, [], CANVAS, {}))
+
+    assert merged["c_overlay"]["target"] == "text"
+    assert merged["c_overlay"]["meta"]["overlay_text"] is True
+    assert merged["c_overlay"]["meta"]["removal_required"] is True
+    assert merged["c_printed"]["target"] == "drop"
+    assert merged["c_printed"]["meta"]["kept_in_photo"] is True
 
 
 def test_headline_text_survives_and_is_editable():
@@ -105,6 +143,96 @@ def test_unlabelled_overlay_text_receives_a_semantic_figma_role():
     layer = _by_id(merge_layers.merge(ocr, [], [], CANVAS, {}))["c_L"]
     assert layer["target"] == "text"
     assert layer["meta"]["role"] == "cta"
+
+
+def test_intentional_raster_cluster_bakes_internal_text_but_preserves_positive_overlay():
+    panel = {
+        "id": "panel", "box": {"x": 80, "y": 80, "w": 400, "h": 320},
+        "kind": "photo-fragment", "area": 128_000, "coverage": .35, "role": "ui_panel",
+    }
+    ocr = {"lines": [
+        {"id": "inside", "text": "likes 128", "conf": .99, "role": "headline",
+         "box": {"x": 120, "y": 150, "w": 150, "h": 30}},
+        {"id": "overlay", "text": "External offer", "conf": .99, "role": "headline",
+         "box": {"x": 120, "y": 220, "w": 220, "h": 30},
+         "meta": {"ownership_decision": {"placement": "overlay", "owner": "none",
+                                             "action": "recreate", "confidence": .99}}},
+    ]}
+    merged = _by_id(merge_layers.merge(ocr, [panel], [], CANVAS, {}))
+
+    assert merged["c_panel"]["target"] == "image"
+    assert merged["c_inside"]["target"] == "drop"
+    assert merged["c_inside"]["meta"]["baked_owner_id"] == "c_panel"
+    assert merged["c_overlay"]["target"] == "text"
+    assert merged["c_overlay"]["meta"]["parent_id"] == "c_panel"
+    assert merged["c_overlay"]["meta"]["external_overlay"] is True
+
+
+def test_word_level_style_evidence_becomes_exact_editable_text_run():
+    base = {"fontFamily": "Inter", "fontSize": 36, "fontWeight": 700, "color": "#111111"}
+    accent = {**base, "color": "#ff2244", "colorRGB": [255, 34, 68],
+              "fill": {"kind": "flat", "color": "#ff2244"}}
+    ocr = {"lines": [{
+        "id": "mixed", "text": "SAVE 30%", "conf": .99,
+        "box": {"x": 40, "y": 40, "w": 220, "h": 46}, "style": base,
+        "words": [
+            {"text": "SAVE", "box": {"x": 40, "y": 40, "w": 100, "h": 46}},
+            {"text": "30%", "box": {"x": 150, "y": 40, "w": 80, "h": 46},
+             "style": accent,
+             "style_evidence": {"source": "word-pixels", "confidence": .93,
+                                "changed": ["color"]}},
+        ],
+    }]}
+    mixed = _by_id(merge_layers.merge(ocr, [], [], CANVAS, {}))["c_mixed"]
+    assert [(run["start"], run["end"]) for run in mixed["text_runs"]] == [(5, 8)]
+    assert mixed["text_runs"][0]["style"]["color"] == "#ff2244"
+
+
+def test_inline_ticker_is_marked_only_from_three_exact_observed_repeats():
+    ocr = {"lines": [{
+        "id": "ticker", "text": "SALE • SALE • SALE", "conf": .99,
+        "box": {"x": 10, "y": 10, "w": 560, "h": 30},
+        "style": {"fontFamily": "Inter", "fontSize": 20, "fontWeight": 700},
+    }]}
+    ticker = _by_id(merge_layers.merge(ocr, [], [], CANVAS, {}))["c_ticker"]
+    assert ticker["target"] == "text"
+    assert ticker["meta"]["native_repeat"] == {
+        "phrase": "SALE", "count": 3, "source": "exact-ocr-sequence",
+    }
+
+
+def test_internal_ui_chrome_is_not_rebuilt_out_of_screenshot_but_external_overlay_is():
+    elements = [
+        {"id": "shot", "box": {"x": 80, "y": 80, "w": 400, "h": 360},
+         "kind": "photo-fragment", "area": 144000, "coverage": .4, "role": "screenshot"},
+        {"id": "internal_button", "box": {"x": 130, "y": 330, "w": 120, "h": 40},
+         "kind": "shape", "area": 4800, "coverage": .02, "role": "button"},
+        {"id": "offer_badge", "box": {"x": 360, "y": 100, "w": 80, "h": 45},
+         "kind": "shape", "area": 3600, "coverage": .01, "role": "badge",
+         "meta": {"external_overlay": True}},
+    ]
+    merged = _by_id(merge_layers.merge({"lines": []}, elements, [], CANVAS, {}))
+    assert merged["c_shot"]["target"] == "image"
+    assert merged["c_shot"]["meta"]["decomposition_policy"]["internal_chrome"] == \
+        "baked-in-raster-owner"
+    assert merged["c_internal_button"]["target"] == "drop"
+    assert merged["c_internal_button"]["meta"]["baked_owner_id"] == "c_shot"
+    assert merged["c_offer_badge"]["target"] in {"shape", "icon"}
+    assert merged["c_offer_badge"]["meta"]["parent_id"] == "c_shot"
+
+
+def test_source_detected_outer_shell_around_screenshot_remains_native():
+    elements = [
+        {"id": "shell", "box": {"x": 65, "y": 65, "w": 430, "h": 390},
+         "kind": "shape", "area": 167700, "coverage": .46, "role": "card",
+         "meta": {"source_evidenced_shell": True}},
+        {"id": "shot", "box": {"x": 80, "y": 80, "w": 400, "h": 360},
+         "kind": "photo-fragment", "area": 144000, "coverage": .4, "role": "ui-panel"},
+    ]
+    merged = _by_id(merge_layers.merge({"lines": []}, elements, [], CANVAS, {}))
+    assert merged["c_shell"]["target"] == "shape"
+    assert not merged["c_shell"]["meta"].get("baked_owner_id")
+    assert merged["c_shot"]["target"] == "image"
 
 
 def test_vlm_failure_does_not_flatten_explicit_cta_or_headline():
@@ -171,6 +299,37 @@ def test_paragraph_block_preserves_wrapping_alignment_line_height_and_baselines(
     assert candidate["style"]["align"] == "CENTER"
     assert candidate["meta"]["baseline_first"]["y0"] == 36
     assert candidate["meta"]["baseline_last"]["y0"] == 60
+    assert candidate["text_runs"] == []
+
+
+def test_paragraph_block_preserves_distinct_line_styles_as_exact_text_runs():
+    """A multi-line node must not flatten its second line to the first line's style."""
+    lines = [
+        {"id": "L0", "text": "Regular", "conf": .99,
+         "box": {"x": 20, "y": 20, "w": 100, "h": 20}, "role": "body",
+         "style": {"fontFamily": "Inter", "fontStyle": "Regular", "fontSize": 16,
+                   "fontWeight": 400, "color": "#111111", "lineHeight": 24}},
+        {"id": "L1", "text": "Bold", "conf": .98,
+         "box": {"x": 20, "y": 44, "w": 100, "h": 20}, "role": "body",
+         "style": {"fontFamily": "Inter", "fontStyle": "Bold", "fontSize": 18,
+                   "fontWeight": 700, "color": "#dd2244", "lineHeight": 24}},
+    ]
+    block = {
+        "id": "B0", "line_ids": ["L0", "L1"], "text": "Regular\nBold",
+        "box": {"x": 20, "y": 20, "w": 100, "h": 44},
+        "painted_box": {"x": 20, "y": 20, "w": 100, "h": 44},
+        "alignment": "LEFT", "line_height": 24, "role": "body", "meta": {},
+    }
+
+    candidate = _by_id(merge_layers.merge(
+        {"lines": lines, "blocks": [block], "styles": []}, [], [], CANVAS, {}
+    ))["c_B0"]
+
+    assert candidate["text"] == "Regular\nBold"
+    assert [(run["start"], run["end"]) for run in candidate["text_runs"]] == [(0, 7), (8, 12)]
+    assert candidate["text_runs"][0]["style"]["fontWeight"] == 400
+    assert candidate["text_runs"][1]["style"]["fontWeight"] == 700
+    assert candidate["text_runs"][1]["style"]["color"] == "#dd2244"
 
 
 def test_partial_block_list_cannot_delete_orphan_ocr_lines():

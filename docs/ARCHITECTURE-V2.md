@@ -34,9 +34,10 @@ normalize
   -> SAM 3 prompt sweep + box refinement of every residual
   -> mask-aware observation fusion
   -> semantic routing
+  -> frozen scene intent: conservative frame/Auto Layout/component inference
   -> canonical asset extraction + vector fidelity gate
   -> one ownership map + one union removal mask + one inpainted plate
-  -> conservative frame/Auto Layout/component inference
+  -> hydrate reconstructed paint/assets into the frozen scene intent
   -> scene-graph v2
   -> recursive Figma compiler
   -> structural + visual QA
@@ -49,8 +50,10 @@ Important artifacts per run:
 - `residual.json`: deterministic non-text proposals.
 - `sam3.json` and `sam3_masks/`: prompt and box-refined observations.
 - `fused_elements.json` and `fused_elements/`: canonical element masks.
+- `scene_intent.json`: hierarchy, parent/child geometry, and layout decisions made before
+  reconstruction changes material assets, plus a fingerprint so resumes rebuild a stale plan.
 - `reconstruction.json`, `ownership.png`, `removal_mask.png`, `background_clean.png`.
-- `layout.json`: nested frame tree with relative child coordinates.
+- `layout.json`: hydrated nested frame tree with relative child coordinates.
 - `design.json` and `design_preflight.json`: Figma scene graph and compiler warnings.
 
 ## GPU deployment

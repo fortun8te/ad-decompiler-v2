@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.0.0","build":46,"commit":"f46f2ac","dirty":true,"built_at":"2026-07-13T21:20:08Z","label":"v2.0.0+b46.f46f2ac-dirty","source":"git"};
+const PLUGIN_BUILD = {"version":"2.1.0","build":47,"commit":"fc8feec","dirty":true,"built_at":"2026-07-15T13:45:06Z","label":"v2.1.0+b47.fc8feec-dirty","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,
@@ -732,8 +732,13 @@ async function applyTextRuns(node, layer, content, context) {
       node.setRangeFontName(run.start, run.end, fontName);
       const size = finite(pick(style, "fontSize", "font_size", "size"), NaN);
       if (Number.isFinite(size)) node.setRangeFontSize(run.start, run.end, Math.max(1, size));
-      const color = pick(style, "color", "fill");
-      if (color) node.setRangeFills(run.start, run.end, [solidPaint(color, style.opacity)]);
+      // A rich text run can carry the same paint vocabulary as a whole text node.
+      // Prefer it over ``color`` so a run-level gradient is not silently flattened
+      // to a solid (or black) paint by the old color-only path.
+      const runPaints = fillSpecs({ style: style })
+        .map(function (spec) { return paintFromSpec(spec, boxOf(layer)); })
+        .filter(Boolean);
+      if (runPaints.length) node.setRangeFills(run.start, run.end, runPaints);
       const spacing = spacingValue(pick(style, "letterSpacing", "letter_spacing", "tracking"));
       if (spacing) node.setRangeLetterSpacing(run.start, run.end, spacing);
       const lh = pick(style, "lineHeight", "line_height", "leading");
@@ -1516,6 +1521,11 @@ function hoistBackgroundShape(layer) {
     if (strokes.length === 1) copy.stroke = strokes[0];
     else copy.strokes = strokes;
   }
+  if (!(Array.isArray(copy.effects) && copy.effects.length)) {
+    const effects = Array.isArray(best.effects) ? best.effects :
+      (best.style && Array.isArray(best.style.effects) ? best.style.effects : []);
+    if (effects.length) copy.effects = effects.slice();
+  }
   copy.children = children.filter(function (child) { return layerId(child) !== layerId(best); });
   return copy;
 }
@@ -1833,7 +1843,8 @@ async function localTextStyles() {
   return [];
 }
 
-function makeContext(doc, assets, settings) {
+function makeContext(doc, assets, settings, handoff) {
+  handoff = handoff || {};
   const report = {
     ok: false,
     created: 0,
@@ -1848,6 +1859,8 @@ function makeContext(doc, assets, settings) {
     fidelity: { unsupported_paint: 0, unsupported_stroke: 0, unsupported_effect: 0, notes: [] },
     byType: {},
     plugin_build: PLUGIN_BUILD,
+    manifest_doc_id: String(handoff.manifest_doc_id || ""),
+    roundtrip_token: String(handoff.roundtrip_token || ""),
   };
   const schemaVersion = finite(pick(doc, "schema_version", "schemaVersion"), 1);
   const declaredCoordinates = normalizedToken(pick(doc.meta || {}, "coordinate_space", "coordinateSpace"));
@@ -1908,7 +1921,10 @@ async function buildDocument(message) {
     const raw = message.assets[key];
     assets[key] = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
   });
-  const context = makeContext(doc, assets, settings);
+  const context = makeContext(doc, assets, settings, {
+    manifest_doc_id: message.manifest_doc_id,
+    roundtrip_token: message.roundtrip_token,
+  });
   activeJob = context;
   context.localTextStyles = await localTextStyles();
   const existingRoots = findImportedRoots(context.docId);
@@ -1978,7 +1994,12 @@ async function buildDocument(message) {
       context.warn("Canvas selection could not be updated", String(viewError && viewError.message || viewError));
     }
     post("build-result", { report: context.report });
-    post("exported", { bytes: Array.from(png), export_to: message.export_to || null });
+    post("exported", {
+      bytes: Array.from(png),
+      export_to: message.export_to || null,
+      manifest_doc_id: context.report.manifest_doc_id,
+      roundtrip_token: context.report.roundtrip_token,
+    });
     try {
       figma.notify("Import complete");
     } catch (_) {}
