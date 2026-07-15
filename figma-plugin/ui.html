@@ -29,9 +29,13 @@
       --text-success: #62d97c;
       --border: #1f1f1f;
       --border-strong: #2a2a2a;
-      --radius-sm: 6px;
-      --radius-md: 10px;
-      --radius-lg: 14px;
+      --radius-sm: 5px;
+      --radius-md: 8px;
+      --radius-lg: 10px;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
       font-family: "SF Pro Text", "Segoe UI", ui-sans-serif, -apple-system, BlinkMacSystemFont, sans-serif;
       font-synthesis: none;
       -webkit-font-smoothing: antialiased;
@@ -70,7 +74,7 @@
 
     .app {
       display: grid;
-      grid-template-rows: auto minmax(0, 1fr) auto;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
       height: 100%;
     }
 
@@ -78,10 +82,10 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 10px;
-      padding: 11px 14px 10px;
+      gap: var(--space-2);
+      padding: var(--space-3) var(--space-4);
       border-bottom: 1px solid var(--border);
-      background: color-mix(in srgb, var(--bg-secondary) 88%, transparent);
+      background: var(--bg-secondary);
     }
 
     .brand {
@@ -97,17 +101,16 @@
       width: 22px;
       height: 22px;
       flex: 0 0 auto;
-      border-radius: 6px;
-      background: linear-gradient(145deg, #1a1a1a, #0a0a0a);
-      box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 6%, transparent),
-                  0 0 0 1px var(--border-strong);
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--bg-tertiary);
     }
 
     .brand-mark svg { width: 13px; height: 13px; }
 
     .brand-name {
       font-size: 12px;
-      font-weight: 650;
+      font-weight: 600;
       letter-spacing: -0.02em;
       color: var(--text);
       white-space: nowrap;
@@ -117,21 +120,17 @@
 
     .build-badge {
       flex: 0 0 auto;
-      padding: 2px 7px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: var(--bg-tertiary);
+      padding: 0;
+      border: 0;
+      background: transparent;
       color: var(--text-tertiary);
-      font: 600 9px/1.2 "SFMono-Regular", Consolas, monospace;
-      font-variant-numeric: tabular-nums;
-      letter-spacing: 0.01em;
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: -0.01em;
       white-space: nowrap;
     }
 
-    .build-badge[data-dirty="true"] {
-      border-color: color-mix(in srgb, var(--text-warning) 35%, var(--border));
-      color: var(--text-warning);
-    }
+    .build-badge[data-dirty="true"] { color: var(--text-warning); }
 
     .header-actions { display: flex; align-items: center; gap: 12px; min-width: 0; }
 
@@ -153,33 +152,63 @@
     .connection-dot {
       width: 6px;
       height: 6px;
+      flex: 0 0 auto;
       border-radius: 50%;
       background: var(--text-tertiary);
-      transition: background-color 200ms ease;
+      transition: background-color 200ms ease, box-shadow 200ms ease, transform 200ms ease;
+    }
+
+    .connection[data-state="idle"] .connection-dot { background: var(--text-tertiary); }
+
+    .connection[data-state="checking"],
+    .connection[data-state="reconnecting"] {
+      color: var(--text-secondary);
+    }
+
+    .connection[data-state="checking"] .connection-dot,
+    .connection[data-state="reconnecting"] .connection-dot {
+      background: var(--brand);
+      animation: connection-pulse 1.15s ease-in-out infinite;
+    }
+
+    @keyframes connection-pulse {
+      0%, 100% { opacity: 0.5; transform: scale(0.9); }
+      50% { opacity: 1; transform: scale(1); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .connection[data-state="checking"] .connection-dot,
+      .connection[data-state="reconnecting"] .connection-dot {
+        animation: none !important;
+        opacity: 1;
+        transform: none;
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand) 38%, transparent);
+      }
     }
 
     .connection[data-state="connected"] {
-      border-color: color-mix(in srgb, var(--text-success) 30%, transparent);
-      background: var(--success-bg);
-      color: var(--text-success);
+      border-color: var(--border);
+      background: var(--bg-secondary);
+      color: var(--text-secondary);
     }
-    .connection[data-state="connected"] .connection-dot { background: #4cd964; }
+    .connection[data-state="connected"] .connection-dot { background: #27ae60; }
     .connection[data-state="error"] {
-      border-color: color-mix(in srgb, var(--text-danger) 30%, transparent);
-      background: var(--danger-bg);
-      color: var(--text-danger);
+      border-color: var(--border);
+      background: var(--bg-secondary);
+      color: var(--text-secondary);
     }
-    .connection[data-state="error"] .connection-dot { background: #ff6b52; }
+    .connection[data-state="error"] .connection-dot { background: #eb5757; }
 
     main {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: var(--space-4);
+      min-height: 0;
       overflow-y: auto;
       overscroll-behavior: contain;
       scrollbar-width: thin;
       scrollbar-color: var(--border-strong) transparent;
-      padding: 14px 14px 10px;
+      padding: var(--space-4);
     }
 
     .section:not(.hidden) {
@@ -192,33 +221,51 @@
     }
 
     .hero {
-      flex: 1;
+      flex: 1 0 auto;
       display: flex;
       flex-direction: column;
       justify-content: center;
       min-height: 0;
     }
 
-    .hero-copy { padding: 2px 2px 12px; }
-    .hero-eyebrow {
-      color: var(--brand-hover);
-      font-size: 9px;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
+    body[data-scan-active="true"] .hero {
+      flex: 0 1 auto;
+      justify-content: flex-start;
     }
+
+    body[data-scan-active="true"] .hero-copy { display: none; }
+
+    body[data-scan-active="true"] .upload-zone {
+      flex: 0 0 auto;
+      min-height: 0;
+      padding: var(--space-2);
+    }
+
+    body[data-scan-active="true"] .settings-body > * {
+      display: none;
+    }
+
+    body[data-scan-active="true"] details.settings summary {
+      padding-bottom: var(--space-2);
+    }
+
+    .hero-copy { padding: 0 0 var(--space-4); }
+
     .hero-heading {
-      margin: 4px 0 3px;
-      font-size: 20px;
-      line-height: 1.12;
-      letter-spacing: -0.04em;
+      margin: 0 0 var(--space-1);
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+      color: var(--text);
     }
+
     .hero-subcopy {
-      max-width: 290px;
+      max-width: 36ch;
       margin: 0;
-      color: var(--text-secondary);
+      color: var(--text-tertiary);
       font-size: 11px;
-      line-height: 1.45;
+      line-height: 1.4;
     }
 
     .section + .section { margin-top: 0; }
@@ -227,8 +274,8 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 7px;
+      gap: var(--space-3);
+      margin-bottom: var(--space-2);
     }
 
     .section-title {
@@ -257,15 +304,15 @@
       border-radius: var(--radius-md);
       background: var(--bg);
       overflow: hidden;
-      box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 3%, transparent);
     }
 
     .source-empty {
       display: block;
       min-height: 0;
-      padding: 10px 11px;
+      padding: var(--space-3) var(--space-4);
       color: var(--text-secondary);
       font-size: 10.5px;
+      line-height: 1.45;
     }
 
     .source-empty .empty-glyph { display: none; }
@@ -287,46 +334,52 @@
     .empty-copy { margin-top: 3px; color: var(--text-secondary); font-size: 10.5px; max-width: 235px; }
 
     .source-loaded {
-      display: grid;
-      grid-template-columns: 52px minmax(0, 1fr);
-      min-height: 52px;
+      display: flex;
+      align-items: stretch;
+      min-height: 0;
     }
 
     .preview {
       position: relative;
       display: grid;
       place-items: center;
-      min-height: 52px;
+      flex: 0 0 72px;
+      width: 72px;
+      min-height: 72px;
       overflow: hidden;
       border-right: 1px solid var(--border);
-      background-color: #0d0d0d;
-      background-image:
-        linear-gradient(45deg, color-mix(in srgb, var(--text) 4%, transparent) 25%, transparent 25%),
-        linear-gradient(-45deg, color-mix(in srgb, var(--text) 4%, transparent) 25%, transparent 25%),
-        linear-gradient(45deg, transparent 75%, color-mix(in srgb, var(--text) 4%, transparent) 75%),
-        linear-gradient(-45deg, transparent 75%, color-mix(in srgb, var(--text) 4%, transparent) 75%);
-      background-size: 14px 14px;
-      background-position: 0 0, 0 7px, 7px -7px, -7px 0;
+      background: var(--bg-tertiary);
     }
 
     .preview img { display: none; width: 100%; height: 100%; object-fit: contain; }
     .preview.has-image img { display: block; }
 
     .preview-fallback {
-      display: grid;
-      place-items: center;
-      width: 34px;
-      height: 34px;
-      border-radius: 9px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       color: var(--text-tertiary);
-      background: color-mix(in srgb, var(--bg) 86%, transparent);
+      opacity: 0.55;
     }
 
     .preview.has-image .preview-fallback { display: none; }
+    .preview-fallback svg { width: 20px; height: 20px; }
 
-    .source-info { min-width: 0; padding: 8px 10px; }
+    .source-info {
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      gap: var(--space-2);
+      min-width: 0;
+      padding: var(--space-3) var(--space-4);
+    }
 
-    .source-name-row { display: flex; align-items: flex-start; gap: 8px; }
+    .source-header {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      min-width: 0;
+    }
 
     .source-name {
       min-width: 0;
@@ -334,74 +387,48 @@
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      font-size: 12.5px;
-      font-weight: 650;
+      font-size: 11px;
+      font-weight: 600;
       letter-spacing: -0.01em;
+      color: var(--text);
     }
 
     .schema-badge {
       flex: 0 0 auto;
-      padding: 2px 5px;
+      padding: 1px 5px;
       border: 1px solid var(--border);
-      border-radius: 4px;
-      color: var(--text-secondary);
-      font: 9px/1.3 "SFMono-Regular", Consolas, monospace;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .source-meta {
-      margin-top: 2px;
-      color: var(--text-secondary);
-      font-size: 10px;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .metrics {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px 10px;
-      margin-top: 6px;
-    }
-
-    .metric-value {
-      display: inline;
-      font: 600 10px/1.1 "SFMono-Regular", Consolas, monospace;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .metric-label { display: inline; margin-left: 3px; color: var(--text-tertiary); font-size: 9px; white-space: nowrap; }
-
-    .import-identity {
-      display: grid;
-      grid-template-columns: auto minmax(0, 1fr);
-      gap: 2px 7px;
-      margin-top: 8px;
-      padding-top: 7px;
-      border-top: 1px solid var(--border);
-      font-size: 9.5px;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--text-tertiary);
+      font-size: 9px;
+      font-weight: 500;
       line-height: 1.35;
     }
 
-    .import-identity-label {
+    .source-meta {
       color: var(--text-tertiary);
-      font-size: 8px;
-      font-weight: 650;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.4;
     }
 
-    .import-identity-value,
-    .import-identity-detail {
-      min-width: 0;
+    .source-summary {
+      color: var(--text-secondary);
+      font-size: 10px;
+      line-height: 1.45;
+    }
+
+    .source-footnote {
+      margin-top: var(--space-1);
+      padding-top: var(--space-2);
+      border-top: 1px solid var(--border);
+      color: var(--text-tertiary);
+      font-size: 9.5px;
+      line-height: 1.4;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      font-family: "SFMono-Regular", Consolas, monospace;
-      font-variant-numeric: tabular-nums;
     }
-
-    .import-identity-value { color: var(--text); }
-    .import-identity-detail { grid-column: 2; color: var(--text-secondary); }
 
     .history-panel {
       overflow: hidden;
@@ -418,7 +445,7 @@
       padding: 9px 11px 7px;
     }
 
-    .history-title { font-size: 11px; font-weight: 650; }
+    .history-title { font-size: 11px; font-weight: 600; }
     .history-note { color: var(--text-tertiary); font-size: 9.5px; }
     .history-list { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--border); }
     .history-item {
@@ -464,43 +491,90 @@
 
     .mode-note { display: none; }
 
-    .progress-panel, .result-panel, .issue-panel {
+    .progress-panel, .result-panel {
       border-radius: var(--radius-md);
-      padding: 10px 11px;
+      padding: var(--space-3);
+    }
+
+    .issue-panel {
+      border-radius: var(--radius-md);
+      padding: var(--space-2) var(--space-3);
     }
 
     .progress-panel { border: 1px solid var(--border); background: var(--bg-secondary); }
 
-    .progress-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .progress-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }
-    .progress-count { color: var(--text-secondary); font: 10px "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .progress-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-2);
+    }
+
+    .progress-label {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .progress-percent {
+      flex: 0 0 auto;
+      font-size: 11px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-secondary);
+    }
 
     .progress-track {
       height: 4px;
-      margin-top: 9px;
+      margin-top: var(--space-2);
       overflow: hidden;
-      border-radius: 3px;
+      border-radius: 999px;
       background: var(--bg-tertiary);
     }
 
     .progress-bar { width: 0; height: 100%; border-radius: inherit; background: var(--brand); transition: width 180ms ease; }
 
+    .progress-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-2);
+      margin-top: var(--space-1);
+    }
+
+    .progress-count {
+      min-width: 0;
+      color: var(--text-tertiary);
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+
     .cancel-button {
-      margin-top: 10px;
-      padding: 4px 0;
+      margin-top: 0;
+      padding: 0;
       background: transparent;
       color: var(--text-secondary);
-      font-size: 10.5px;
+      font-size: 10px;
     }
     .cancel-button:hover { color: var(--text); }
-    #uploadBusy .cancel-button { width: 100%; }
 
-    .issue-panel { border: 1px solid color-mix(in srgb, var(--text-warning) 25%, var(--border)); background: var(--warning-bg); }
-    .issue-panel[data-tone="error"] { border-color: color-mix(in srgb, var(--text-danger) 25%, var(--border)); background: var(--danger-bg); }
+    .issue-panel {
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+      border-left: 2px solid color-mix(in srgb, var(--text-warning) 70%, var(--border));
+    }
+    .issue-panel[data-tone="error"] {
+      border-left-color: color-mix(in srgb, var(--text-danger) 70%, var(--border));
+    }
 
-    .issue-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-    .issue-title { color: var(--text-warning); font-weight: 650; }
-    .issue-panel[data-tone="error"] .issue-title { color: var(--text-danger); }
+    .issue-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 18px; }
+    .issue-title { font-size: 11px; font-weight: 600; letter-spacing: -0.01em; color: var(--text); }
+    .issue-panel[data-tone="warning"] .issue-title { color: color-mix(in srgb, var(--text-warning) 28%, var(--text)); }
+    .issue-panel[data-tone="error"] .issue-title { color: color-mix(in srgb, var(--text-danger) 32%, var(--text)); }
     .issue-dismiss {
       flex: 0 0 auto;
       display: grid;
@@ -510,48 +584,68 @@
       margin: -2px -2px 0 0;
       border-radius: 5px;
       background: transparent;
-      color: var(--text-warning);
+      color: var(--text-tertiary);
       font-size: 14px;
       line-height: 1;
       opacity: 0.7;
     }
-    .issue-panel[data-tone="error"] .issue-dismiss { color: var(--text-danger); }
     .issue-dismiss:hover { opacity: 1; background: color-mix(in srgb, currentColor 12%, transparent); }
 
-    .issue-list { margin: 7px 0 0; padding: 0; list-style: none; }
-    .issue-list li + li { margin-top: 6px; }
-    .issue-item-title { font-weight: 550; }
-    .issue-item-detail { margin-top: 4px; color: var(--text-secondary); font-size: 10.5px; line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .issue-list { margin: 3px 0 0; padding: 0; list-style: none; }
+    .issue-list li + li { margin-top: 5px; }
+    .issue-list[data-single="true"] .issue-item-title { display: none; }
+    .issue-item-title { font-size: 10.5px; font-weight: 600; }
+    .issue-item-body { color: var(--text-secondary); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
+    .issue-item-detail { margin-top: 2px; color: var(--text-secondary); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; white-space: pre-wrap; }
 
-    .result-panel { border: 1px solid var(--border); background: var(--bg-secondary); }
-    .result-panel[data-tone="success"] { border-color: color-mix(in srgb, var(--text-success) 22%, var(--border)); background: var(--success-bg); }
-    .result-panel[data-tone="error"] { border-color: color-mix(in srgb, var(--text-danger) 22%, var(--border)); background: var(--danger-bg); }
+    .result-panel {
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+    }
 
-    .result-head { display: flex; align-items: center; gap: 9px; }
+    .result-panel[data-tone="success"] {
+      border-left: 2px solid color-mix(in srgb, var(--text-success) 70%, var(--border));
+    }
+
+    .result-panel[data-tone="error"] {
+      border-left: 2px solid color-mix(in srgb, var(--text-danger) 70%, var(--border));
+    }
+
+    .result-head {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--space-2);
+    }
 
     .result-icon {
-      display: grid;
-      place-items: center;
-      width: 24px;
-      height: 24px;
+      display: flex;
       flex: 0 0 auto;
-      border-radius: 7px;
-      background: var(--bg);
+      align-items: center;
+      margin-top: 1px;
+      color: var(--text-secondary);
+      background: transparent;
     }
 
-    .result-panel[data-tone="success"] .result-icon {
-      color: var(--text-success);
-      background: color-mix(in srgb, var(--text-success) 12%, var(--bg));
+    .result-panel[data-tone="success"] .result-icon { color: var(--text-success); }
+    .result-panel[data-tone="error"] .result-icon { color: var(--text-danger); }
+
+    .result-icon svg { width: 13px; height: 13px; }
+
+    .result-body { min-width: 0; flex: 1; }
+
+    .result-title {
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.35;
+      color: var(--text);
     }
 
-    .result-panel[data-tone="error"] .result-icon {
-      color: var(--text-danger);
-      background: color-mix(in srgb, var(--text-danger) 12%, var(--bg));
+    .result-copy {
+      margin-top: var(--space-1);
+      color: var(--text-secondary);
+      font-size: 10px;
+      line-height: 1.45;
     }
-
-    .result-icon svg { width: 14px; height: 14px; }
-    .result-title { font-weight: 650; }
-    .result-copy { margin-top: 2px; color: var(--text-secondary); font-size: 10.5px; }
 
     .result-stats {
       display: grid;
@@ -580,8 +674,8 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      min-height: 34px;
-      padding: 0 11px;
+      min-height: 40px;
+      padding: var(--space-2) var(--space-4);
       color: var(--text-secondary);
       cursor: pointer;
       list-style: none;
@@ -615,31 +709,38 @@
     .settings-body {
       display: flex;
       flex-direction: column;
-      gap: 10px;
-      padding: 10px 11px 11px;
-      border-top: 1px solid var(--border);
+      gap: var(--space-4);
+      padding: var(--space-4);
+    }
+
+    .settings-bridge {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+      padding-bottom: var(--space-3);
+      border-bottom: 1px solid var(--border);
     }
 
     .settings-row {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
+      gap: var(--space-2);
       min-width: 0;
     }
 
-    .settings-body .text-input { margin-top: 6px; }
+    .settings-body .text-input { margin-top: 0; }
 
     .settings-links {
       display: flex;
       flex-wrap: wrap;
-      gap: 6px 10px;
-      margin-top: 6px;
+      gap: var(--space-2) var(--space-3);
+      margin-top: var(--space-1);
     }
 
     .settings-label {
       display: block;
-      margin-bottom: 6px;
+      margin-bottom: 0;
       color: var(--text-tertiary);
       font-size: 10px;
       font-weight: 600;
@@ -664,36 +765,27 @@
     .field-help { margin: 5px 0 10px; color: var(--text-tertiary); font-size: 9.5px; }
 
     footer {
-      padding: 10px 14px 12px;
+      padding: var(--space-3) var(--space-4);
       border-top: 1px solid var(--border);
-      background: color-mix(in srgb, var(--bg) 72%, #0c0c0c);
-      box-shadow: 0 -8px 24px color-mix(in srgb, #000 35%, transparent);
+      background: var(--bg-secondary);
     }
 
     .primary-button {
       width: 100%;
-      min-height: 38px;
+      min-height: 36px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
       border-radius: var(--radius-md);
-      background: linear-gradient(180deg, var(--brand-hover) 0%, var(--brand) 48%, var(--brand-pressed) 100%);
+      background: var(--brand);
       color: var(--text-onbrand);
-      font-weight: 650;
-      font-size: 12.5px;
+      font-weight: 600;
+      font-size: 12px;
       letter-spacing: -0.01em;
-      box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 14%, transparent),
-                  0 1px 2px color-mix(in srgb, #000 50%, transparent),
-                  0 0 0 1px color-mix(in srgb, var(--brand-pressed) 60%, transparent);
     }
 
-    .primary-button:hover:not(:disabled) {
-      background: linear-gradient(180deg, #45b5ff 0%, var(--brand-hover) 48%, var(--brand) 100%);
-      box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 18%, transparent),
-                  0 2px 8px var(--brand-glow),
-                  0 0 0 1px color-mix(in srgb, var(--brand) 50%, transparent);
-    }
-    .primary-button:active:not(:disabled) { background: var(--brand-pressed); box-shadow: none; }
+    .primary-button:hover:not(:disabled) { background: var(--brand-hover); }
+    .primary-button:active:not(:disabled) { background: var(--brand-pressed); }
     .primary-button:disabled {
       background: var(--bg-tertiary);
       color: var(--text-tertiary);
@@ -714,49 +806,34 @@
 
     .footer-status {
       display: block;
-      margin-top: 8px;
+      margin-top: var(--space-2);
       color: var(--text-tertiary);
       font-size: 10px;
       text-align: center;
-      letter-spacing: 0.01em;
     }
 
-    /* Calm visual layer: keep diagnostics available without making the plugin feel like a console. */
-    .readiness-strip { margin: 0 14px; border: 0; border-radius: 8px; background: transparent; color: var(--text-tertiary); }
-    .readiness-strip[data-state="ok"] { color: var(--text-secondary); }
-    .connection { border-color: transparent; background: transparent; }
-    .build-badge { border-color: transparent; background: transparent; }
-    .source-card, .history-panel, .progress-panel, .result-panel, .issue-panel { box-shadow: 0 8px 24px rgba(0,0,0,.16); }
-    .source-info, .history-detail, .history-time, .import-identity-value, .import-identity-detail { font-family: inherit; }
-    .upload-zone { min-height: 230px; border-style: solid; border-color: var(--border-strong); background: linear-gradient(180deg, #171b22, #101217); }
-    .upload-zone:hover { border-color: color-mix(in srgb, var(--brand) 55%, var(--border-strong)); }
-    .upload-zone[data-dragover="true"] { box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 18%, transparent); }
-    .upload-title { font-size: 14px; }
-    .upload-copy { color: var(--text-secondary); }
-    .settings { border-top-color: transparent; }
-    .settings summary { color: var(--text-secondary); }
-    .primary-button { min-height: 42px; border-radius: 11px; }
+    .source-info, .history-detail, .history-time { font-family: inherit; }
 
     .hidden { display: none !important; }
 
     .skeleton {
-      position: relative;
-      overflow: hidden;
-      color: transparent !important;
-      border-radius: 4px;
-      background: var(--bg-tertiary);
+      animation: skeleton-pulse 2.8s ease-in-out infinite;
     }
 
-    .skeleton::after {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--bg) 65%, transparent), transparent);
-      transform: translateX(-100%);
-      animation: shimmer 1.15s ease-in-out infinite;
+    .empty-title.skeleton { color: var(--text-secondary) !important; }
+    .empty-copy.skeleton { color: var(--text-tertiary) !important; }
+
+    @keyframes skeleton-pulse {
+      0%, 100% { opacity: 0.68; }
+      50% { opacity: 1; }
     }
 
-    @keyframes shimmer { to { transform: translateX(100%); } }
+    @media (prefers-reduced-motion: reduce) {
+      .skeleton {
+        animation: none !important;
+        opacity: 0.82;
+      }
+    }
 
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
@@ -765,18 +842,23 @@
     .upload-zone {
       position: relative;
       display: flex;
-      flex: 1;
+      flex: 0 1 auto;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 8px;
-      min-height: 210px;
-      padding: 30px 22px;
+      gap: var(--space-2);
+      min-height: 168px;
+      padding: var(--space-4);
       border: 1px dashed var(--border-strong);
       border-radius: var(--radius-lg);
       background: var(--bg-secondary);
       cursor: pointer;
       text-align: center;
+      transition: border-color 160ms ease, background-color 160ms ease;
+    }
+
+    .upload-zone:hover {
+      border-color: color-mix(in srgb, var(--brand) 35%, var(--border-strong));
     }
 
     .upload-zone[data-dragover="true"] {
@@ -790,16 +872,18 @@
       border-style: solid;
       border-color: var(--border-strong);
       background: var(--bg-secondary);
-      padding: 12px 12px 16px;
-      min-height: 300px;
+      padding: var(--space-2);
+      min-height: 0;
       justify-content: flex-start;
+      align-items: stretch;
+      gap: 0;
     }
 
     .upload-idle, .upload-busy {
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 10px;
+      gap: var(--space-2);
       width: 100%;
       min-width: 0;
       max-width: 320px;
@@ -807,16 +891,18 @@
 
     .upload-zone[data-busy="true"] .upload-busy {
       max-width: none;
-      gap: 12px;
+      gap: var(--space-3);
+      align-items: stretch;
     }
 
     .work-preview-frame {
       position: relative;
       width: 100%;
       flex: 0 0 auto;
-      min-height: 120px;
-      max-height: min(44vh, 300px);
-      aspect-ratio: 4 / 5;
+      height: auto;
+      min-height: 72px;
+      max-height: min(28vh, 168px);
+      aspect-ratio: 16 / 10;
       border-radius: var(--radius-md);
       overflow: hidden;
       border: 1px solid var(--border);
@@ -828,7 +914,6 @@
         linear-gradient(-45deg, transparent 75%, color-mix(in srgb, var(--text) 4%, transparent) 75%);
       background-size: 14px 14px;
       background-position: 0 0, 0 7px, 7px -7px, -7px 0;
-      box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 4%, transparent);
     }
 
     .work-preview-frame img {
@@ -841,15 +926,115 @@
 
     .work-preview-frame.has-image img { display: block; }
 
+    .work-preview-frame[data-scanning="true"] {
+      border-color: color-mix(in srgb, var(--brand) 30%, var(--border));
+    }
+
+    .scan-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+      overflow: hidden;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 180ms ease;
+      container-type: size;
+    }
+
+    .work-preview-frame[data-scanning="true"] .scan-overlay {
+      opacity: 1;
+    }
+
+    .scan-sweep {
+      --sweep-band: 12%;
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 0;
+      height: var(--sweep-band);
+      transform: translateY(-100%);
+      animation: previewScanSweep 3.6s cubic-bezier(0.42, 0, 0.58, 1) infinite;
+      will-change: transform;
+    }
+
+    .scan-sweep-light {
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(
+        to top,
+        rgba(255, 255, 255, 0.13) 0%,
+        rgba(255, 255, 255, 0.045) 42%,
+        transparent 100%
+      );
+      mix-blend-mode: soft-light;
+      pointer-events: none;
+    }
+
+    .scan-sweep-trail {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 1px;
+      height: calc(100% - 1px);
+      background: linear-gradient(
+        to top,
+        rgba(255, 255, 255, 0.09) 0%,
+        rgba(255, 255, 255, 0.028) 38%,
+        rgba(255, 255, 255, 0.008) 72%,
+        transparent 100%
+      );
+      pointer-events: none;
+    }
+
+    .scan-sweep-line {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 1px;
+      background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(255, 255, 255, 0.28) 8%,
+        rgba(255, 255, 255, 0.78) 50%,
+        rgba(255, 255, 255, 0.28) 92%,
+        transparent 100%
+      );
+      opacity: 0.92;
+    }
+
+    @keyframes previewScanSweep {
+      0%, 100% { transform: translateY(-100%); }
+      50% { transform: translateY(calc(100cqh - 100%)); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .scan-sweep {
+        top: 50%;
+        transform: translateY(-50%);
+        animation: previewScanPulse 2.4s ease-in-out infinite;
+      }
+
+      .scan-sweep-light { display: none; }
+
+      .scan-sweep-line { opacity: 0.72; }
+
+      @keyframes previewScanPulse {
+        0%, 100% { opacity: 0.38; }
+        50% { opacity: 0.88; }
+      }
+    }
+
     .work-preview-meta {
+      z-index: 3;
       position: absolute;
       inset: auto 0 0 0;
       display: flex;
       align-items: flex-end;
       justify-content: space-between;
-      gap: 8px;
-      padding: 36px 10px 9px;
-      background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, #000 78%, transparent) 55%, color-mix(in srgb, #000 92%, transparent) 100%);
+      gap: var(--space-2);
+      padding: var(--space-4) var(--space-2) var(--space-2);
+      background: linear-gradient(180deg, transparent, color-mix(in srgb, #000 85%, transparent));
       pointer-events: none;
     }
 
@@ -866,84 +1051,77 @@
 
     .work-preview-stage {
       flex: 0 0 auto;
-      padding: 3px 8px;
-      border-radius: 999px;
-      border: 1px solid color-mix(in srgb, var(--brand) 35%, transparent);
-      background: color-mix(in srgb, var(--brand) 22%, #000);
-      color: var(--text);
+      padding: 2px 7px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--bg-tertiary);
+      color: var(--text-secondary);
       font-size: 9px;
-      font-weight: 650;
-      letter-spacing: 0.02em;
+      font-weight: 600;
       white-space: nowrap;
     }
 
     .work-progress-block {
       display: flex;
       flex-direction: column;
-      align-items: center;
-      gap: 10px;
+      align-items: stretch;
+      gap: 0;
       width: 100%;
       min-width: 0;
-      max-width: 360px;
-      margin: 0 auto;
+      flex: 0 0 auto;
     }
 
     .upload-zone[data-busy="true"] .work-progress-block {
       max-width: none;
     }
 
-    .scan-percent {
-      font: 700 32px/1 "SF Pro Display", "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
-      font-variant-numeric: tabular-nums;
-      letter-spacing: -0.04em;
-      color: var(--text);
-    }
-
-    .scan-track {
-      width: 100%;
-      height: 5px;
-      overflow: hidden;
-      border-radius: 999px;
-      background: var(--bg-tertiary);
-      box-shadow: inset 0 1px 2px color-mix(in srgb, #000 35%, transparent);
-    }
-
-    .scan-bar {
-      position: relative;
-      width: 0;
-      height: 100%;
-      border-radius: inherit;
-      background: linear-gradient(90deg, var(--brand-pressed), var(--brand), #5cc4ff);
-      box-shadow: 0 0 14px var(--brand-glow);
-      transition: width 360ms cubic-bezier(0.22, 1, 0.36, 1);
-    }
-
-    .scan-bar::after {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background: linear-gradient(90deg, transparent, color-mix(in srgb, #fff 35%, transparent), transparent);
-      transform: translateX(-100%);
-      animation: scanShimmer 1.8s ease-in-out infinite;
-    }
-
-    @keyframes scanShimmer {
-      to { transform: translateX(100%); }
-    }
-
-    .scan-header {
+    .scan-head {
       display: flex;
       align-items: baseline;
       justify-content: space-between;
-      gap: 12px;
-      width: 100%;
+      gap: var(--space-2);
+      min-width: 0;
     }
 
-    .scan-step-count {
+    .scan-stage {
+      min-width: 0;
+      margin: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.3;
+      letter-spacing: -0.01em;
+      color: var(--text);
+    }
+
+    .scan-metric {
+      flex: 0 0 auto;
       color: var(--text-tertiary);
-      font: 600 10px/1 "SFMono-Regular", Consolas, monospace;
+      font-size: 10px;
+      font-weight: 600;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
+    }
+
+    .scan-metric:empty { display: none; }
+
+    .scan-track {
+      width: 100%;
+      height: 4px;
+      margin-top: var(--space-2);
+      overflow: hidden;
+      border-radius: 999px;
+      background: var(--bg-tertiary);
+    }
+
+    .scan-bar {
+      width: 0;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--brand);
+      transition: width 180ms ease;
     }
 
     .scan-track-wrap {
@@ -951,60 +1129,57 @@
     }
 
     .scan-segments {
-      display: grid;
-      grid-template-columns: repeat(15, minmax(0, 1fr));
-      gap: 3px;
-      width: 100%;
-      margin-bottom: 7px;
+      display: none;
     }
 
-    .scan-segment {
-      height: 3px;
-      border-radius: 999px;
-      background: var(--bg-tertiary);
-      transition: background-color 220ms ease, box-shadow 220ms ease;
-    }
-
-    .scan-segment.is-done { background: color-mix(in srgb, var(--brand) 55%, var(--bg-tertiary)); }
-    .scan-segment.is-active {
-      background: var(--brand);
-      box-shadow: 0 0 8px var(--brand-glow);
+    .scan-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-2);
+      margin-top: var(--space-1);
+      min-width: 0;
     }
 
     .scan-timing {
       display: flex;
-      flex-wrap: wrap;
-      justify-content: center;
-      gap: 4px 10px;
-      width: 100%;
-      color: var(--text-secondary);
-      font: 500 10px/1.35 "SFMono-Regular", Consolas, monospace;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .scan-timing span::before {
+      align-items: center;
+      gap: 5px;
+      min-width: 0;
+      overflow: hidden;
       color: var(--text-tertiary);
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      font-size: 8px;
+      font-size: 10px;
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      text-overflow: ellipsis;
     }
 
-    .scan-timing .timing-elapsed::before { content: "Elapsed "; }
-    .scan-timing .timing-remaining::before { content: "Left "; }
-    .scan-timing .timing-total::before { content: "Total "; }
+    .scan-timing-sep {
+      color: var(--text-tertiary);
+      opacity: 0.55;
+    }
 
-    .scan-timing .timing-muted { color: var(--text-tertiary); }
-    .scan-timing .timing-muted::before { content: none; }
+    .scan-timing-sep.hidden { display: none; }
+
+    .scan-meta {
+      margin-top: var(--space-1);
+      color: var(--text-tertiary);
+      font-size: 9.5px;
+      text-align: left;
+      line-height: 1.35;
+    }
+
+    .scan-meta.hidden { display: none; }
 
     .issue-hint {
-      margin-top: 8px;
-      padding: 7px 8px;
-      border-radius: 6px;
-      background: color-mix(in srgb, var(--bg) 55%, transparent);
+      margin-top: 0;
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
       color: var(--text-secondary);
       font-size: 10px;
-      line-height: 1.4;
+      line-height: 1.35;
     }
 
     .issue-debug {
@@ -1012,48 +1187,143 @@
       font-size: 10px;
       color: var(--text-tertiary);
     }
-    .issue-debug summary {
-      cursor: pointer;
-      user-select: none;
+
+    .debug-details {
+      display: grid;
+      gap: 4px;
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+    }
+
+    .debug-row {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px;
+      align-items: start;
+      font-size: 10px;
+      line-height: 1.35;
       color: var(--text-secondary);
     }
-    .issue-debug pre {
-      margin: 6px 0 0;
-      padding: 6px 7px;
-      border-radius: 6px;
-      background: color-mix(in srgb, var(--bg) 65%, transparent);
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 9.5px;
-      line-height: 1.35;
-    }
 
-    .scan-stage {
-      width: 100%;
-      font-size: 13px;
-      font-weight: 650;
-      letter-spacing: -0.01em;
-      text-align: center;
-    }
-
-    .scan-meta {
+    .debug-code {
+      flex: 0 0 auto;
+      padding: 1px 5px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg-tertiary);
       color: var(--text-tertiary);
+      font-size: 9px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
+    .debug-code[data-level="error"] {
+      border-color: color-mix(in srgb, var(--text-danger) 25%, var(--border));
+      color: var(--text-danger);
+    }
+
+    .debug-code[data-level="warn"] {
+      border-color: color-mix(in srgb, var(--text-warning) 25%, var(--border));
+      color: var(--text-warning);
+    }
+
+    .issue-item-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .issue-item-head .issue-item-title {
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .debug-feed {
+      margin-top: 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--bg-secondary);
+      overflow: hidden;
+    }
+
+    .debug-feed summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 10px;
+      color: var(--text-secondary);
       font-size: 10px;
-      text-align: center;
-      line-height: 1.4;
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+    }
+
+    .debug-feed summary::-webkit-details-marker { display: none; }
+
+    .debug-feed-count {
+      color: var(--text-tertiary);
+      font-size: 9px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .debug-feed-list {
+      margin: 0;
+      padding: 0 10px 8px;
+      list-style: none;
+      border-top: 1px solid var(--border);
+    }
+
+    .debug-feed-item {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px;
+      align-items: start;
+      padding: 6px 0;
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+      font-size: 10px;
+      line-height: 1.35;
+      color: var(--text-secondary);
+    }
+
+    .debug-feed-item:last-child { border-bottom: 0; }
+
+    .debug-feed-text {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .scan-debug-code {
+      margin-left: auto;
+    }
+
+    .activity-line-main {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      width: 100%;
     }
 
     .scan-activity {
       display: grid;
-      gap: 4px;
+      gap: var(--space-1);
       width: 100%;
-      padding: 8px 9px;
+      margin-top: var(--space-2);
+      padding: var(--space-2);
       border: 1px solid var(--border);
-      border-radius: 7px;
-      background: color-mix(in srgb, var(--bg) 55%, transparent);
+      border-radius: var(--radius-sm);
+      background: var(--bg);
       text-align: left;
     }
+
+    .scan-activity.hidden { display: none; }
 
     .activity-line {
       display: flex;
@@ -1062,17 +1332,16 @@
       min-width: 0;
       color: var(--text-secondary);
       font-size: 9.5px;
-      line-height: 1.35;
+      line-height: 1.3;
     }
 
     .activity-dot {
-      width: 5px;
-      height: 5px;
+      width: 4px;
+      height: 4px;
       flex: 0 0 auto;
       margin-top: 4px;
       border-radius: 50%;
       background: var(--brand);
-      box-shadow: 0 0 6px var(--brand-glow);
     }
 
     .activity-line:last-child .activity-dot {
@@ -1081,33 +1350,33 @@
     }
 
     .upload-title {
-      font-size: 16px;
-      font-weight: 650;
-      letter-spacing: -0.025em;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
     }
 
     .upload-copy {
       color: var(--text-secondary);
-      font-size: 10.5px;
-      line-height: 1.4;
+      font-size: 11px;
+      line-height: 1.45;
     }
 
     .upload-formats {
       display: flex;
       flex-wrap: wrap;
       justify-content: center;
-      gap: 5px;
-      margin-top: 2px;
+      gap: var(--space-1);
+      margin-top: var(--space-1);
     }
 
     .format-chip {
-      padding: 3px 7px;
+      padding: 2px 6px;
       border: 1px solid var(--border);
-      border-radius: 999px;
-      background: color-mix(in srgb, var(--bg) 60%, transparent);
+      border-radius: var(--radius-sm);
+      background: transparent;
       color: var(--text-tertiary);
-      font: 600 9px/1 "SFMono-Regular", Consolas, monospace;
-      letter-spacing: 0.03em;
+      font-size: 9px;
+      font-weight: 500;
     }
 
     .upload-zone[data-dragover="true"] .format-chip {
@@ -1116,38 +1385,40 @@
     }
 
     .upload-zone .empty-glyph {
-      width: 52px;
-      height: 52px;
-      border-style: solid;
+      width: 40px;
+      height: 40px;
+      border-style: dashed;
       border-color: var(--border-strong);
-      background: var(--bg-tertiary);
-      border-radius: 16px;
-      color: var(--brand);
+      background: transparent;
+      border-radius: var(--radius-md);
+      color: var(--text-secondary);
     }
 
     .upload-zone[data-dragover="true"] .empty-glyph {
       border-color: color-mix(in srgb, var(--brand) 40%, var(--border-strong));
+      color: var(--brand);
     }
 
-    .upload-zone .empty-glyph svg { width: 22px; height: 22px; }
+    .upload-zone .empty-glyph svg { width: 18px; height: 18px; }
     .upload-busy .empty-glyph { animation: spin 1.1s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
     .readiness-strip {
       display: flex;
       align-items: center;
-      gap: 7px;
-      min-height: 28px;
-      padding: 6px 12px;
+      gap: var(--space-2);
+      min-height: 32px;
+      padding: var(--space-2) var(--space-4);
       border-bottom: 1px solid var(--border);
       color: var(--text-secondary);
       background: var(--bg-secondary);
-      font-size: 10.5px;
+      font-size: 10px;
     }
     .readiness-strip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary); }
     .readiness-strip[data-state="ok"]::before { background: #27ae60; }
     .readiness-strip[data-state="warn"]::before { background: #e5a93d; }
     .readiness-strip[data-state="error"]::before { background: #eb5757; }
+
   </style>
 </head>
 <body>
@@ -1163,9 +1434,11 @@
         <span class="brand-name">Ad Decompiler</span>
         <span class="build-badge" id="buildBadge" title="Plugin build">…</span>
       </div>
-      <div class="connection" id="connection" data-state="idle" title="Bridge status">
-        <span class="connection-dot" aria-hidden="true"></span>
-        <span id="connectionText">Checking</span>
+      <div class="header-actions">
+        <div class="connection" id="connection" data-state="checking" title="Bridge status" aria-live="polite" aria-busy="true">
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span id="connectionText">Checking</span>
+        </div>
       </div>
     </header>
     <div class="readiness-strip" id="readinessStrip" data-state="idle">Checking model readiness…</div>
@@ -1173,9 +1446,8 @@
     <main>
       <section class="hero">
         <div class="hero-copy">
-          <div class="hero-eyebrow">Image → editable Figma</div>
-          <h1 class="hero-heading">Bring your ad to life.</h1>
-          <p class="hero-subcopy">Upload a screenshot and we’ll turn the parts we can prove into clean, editable layers.</p>
+          <h1 class="hero-heading">Import from image</h1>
+          <p class="hero-subcopy">Rebuilds text, shapes, and images as native Figma layers.</p>
         </div>
         <div class="upload-zone" id="uploadZone" tabindex="0" role="button" aria-label="Upload an image to process">
           <input type="file" id="uploadInput" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" hidden />
@@ -1196,34 +1468,48 @@
           <div class="upload-busy hidden" id="uploadBusy">
             <div class="work-preview-frame" id="workPreviewFrame">
               <img id="workPreviewImage" alt="Ad being processed" />
+              <div class="scan-overlay" aria-hidden="true">
+                <div class="scan-sweep">
+                  <div class="scan-sweep-light" aria-hidden="true"></div>
+                  <div class="scan-sweep-trail" aria-hidden="true"></div>
+                  <div class="scan-sweep-line" aria-hidden="true"></div>
+                </div>
+              </div>
               <div class="work-preview-meta">
                 <span class="work-preview-name" id="workPreviewName">—</span>
                 <span class="work-preview-stage" id="workPreviewStage">Processing</span>
               </div>
             </div>
             <div class="work-progress-block">
-              <div class="scan-header">
-                <div class="scan-percent" id="processPercent" aria-hidden="true">0%</div>
-                <div class="scan-step-count" id="processStepCount">Step 1 / 15</div>
+              <div class="scan-head">
+                <div class="scan-stage" id="uploadBusyTitle">Scanning…</div>
+                <div class="scan-metric" id="processStepCount">Step 1 / 15</div>
               </div>
-              <div class="scan-stage upload-title" id="uploadBusyTitle">Scanning…</div>
               <div class="scan-track-wrap">
                 <div class="scan-segments" id="processSegments" aria-hidden="true"></div>
                 <div class="scan-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="processTrack" aria-labelledby="uploadBusyTitle">
                   <div class="scan-bar" id="processBar"></div>
                 </div>
               </div>
-              <div class="scan-timing" id="uploadBusyTiming">
-                <span class="timing-elapsed" id="processElapsed">—</span>
-                <span class="timing-remaining" id="processRemaining">—</span>
-                <span class="timing-total hidden" id="processTotal">—</span>
+              <div class="scan-foot">
+                <div class="scan-timing" id="uploadBusyTiming">
+                  <span id="processElapsed">—</span>
+                  <span class="scan-timing-sep hidden" id="processTimingSep" aria-hidden="true">·</span>
+                  <span id="processRemaining"></span>
+                </div>
+                <button class="cancel-button" id="cancelProcess" type="button">Cancel</button>
               </div>
-              <div class="scan-activity" aria-live="polite">
-                <div class="activity-line"><span class="activity-dot" aria-hidden="true"></span><span id="processActivityStage">Preparing the local pipeline</span></div>
-                <div class="activity-line"><span class="activity-dot" aria-hidden="true"></span><span id="processActivityDetail">ETA appears after the bridge has a completed run to compare.</span></div>
+              <div class="scan-activity hidden" id="processActivityBox" aria-live="polite">
+                <div class="activity-line">
+                  <span class="activity-dot" aria-hidden="true"></span>
+                  <span class="activity-line-main">
+                    <span id="processActivityStage" class="activity-line-stage">Working</span>
+                    <span id="processActivityDetail">—</span>
+                    <span class="debug-code scan-debug-code" id="processDebugCode" hidden>AD-PIP-000</span>
+                  </span>
+                </div>
               </div>
-              <div class="scan-meta upload-copy" id="uploadBusyCopy">Starting pipeline…</div>
-              <button class="cancel-button" id="cancelProcess" type="button">Cancel</button>
+              <div class="scan-meta upload-copy hidden" id="uploadBusyCopy">Starting pipeline…</div>
             </div>
           </div>
         </div>
@@ -1231,14 +1517,17 @@
 
       <section class="section hidden" id="progressSection" aria-live="polite">
         <div class="progress-panel">
-          <div class="progress-top">
+          <div class="progress-head">
             <div class="progress-label" id="progressLabel">Preparing layers…</div>
-            <div class="progress-count" id="progressCount">0 / 0</div>
+            <div class="progress-percent" id="progressPercent">0%</div>
           </div>
-          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressTrack">
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressTrack" aria-labelledby="progressLabel">
             <div class="progress-bar" id="progressBar"></div>
           </div>
-          <button class="cancel-button" id="cancelImport" type="button">Cancel import</button>
+          <div class="progress-meta">
+            <span class="progress-count" id="progressCount">0 / 0 layers</span>
+            <button class="cancel-button" id="cancelImport" type="button">Cancel import</button>
+          </div>
         </div>
       </section>
 
@@ -1256,7 +1545,7 @@
         <div class="result-panel" id="resultPanel" data-tone="success">
           <div class="result-head">
             <div class="result-icon" id="resultIcon" aria-hidden="true"></div>
-            <div>
+            <div class="result-body">
               <div class="result-title" id="resultTitle">Done</div>
               <div class="result-copy" id="resultCopy">Ready on canvas.</div>
             </div>
@@ -1277,7 +1566,7 @@
       <details class="settings">
         <summary>Import details &amp; settings</summary>
         <div class="settings-body">
-          <div>
+          <div class="settings-bridge">
             <span class="settings-label">Bridge</span>
             <input class="text-input" id="bridge" value="http://localhost:8790" spellcheck="false" autocomplete="off" aria-label="Bridge address" />
             <div class="settings-links">
@@ -1297,27 +1586,21 @@
               <div class="preview" id="preview">
                 <img id="previewImage" alt="Source ad preview" />
                 <div class="preview-fallback" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5">
                     <rect x="3.5" y="4" width="17" height="16" rx="2"/><circle cx="8.5" cy="9" r="1.5"/><path d="M5.5 17l4.2-4.3 3.1 3 2.2-2.2 3.5 3.5"/>
                   </svg>
                 </div>
               </div>
               <div class="source-info">
-                <div class="source-name-row">
+                <div class="source-header">
                   <div class="source-name" id="sourceName">Run</div>
                   <span class="schema-badge" id="schemaBadge">v1</span>
                 </div>
-                <div class="source-meta" id="sourceMeta">1080 × 1350 · bridge</div>
-                <div class="metrics" aria-label="Run summary">
-                  <div><span class="metric-value" id="metricText">0</span><span class="metric-label">text</span></div>
-                  <div><span class="metric-value" id="metricGraphics">0</span><span class="metric-label">gfx</span></div>
-                  <div><span class="metric-value" id="metricImages">0</span><span class="metric-label">img</span></div>
-                  <div><span class="metric-value" id="metricGroups">0</span><span class="metric-label">grp</span></div>
-                </div>
-                <div class="import-identity hidden" id="importIdentity">
-                  <span class="import-identity-label">Import target</span>
+                <div class="source-meta" id="sourceMeta">1080 × 1350 · Bridge</div>
+                <div class="source-summary" id="sourceSummary" aria-label="Layer summary">—</div>
+                <div class="source-footnote hidden" id="importIdentity">
                   <span class="import-identity-value" id="importIdentityValue">—</span>
-                  <span class="import-identity-detail" id="importIdentityDetail">—</span>
+                  <span id="importIdentityDetail">—</span>
                 </div>
               </div>
             </div>
@@ -1351,7 +1634,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.1.0","build":50,"commit":"7b0a0c4","dirty":false,"built_at":"2026-07-15T14:39:33Z","label":"v2.1.0+b50.7b0a0c4","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.1.0","build":51,"commit":"a8d9a3e","dirty":false,"built_at":"2026-07-15T15:08:25Z","label":"v2.1.0+b51.a8d9a3e","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -1374,6 +1657,33 @@
       pollFailures: 0,
       roundtripReport: null,
     };
+
+    function shouldShowProcessActivity(status) {
+      return Boolean(status && (status.reconnecting || status.harness_running));
+    }
+
+    function processActivityDetail(status) {
+      if (status.reconnecting) {
+        return "The bridge keeps the job running while this panel reconnects.";
+      }
+      if (status.harness_running) {
+        return "Running repair passes before staging the design.";
+      }
+      return "";
+    }
+
+    function shouldShowUploadBusyCopy(status) {
+      if (!status) return false;
+      if (status.reconnecting || status.harness_running) return true;
+      if (status.phase === "upload" || status.status === "queued" || status.status === "done") return false;
+      if (status.status === "running" && !status.eta_sample_size) return true;
+      if (status.eta_sample_size && status.eta_sample_size < 3 && typeof status.eta_s === "number") return true;
+      return false;
+    }
+
+    function uploadBusyCopyText(status) {
+      return statusFootnote(status);
+    }
 
     let DEBUG_SESSION = null;
 
@@ -1428,9 +1738,19 @@
       const info = build || state.pluginBuild || PLUGIN_BUILD;
       const el = $("buildBadge");
       if (!el || !info) return;
+      const version = info.version || "0";
+      el.textContent = "v" + version;
       const commit = info.commit && info.commit !== "local" ? info.commit : "";
-      el.textContent = "b" + info.build + (commit ? " · " + commit : "");
-      el.title = (info.label || ("v" + info.version + "+b" + info.build)) + "\nBuilt " + (info.built_at || "");
+      const builtAt = info.built_at
+        ? new Date(info.built_at).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" })
+        : "";
+      const tooltip = [
+        info.label || ("v" + version + "+b" + info.build),
+        "Build " + info.build + (commit ? " (" + commit + ")" : ""),
+        builtAt ? "Built " + builtAt : "",
+        info.dirty ? "Unsaved local changes" : ""
+      ].filter(Boolean).join("\n");
+      el.title = tooltip;
       el.dataset.dirty = info.dirty ? "true" : "false";
     }
 
@@ -1492,14 +1812,96 @@
       return raw;
     }
 
-    function setConnection(status, text) {
-      $("connection").dataset.state = status;
-      $("connectionText").textContent = text;
+    function setConnection(status, text, options) {
+      const el = $("connection");
+      const label = $("connectionText");
+      if (!el || !label) return;
+      const opts = options || {};
+      const active = status === "checking" || status === "reconnecting";
+      el.dataset.state = status;
+      label.textContent = text || "";
+      el.setAttribute("aria-busy", active ? "true" : "false");
+
+      const lines = [];
+      if (active) {
+        lines.push(status === "reconnecting" ? "Waiting for bridge to respond" : "Contacting bridge");
+        if (opts.detail) lines.push(opts.detail);
+      } else if (status === "connected") {
+        lines.push("Bridge is reachable");
+        if (opts.detail) lines.push(opts.detail);
+      } else if (status === "error") {
+        lines.push("Bridge is not reachable");
+        if (opts.detail) lines.push(opts.detail);
+      } else if (opts.detail) {
+        lines.push(opts.detail);
+      }
+
+      const bridge = opts.bridge || cleanBase();
+      if (bridge && validBridge(bridge)) lines.push(bridge);
+      el.title = lines.filter(Boolean).join("\n") || "Bridge status";
     }
 
     function setFooter(text) {
-      $("footerStatus").textContent = text;
-      $("liveStatus").textContent = text;
+      const label = String(text || "");
+      $("footerStatus").textContent = label;
+      $("liveStatus").textContent = label;
+    }
+
+    function processStageLabel(status) {
+      if (!status) return "";
+      if (status.reconnecting) return "Reconnecting to bridge";
+      if (status.harness_running) return "Auto-fixing…";
+      if (status.phase === "upload") return "Uploading image";
+      if (status.status === "queued") return "Queued for processing";
+      if (status.status === "done") return "Finishing up";
+      return STAGE_LABELS[status.stage] || "Starting pipeline";
+    }
+
+    function processShowsPercent(status) {
+      if (!status || status.reconnecting) return false;
+      if (status.phase === "upload") return false;
+      if (status.status === "queued") return false;
+      if (status.status === "done") return true;
+      if (typeof status.progress_pct === "number") return true;
+      if (status.status === "running" && status.stage) return true;
+      if (status.harness_running) return true;
+      return false;
+    }
+
+    function footerTextForProcessStatus(status) {
+      const label = processStageLabel(status);
+      if (!processShowsPercent(status)) return label;
+      return label + " · " + percentForProcessStatus(status) + "%";
+    }
+
+    function refreshIdleFooter() {
+      if (state.uploading || state.building) return;
+      const conn = $("connection");
+      const connState = conn ? conn.dataset.state : "idle";
+      const connText = $("connectionText") ? $("connectionText").textContent.trim() : "";
+      if (connState === "error") {
+        setFooter(/invalid/i.test(connText) ? "Bridge address is invalid" : "Bridge unavailable");
+        return;
+      }
+      if (connState === "idle") {
+        if (/reconnecting/i.test(connText)) {
+          setFooter("Reconnecting to bridge");
+          return;
+        }
+        if (/checking/i.test(connText)) {
+          setFooter("Connecting to the local bridge");
+          return;
+        }
+      }
+      if (state.doc) {
+        setFooter(summarize(state.doc).total + " source layers ready");
+        return;
+      }
+      if (connState === "connected") {
+        setFooter("Bridge connected · nothing staged yet");
+        return;
+      }
+      setFooter("Upload an image to get started");
     }
 
     function setEmpty(title, copy, loading) {
@@ -1541,6 +1943,28 @@
       return summary;
     }
 
+    function titleCase(value) {
+      return String(value || "")
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(function (word) { return word.charAt(0).toUpperCase() + word.slice(1); })
+        .join(" ");
+    }
+
+    function formatLayerSummary(summary) {
+      const parts = [];
+      function add(count, singular, plural) {
+        const n = Number(count || 0);
+        if (n <= 0) return;
+        parts.push(n + " " + (n === 1 ? singular : plural));
+      }
+      add(summary.text, "text layer", "text layers");
+      add(summary.graphics, "shape", "shapes");
+      add(summary.images, "image", "images");
+      add(summary.groups, "group", "groups");
+      return parts.length ? parts.join(" · ") : "No layers detected";
+    }
+
     function assetReferences(doc) {
       const refs = new Map();
       visit(doc.layers || [], function (layer) {
@@ -1576,7 +2000,10 @@
       state.workPreview = { blobUrl: null, filename: null, snapshotKey: null };
       const frame = $("workPreviewFrame");
       const img = $("workPreviewImage");
-      if (frame) frame.classList.remove("has-image");
+      if (frame) {
+        frame.classList.remove("has-image");
+        frame.dataset.scanning = "false";
+      }
       if (img) img.removeAttribute("src");
       if ($("workPreviewName")) $("workPreviewName").textContent = "—";
       if ($("workPreviewStage")) $("workPreviewStage").textContent = "Processing";
@@ -1630,6 +2057,11 @@
 
     function updateWorkPreviewStage(status) {
       const stage = $("workPreviewStage");
+      const frame = $("workPreviewFrame");
+      if (frame) {
+        const scanning = Boolean(status && status.status !== "done");
+        frame.dataset.scanning = scanning ? "true" : "false";
+      }
       if (!stage) return;
       const label = status.harness_running
         ? "Auto-fixing"
@@ -1690,28 +2122,23 @@
       const detail = $("importIdentityDetail");
       if (!root || !value || !detail) return;
       const manifest = state.manifest || {};
-      const docId = String(manifest.doc_id || doc && (doc.id || doc.name) || "");
-      const row = rowForCurrentDoc(docId);
+      const row = rowForCurrentDoc(String(manifest.doc_id || doc && (doc.id || doc.name) || ""));
+      const stagedAt = manifest.staged_at || row && row.finished_at;
       if (state.source === "files") {
-        const localName = String(doc && (doc.name || doc.id) || "local design.json");
-        value.textContent = "Local file set · " + localName;
-        detail.textContent = docId ? "Document " + docId : "No bridge job attached";
-        value.title = value.textContent;
+        const localName = String(doc && (doc.name || doc.id) || "design.json");
+        value.textContent = "Local design";
+        detail.textContent = "From local files · " + localName;
         detail.title = detail.textContent;
         root.classList.remove("hidden");
         return;
       }
       const filename = row && row.filename;
-      const jobId = row && row.job_id;
-      const stagedAt = manifest.staged_at || row && row.finished_at;
-      value.textContent = filename || (docId ? "Document " + docId : "Staged bridge design");
-      detail.textContent = [
-        jobId ? "Job " + jobId : "Job unavailable",
-        docId ? "Doc " + docId : "Document unavailable",
-        stagedAt ? "Staged " + displayDateTime(stagedAt) : null,
-      ].filter(Boolean).join(" · ");
-      value.title = value.textContent;
-      detail.title = detail.textContent;
+      value.textContent = filename || "Staged ad";
+      const line = stagedAt
+        ? "Staged " + displayDateTime(stagedAt)
+        : (filename ? "From bridge · " + filename : "From bridge");
+      detail.textContent = line;
+      detail.title = line;
       root.classList.remove("hidden");
     }
 
@@ -1765,11 +2192,8 @@
       $("sourceLoaded").classList.remove("hidden");
       $("sourceName").textContent = String(doc.name || doc.id || "Untitled reconstruction");
       $("schemaBadge").textContent = "v" + version;
-      $("sourceMeta").textContent = width + " × " + height + " · " + sourceLabel;
-      $("metricText").textContent = summary.text;
-      $("metricGraphics").textContent = summary.graphics;
-      $("metricImages").textContent = summary.images;
-      $("metricGroups").textContent = summary.groups;
+      $("sourceMeta").textContent = width + " × " + height + (sourceLabel ? " · " + titleCase(sourceLabel) : "");
+      $("sourceSummary").textContent = formatLayerSummary(summary);
       renderImportIdentity(doc);
       const targetName = String(
         (state.manifest && state.manifest.filename) ||
@@ -1880,23 +2304,27 @@
       if (state.building || state.uploading) return;
       const base = cleanBase();
       if (!validBridge(base)) {
-        setConnection("error", "Invalid address");
+        setConnection("error", "Invalid address", { detail: "Check the bridge URL in settings" });
         if (!(state.doc && state.source === "files")) {
           setEmpty("Bridge address is invalid", "Use http://localhost:8790 on the same machine, or https://<host>.ts.net for a remote bridge fronted by `tailscale serve`.", false);
         }
         $("importButton").disabled = !state.doc;
         showIssues([{ title: "Invalid bridge address", detail: base || "No address entered." }], "error");
+        refreshIdleFooter();
         return;
       }
       $("refreshButton").disabled = true;
       $("importButton").disabled = true;
-      setConnection("idle", "Checking");
+      setConnection("checking", "Checking", { bridge: base, detail: "Health check in progress" });
       setEmpty("Checking the bridge", "Looking for a design.json and its asset manifest…", true);
       setFooter("Connecting to the local bridge");
       try {
         const health = await probeBridge(base);
         renderBridgeHealth(health);
-        setConnection("connected", health.machine_ready === true ? "Bridge ready" : "Setup needed");
+        setConnection("connected", health.machine_ready === true ? "Bridge ready" : "Setup needed", {
+          bridge: base,
+          detail: health.machine_ready === true ? "Models loaded on bridge" : "Bridge needs setup on your PC"
+        });
         resumeActiveProcess(base, health.active_job);
         // Ask for history alongside the staged design; it must never delay loading a
         // usable import when an older bridge does not implement this endpoint.
@@ -1928,7 +2356,7 @@
           state.manifest = null;
           setEmpty("Nothing staged", "Upload or open design.json.", false);
         }
-        setConnection("error", "Bridge offline");
+        setConnection("error", "Bridge offline", { bridge: base, detail: String(error && error.message || error) });
         setFooter("Bridge unavailable");
         if (!(options && options.silent)) {
           const detail = String(error && error.message || error) + " — start the local bridge, or open files in Settings.";
@@ -1976,7 +2404,7 @@
         state.manifest = null;
         state.lastCompletedJob = null;
         renderHistory([]);
-        setConnection("idle", "Files loaded");
+        setConnection("idle", "Files loaded", { detail: "Using local files instead of bridge" });
         renderDoc(doc, "local files");
         const refs = assetReferences(doc);
         const missing = [];
@@ -1994,14 +2422,25 @@
     function setUploadBusy(busy, status) {
       $("uploadZone").dataset.busy = busy ? "true" : "false";
       $("uploadZone").setAttribute("aria-disabled", busy ? "true" : "false");
+      document.body.dataset.scanActive = busy ? "true" : "false";
       $("uploadIdle").classList.toggle("hidden", Boolean(busy));
       $("uploadBusy").classList.toggle("hidden", !busy);
-      if (busy) $("progressSection").classList.add("hidden");
-      if (!busy) releaseWorkPreview();
-      if (busy && status) {
-        const base = cleanBase();
-        if (status.job_id && validBridge(base)) refreshWorkPreviewFromBridge(base, status, status.filename);
-        renderProcessStatus(status);
+      if (busy) {
+        $("progressSection").classList.add("hidden");
+        const details = document.querySelector("details.settings");
+        if (details) details.open = false;
+      }
+      if (!busy) {
+        releaseWorkPreview();
+        refreshIdleFooter();
+      } else {
+        const frame = $("workPreviewFrame");
+        if (frame) frame.dataset.scanning = "true";
+        if (status) {
+          const base = cleanBase();
+          if (status.job_id && validBridge(base)) refreshWorkPreviewFromBridge(base, status, status.filename);
+          renderProcessStatus(status);
+        }
       }
       // #region agent log
       agentDebugLog("ui.html:setUploadBusy", "upload busy state", progressVisibilitySnapshot("setUploadBusy:" + Boolean(busy)), "H6");
@@ -2096,47 +2535,40 @@
     function timingRows(status) {
       const elapsedEl = $("processElapsed");
       const remainingEl = $("processRemaining");
-      const totalEl = $("processTotal");
+      const sepEl = $("processTimingSep");
+      if (!elapsedEl || !remainingEl) return;
+
+      function setTiming(elapsed, remaining) {
+        elapsedEl.textContent = elapsed || "";
+        if (remaining) {
+          remainingEl.textContent = remaining;
+          remainingEl.classList.remove("hidden");
+          if (sepEl) sepEl.classList.remove("hidden");
+        } else {
+          remainingEl.textContent = "";
+          remainingEl.classList.add("hidden");
+          if (sepEl) sepEl.classList.add("hidden");
+        }
+      }
+
       if (status.phase === "upload") {
-        elapsedEl.textContent = "Sending file";
-        elapsedEl.className = "timing-muted";
-        remainingEl.textContent = "";
-        remainingEl.className = "timing-muted hidden";
-        totalEl.classList.add("hidden");
+        setTiming("Sending file", "");
         return;
       }
       if (status.status === "queued") {
-        elapsedEl.textContent = "Waiting to start";
-        elapsedEl.className = "timing-muted";
-        remainingEl.textContent = "";
-        remainingEl.className = "timing-muted hidden";
-        totalEl.classList.add("hidden");
+        setTiming("Waiting to start", "");
         return;
       }
-      elapsedEl.className = "timing-elapsed";
-      remainingEl.className = "timing-remaining";
       const elapsed = typeof status.elapsed_s === "number" ? formatElapsed(status.elapsed_s * 1000) : "—";
-      elapsedEl.textContent = elapsed;
+      let remaining = "";
       if (typeof status.eta_s === "number") {
-        if (status.eta_s <= 2) {
-          remainingEl.textContent = "< 5s";
-        } else {
-          remainingEl.textContent = "~" + formatElapsed(status.eta_s * 1000);
-        }
-        remainingEl.classList.remove("hidden");
-        const elapsedS = typeof status.elapsed_s === "number" ? status.elapsed_s : 0;
-        totalEl.textContent = "~" + formatElapsed((elapsedS + status.eta_s) * 1000);
-        totalEl.className = "timing-total";
-        totalEl.classList.remove("hidden");
+        remaining = status.eta_s <= 2 ? "< 5s left" : "~" + formatElapsed(status.eta_s * 1000) + " left";
       } else if (status.status === "running" && status.stage) {
-        remainingEl.textContent = "No ETA yet";
-        remainingEl.classList.remove("hidden");
-        totalEl.classList.add("hidden");
+        remaining = "No ETA yet";
       } else {
-        remainingEl.textContent = "No ETA yet";
-        remainingEl.classList.remove("hidden");
-        totalEl.classList.add("hidden");
+        remaining = "No ETA yet";
       }
+      setTiming(elapsed, remaining);
     }
 
     function statusFootnote(status) {
@@ -2146,7 +2578,7 @@
       if (status.status === "queued") return "Job queued — pipeline will start shortly";
       if (status.status === "done") return "Pipeline finished";
       if (!status.eta_sample_size) {
-        return "No ETA yet — the bridge needs a completed run to compare";
+        return "No ETA yet — this bridge needs a completed run to compare.";
       }
       if (status.eta_sample_size < 3) {
         return "ETA based on " + status.eta_sample_size + " completed run" + (status.eta_sample_size === 1 ? "" : "s");
@@ -2159,67 +2591,43 @@
     }
 
     function renderProcessActivity(status) {
+      const box = $("processActivityBox");
       const stage = $("processActivityStage");
       const detail = $("processActivityDetail");
-      if (!stage || !detail) return;
-      if (status.reconnecting) {
-        stage.textContent = "Connection interrupted; retrying the same job";
-        detail.textContent = "The bridge keeps the job running while this panel reconnects.";
+      if (!detail) return;
+      if (!shouldShowProcessActivity(status)) {
+        if (box) box.classList.add("hidden");
         return;
       }
-      if (status.phase === "upload") {
-        stage.textContent = "Sending the selected image to the local bridge";
-        detail.textContent = "Processing has not started yet.";
-        return;
-      }
-      if (status.status === "queued") {
-        stage.textContent = "Queued locally; waiting for the bridge to start";
-        detail.textContent = "No ETA is shown until processing begins.";
-        return;
-      }
-      if (status.harness_running) {
-        stage.textContent = "Repairing the staged design after its first quality check";
-        detail.textContent = "The estimate remains tied to completed bridge runs.";
-        return;
-      }
-      if (status.status === "done") {
-        stage.textContent = "Pipeline complete; loading the exact staged design";
-        detail.textContent = "The import card below will show the document and job.";
-        return;
-      }
-      stage.textContent = "Active: " + (STAGE_LABELS[status.stage] || "Starting pipeline");
-      if (typeof status.eta_s === "number" && status.eta_sample_size) {
-        const samples = status.eta_sample_size;
-        detail.textContent = "~" + formatElapsed(status.eta_s * 1000) + " remaining from "
-          + samples + " completed run" + (samples === 1 ? "" : "s") + ".";
-      } else {
-        detail.textContent = "No ETA yet — this bridge needs a completed run to compare.";
-      }
+      if (box) box.classList.remove("hidden");
+      if (stage) stage.textContent = processStageLabel(status);
+      detail.textContent = processActivityDetail(status);
     }
 
     function renderProcessStatus(status) {
-      const percent = percentForProcessStatus(status);
-      const stageLabel = status.harness_running
-        ? "Auto-fixing…"
-        : status.phase === "upload"
-          ? "Uploading image"
-          : status.status === "queued"
-            ? "Queued for processing"
-            : status.status === "done"
-              ? "Finishing up"
-              : (STAGE_LABELS[status.stage] || "Starting pipeline");
-      $("processPercent").textContent = percent + "%";
+      const showPercent = processShowsPercent(status);
+      const percent = showPercent ? percentForProcessStatus(status) : null;
+      const stageLabel = processStageLabel(status);
+      if (showPercent) {
+        $("processBar").style.width = percent + "%";
+        $("processTrack").setAttribute("aria-valuenow", String(percent));
+      } else {
+        $("processBar").style.width = status.reconnecting ? "10%" : (status.phase === "upload" ? "14%" : "8%");
+        $("processTrack").removeAttribute("aria-valuenow");
+      }
       $("processStepCount").textContent = stepLabelForStatus(status);
       $("uploadBusyTitle").textContent = stageLabel;
-      $("uploadBusyCopy").textContent = statusFootnote(status);
-      $("processBar").style.width = percent + "%";
-      $("processTrack").setAttribute("aria-valuenow", String(percent));
-      $("processPercent").setAttribute("aria-hidden", "false");
+      const copyEl = $("uploadBusyCopy");
+      if (copyEl) {
+        const showCopy = shouldShowUploadBusyCopy(status);
+        copyEl.textContent = showCopy ? uploadBusyCopyText(status) : "";
+        copyEl.classList.toggle("hidden", !showCopy || !copyEl.textContent);
+      }
       updateProcessSegments(status);
       updateWorkPreviewStage(status);
       timingRows(status);
       renderProcessActivity(status);
-      setFooter(stageLabel + " · " + percent + "%");
+      setFooter(footerTextForProcessStatus(status));
       // #region agent log
       agentDebugLog("ui.html:renderProcessStatus", "process status rendered", Object.assign(progressVisibilitySnapshot("renderProcessStatus"), {
         stage: status.stage, status: status.status, percent: percent,
@@ -2279,7 +2687,7 @@
         return "SAM model issue. Set the local checkpoint path in config.yaml on the bridge PC.";
       }
       if (code === "bridge_unreachable" || /ECONNREFUSED|Failed to fetch|NetworkError|health check/i.test(blob)) {
-        return "Can't reach the bridge. Double-click Start Bridge.bat, then open http://localhost:8790/health in a browser.";
+        return "Start the bridge on your PC, then hit Refresh.";
       }
       if (code === "job_busy" || /409|already processing/i.test(blob)) {
         return "Wait for the current image to finish, or restart Start Bridge.bat if a job is stuck.";
@@ -2367,10 +2775,10 @@
         state.pollFailures += 1;
         const last = Object.assign({}, state.lastProcessStatus || { status: "running" }, { reconnecting: true });
         setUploadBusy(true, last);
-        setConnection("idle", "Reconnecting");
+        setConnection("reconnecting", "Reconnecting", { bridge: base, detail: "Retrying job status" });
         if (Date.now() - startedAt > maxWaitMs) {
-          setUploadBusy(false);
           state.uploading = false;
+          setUploadBusy(false);
           showIssues([{ title: "Lost contact with the bridge", detail: "\"" + filename + "\" may still be processing — check back and click Refresh." }], "warning");
           return;
         }
@@ -2379,7 +2787,7 @@
       }
       state.pollFailures = 0;
       state.lastProcessStatus = status;
-      setConnection("connected", "Bridge ready");
+      setConnection("connected", "Bridge ready", { bridge: base, detail: "Processing in progress" });
       applyDebugSession(status);
       if (status.status === "cancelled") {
         state.processJobId = null;
@@ -2442,6 +2850,7 @@
         state.uploading = false;
         state.processJobId = null;
         setUploadBusy(false);
+        setFooter("Processing failed");
         if (status.agent_debug) forwardAgentDebug(status.agent_debug);
         const err = formatProcessingError(status);
         let failedSummary = null;
@@ -2516,6 +2925,7 @@
       } catch (error) {
         state.uploading = false;
         setUploadBusy(false);
+        setFooter($("connection").dataset.state === "error" ? "Bridge unavailable" : "Upload failed");
         const issue = error && error._issue
           ? error._issue
           : formatUploadError(error, null, null);
@@ -2542,47 +2952,70 @@
       }
     }
 
+    function isTechnicalDetail(detail) {
+      const text = String(detail || "").trim();
+      if (!text) return true;
+      if (/^(failed to fetch|networkerror|load failed|typeerror: failed to fetch)$/i.test(text)) return true;
+      if (/^HTTP \d{3}/i.test(text)) return true;
+      return false;
+    }
+
+    function issueDisplay(item) {
+      const detail = String(item && item.detail || "").trim();
+      const hint = String(item && item.hint || "").trim() || errorHint(detail, item && item.errorCode);
+      let title = String(item && item.title || "Something went wrong");
+      if (hint && /failed to fetch|econnrefused|bridge/i.test(detail + " " + hint + " " + title)) {
+        title = "Can't reach the bridge";
+      }
+      const body = hint || (isTechnicalDetail(detail) ? "" : detail);
+      return { title: title, body: body, detail: isTechnicalDetail(detail) ? "" : detail };
+    }
+
     function showIssues(items, tone) {
       const isError = tone === "error";
       (items || []).forEach(function (item) {
         recordLog(isError ? "error" : "warn", item.title || "Notice", item.detail || "");
       });
       if (!items || !items.length) return;
+      const visible = (items || []).slice(0, 3).map(issueDisplay);
       const list = $("issueList");
       list.innerHTML = "";
-      (items || []).slice(0, 3).forEach(function (item) {
+      list.dataset.single = visible.length === 1 ? "true" : "false";
+      visible.forEach(function (item, index) {
+        const source = (items || [])[index] || {};
         const li = document.createElement("li");
         const title = document.createElement("div");
         title.className = "issue-item-title";
-        title.textContent = item.title || "Something went wrong";
+        title.textContent = item.title;
         li.appendChild(title);
-        if (item.detail) {
+        if (item.body) {
+          const body = document.createElement("div");
+          body.className = "issue-item-body";
+          body.textContent = item.body;
+          li.appendChild(body);
+        } else if (item.detail) {
           const detail = document.createElement("div");
           detail.className = "issue-item-detail";
           detail.textContent = item.detail;
           li.appendChild(detail);
         }
-        if (item.hint) {
-          const hint = document.createElement("div");
-          hint.className = "issue-hint";
-          hint.textContent = item.hint;
-          li.appendChild(hint);
-        }
-        if (item.debugLines && item.debugLines.length) {
+        if (source.debugLines && source.debugLines.length) {
           const debug = document.createElement("details");
           debug.className = "issue-debug";
           const summary = document.createElement("summary");
-          summary.textContent = "Support details";
+          summary.textContent = "Details";
           debug.appendChild(summary);
           const pre = document.createElement("pre");
-          pre.textContent = item.debugLines.join("\n");
+          pre.textContent = source.debugLines.join("\n");
           debug.appendChild(pre);
           li.appendChild(debug);
         }
         list.appendChild(li);
       });
       $("issuePanel").dataset.tone = isError ? "error" : "warning";
-      $("issueTitle").textContent = isError ? "Couldn't finish" : "Heads up";
+      $("issueTitle").textContent = visible.length === 1
+        ? visible[0].title
+        : (isError ? "A few things went wrong" : "Heads up");
       $("issueSection").classList.remove("hidden");
     }
 
@@ -2595,8 +3028,9 @@
       const safeTotal = Math.max(1, Number(total || 1));
       const safeCurrent = Math.max(0, Number(current || 0));
       const percent = Math.min(100, Math.round(safeCurrent / safeTotal * 100));
-      $("progressLabel").textContent = (message || "Building layers…") + " · " + percent + "%";
-      $("progressCount").textContent = safeCurrent + " / " + safeTotal;
+      $("progressLabel").textContent = message || "Building layers…";
+      $("progressPercent").textContent = percent + "%";
+      $("progressCount").textContent = safeCurrent + " / " + safeTotal + " layers";
       $("progressBar").style.width = percent + "%";
       $("progressTrack").setAttribute("aria-valuenow", String(percent));
     }
@@ -2838,6 +3272,8 @@
       send("cancel");
       $("cancelImport").disabled = true;
       $("progressLabel").textContent = "Cancelling safely…";
+      $("progressPercent").textContent = "";
+      $("progressCount").textContent = "";
     });
     $("cancelProcess").addEventListener("click", function (event) {
       event.stopPropagation();
@@ -2920,6 +3356,7 @@
     send("ui-ready");
     renderBuildBadge(PLUGIN_BUILD);
     initProcessSegments();
+    if (window === window.parent) refreshLatest({ silent: true });
   </script>
 </body>
 </html>
