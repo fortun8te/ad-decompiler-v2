@@ -892,9 +892,23 @@ function createFigmaMock(options) {
         fail(where, "Range [" + start + ", " + end + ") is outside the bounds of the text (length " + this._characters.length + ")");
       }
     }
+    // Real Figma throws when a range is mutated while the font ACTUALLY COVERING that
+    // range is not loaded — that font is the last setRangeFontName applied over each
+    // char, falling back to the node's base fontName. Checking only the base font (the
+    // old behavior) let a "set range size before loading the range's own font" bug slip
+    // through the mock while crashing in the real sandbox. Enforce the per-range font.
+    _requireRangeFontsLoaded(where, start, end) {
+      for (let i = start; i < end; i += 1) {
+        const font = this._rangeValue("fontName", i, this._fontName);
+        if (!state.loadedFonts.has(fontKey(font))) {
+          fail(where, 'Cannot write to a range with unloaded font "' + font.family + " " + font.style +
+            '". Please call figma.loadFontAsync first');
+        }
+      }
+    }
     _pushRange(where, start, end, prop, value) {
       this._assertRange(where, start, end);
-      this._requireFontLoaded(where);
+      this._requireRangeFontsLoaded(where, start, end);
       this._styleRanges.push({ start, end, prop, value });
       this._measure();
     }

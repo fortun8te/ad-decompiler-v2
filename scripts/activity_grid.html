@@ -60,21 +60,43 @@
     font-weight: 400;
   }
   .ticker {
-    margin: -8px 0 16px;
+    display: none;
+  }
+  .feed {
+    margin: -4px 0 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-height: 0;
+    max-height: 72px;
+    overflow: hidden;
+    font-variant-numeric: tabular-nums;
+  }
+  .feed-row {
+    display: block;
     font-size: 11px;
+    line-height: 1.3;
     color: #6e6e78;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    min-height: 16px;
-    font-variant-numeric: tabular-nums;
   }
-  .ticker em {
+  .feed-row .t { display: none; }
+  .feed-row .msg {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .feed-row .msg em {
     font-style: normal;
     color: var(--lavender);
   }
-  .ticker.flash {
-    color: var(--text-dim);
+  .feed-row.fresh .msg { color: var(--text-dim); }
+  .feed-row.error .msg { color: var(--rose); }
+  .feed-row.done .msg em { color: #86efac; }
+  .feed-empty {
+    font-size: 11px;
+    color: #3a3a44;
+    padding: 2px 0;
   }
   .pulse-dot {
     width: 6px;
@@ -383,7 +405,7 @@
         <span class="nums" id="liveNums"><b>0.0%</b> · 00:00</span>
       </div>
     </div>
-    <div class="ticker" id="ticker">waiting for pipeline.log</div>
+    <div class="feed" id="feed"><div class="feed-empty">waiting for activity</div></div>
 
     <div class="section-label" id="benchLabel">benchmark</div>
     <div class="capsule">
@@ -443,7 +465,7 @@ const liveAd = document.getElementById("liveAd");
 const liveChip = document.getElementById("liveChip");
 const liveNums = document.getElementById("liveNums");
 const pulseDot = document.getElementById("pulseDot");
-const ticker = document.getElementById("ticker");
+const feedEl = document.getElementById("feed");
 const benchLabel = document.getElementById("benchLabel");
 const benchCount = document.getElementById("benchCount");
 const benchPct = document.getElementById("benchPct");
@@ -672,7 +694,7 @@ function renderDetail() {
 
   setShot(
     shotOriginal, run, origFile,
-    run.status === "pending" ? "not started" : "no original",
+    run.status === "pending" ? "queued" : "waiting on normalize…",
     origCache
   );
 
@@ -683,28 +705,79 @@ function renderDetail() {
       prevCache
     );
   } else if (run.status === "running" || run.status === "stalled") {
-    setShot(shotPreview, null, null, "live · waiting on preview", prevCache);
+    setShot(
+      shotPreview, null, null,
+      "live · " + (run.active || "…") + " — preview after reconstruct",
+      prevCache
+    );
   } else if (run.status === "partial") {
     setShot(shotPreview, run, prevFile, "stopped before preview", prevCache);
   } else {
-    setShot(shotPreview, null, null, "—", prevCache);
+    setShot(shotPreview, null, null, "queued", prevCache);
   }
+}
+
+function paintFeed() {
+  const items = ((state && state.feed) || []).slice();
+  const live = state && state.live;
+  // Heartbeat so long stages (ocr/sam/inpaint) don't look frozen on an old line.
+  if (live && !live.complete && live.active && live.image_id !== "runtime-smoke") {
+    const heartbeat = (live.active || "…") + "…";
+    const last = items[items.length - 1];
+    if (!last || last.text !== heartbeat) {
+      items.push({ t: "", kind: "stage", text: heartbeat, ad: live.image_id });
+    }
+  }
+  if (!items.length) {
+    const hint = (state && state.phase === "smoke")
+      ? "runtime smoke…"
+      : (live && live.last_line) || "waiting";
+    feedEl.innerHTML = '<div class="feed-empty">' + hint + "</div>";
+    feedEl.dataset.sig = "empty:" + hint;
+    return;
+  }
+  const sig = items.map(e => (e.t || "") + "|" + (e.text || "")).join("\n");
+  if (feedEl.dataset.sig === sig) return;
+  feedEl.dataset.sig = sig;
+  const latest = items[items.length - 1];
+  feedEl.innerHTML = items.slice(-5).map((e) => {
+    const cls = ["feed-row"];
+    if (e === latest) cls.push("fresh");
+    if (e.kind === "error") cls.push("error");
+    if (e.kind === "done") cls.push("done");
+    return (
+      '<div class="' + cls.join(" ") + '">' +
+        '<span class="msg">' + escapeHtml(e.text || "") + "</span>" +
+      "</div>"
+    );
+  }).join("");
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function renderLive() {
   const live = state && state.live;
   const bench = state && state.benchmark;
+  const phase = (state && state.phase) || "waiting";
   if (!live) {
-    liveAd.innerHTML = "<span>waiting for pipeline.log</span>";
-    liveChip.textContent = "idle";
-    liveChip.className = "chip";
+    liveAd.innerHTML = phase === "smoke"
+      ? "runtime-smoke <span>· starting</span>"
+      : "<span>waiting</span>";
+    liveChip.textContent = phase === "smoke" ? "smoke" : "idle";
+    liveChip.className = "chip" + (phase === "smoke" ? " stage" : "");
     liveChip.title = "";
     liveNums.innerHTML = "<b>0.0%</b> · 00:00";
-    pulseDot.className = "pulse-dot";
-    ticker.textContent = "waiting for pipeline.log";
+    pulseDot.className = phase === "smoke" ? "pulse-dot on" : "pulse-dot";
   } else {
     const doing = live.complete ? "done" : (live.active || "…");
-    liveAd.innerHTML = shortId(live.image_id) + " <span>· " + doing + "</span>";
+    const idLabel = live.image_id === "runtime-smoke" ? "smoke" : shortId(live.image_id);
+    liveAd.innerHTML = idLabel + " <span>· " + doing + "</span>";
     liveAd.title = live.image_id;
     liveChip.textContent = doing;
     liveChip.className = "chip stage";
@@ -712,33 +785,28 @@ function renderLive() {
     if (live.stalled) {
       liveChip.className = "chip stall";
       liveChip.textContent = "stalled";
-      liveChip.title = "no new pipeline.log line for 90s on the current ad";
+      liveChip.title = "no new writes for 90s";
       pulseDot.className = "pulse-dot stall";
     } else {
       liveChip.title = "";
     }
     if (live.failed) { liveChip.className = "chip fail"; liveChip.textContent = "failed"; liveChip.title = ""; }
     const elapsed = live.started_at ? (Date.now() / 1000 - live.started_at) : live.elapsed_s;
-    liveNums.innerHTML = "<b>" + live.percent.toFixed(1) + "%</b> · " + fmtElapsed(elapsed);
-    const line = live.last_line || doing;
-    if (ticker.dataset.line !== line) {
-      ticker.dataset.line = line;
-      ticker.classList.remove("flash");
-      void ticker.offsetWidth;
-      ticker.classList.add("flash");
-      ticker.innerHTML = "<em>" + doing + "</em> · " + line;
-    }
+    liveNums.innerHTML = "<b>" + Number(live.percent || 0).toFixed(1) + "%</b> · " + fmtElapsed(elapsed);
   }
+  paintFeed();
   if (bench) {
-    benchLabel.textContent = "benchmark · " + (bench.name || "runs");
+    const phaseTag = phase === "smoke" ? " · smoke" : "";
+    benchLabel.textContent = "benchmark · " + (bench.name || "runs") + phaseTag;
     benchCount.textContent = bench.done_count + " / " + bench.total + " ads";
-    benchPct.textContent = bench.percent.toFixed(1) + "%";
+    benchPct.textContent = Number(bench.percent || 0).toFixed(1) + "%";
   }
 }
 
 function followLiveIfNeeded() {
   const live = state && state.live;
   if (!live) return;
+  if (live.image_id === "runtime-smoke") return;
   const gen = state.generation || 0;
   if (gen !== lastGeneration) {
     // New live image — unfollow pin so the grid tracks the batch.
@@ -797,9 +865,12 @@ function connectSSE() {
 }
 
 const sseOk = connectSSE();
-setInterval(pollOnce, sseOk ? 400 : 120);
+setInterval(pollOnce, sseOk ? 250 : 100);
 setInterval(() => { if (state) { renderLive(); renderDetail(); } }, 100);
 pollOnce();
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) pollOnce();
+});
 </script>
 </body>
 </html>

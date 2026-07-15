@@ -723,6 +723,79 @@ def test_word_style_enrichment_uses_strong_pixel_difference_without_guessing_fam
     assert word["style_evidence"]["source"] == "word-pixels"
 
 
+def test_word_size_enrichment_does_not_fire_on_per_100g_pattern(monkeypatch):
+    # Benchmark 002 "weird scaling": the line "per 100g" was fragmented into
+    # per=12.5px + 100g=31px because a per-word size override fired on noisy
+    # measurements. A multi-word line must stay uniform (no 2x word).
+    base = {
+        "fontFamily": "Inter", "fontSize": 41.67, "fontWeight": 400,
+        "fontStyle": "Regular", "color": "#111111",
+    }
+    line = {
+        "text": "per 100g", "style": base,
+        "words": [
+            {"text": "per", "box": {"x": 456, "y": 1365, "w": 24, "h": 17}},
+            {"text": "100g", "box": {"x": 485, "y": 1365, "w": 59, "h": 27}},
+        ],
+    }
+    # Per-word measured sizes diverge wildly from the line (12.5 and 31 vs 41.67) with
+    # high ink confidence and colour/weight jitter — exactly the 002 noise profile.
+    measured = {"per": (12.5, 700), "100g": (31.0, 400)}
+
+    def fake_geo(image, word):
+        return ({"x": word["box"]["x"], "y": word["box"]["y"],
+                 "w": word["box"]["w"], "h": word["box"]["h"]},
+                None, "#2a2a2a", 1.0, np.ones((10, 10), dtype=bool),
+                {"fill": {"kind": "flat", "color": "#2a2a2a"}})
+
+    def fake_signals(word, painted, mask, config):
+        size, weight = measured[word["text"]]
+        return {"font_size": size, "weight": weight, "shear_angle": 0}
+
+    monkeypatch.setattr(text_analysis, "_painted_geometry", fake_geo)
+    monkeypatch.setattr(text_analysis, "_pre_font_signals", fake_signals)
+    text_analysis._enrich_word_styles(np.zeros((40, 120, 3), dtype=np.uint8), line, {})
+    for word in line["words"]:
+        style = word.get("style")
+        if style is not None:
+            # Whatever else may change, the SIZE must not blow up relative to the line.
+            assert style["fontSize"] == base["fontSize"], word["text"]
+            assert "size" not in word.get("style_evidence", {}).get("changed", [])
+
+
+def test_punctuation_only_word_never_becomes_a_styled_run(monkeypatch):
+    # Benchmark 002: ingredient lines fragmented into "aroma"/"," pieces. A lone
+    # punctuation mark (or 1-char sliver) must never carry its own style run.
+    base = {
+        "fontFamily": "Poppins", "fontSize": 9.2, "fontWeight": 400,
+        "fontStyle": "Regular", "color": "#111111",
+    }
+    line = {
+        "text": "aroma ,", "style": base,
+        "words": [
+            {"text": "aroma", "box": {"x": 465, "y": 1308, "w": 39, "h": 17}},
+            {"text": ",", "box": {"x": 505, "y": 1308, "w": 4, "h": 10}},
+            {"text": "→", "box": {"x": 512, "y": 1308, "w": 6, "h": 12}},
+        ],
+    }
+
+    def fake_geo(image, word):
+        return ({"x": word["box"]["x"], "y": word["box"]["y"],
+                 "w": word["box"]["w"], "h": word["box"]["h"]},
+                None, "#ff0000", 1.0, np.ones((10, 10), dtype=bool),
+                {"fill": {"kind": "flat", "color": "#ff0000"}})
+
+    monkeypatch.setattr(text_analysis, "_painted_geometry", fake_geo)
+    monkeypatch.setattr(text_analysis, "_pre_font_signals",
+                        lambda *a, **k: {"font_size": 40.0, "weight": 800, "shear_angle": 0})
+    text_analysis._enrich_word_styles(np.zeros((40, 120, 3), dtype=np.uint8), line, {})
+    words = {w["text"]: w for w in line["words"]}
+    # Even with a huge (spurious) colour/size/weight signal, the punctuation fragments
+    # get no style run at all.
+    assert "style" not in words[","]
+    assert "style" not in words["→"]
+
+
 def test_continuous_source_rules_become_native_text_decoration():
     underline = np.zeros((20, 100), dtype=bool)
     underline[3:14, 5:95:8] = True

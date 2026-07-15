@@ -403,13 +403,17 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                         run_dir, els, canvas, cfg=cfg, ocr=ocr_res)
 
                     def _peel_inpaint(rgb, mask, meta=None):
-                        # Route through the pipeline's entropy-routed ladder; text
-                        # holes are pinned to LaMa/OpenCV (Flux leaves glyph residue).
+                        # Peel holes are small (one occluder's footprint on one owner),
+                        # so LaMa is unconditionally the right tool — never route them
+                        # through the Flux ladder: with SAM3 still resident at this
+                        # point in the pipeline (no vram.stage_boundary before peel),
+                        # an escalation partial-offloads Flux and one call can take
+                        # ~25 minutes (observed live during validation). Flat/plate
+                        # holes are handled upstream by peel_scene's own flat-fill
+                        # before this callback ever runs.
                         from src import inpaint as inpaint_mod
-                        route_cfg = cfg
-                        if (meta or {}).get("text_occluder"):
-                            route_cfg = dict(cfg)
-                            route_cfg["inpaint"] = {**(cfg.get("inpaint") or {}), "mode": "lama"}
+                        route_cfg = dict(cfg)
+                        route_cfg["inpaint"] = {**(cfg.get("inpaint") or {}), "mode": "lama"}
                         out, _backend, _diag = inpaint_mod.inpaint_array(
                             rgb, mask.astype("uint8") * 255, route_cfg, return_diagnostics=True)
                         return out

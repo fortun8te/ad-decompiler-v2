@@ -64,6 +64,53 @@ def _inside_frac(a, b):
     return (ix * iy) / max(1.0, a["w"] * a["h"])
 
 
+# ── discrete product/photo cutouts own their printed text ─────────────────────────────
+# Text physically printed on a product package/photo cutout (a label like "WHEY
+# MILKSHAKE", a nutrition table, an ingredient list) is NOT overlay copy: the pixels
+# already live inside the product raster. Emitting it as a native text layer double-
+# prints it (native glyphs stacked on the cutout that still shows them) and, worse, the
+# removal mask then erases the label from the product. These roles name a *bounded
+# object* cutout, never the flat plate or a full-bleed hero photo.
+_PRODUCT_CUTOUT_ROLES = frozenset({
+    "product", "package", "packaging", "bottle", "jar", "tube", "can", "canister",
+    "pouch", "box", "carton", "device", "sign", "label",
+    "photo", "photo-fragment", "photo_fragment", "person", "people", "portrait",
+    "logo",
+})
+
+
+def _is_full_bleed(box: dict, canvas: dict, frac: float = 0.85) -> bool:
+    """True when ``box`` spans essentially the whole canvas (a plate/hero, not a cutout).
+
+    A full-bleed background photo or the flat plate is the canvas, so deliberate overlay
+    copy on top of it must stay editable. Only a raster that covers most of BOTH canvas
+    dimensions is treated as full-bleed; a tall or wide-but-inset product scene is not.
+    """
+    cw = float((canvas or {}).get("w", 0) or 0)
+    ch = float((canvas or {}).get("h", 0) or 0)
+    if cw <= 0 or ch <= 0:
+        return False
+    w = float((box or {}).get("w", 0) or 0)
+    h = float((box or {}).get("h", 0) or 0)
+    return (w >= frac * cw) and (h >= frac * ch)
+
+
+def _scene_cutout_owner(box: dict, regions: list[dict], threshold: float):
+    """Smallest discrete cutout region that ``box`` sits at least ``threshold`` inside.
+
+    Preferring the smallest containing region attributes text to the specific product it
+    is printed on rather than an enclosing scene, which keeps ownership deterministic when
+    products overlap.
+    """
+    matches = [r for r in regions if _inside_frac(box, r["box"]) >= threshold]
+    if not matches:
+        return None
+    return min(matches, key=lambda r: (
+        float(r["box"].get("w", 0) or 0) * float(r["box"].get("h", 0) or 0),
+        str(r.get("id") or ""),
+    ))
+
+
 def _raster_cluster_owner(box: dict, owners: list[dict], threshold: float):
     """Return the smallest positive intentional-raster owner around ``box``."""
     area = float(box.get("w", 0) or 0) * float(box.get("h", 0) or 0)
@@ -672,6 +719,11 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     dedup_iou = float((cfg.get("merge") or {}).get("dedup_iou", 0.6))
     match_iou = float((cfg.get("merge") or {}).get("qwen_match_iou", 0.3))
     photo_inside = float((cfg.get("merge") or {}).get("photo_inside_frac", 0.82))
+    # Geometric threshold for "printed on a discrete product cutout" scene text. Lower and
+    # separate from ``photo_inside`` (which gates the stricter raster-cluster ownership):
+    # a product name/label frequently sits only ~55-70% inside the segmented package box
+    # because ascenders/kerning spill past the mask, yet it is unambiguously baked-in.
+    scene_text_inside = float((cfg.get("merge") or {}).get("scene_text_inside_frac", 0.55))
     scene_roles = set((cfg.get("merge") or {}).get(
         "scene_text_roles", ["product", "package", "bottle", "jar", "tube", "device", "sign"]
     ))
@@ -790,6 +842,21 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             "raster_cluster_owner": owner["id"],
         })
 
+    # Discrete product/photo cutouts (bounded objects, never the full-bleed plate/hero)
+    # own any text printed on them. Built from the FINAL elem_cands so qwen-corrected
+    # roles are reflected. A full-bleed raster is excluded so overlay copy on a background
+    # photo/plate stays editable.
+    product_regions = []
+    for c in elem_cands:
+        box = c.get("box") or {}
+        if not (float(box.get("w", 0) or 0) > 0 and float(box.get("h", 0) or 0) > 0):
+            continue
+        if _is_full_bleed(box, canvas):
+            continue
+        role = str(c["meta"].get("role") or "").lower()
+        if role in _PRODUCT_CUTOUT_ROLES or c["meta"].get("contains_scene_text"):
+            product_regions.append({"id": c.get("id"), "box": dict(box)})
+
     # ── assemble + route ──────────────────────────────────────────────────────────────
     candidates = text_cands + elem_cands
 
@@ -895,6 +962,33 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             continue
         if scene_text_role == "overlay_copy":
             continue
+        # Geometric scene-text on a discrete product/photo cutout. This runs BEFORE the
+        # role-based overlay promotion below because a large product name reads as a
+        # "subheadline" and a package's ingredient list reads as "offer"/"body": the
+        # semantic role cannot distinguish printed-on-product text from real overlay copy,
+        # but geometry can. If the line sits substantially inside a bounded product/photo
+        # cutout (not the plate/hero, which is excluded from product_regions), it is baked
+        # into that raster — no native layer, no pixel removal, single owner. Positive
+        # external-overlay/recreate evidence (a VLM verdict or an explicit promotion flag)
+        # still wins; a merely *tentative* overlay flag from an uncorroborated VLM guess
+        # loses to corroborating geometry and is cleared to keep the scene-text contract.
+        positive_overlay_evidence = bool(
+            c["meta"].get("external_overlay") or c["meta"].get("promote_text")
+            or c["meta"].get("editable_text") or c["meta"].get("text_promoted")
+            or scene_text_role == "overlay_copy" or ownership_action == "recreate"
+        )
+        if not positive_overlay_evidence:
+            cutout_owner = _scene_cutout_owner(c["box"], product_regions, scene_text_inside)
+            if cutout_owner is not None:
+                c["kept_in_photo"] = True
+                c["meta"]["origin"] = "scene"
+                c["meta"]["role"] = "scene-text"
+                c["meta"]["baked_owner_id"] = cutout_owner["id"]
+                c["meta"]["scene_text_geometric"] = True
+                c["meta"]["suppression_reason"] = "text-inside-product-cutout"
+                for tentative in ("overlay_text", "removal_required"):
+                    c["meta"].pop(tentative, None)
+                continue
         if c["meta"].get("role") in overlay_text_roles:
             # Overlay copy must be painted back as editable text, so its original
             # glyphs have to be removed from the Big-LaMa plate first.  Keep this

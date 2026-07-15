@@ -130,6 +130,65 @@ def test_disabled_via_config(fit_stub):
     assert result is None
 
 
+def test_sans_block_unifies_scattered_families_to_one(fit_stub):
+    # Benchmark 002: a block of sans body/label lines each independently matched a
+    # different sans family (Inter/Poppins/Albert Sans). A dominant, class-consistent
+    # sans must pull the outliers in when their consensus fit is decent.
+    dominant = [
+        _item(f"L{i}", "Inter", 0.60, w=600, path=fit_stub["path"], text="Inter line")
+        for i in range(4)
+    ]
+    poppins = _item("P1", "Poppins", 0.50, w=200, text="wei-eiwit concentraat")
+    albert = _item("A1", "Albert Sans", 0.48, w=180, text="koolhydraten")
+    fit_stub["scores"]["wei-eiwit concentraat"] = 0.55
+    fit_stub["scores"]["koolhydraten"] = 0.52
+    evidence = text_analysis._apply_font_consensus(
+        dominant + [poppins, albert],
+        {"enabled": True, "min_score": 0.30}, {"consensus": {"enabled": True}})
+    assert evidence["applied"] is True
+    assert evidence["family"] == "Inter"
+    assert evidence["class_consistent"] is True
+    assert poppins["line"]["style"]["fontFamily"] == "Inter"
+    assert albert["line"]["style"]["fontFamily"] == "Inter"
+
+
+def test_serif_cannot_win_on_sans_consensus_line(fit_stub):
+    # Benchmark 002: EB Garamond (a serif) leaked onto the sans body line
+    # "zoetstof: sucralose". Even when the consensus refit does not score well enough
+    # to adopt on evidence, a serif must never survive on a sans-consistent document.
+    dominant = [
+        _item(f"L{i}", "Inter", 0.62, w=600, path=fit_stub["path"], text="Inter line")
+        for i in range(4)
+    ]
+    serif = _item("S1", "EB Garamond", 0.37, w=110, text="zoetstof: sucralose")
+    # Refit against the consensus sans fits poorly (below the 0.30 keep bar) — the normal
+    # evidence path would keep EB Garamond, but the hard class gate must relabel it.
+    fit_stub["scores"]["zoetstof: sucralose"] = 0.20
+    evidence = text_analysis._apply_font_consensus(
+        dominant + [serif], {"enabled": True, "min_score": 0.30},
+        {"consensus": {"enabled": True}})
+    assert evidence["applied"] is True
+    assert serif["line"]["style"]["fontFamily"] == "Inter"
+    assert serif["line"]["style"]["fontCandidates"][0]["family"] == "Inter"
+    forbidden = [r for r in evidence["refit"] if r.get("forbidden_class") == "serif"]
+    assert forbidden and forbidden[0]["from"] == "EB Garamond"
+
+
+def test_genuine_serif_headline_survives_when_strongly_matched(fit_stub):
+    # The two-tier policy: a distinctive serif/display headline that matches its own
+    # face in exact-font territory (>= strong_keep) is NOT force-unified to body sans.
+    dominant = [
+        _item(f"L{i}", "Inter", 0.60, w=300, path=fit_stub["path"], text="Inter line")
+        for i in range(4)
+    ]
+    headline = _item("H1", "Playfair Display", 0.86, w=160, h=40, text="Elegant Headline")
+    text_analysis._apply_font_consensus(
+        dominant + [headline], {"enabled": True, "min_score": 0.30},
+        {"consensus": {"enabled": True}})
+    assert headline["line"]["style"]["fontFamily"] == "Playfair Display"
+    assert "Elegant Headline" not in fit_stub["calls"]  # not even re-fit
+
+
 def test_staple_families_rank_ahead_of_alphabet_head():
     metas = [
         {"family": "Candara", "path": "candara.ttf", "weight": 400},

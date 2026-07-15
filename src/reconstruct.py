@@ -801,6 +801,58 @@ def _build_removal_ledger(observations: list, canvas: tuple[int, int]):
     return records, union, ledger, owner_index
 
 
+def _cover_kept_raster_footprints(background_path, candidates, masks, cfg):
+    """Fill kept-in-plate opaque-raster footprints with plate colour (no ghost silhouette).
+
+    Targets exactly the rasters the removal cap left in the plate (``meta.removal_capped``)
+    and any explicit ``meta.keep_in_background`` opaque raster that still re-renders on top.
+    Those pixels are hidden by the re-rendered asset, so replacing them with the surrounding
+    plate colour is loss-free for the composite and removes the silhouette QA sees in
+    background_clean. Config gate ``reconstruct.cover_kept_footprints`` (default ON)."""
+    cv2, np, Image = _deps()
+    rcfg = (cfg or {}).get("reconstruct") or {}
+    if not bool(rcfg.get("cover_kept_footprints", True)):
+        return 0
+    if not os.path.exists(background_path):
+        return 0
+    targets = []
+    for c in candidates or []:
+        meta = c.get("meta") or {}
+        # Full-canvas plates are dropped to target="drop" upstream, so the image filter
+        # already excludes them; we only cover opaque rasters that re-render on top.
+        if not (meta.get("removal_capped") or (meta.get("keep_in_background")
+                                               and c.get("target") == "image")):
+            continue
+        mask = masks.get(c.get("id"))
+        if mask is not None and np.count_nonzero(mask):
+            targets.append(mask)
+    if not targets:
+        return 0
+    try:
+        plate = np.asarray(Image.open(background_path).convert("RGB"), dtype=np.uint8).copy()
+    except Exception:
+        return 0
+    ph, pw = plate.shape[:2]
+    dilate = max(1, int(rcfg.get("cover_footprint_dilate", 3)))
+    ring_radius = max(4, int(rcfg.get("cover_footprint_ring", 12)))
+    covered = 0
+    for mask in targets:
+        binary = (np.asarray(mask) > 0).astype(np.uint8)
+        if binary.shape != (ph, pw):
+            binary = cv2.resize(binary, (pw, ph), interpolation=cv2.INTER_NEAREST)
+        binary = cv2.dilate(binary, np.ones((2 * dilate + 1,) * 2, np.uint8))
+        ring = (cv2.dilate(binary, np.ones((2 * ring_radius + 1,) * 2, np.uint8)) > 0) & (binary == 0)
+        exterior = plate[ring]
+        if exterior.shape[0] < 16:
+            continue
+        fill = np.median(exterior.astype(np.float32), axis=0).astype(np.uint8)
+        plate[binary > 0] = fill
+        covered += 1
+    if covered:
+        Image.fromarray(plate).save(background_path)
+    return covered
+
+
 def _crop_rgba(rgb, mask, box):
     _, np, Image = _deps()
     h, w = rgb.shape[:2]
@@ -2234,6 +2286,14 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         if ((cfg.get("scene") or {}).get("archetype") == "social_screenshot"
                 and c.get("target") == "text"):
             dilate = max(dilate, int(rcfg.get("social_text_dilate", 6)))
+        # An opaque cutout (product/person/photo) is re-rendered on top of the plate, so
+        # the removal mask MUST cover its full footprint plus the anti-aliased rim — a
+        # tighter removal leaves a halo of the ORIGINAL object peeking around the placed
+        # cutout (002 product silhouettes). Give image cutouts a rim-dilation floor so
+        # removal ⊇ cutout footprint.
+        _role = str((c.get("meta") or {}).get("role") or "").lower()
+        if c.get("target") == "image" and _role in _CAP_EXEMPT_ROLES:
+            dilate = max(dilate, int(rcfg.get("cutout_rim_dilate", 3)))
         observation = {
             "id": c.get("id"),
             "target": c.get("target"),
@@ -2280,6 +2340,13 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     text_residual = _post_inpaint_text_residual(
         rgb, background_path, removal, masks, union, removal_ownership, cfg,
     )
+    # Clean-plate cover pass: a low-confidence opaque raster kept in the plate (removal
+    # cap) leaves a ghost SILHOUETTE in background_clean (002 product panel). Because that
+    # raster is re-rendered opaquely on top, its plate pixels are never seen — cover its
+    # footprint with the surrounding plate colour so the clean plate has no silhouette.
+    footprints_covered = _cover_kept_raster_footprints(
+        background_path, updated, masks, cfg,
+    )
     mask_path = os.path.join(run_dir, "removal_mask.png")
     Image.fromarray(union).save(mask_path)
     removal_ownership_path = os.path.join(run_dir, "removal_ownership.png")
@@ -2315,6 +2382,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "plate_fragments_suppressed": plate_fragments_suppressed,
             "mask_rejected": mask_rejected,
             "removal_capped": removal_capped,
+            "kept_footprints_covered": footprints_covered,
             # Ghost-text audit evidence: repair.assess turns unresolved residue into a
             # rebuild-clean-plate repair instead of letting duplicate text ship.
             "text_residual": text_residual,

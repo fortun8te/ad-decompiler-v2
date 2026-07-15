@@ -283,7 +283,40 @@ def _worker(name: str, cfg: dict, work: str, output) -> None:
     output.put(result)
 
 
+# Probes that submit a job to a REMOTE server (ComfyUI) rather than only doing local
+# work. Terminating our own probe subprocess on timeout does NOT cancel that remote
+# job — ComfyUI keeps loading/sampling for minutes afterward, orphaned and still
+# holding VRAM, so the very next probe/benchmark attempt collides with it and can
+# time out again (observed live: a 6+ minute orphaned Flux job blocked a fresh
+# benchmark run at 0/16 images). These probes get a longer cold-load timeout AND an
+# on-timeout cleanup that actually interrupts the server-side job.
+_REMOTE_JOB_PROBES = {"flux_comfy", "powerpaint"}
+_REMOTE_PROBE_TIMEOUT_S = 300.0  # cold 9GB GGUF + text encoders from disk needs headroom
+
+
+def _cancel_remote_comfy_job(cfg: dict) -> None:
+    """Best-effort: tell ComfyUI to drop whatever it's still doing after we gave up
+    waiting, so the GPU/VRAM is actually free for the next attempt."""
+    try:
+        import urllib.request
+        base = str(((cfg or {}).get("inpaint") or {}).get("comfy", {}).get("base_url")
+                   or (cfg or {}).get("backend_url") or "http://127.0.0.1:8188").rstrip("/")
+        for path, payload in ((f"{base}/interrupt", b"{}"),
+                              (f"{base}/queue", b'{"clear":true}'),
+                              (f"{base}/free", b'{"unload_models":true,"free_memory":true}')):
+            try:
+                req = urllib.request.Request(path, data=payload,
+                                             headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=8).read()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _run_bounded(name: str, cfg: dict, work: Path, timeout_s: float) -> dict:
+    if name in _REMOTE_JOB_PROBES:
+        timeout_s = max(timeout_s, _REMOTE_PROBE_TIMEOUT_S)
     context = mp.get_context("spawn")
     output = context.Queue(maxsize=1)
     # Some OCR/model runtimes create helper processes of their own; a daemonic Python
@@ -294,6 +327,8 @@ def _run_bounded(name: str, cfg: dict, work: Path, timeout_s: float) -> dict:
     process.join(timeout_s)
     if process.is_alive():
         process.terminate(); process.join(5)
+        if name in _REMOTE_JOB_PROBES:
+            _cancel_remote_comfy_job(cfg)
         return {"name": name, "ok": False, "timeout": True,
                 "duration_s": round(time.monotonic() - started, 3),
                 "detail": f"probe exceeded {timeout_s:.1f}s timeout"}

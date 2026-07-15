@@ -1,0 +1,36 @@
+{
+  "_comment": "Real-Figma STRICT enforcement fixture. installedFonts is an EXPLICIT list using Figma's exact Inter style-name spellings (Thin/Extra Light/Light/Regular/Medium/Semi Bold/Bold/Extra Bold/Black) — NOT 'auto', which would fabricate whatever style the design asks for and hide substitution bugs. Playfair Display and 'Nonexistent Font Family' are deliberately NOT installed, and the design requests 'Inter SemiBold' (no space) which does not exist verbatim. Every one of these must degrade through the font-fallback chain and still build a node, with the whole import completing (ok:true) and ZERO uncaught rejections / onmessage throws (the harness enforces those unconditionally).",
+  "installedFonts": [
+    { "family": "Inter", "style": "Thin" },
+    { "family": "Inter", "style": "Extra Light" },
+    { "family": "Inter", "style": "Light" },
+    { "family": "Inter", "style": "Regular" },
+    { "family": "Inter", "style": "Medium" },
+    { "family": "Inter", "style": "Semi Bold" },
+    { "family": "Inter", "style": "Bold" },
+    { "family": "Inter", "style": "Extra Bold" },
+    { "family": "Inter", "style": "Black" },
+    { "family": "Roboto", "style": "Regular" },
+    { "family": "Roboto", "style": "Bold" },
+    { "family": "Arial", "style": "Regular" }
+  ],
+  "expect": {
+    "ok": true,
+    "mustBuild": [
+      "card",
+      "serif-headline",
+      "split-row",
+      "split-a",
+      "split-b",
+      "semibold-mismatch",
+      "richtext",
+      "missing-family",
+      "divider",
+      "cta",
+      "cta-label"
+    ],
+    "warningsContain": [
+      "Font substituted"
+    ]
+  }
+}

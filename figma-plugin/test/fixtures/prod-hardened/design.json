@@ -1,0 +1,188 @@
+{
+  "id": "prod-hardened",
+  "name": "prod-hardened",
+  "canvas": {
+    "w": 600,
+    "h": 520
+  },
+  "schema_version": 2,
+  "meta": {
+    "coordinate_space": "local"
+  },
+  "layers": [
+    {
+      "id": "card",
+      "type": "frame",
+      "name": "card",
+      "box": { "x": 40, "y": 40, "w": 520, "h": 440 },
+      "fill": { "kind": "flat", "color": "#ffffff" },
+      "radius": 16,
+      "layout": {
+        "mode": "VERTICAL",
+        "gap": 20,
+        "padding": { "top": 24, "right": 24, "bottom": 24, "left": 24 }
+      },
+      "sizing": { "w": "fixed", "h": "hug" },
+      "children": [
+        {
+          "id": "serif-headline",
+          "type": "text",
+          "name": "serif-headline",
+          "box": { "x": 24, "y": 24, "w": 472, "h": 60 },
+          "text": "Elegant Serif Headline",
+          "style": {
+            "fontFamily": "Playfair Display",
+            "fontStyle": "Bold",
+            "fontWeight": 700,
+            "fontSize": 44,
+            "color": "#141414",
+            "autoResize": "WIDTH_AND_HEIGHT"
+          },
+          "sizing": { "w": "hug", "h": "hug" }
+        },
+        {
+          "id": "split-row",
+          "type": "frame",
+          "name": "split-row",
+          "box": { "x": 24, "y": 104, "w": 472, "h": 36 },
+          "fill": { "kind": "flat", "color": "#ffffff" },
+          "layout": { "mode": "HORIZONTAL", "gap": 8 },
+          "sizing": { "w": "fill", "h": "hug" },
+          "children": [
+            {
+              "id": "split-a",
+              "type": "text",
+              "name": "split-a",
+              "box": { "x": 0, "y": 0, "w": 120, "h": 32 },
+              "text": "Save ",
+              "style": {
+                "fontFamily": "Inter",
+                "fontStyle": "Regular",
+                "fontWeight": 400,
+                "fontSize": 24,
+                "color": "#333333",
+                "autoResize": "WIDTH_AND_HEIGHT"
+              },
+              "sizing": { "w": "hug", "h": "hug" }
+            },
+            {
+              "id": "split-b",
+              "type": "text",
+              "name": "split-b",
+              "box": { "x": 128, "y": 0, "w": 120, "h": 32 },
+              "text": "40% today",
+              "style": {
+                "fontFamily": "Inter",
+                "fontStyle": "Extra Bold",
+                "fontWeight": 800,
+                "fontSize": 24,
+                "color": "#cc2222",
+                "autoResize": "WIDTH_AND_HEIGHT"
+              },
+              "sizing": { "w": "hug", "h": "hug" }
+            }
+          ]
+        },
+        {
+          "id": "semibold-mismatch",
+          "type": "text",
+          "name": "semibold-mismatch",
+          "box": { "x": 24, "y": 160, "w": 472, "h": 28 },
+          "text": "Requests Inter SemiBold (no space)",
+          "style": {
+            "fontFamily": "Inter",
+            "fontStyle": "SemiBold",
+            "fontWeight": 600,
+            "fontSize": 18,
+            "color": "#444444",
+            "autoResize": "HEIGHT",
+            "multiline": true
+          },
+          "sizing": { "w": "fill", "h": "hug" }
+        },
+        {
+          "id": "richtext",
+          "type": "text",
+          "name": "richtext",
+          "box": { "x": 24, "y": 196, "w": 472, "h": 52 },
+          "text": "Mixed weight runs inline",
+          "style": {
+            "fontFamily": "Inter",
+            "fontStyle": "Regular",
+            "fontWeight": 400,
+            "fontSize": 20,
+            "color": "#222222",
+            "autoResize": "HEIGHT",
+            "multiline": true
+          },
+          "text_runs": [
+            { "start": 0, "end": 6, "style": { "fontFamily": "Inter", "fontWeight": 400, "fontStyle": "Regular" } },
+            { "start": 6, "end": 12, "style": { "fontFamily": "Inter", "fontWeight": 900, "fontStyle": "Black" } },
+            { "start": 12, "end": 24, "style": { "fontFamily": "Playfair Display", "fontWeight": 700, "fontStyle": "Bold", "textDecoration": "UNDERLINE" } }
+          ],
+          "sizing": { "w": "fill", "h": "hug" }
+        },
+        {
+          "id": "missing-family",
+          "type": "text",
+          "name": "missing-family",
+          "box": { "x": 24, "y": 256, "w": 472, "h": 28 },
+          "text": "Totally uninstalled family here",
+          "style": {
+            "fontFamily": "Nonexistent Font Family",
+            "fontStyle": "Regular",
+            "fontWeight": 400,
+            "fontSize": 18,
+            "color": "#555555",
+            "autoResize": "HEIGHT",
+            "multiline": true
+          },
+          "sizing": { "w": "fill", "h": "hug" }
+        },
+        {
+          "id": "divider",
+          "type": "shape",
+          "shape_kind": "rect",
+          "name": "divider",
+          "box": { "x": 24, "y": 300, "w": 472, "h": 2 },
+          "fill": { "kind": "flat", "color": "#e0e0e0" },
+          "sizing": { "w": "fill", "h": "fixed" }
+        },
+        {
+          "id": "cta",
+          "type": "frame",
+          "name": "cta",
+          "box": { "x": 24, "y": 320, "w": 200, "h": 52 },
+          "fill": { "kind": "flat", "color": "#141414" },
+          "radius": 26,
+          "layout": {
+            "mode": "HORIZONTAL",
+            "gap": 0,
+            "padding": { "top": 14, "right": 24, "bottom": 14, "left": 24 }
+          },
+          "meta": { "role": "button" },
+          "sizing": { "w": "hug", "h": "hug" },
+          "children": [
+            {
+              "id": "cta-label",
+              "type": "text",
+              "name": "cta-label",
+              "box": { "x": 24, "y": 14, "w": 152, "h": 24 },
+              "text": "Shop the sale",
+              "style": {
+                "fontFamily": "Inter",
+                "fontStyle": "Medium",
+                "fontWeight": 500,
+                "fontSize": 17,
+                "color": "#ffffff",
+                "align": "CENTER",
+                "autoResize": "WIDTH_AND_HEIGHT"
+              },
+              "sizing": { "w": "hug", "h": "hug" }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

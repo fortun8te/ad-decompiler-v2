@@ -1,7 +1,25 @@
 # Peel Decomposition — occlusion-attributed layer completion
 
-Status: implemented and tested; NOT wired into `run_pipeline.py` yet (exact diff in §5,
-to be applied by the pipeline owner — peel files must not edit the core pipeline).
+Status: implemented, tested, WIRED into `run_pipeline.py` (the §5 diff is applied and
+verified: `peel` sits in STAGES between `elements` and `merge`, gated on
+`peel.enabled`, and merge consumes `peel_layers or qwen`; the stage was exercised live
+on a resumed real run). Fill quality validated on real overlap ads (§6: 052
+before/after tube, 002 product bundle) — revealed holes confirmed clean by visual
+inspection.
+
+**Default `peel.enabled: false`, ONE wiring change from ON.** The gate + granularity
+guard (§4a) already make ON safe *semantically* (flat/UI ads skip untouched). What
+blocks it is *runtime*: the §5 adapter passes element-class peel holes to the entropy
+ladder, which escalates to Flux Fill while SAM3 is still resident (no
+`vram.stage_boundary` before peel) → Flux Q6 partially offloads and one call takes
+~25 min (observed live on the 052 resume; the run was killed). Fix, in the adapter
+(`run_pipeline.py` `_peel_inpaint`, pipeline-owner change): pin ALL peel holes to
+LaMa — make the `route_cfg["inpaint"] = {**…, "mode": "lama"}` override unconditional
+instead of text-only. LaMa is the validated quality bar (§6; flat-fill absorbs
+card/plate holes before the router anyway, and peel then costs seconds, 0 VRAM).
+Alternatively add `vram.stage_boundary("elements", "peel", …)` before the stage and
+keep Flux — costlier, not needed for the validated quality. After either: flip
+`peel.enabled: true`.
 Owner artifacts: `src/peel_scene.py` (primary, element-guided), `src/peel_decompose.py`
 (blind LayerD loop, standalone/fallback), `scripts/peel_scene_demo.py`,
 `scripts/peel_demo.py`, `tests/test_peel_scene.py`, `tests/test_peel_decompose.py`,
@@ -158,19 +176,69 @@ The gate is `overlap_report()`:
 
 * a pair qualifies when `intersection ≥ peel.min_overlap_area` px AND
   `intersection ≥ peel.min_overlap_frac ×` the smaller element's area;
-* peel is *needed* only when some qualifying pair covers a **non-text** under-layer
-  (element-over-element). Elements over plain background are already handled by the
-  plate; text under-layers stay native.
-* No qualifying pair → `peel_scene` returns `skipped=True, skip_reason="no-overlap"`
-  and the run continues exactly as today (asserted in tests).
+* peel is *needed* only when some qualifying pair is **element-over-element** — BOTH
+  members non-text (text-over-element alone never activates; text stays native, and
+  once peel runs for a real element pair the text holes get filled as a bonus), AND
+  both members pass the granularity guard (§4a). Elements over plain background are
+  already handled by the plate.
+* No qualifying pair → `peel_scene` returns `skipped=True, skip_reason="no-overlap"`;
+  qualifying pairs blocked only by the guard → `skip_reason="no-eligible-overlap: <id>:
+  <why>"`. Either way the run continues exactly as today (asserted in tests).
+
+### 4a. Detection-granularity guard (`element_eligibility`)
+
+Peel is only as good as the elements it is fed. Fusion sometimes emits **residual**
+masks — "photo panel minus persons minus product", a swiss-cheese of hundreds of
+specks (052's E000: largest connected component 57% of the mask across 402 pieces).
+Such a mask can neither be a trustworthy occluder footprint nor provide usable inpaint
+context, so a pair involving one must not switch peel on. `mask_integrity()` computes
+per element:
+
+* `cc_frac` — largest connected component / mask area (`peel.min_cc_frac`, 0.80);
+* `hole_frac` — interior holes / (mask + holes) (`peel.max_hole_frac`, 0.25).
+
+Measured separation on real runs: genuine cutouts (persons, products, cards, icons)
+score `cc_frac ≥ 0.996` with 1–16 components; the residual fragment scored 0.572 with
+402 — the guard is nowhere near its own margins. Text and `background`/`plate` kinds
+are never eligible pair members. `require_eligible: false` disables the guard for
+research runs. **What detection must surface for peel to help more:** large photo
+panels as distinct solid elements (e.g. the two before/after portraits of 052 live in
+a fragmented leftover today, so a seam-straddling product attributes to that
+fragment/background and the panels are not separately completed — correct per the
+contract, but the win waits on panel-level detection).
+
+### 4b. Fill quality (what makes the revealed hole clean)
+
+* **Shadow blinding** (`context_shadow_px`, 12): occluder drop shadows / AA halos live
+  just OUTSIDE the detection mask, survive into the visible-context ring, and smear
+  gray into any inpaint (the 002 gray-gradient ghosts). The band around the hole is
+  masked unknown for the fill call — but never written back.
+* **Robust flat-fill** (`flat_fill_tol`, 8): sample a ring beyond the shadow band; if
+  ≥ `flat_fill_inlier_frac` of ring pixels sit within ±tol of the ring median, the
+  surface is flat — fill with the inlier median. Crisper than any inpainter on
+  cards/plates, immune to minority contamination (shadows, seams, adjacent color
+  bands) that inflates a naive std. Element-class holes only: text holes are small and
+  often sit on gradients where a global median leaves a tone-mismatched fringe — the
+  router's LaMa preserves local shading there.
+* **z-order role bands** (`_band_of`): fusion tags product/person cutouts
+  `kind="photo-fragment"` (band 5) while the detector role-tags them `product`/`person`
+  (band 20); the band is the MAX of both, otherwise the card an element sits ON is
+  treated as its occluder (inverted z — 002 originally "filled" every product fully
+  under its own card).
+* **LaMa over Telea**: `scripts/peel_scene_demo.py --inpaint auto` (default) uses
+  Big-LaMa (CPU) when importable; the pipeline adapter routes through the entropy
+  ladder with text pinned to LaMa. Telea remains the zero-dep test default.
 
 Config (all optional; `enabled` gates the pipeline stage, the module itself ignores it):
 
 ```yaml
 peel:
-  enabled: false            # pipeline integration gate (§5)
+  enabled: false            # pipeline integration gate (§5). Flip to true after the
+                            # adapter LaMa pin (see Status) — the overlap gate + the
+                            # granularity guard then make it a conservative ON where
+                            # only genuine element-over-element scenes actually peel
   # ── scene mode ──
-  min_overlap_area: 64      # px² — gate threshold
+  min_overlap_area: 400     # px² — gate threshold
   min_overlap_frac: 0.02    # fraction of the smaller element's area
   hole_dilate_px: 2         # anti-alias fringe ring; 0 = exact masks (synthetic tests)
   context_pad_px: 24        # inpaint context crop padding
@@ -178,6 +246,16 @@ peel:
   text_occluders: box       # box | off
   refine_alpha: false       # BiRefNet cutout-edge refinement (needs matting callable)
   refine_band_px: 3
+  # ── detection-granularity guard (§4a) ──
+  require_eligible: true
+  min_cc_frac: 0.80
+  max_hole_frac: 0.25
+  # ── fill quality (§4b) ──
+  context_shadow_px: 12
+  flat_fill_tol: 8.0        # 0 disables the flat-fill fast path
+  flat_fill_inlier_frac: 0.60
+  flat_fill_ring_px: 16
+  flat_fill_min_px: 40
   # ── blind mode (LayerD defaults, see §7) ──
   max_layers: 3
   alpha_threshold: 0.005
@@ -197,15 +275,21 @@ peel:
 Demos:
 
 ```bash
-# scene mode over an existing run's artifacts (no models; honors the gate):
-.venv\Scripts\python.exe scripts\peel_scene_demo.py --run runs\ad9_regional_final \
-    --output runs\peel-scene\ad9            # add --inpaint lama / --force / --reuse-background
+# scene mode over an existing run's artifacts (honors the gate; --inpaint auto default
+# uses Big-LaMa CPU when importable, else Telea; prints gate + eligibility verdicts):
+.venv\Scripts\python.exe scripts\peel_scene_demo.py --run runs\parity-v2-052 \
+    --output runs\peel-scene\052            # add --inpaint opencv / --force / --reuse-background
 
 # blind LayerD loop on a raw image (downloads ~1 GB BiRefNet on first use):
 .venv\Scripts\python.exe scripts\peel_demo.py --input ad.png --output out --device cpu
 ```
 
-## 5. Integration seam (exact diff, to be applied by the pipeline owner)
+## 5. Integration seam (APPLIED — kept as the wiring reference)
+
+The diff below is live in `run_pipeline.py` (import at line ~18, `"peel"` in STAGES,
+stage body after the elements load, merge fed `peel_layers or qwen`) — verified
+end-to-end with `--resume peel` on a real run. Peel failures degrade to
+`report.stage("peel", "fallback", ...)` and never abort the run.
 
 Peel becomes an optional stage between `elements` and `merge`, feeding
 `merge_layers.merge` decomposed layers in the exact shape qwen layers already use
@@ -334,11 +418,29 @@ Notes for the applier:
    byte-exact (`max_abs_diff=0`) with `hole_dilate_px: 0`; with the default 2 px
    fringe, **all** diff pixels lie inside the intentional fringe ring
    (17 105 px, mean 0.17/255).
-3. **Still open** (needs the integration applied): move-test A/B (translate a peeled
-   under-layer 40 px, count revealed hole pixels vs the ownership-crop baseline; gate
-   ≥ 80 % reduction on overlap-heavy fixtures), 16-image benchmark A/B with
-   `peel.enabled` on/off watching qa.json SSIM / editable-ratio / ghost-text counts,
-   and Crello ground-truth matte quality for the blind mode.
+3. **Real overlap ads, visual inspection of revealed holes** (runs/peel-validate/*):
+   * **052 before/after** (`runs/parity-v2-052`, comparison_grid): guard blocked all 4
+     pairs against the fragmented E000 residual (57 % / 402 pieces) and activated on
+     E004 (logo) over E003 (product tube). LaMa + shadow blinding: the tube under the
+     lifted "wavy" script logo reads as an intact tube — no smearing, no glyph
+     residue, only a slightly flatter green where the specular gradient was
+     synthesized. Recomposite `max_abs_diff=0` with `hole_dilate_px: 0` (byte-exact);
+     the default 2 px fringe accounts for the entire diff otherwise.
+   * **002 product bundle** (3 products over a white card): role bands fixed the
+     inverted z (card had outranked its products); the card completes under all three
+     product footprints. Robust flat-fill goes `solid` on the card — pure clean white
+     where each product was, where plain LaMa had left gray-gradient shadow ghosts and
+     Telea had smeared. The remaining dark sliver between the two tubs is ORIGINAL
+     card pixels (their contact shadow, byte-preserved) — not a fill artifact.
+   * **Negative case honestly reported:** 052's seam-straddling tube itself attributes
+     mostly to background/fragment because the two portrait panels are NOT distinct
+     detected elements (§4a) — the guard correctly refuses those pairs instead of
+     producing the smears the earlier stale-run test showed.
+4. **Still open**: move-test A/B (translate a peeled under-layer 40 px, count revealed
+   hole pixels vs the ownership-crop baseline; gate ≥ 80 % reduction on overlap-heavy
+   fixtures), 16-image benchmark A/B with `peel.enabled` on/off watching qa.json SSIM /
+   editable-ratio / ghost-text counts, and Crello ground-truth matte quality for the
+   blind mode.
 
 ## 7. Blind mode: LayerD recipe (unchanged)
 
@@ -388,17 +490,34 @@ on numpy/opencv alone with Telea (2–3 s per 1080² ad, 0 VRAM). Optional extra
 ## 9. Known risks
 
 * **Detection granularity bounds peel granularity (scene mode).** If the two portraits
-  are not detected as elements (they weren't in `ad9_regional_final` — they live in the
-  plate), a seam-straddling occluder attributes to *background* and the portraits are
-  not separately completed. Correct per the contract, but the leapfrog needs the
-  detector to surface large photo panels; revisit the fusion "background plate"
-  threshold for before/after archetypes (`archetype.py` already detects comparisons).
+  are not detected as elements (they weren't in `ad9_regional_final` OR
+  `parity-v2-052` — they live in the plate / a fragmented residual), a seam-straddling
+  occluder attributes to *background* and the portraits are not separately completed.
+  Correct per the contract, and since §4a the guard SKIPS rather than peeling against
+  residual fragments — but the leapfrog needs the detector to surface large photo
+  panels as distinct solid elements; revisit the fusion "background plate" threshold
+  for before/after archetypes (`archetype.py` already detects comparisons).
+* **Flat-fill flattens genuine subtle texture** when a surface passes the inlier test
+  (paper grain, soft vignettes). Bounded by `flat_fill_tol` (max-channel deviation 8)
+  and only inside true holes; drop `flat_fill_tol` to 0 to force the router
+  everywhere.
+* **Enabled-by-default blast radius**: with `peel.enabled: true`, merge prefers peel
+  layers over qwen layers whenever peel produced any (`peel_layers or qwen`);
+  `qwen.enabled: false` today so peel simply fills an empty slot, but re-enabling qwen
+  changes precedence — revisit then.
 * **Box-footprint text occluders overfill** inter-glyph gaps on busy under-layers.
   Bounded by the text box, filled from the layer's own context, and recorded
   (`fills[].text_occluder`); switch to ink-level masks once reconstruct's
   text-removal mattes are exposed pre-merge.
 * **Inpaint hallucination inside large peel holes** — same class as gap P0-3. Keep
   Telea/LaMa as the default; Flux only via the §5 router and never for text holes.
+* **Peel-stage runtime when the ladder escalates to Flux.** The §5 adapter routes
+  element-class peel holes through `inpaint_array`'s entropy ladder; on overlap-heavy
+  ads that can mean several Flux Fill calls (minutes each) at peel time. The robust
+  flat-fill absorbs card/plate holes before the router, but if wall-clock matters,
+  pin peel element holes to LaMa in the adapter exactly like the text pin
+  (`route_cfg["inpaint"]["mode"] = "lama"` unconditionally) — demo validation (§6)
+  shows LaMa quality is already the accepted bar. Pipeline-owner decision.
 * **Fringe ring vs byte-exactness:** `hole_dilate_px: 2` intentionally rewrites a 2 px
   ring inside the under-layer around every hole (kills AA ghosts) — recomposite is then
   exact *except* inside that ring (measured mean 0.17/255 on ad9). Set 0 where masks

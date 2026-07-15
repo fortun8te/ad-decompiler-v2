@@ -538,6 +538,115 @@ def test_merge_layer_order_is_deterministic():
     assert order_a == order_b
 
 
+# ── product-label scene text (benchmark 002 real geometry) ───────────────────────────
+# 002 is an UPFRONT supplement bundle: three product packages sit on a white plate under
+# an "ALLE ESSENTIALS" headline / "€63 → €49" price / "KOOP NU" CTA. OCR reads every
+# printed package label (product names, nutrition tables, ingredient lists) with a bold
+# headline-ish style, so the semantic router labels them "subheadline"/"offer". These
+# boxes are copied from the real run's canvas coordinates.
+_C002 = {"w": 1080, "h": 1920}
+
+
+def _products_002():
+    # E005/E006/E007 are the segmented product cutouts (role=product); E003 is the big
+    # low-confidence scene "shape" that is NOT a discrete cutout (must not own scene text).
+    return [
+        {"id": "E003", "box": {"x": 55, "y": 502, "w": 1025, "h": 1418}, "kind": "shape",
+         "area": 1453450, "coverage": .70, "role": "shape"},
+        {"id": "E005", "box": {"x": 673, "y": 910, "w": 343, "h": 382},
+         "kind": "photo-fragment", "area": 128580, "coverage": .06, "role": "product"},
+        {"id": "E006", "box": {"x": 61, "y": 933, "w": 609, "h": 740},
+         "kind": "photo-fragment", "area": 443490, "coverage": .21, "role": "product"},
+        {"id": "E007", "box": {"x": 675, "y": 1292, "w": 339, "h": 383},
+         "kind": "photo-fragment", "area": 127582, "coverage": .06, "role": "product"},
+    ]
+
+
+def test_product_label_text_over_a_cutout_is_kept_in_photo_not_native():
+    """The #1 002 defect: a product name printed on the package (read as a bold
+    'subheadline') sits inside the product cutout, so it is scene text — baked into the
+    raster, never a native layer, never removed from the plate."""
+    ocr = {"lines": [
+        # UPFRONT / CREATINE printed on the E005 cutout (0.6-1.0 inside it)
+        {"id": "up", "text": "UPFRONT", "conf": .9, "role": "subheadline",
+         "box": {"x": 668, "y": 863, "w": 260, "h": 125}},
+        {"id": "cr", "text": "CREATINE", "conf": .9, "role": "subheadline",
+         "box": {"x": 668, "y": 944, "w": 122, "h": 56}},
+        # a nutrition/ingredient line printed on E006, read as 'offer'
+        {"id": "ing", "text": "wei-eiwit concentraat (melk)", "conf": .8, "role": "offer",
+         "box": {"x": 106, "y": 1100, "w": 318, "h": 49}},
+    ]}
+    m = _by_id(merge_layers.merge(ocr, _products_002(), [], _C002, {}))
+    for cid in ("c_up", "c_cr", "c_ing"):
+        node = m[cid]
+        assert node.get("kept_in_photo") is True, cid
+        assert node["target"] == "drop", cid
+        assert node["meta"]["role"] == "scene-text", cid
+        # single owner: baked, so its pixels are NOT scheduled for removal
+        assert not node["meta"].get("overlay_text"), cid
+        assert not node["meta"].get("removal_required"), cid
+        assert node["meta"].get("baked_owner_id") in {"c_E005", "c_E006", "c_E007"}, cid
+
+
+def test_overlay_headline_and_price_on_the_plate_stay_editable():
+    """Guard against over-baking: the ALLE ESSENTIALS headline, €63→€49 price and KOOP NU
+    CTA live on the white plate (above/outside every product cutout), so they remain
+    native editable text with their glyphs removed from the plate."""
+    ocr = {"lines": [
+        {"id": "hl", "text": "ALLE ESSENTIALS", "conf": .95, "role": "headline",
+         "box": {"x": 116, "y": 250, "w": 700, "h": 90}},
+        {"id": "pr", "text": "€63 → €49", "conf": .9, "role": "price",
+         "box": {"x": 285, "y": 360, "w": 390, "h": 120}},
+        {"id": "cta", "text": "KOOP NU VIA UPFRONT.NL", "conf": .9, "role": "cta",
+         "box": {"x": 226, "y": 430, "w": 518, "h": 60}},
+    ]}
+    m = _by_id(merge_layers.merge(ocr, _products_002(), [], _C002, {}))
+    for cid in ("c_hl", "c_pr", "c_cta"):
+        node = m[cid]
+        assert node["target"] == "text", cid
+        assert not node.get("kept_in_photo"), cid
+        assert node["meta"].get("overlay_text") is True, cid
+        assert node["meta"].get("removal_required") is True, cid
+
+
+def test_full_bleed_background_photo_overlay_copy_stays_editable():
+    """A full-bleed hero/UGC photo IS the canvas background, not a discrete object cutout,
+    so deliberate overlay copy printed on top of it must stay editable — a full-bleed
+    raster is excluded from the product-cutout owners."""
+    elements = [{"id": "hero", "box": {"x": 0, "y": 0, "w": 1080, "h": 1920},
+                 "kind": "photo-fragment", "area": 2073600, "coverage": 1.0, "role": "photo"}]
+    ocr = {"lines": [{"id": "copy", "text": "SUMMER SALE", "conf": .95, "role": "headline",
+                      "box": {"x": 300, "y": 900, "w": 480, "h": 120}}]}
+    node = _by_id(merge_layers.merge(ocr, elements, [], _C002, {}))["c_copy"]
+    assert node["target"] == "text"
+    assert not node.get("kept_in_photo")
+    assert node["meta"].get("overlay_text") is True
+
+
+def test_product_label_bakes_even_below_the_raster_cluster_threshold():
+    """A label only ~60% inside its package box (ascenders/kerning spill past the mask)
+    still bakes: scene_text_inside_frac (0.55) is deliberately looser than the strict
+    raster-cluster containment gate."""
+    ocr = {"lines": [{"id": "sp", "text": "UPFRONT", "conf": .9, "role": "subheadline",
+                      "box": {"x": 668, "y": 863, "w": 260, "h": 125}}]}  # ~0.61 inside E005
+    node = _by_id(merge_layers.merge(ocr, _products_002(), [], _C002, {}))["c_sp"]
+    assert node.get("kept_in_photo") is True
+    assert node["meta"].get("baked_owner_id") == "c_E005"
+
+
+def test_positive_overlay_evidence_beats_product_geometry():
+    """If a VLM (or explicit promotion) positively says overlay copy, that wins even when
+    the box sits inside a product cutout — geometry only decides the unlabeled case."""
+    elements = [{"id": "E005", "box": {"x": 673, "y": 910, "w": 343, "h": 382},
+                 "kind": "photo-fragment", "area": 128580, "coverage": .06, "role": "product"}]
+    ocr = {"lines": [{"id": "ov", "text": "50% OFF", "conf": .9, "role": "subheadline",
+                      "box": {"x": 700, "y": 1000, "w": 200, "h": 60},
+                      "meta": {"external_overlay": True, "overlay_text": True}}]}
+    node = _by_id(merge_layers.merge(ocr, elements, [], _C002, {}))["c_ov"]
+    assert node["target"] == "text"
+    assert not node.get("kept_in_photo")
+
+
 def test_merge_report_records_dedup_reasons_when_run_dir_given(tmp_path):
     """Diagnostics counts/reasons are emitted as a sidecar report next to merged.json."""
     import json

@@ -1001,6 +1001,61 @@ def _norm_family(name: Any) -> str:
     return re.sub(r"\s+", "", str(name or "").lower())
 
 
+# Family -> glyph class by NAME, for the document-level consensus gate.  This is a
+# name lookup (not a font-file probe) so it works on the already-relabelled Google
+# family names carried on each line's style, where the local .ttf path may be
+# absent.  Only true serif and script/handwriting families are enumerated; every
+# other family (grotesque/geometric/humanist sans AND condensed *display* faces
+# like Oswald/Anton/Bebas Neue) is treated as ``SANS`` so the two-tier policy is
+# preserved — a distinctive display headline is never force-unified to body sans.
+_SERIF_FAMILY_NAMES = (
+    "Playfair Display", "Merriweather", "PT Serif", "Noto Serif", "Lora", "Bitter",
+    "Crimson Text", "Cormorant Garamond", "EB Garamond", "Libre Baskerville",
+    "Source Serif 4", "DM Serif Display", "IBM Plex Serif", "Bree Serif",
+    "Marcellus", "Roboto Serif", "Roboto Slab", "Zilla Slab",
+    # metric-compatible OFL serif substitutes for local faces
+    "Tinos", "Gelasio", "Caladea",
+    # common local serif names that may survive unmapped
+    "Times New Roman", "Times", "Georgia", "Garamond", "Cambria", "Baskerville",
+    "Book Antiqua", "Palatino", "Palatino Linotype", "Constantia",
+)
+_SCRIPT_FAMILY_NAMES = (
+    "Dancing Script", "Pacifico", "Great Vibes", "Caveat", "Sacramento",
+    "Lobster", "Comic Neue", "Gabriola", "Segoe Script", "Brush Script MT",
+    "Mistral", "Freestyle Script", "Inkfree",
+)
+_SERIF_FAMILY_NORM = {_norm_family(n) for n in _SERIF_FAMILY_NAMES}
+_SCRIPT_FAMILY_NORM = {_norm_family(n) for n in _SCRIPT_FAMILY_NAMES}
+
+
+def _family_class(family: Any, path: Optional[str] = None) -> str:
+    """Coarse sans/serif/script class for a family, for the consensus gate.
+
+    Prefers the font FILE's PANOSE class (font_fit.classify_font_file) when a
+    real, on-disk ``path`` is available; otherwise falls back to a name lookup.
+    Returns one of ``"sans"``/``"serif"``/``"script"``; anything not positively
+    serif or script is reported ``"sans"`` (the safe default that keeps display
+    headline faces out of the forbidden set).
+    """
+    if path and os.path.isfile(str(path)):
+        try:
+            from src import font_fit
+
+            cls = font_fit.classify_font_file(path)
+            if cls in (font_fit.SERIF, font_fit.SCRIPT):
+                return cls
+            if cls == font_fit.SANS:
+                return "sans"
+        except Exception:
+            pass
+    norm = _norm_family(family)
+    if norm in _SERIF_FAMILY_NORM:
+        return "serif"
+    if norm in _SCRIPT_FAMILY_NORM:
+        return "script"
+    return "sans"
+
+
 # Closest Google-Fonts equivalent for common local-only (Windows/macOS) faces.
 # Every target is the SAME CLASS as its source and appears in
 # GOOGLE_FONTS_FAMILIES. The metric-compatible OFL substitutes are used where
@@ -1857,16 +1912,47 @@ def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
     total = sum(entry["weight"] for entry in votes.values())
     family, info = max(votes.items(), key=lambda kv: kv[1]["weight"])
     share = (info["weight"] / total) if total > 0 else 0.0
+
+    # Class consistency: when almost all voting weight is a single class (sans is
+    # the overwhelming case for ad body/label copy), the document clearly wants ONE
+    # family for that class.  We then (a) lower the share bar so a dominant-but-not
+    # -majority sans family still unifies the block, and (b) raise the pull
+    # (tolerance) so more per-line matches fold into it — the scattered
+    # Archivo/Poppins/Inter/Albert-Sans zoo on benchmark 002 is exactly this.
+    class_weight: dict[str, float] = {}
+    for fam, entry in votes.items():
+        cand = entry.get("candidate") or {}
+        cls = _family_class(fam, cand.get("path"))
+        class_weight[cls] = class_weight.get(cls, 0.0) + entry["weight"]
+    sans_share = (class_weight.get("sans", 0.0) / total) if total > 0 else 0.0
+    consensus_class = _family_class(family, (info.get("candidate") or {}).get("path"))
+    sans_consistency = _num(opts.get("sans_consistency"), 0.70)
+    class_consistent = consensus_class == "sans" and sans_share >= sans_consistency
+    # Dominance: the winning family clearly leads the runner-up, not a near-tie among
+    # several families (that is not a "dominant sans" and must not be forced through).
+    others = sorted((e["weight"] for f, e in votes.items() if f != family), reverse=True)
+    second_weight = others[0] if others else 0.0
+    dominant = info["weight"] >= max(second_weight, 1e-6) * _num(opts.get("dominance_ratio"), 1.4)
+
     evidence: dict[str, Any] = {
         "family": family, "share": round(share, 3),
         "lines_voting": info["lines"], "applied": False, "refit": [],
+        "consensus_class": consensus_class, "sans_share": round(sans_share, 3),
+        "class_consistent": class_consistent, "dominant": dominant,
     }
     candidate = info.get("candidate")
     path = str((candidate or {}).get("path") or "")
-    if share < _num(opts.get("min_share"), 0.30) or not path or not os.path.exists(path):
+    min_share = _num(opts.get("min_share"), 0.30)
+    if class_consistent and dominant:
+        # A dominant, consistent sans still unifies the block when its share sits just
+        # under the default floor (each body line otherwise keeps its own scattered pick).
+        min_share = min(min_share, _num(opts.get("consistent_min_share"), 0.20))
+    if share < min_share or not path or not os.path.exists(path):
         return evidence
 
     tolerance = _num(opts.get("tolerance"), 0.10)
+    if class_consistent:
+        tolerance = max(tolerance, _num(opts.get("consistent_tolerance"), 0.18))
     strong_keep = _num(opts.get("strong_keep"), 0.72)
     min_score = _num(render_fit_options.get("min_score"), 0.30)
     try:
@@ -1887,63 +1973,105 @@ def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
         # Only unify the FAMILY across same-weight lines; a genuinely different
         # weight keeps its own correct-weight match (benchmark 025/091/002:
         # weight-flattened body/headlines drove the editable-text collapse).
+        # HARD class gate: a serif/script family that leaked onto a sans-consensus
+        # document (benchmark 002: EB Garamond on the sans body line
+        # "zoetstof: sucralose") is a cross-class defect, never a real accent. When
+        # the document is a consistent sans, such a line is FORBIDDEN its own family
+        # and must fold into the consensus sans — even if the consensus refit scores
+        # worse or the weight differs. A genuinely distinctive serif/display headline
+        # is still protected below by the ``strong_keep`` guard (a real Playfair-class
+        # headline scores in exact-font territory and is left untouched).
+        line_family = str(style.get("fontFamily") or "")
+        line_cand = next(
+            (c for c in (style.get("fontCandidates") or [])
+             if isinstance(c, dict) and str(c.get("family")) == line_family and c.get("path")),
+            None,
+        )
+        line_class = _family_class(line_family, (line_cand or {}).get("path"))
+        forbidden = class_consistent and line_class in ("serif", "script")
+
         rep_weight = candidate.get("weight") if isinstance(candidate, dict) else None
         line_weight = style.get("fontWeight")
         max_weight_delta = _num(opts.get("max_weight_delta"), 200)
-        if (isinstance(rep_weight, (int, float)) and isinstance(line_weight, (int, float))
+        if (not forbidden and isinstance(rep_weight, (int, float))
+                and isinstance(line_weight, (int, float))
                 and abs(int(rep_weight) - int(line_weight)) >= max_weight_delta):
             continue
         meta = line.setdefault("meta", {})
         own = _num((meta.get("render_fit") or {}).get("score"), 0.0)
         if own >= strong_keep:
-            continue  # near-exact per-line match outranks consistency
+            continue  # near-exact per-line match outranks consistency (incl. real serif)
         mask = item.get("font_mask")
-        if mask is None:
-            continue
-        try:
-            fit = font_fit.fit_line(
-                line.get("text", ""), path, mask,
-                _num(style.get("fontSize"), 16.0), render_fit_options,
-            )
-        except Exception:
-            continue
-        if fit is None:
-            continue
-        new_score = _num(fit.get("score"), 0.0)
-        if new_score < max(min_score, own - tolerance):
-            continue
-        # Never trade text-editability for consistency: if the line's own match
-        # already clears the keep-as-text bar, refuse a consensus fit that would
-        # drop it under (routing then rasterizes it — the exact regression we're
-        # fighting). Consistency only reshuffles among already-editable lines.
-        if own >= min_score and new_score < min_score:
-            continue
-        previous = style.get("fontFamily")
-        new_size = _num(fit.get("fontSize"), _num(style.get("fontSize"), 16.0))
-        style["fontFamily"] = family
-        style["fontSize"] = round(new_size, 2)
-        style["letterSpacing"] = round(_num(fit.get("letterSpacing")), 3)
-        style["lineHeight"] = round(
-            max(new_size * 1.15, _num((item.get("painted") or {}).get("h"))), 2)
-        style["fontSizeCandidates"] = _size_candidates(new_size)
-        promoted = dict(candidate)
-        promoted["fit"] = {"score": new_score}
-        style["fontCandidates"] = [promoted] + [
-            c for c in (style.get("fontCandidates") or [])
-            if not (isinstance(c, dict) and str(c.get("family")) == family)
-        ]
-        # The renderer draws candidates[0]; keep the declared weight/style in sync
-        # so the exported Figma node matches the promoted face.
-        _reconcile_style_weight(style)
-        meta["render_fit"] = {
-            "family": family, "score": new_score, "fontSize": fit.get("fontSize"),
-            "letterSpacing": fit.get("letterSpacing"), "applied": True, "consensus": True,
-        }
-        item["line_fit"] = fit
-        evidence["refit"].append({
-            "id": line.get("id"), "from": previous, "to": family,
-            "own_score": round(own, 3), "new_score": round(new_score, 3),
-        })
+        fit = None
+        if mask is not None:
+            try:
+                fit = font_fit.fit_line(
+                    line.get("text", ""), path, mask,
+                    _num(style.get("fontSize"), 16.0), render_fit_options,
+                )
+            except Exception:
+                fit = None
+        new_score = _num(fit.get("score"), 0.0) if fit is not None else 0.0
+        # Adopt on evidence when the consensus fit is within tolerance of (or beats)
+        # the line's own match AND does not push an editable line below the raster bar.
+        adopt = (
+            fit is not None
+            and new_score >= max(min_score, own - tolerance)
+            and not (own >= min_score and new_score < min_score)
+        )
+        previous = line_family
+        if adopt:
+            new_size = _num(fit.get("fontSize"), _num(style.get("fontSize"), 16.0))
+            style["fontFamily"] = family
+            style["fontSize"] = round(new_size, 2)
+            style["letterSpacing"] = round(_num(fit.get("letterSpacing")), 3)
+            style["lineHeight"] = round(
+                max(new_size * 1.15, _num((item.get("painted") or {}).get("h"))), 2)
+            style["fontSizeCandidates"] = _size_candidates(new_size)
+            promoted = dict(candidate)
+            promoted["fit"] = {"score": new_score}
+            style["fontCandidates"] = [promoted] + [
+                c for c in (style.get("fontCandidates") or [])
+                if not (isinstance(c, dict) and str(c.get("family")) == family)
+            ]
+            # The renderer draws candidates[0]; keep the declared weight/style in sync
+            # so the exported Figma node matches the promoted face.
+            _reconcile_style_weight(style)
+            meta["render_fit"] = {
+                "family": family, "score": new_score, "fontSize": fit.get("fontSize"),
+                "letterSpacing": fit.get("letterSpacing"), "applied": True, "consensus": True,
+            }
+            item["line_fit"] = fit
+            evidence["refit"].append({
+                "id": line.get("id"), "from": previous, "to": family,
+                "own_score": round(own, 3), "new_score": round(new_score, 3),
+            })
+        elif forbidden:
+            # No confident refit to promote geometry from, but a serif/script must
+            # not survive on sans body copy. Relabel the FAMILY to the consensus sans
+            # (keeping the line's own size and weight — we are not confident enough to
+            # move geometry), so a Figma-loadable sans is emitted instead of the leak.
+            style["fontFamily"] = family
+            promoted = dict(candidate)
+            promoted["family"] = family
+            if isinstance(line_weight, (int, float)):
+                promoted["weight"] = int(line_weight)
+            promoted["fit"] = {"score": new_score} if fit is not None else {}
+            style["fontCandidates"] = [promoted] + [
+                c for c in (style.get("fontCandidates") or [])
+                if not (isinstance(c, dict) and str(c.get("family")) in (family, previous))
+            ]
+            meta["render_fit"] = {
+                "family": family, "score": round(new_score, 4) if fit is not None else round(own, 4),
+                "fontSize": _num(style.get("fontSize"), 16.0),
+                "letterSpacing": _num(style.get("letterSpacing")),
+                "applied": True, "consensus": True, "forbidden_class": line_class,
+            }
+            evidence["refit"].append({
+                "id": line.get("id"), "from": previous, "to": family,
+                "own_score": round(own, 3), "new_score": round(new_score, 3),
+                "forbidden_class": line_class,
+            })
     evidence["applied"] = True
     return evidence
 
@@ -1965,7 +2093,18 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
     base_colour = str(base.get("color") or "#000000")
     min_conf = _num(config.get("word_style_min_ink_confidence"), 0.42)
     colour_delta = _num(config.get("word_style_color_distance"), 58.0)
-    size_ratio_gate = _num(config.get("word_style_size_ratio"), 1.16)
+    # Per-word SIZE is the "weird scaling" defect (benchmark 002: "per 100g" split into
+    # per=12.5px + 100g=31px; ingredient lines fragmented). A single word measured
+    # inside a normal line is noisy — glyph composition alone (a short lowercase token
+    # lacks caps/ascenders; a digit run is taller) shifts the tight-ink height enough to
+    # read as a spurious size. So a per-word size override now demands the same standard
+    # the weight guard already got: a raised ratio, high ink confidence, INDEPENDENT
+    # corroboration (contrast/weight), a sane cap on how far a word may exceed its line,
+    # and — for the always-noisier "smaller than the line" direction — a standalone token.
+    # When in doubt we keep the line uniform rather than emit a mis-scaled word.
+    size_ratio_gate = _num(config.get("word_style_size_ratio"), 1.35)
+    size_min_conf = _num(config.get("word_style_size_min_ink_confidence"), 0.60)
+    size_max_up_ratio = _num(config.get("word_style_size_max_up_ratio"), 1.5)
     # Per-word weight is estimated from stroke density, which is the noisiest signal —
     # same-weight lines jitter ±100-150. Codia only splits on CLEAR contrast (its real
     # splits are ~400 apart: 121K/700 vs weergaven/300). Keep the delta well above the
@@ -1974,8 +2113,18 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
     weight_delta = int(_num(config.get("word_style_weight_delta"), 260))
     weight_min_conf = _num(config.get("word_style_weight_min_ink_confidence"), 0.60)
 
+    def _styleable(candidate: Any) -> bool:
+        # A lone punctuation mark or a 1-char sliver (",", "->", a stray digit) carries
+        # no reliable per-word style and must never become its own Figma run.
+        txt = str((candidate or {}).get("text") or "").strip()
+        return len(txt) >= 2 and any(ch.isalnum() for ch in txt)
+
+    valid_word_count = sum(
+        1 for w in (line.get("words") or []) if isinstance(w, dict) and _styleable(w)
+    )
+
     for raw_word in line.get("words") or []:
-        if not isinstance(raw_word, dict) or not str(raw_word.get("text") or "").strip():
+        if not isinstance(raw_word, dict) or not _styleable(raw_word):
             continue
         word = raw_word
         word["box"] = _clean_box(word.get("box"))
@@ -1987,9 +2136,31 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
         measured_weight = int(round(_num(geo.get("weight"), base_weight)))
         ratio = max(measured_size, base_size) / max(1.0, min(measured_size, base_size))
         colour_changed = _colour_distance(colour, base_colour) >= colour_delta
-        size_changed = ratio >= size_ratio_gate
         weight_changed = (abs(measured_weight - base_weight) >= weight_delta
                           and ink_conf >= weight_min_conf)
+        # A per-word size override needs an independent reason to believe the word is a
+        # genuinely different run (a contrasting colour or a real weight change), not just
+        # a different measured height. A single, emphasised token can stand alone; a word
+        # mid-line among peers cannot carry a size split on its own.
+        standalone = valid_word_count <= 1 or (colour_changed and valid_word_count <= 2)
+        corroborated = colour_changed or weight_changed
+        if measured_size >= base_size:
+            # Word BIGGER than its line (the "blew up 100g" case): allow only a bounded
+            # jump unless it is a clearly standalone emphasised token.
+            size_changed = (
+                ratio >= size_ratio_gate and ink_conf >= size_min_conf and corroborated
+                and (measured_size <= base_size * size_max_up_ratio or standalone)
+            )
+        else:
+            # Word SMALLER than its line: dominated by glyph-composition noise (a short
+            # lowercase token lacks caps/ascenders, so its tight-ink height under-reads).
+            # Demand the strongest evidence — contrast AND weight AND the word being the
+            # line's ONLY token — otherwise keep the line uniform. This is what suppresses
+            # the "per 100g" fragmentation: any multi-word line never splits downward.
+            size_changed = (
+                ratio >= size_ratio_gate and ink_conf >= size_min_conf
+                and colour_changed and weight_changed and valid_word_count <= 1
+            )
         shear = geo.get("shear_angle")
         italic_changed = bool(shear is not None and abs(shear) >= _num(config.get("italic_shear_deg"), 6.0)) \
             != ("italic" in str(base.get("fontStyle") or "").lower())

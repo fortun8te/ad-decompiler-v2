@@ -859,6 +859,79 @@ def _simple_lama(rgb, mask):
     return np.asarray(result.convert("RGB"), dtype=np.uint8)
 
 
+# Archetypes whose plates are flat/banded UI chrome (Codia ships these as SOLID rects,
+# never a generative inpaint). For these, uniform mask holes are filled with their local
+# plate colour analytically and never routed through Flux/LaMa — this removes the messy
+# inpainted chrome + residue that a generative backend leaves on 009's dark bands.
+_FLAT_PLATE_ARCHETYPES = frozenset({
+    "social_screenshot", "caption_over_photo", "comparison_grid", "product_on_flat",
+})
+
+
+def _solid_flat_enabled(cfg: Optional[dict]) -> bool:
+    """Route flat/uniform holes to a solid plate-colour fill instead of a generative model."""
+    icfg = (cfg or {}).get("inpaint") or {}
+    if "solid_flat_regions" in icfg:
+        return bool(icfg.get("solid_flat_regions"))
+    # Default ON for flat/UI archetypes only; genuine-photo archetypes keep pure inpaint.
+    archetype = str(((cfg or {}).get("scene") or {}).get("archetype") or "").lower()
+    extra = set(icfg.get("solid_flat_archetypes") or ())
+    return archetype in (_FLAT_PLATE_ARCHETYPES | extra)
+
+
+def _flat_hole_fill(rgb, mask, cfg: Optional[dict] = None):
+    """Solid-fill every uniform mask component with its local plate colour.
+
+    Returns ``(working, remaining_mask, info)`` where ``working`` has the flat components
+    replaced by their surrounding plate colour and ``remaining_mask`` is the still-unfilled
+    (genuinely textured) portion for the generative backend, or ``None`` when disabled.
+
+    A component is "flat" when the ring of source pixels just outside it is dominated by a
+    single colour (>= ``uniform_fraction`` within ``tolerance``). Textured holes (photo
+    plates) stay in ``remaining_mask`` so real inpainting still runs for them.
+    """
+    if not _solid_flat_enabled(cfg):
+        return None
+    cv2, np, _ = _deps()
+    icfg = (cfg or {}).get("inpaint") or {}
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if not binary.any():
+        return None
+    ring_radius = max(2, int(icfg.get("solid_flat_ring", 6)))
+    uniform_fraction = float(icfg.get("solid_flat_uniform_fraction", 0.85))
+    tolerance = float(icfg.get("solid_flat_tolerance", 8.0))
+    min_ring = int(icfg.get("solid_flat_min_ring", 24))
+    source = np.asarray(rgb, dtype=np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    kernel = np.ones((2 * ring_radius + 1, 2 * ring_radius + 1), np.uint8)
+    working = source.copy()
+    remaining = np.zeros_like(binary)
+    filled = filled_px = 0
+    for lab in range(1, num):
+        comp = labels == lab
+        comp_u8 = comp.astype(np.uint8)
+        ring = (cv2.dilate(comp_u8, kernel) > 0) & (~comp) & (binary == 0)
+        exterior = source[ring]
+        if exterior.shape[0] < min_ring:
+            remaining[comp] = 1
+            continue
+        plate = np.median(exterior.astype(np.float32), axis=0)
+        near = np.max(np.abs(exterior.astype(np.float32) - plate), axis=1) <= tolerance
+        if float(np.mean(near)) >= uniform_fraction:
+            working[comp] = plate.astype(np.uint8)
+            filled += 1
+            filled_px += int(comp.sum())
+        else:
+            remaining[comp] = 1
+    info = {
+        "components": int(num - 1),
+        "flat_filled": filled,
+        "flat_filled_px": filled_px,
+        "remaining_px": int(remaining.sum()),
+    }
+    return working, (remaining * 255).astype(np.uint8), info
+
+
 def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
     """Run one inpaint backend selection without multi-pass orchestration."""
     _, np, _ = _deps()
@@ -1055,11 +1128,40 @@ def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: boo
         })
         return result if return_diagnostics else result[:2]
 
-    generated, used, diagnostics = _multipass_inpaint(
-        np.asarray(rgb, dtype=np.uint8), composite_mask, cfg,
-    )
-
     original = np.asarray(rgb, dtype=np.uint8)
+    # Flat/UI plates (Codia's solid-rect strategy): fill uniform holes with their local
+    # plate colour and only route the genuinely-textured remainder through the generative
+    # backend. This keeps 009's dark chrome clean instead of a messy inpaint + residue.
+    flat = _flat_hole_fill(original, composite_mask, cfg)
+    solid_flat_info = None
+    generative_mask = composite_mask
+    flat_source = original
+    if flat is not None:
+        flat_source, generative_mask, solid_flat_info = flat
+
+    if solid_flat_info is not None and not np.any(generative_mask):
+        # Whole plate was uniform → no generative backend needed at all.
+        out = original.copy()
+        selected = composite_mask > 0
+        out[selected] = flat_source[selected]
+        diagnostics = {
+            "backend_class": "analytic", "solid_flat": solid_flat_info,
+            "backend_route": {
+                "requested": str((cfg.get("inpaint") or {}).get("mode", "auto")).lower(),
+                "selected": "solid-flat", "selected_class": "analytic",
+                "strict_acceptance": bool((cfg.get("inpaint") or {}).get("strict_acceptance", False)),
+                "opencv_fallback_used": False, "fallback_reason": None,
+            },
+        }
+        result = (out, "solid-flat", diagnostics)
+        return result if return_diagnostics else result[:2]
+
+    generated, used, diagnostics = _multipass_inpaint(
+        flat_source, generative_mask, cfg,
+    )
+    if solid_flat_info is not None:
+        diagnostics["solid_flat"] = solid_flat_info
+
     generated = np.asarray(generated, dtype=np.uint8)
     # Big-LaMa internally pads the image up to a multiple of 8 and returns at that padded
     # size, so its output can be a few pixels larger/smaller than the input (e.g. 344 vs

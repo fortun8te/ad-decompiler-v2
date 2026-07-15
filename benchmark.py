@@ -487,6 +487,34 @@ def main():
         print(f"Figma acceptance: waiting up to {cfg['export_wait_s']}s per image for a fresh plugin export.")
     auto_repair = args.auto_repair if args.auto_repair is not None else harness_enabled(cfg)
     configure_auto_repair(cfg, auto_repair)
+
+    # Resolve the image roster BEFORE smoke so activity grids can pre-seed all dots.
+    try:
+        requested_ids = parse_fixture_ids(args.ids)
+        images = select_images(source_dir, args.max_images, requested_ids)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not images:
+        raise SystemExit(f"No images found in {source_dir}")
+    planned = {
+        "version": 1,
+        "input_dir": str(source_dir.resolve()),
+        "output": str(output.resolve()),
+        "images": [
+            {
+                "id": path.stem,
+                "fixture_id": _file_fixture_id(path),
+                "filename": path.name,
+                "path": str(path.resolve()),
+            }
+            for path in images
+        ],
+    }
+    (output / "planned.json").write_text(json.dumps(planned, indent=2), encoding="utf-8")
+    for path in images:
+        (output / path.stem).mkdir(parents=True, exist_ok=True)
+    print(f"Planned {len(images)} ads -> {output / 'planned.json'}", flush=True)
+
     from src.runtime_bootstrap import ensure_services
     startup = ensure_services(cfg)
     (output / "startup.json").write_text(json.dumps(startup, indent=2), encoding="utf-8")
@@ -516,13 +544,6 @@ def main():
         if not smoke.get("ok"):
             print(json.dumps({"benchmark": "blocked", "runtime_smoke": smoke.get("checks")}, indent=2))
             raise SystemExit(2)
-    try:
-        requested_ids = parse_fixture_ids(args.ids)
-        images = select_images(source_dir, args.max_images, requested_ids)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-    if not images:
-        raise SystemExit(f"No images found in {source_dir}")
 
     runs = []
     for image in images:

@@ -58,7 +58,8 @@ def main() -> int:
     parser.add_argument("--run", required=True, help="existing pipeline run directory")
     parser.add_argument("--output", required=True, help="output directory")
     parser.add_argument("--config", default=str(ROOT / "config.yaml"))
-    parser.add_argument("--inpaint", choices=["opencv", "lama"], default="opencv")
+    parser.add_argument("--inpaint", choices=["auto", "opencv", "lama"], default="auto",
+                        help="auto = Big-LaMa when importable, else OpenCV Telea")
     parser.add_argument("--force", action="store_true",
                         help="bypass the overlap gate (peel even a flat scene)")
     parser.add_argument("--no-text-occluders", action="store_true",
@@ -85,15 +86,33 @@ def main() -> int:
           f"({sum(1 for e in elements if e.is_text)} text occluders)")
 
     report = peel_scene.overlap_report(elements, cfg)
-    qualifying = [p for p in report["pairs"] if p["qualifies"] and not p["under_is_text"]]
+    qualifying = [p for p in report["pairs"] if p["qualifies"]
+                  and not p["under_is_text"] and not p.get("top_is_text")]
     print(f"[peel-scene] overlap gate: needed={report['needed']} "
-          f"({len(qualifying)} qualifying element-over-element pairs)")
+          f"({len(qualifying)} qualifying element-over-element pairs, "
+          f"{report.get('blocked_qualifying', 0)} blocked by the granularity guard)")
     for pair in qualifying[:12]:
+        tag = "" if pair.get("eligible") else "  [BLOCKED: ineligible member]"
         print(f"    {pair['top']} over {pair['under']}: {pair['area']} px "
-              f"({pair['frac']:.1%} of the smaller)")
+              f"({pair['frac']:.1%} of the smaller){tag}")
+    for eid, e in sorted((report.get("eligibility") or {}).items()):
+        if not e["eligible"]:
+            print(f"    ineligible {eid}: {e['reason']}")
 
-    inpaint = (peel_decompose.make_simple_lama_inpaint() if args.inpaint == "lama"
-               else peel_decompose.opencv_inpaint)
+    if args.inpaint == "lama":
+        inpaint = peel_decompose.make_simple_lama_inpaint()
+        chosen = "lama"
+    elif args.inpaint == "auto":
+        try:
+            inpaint = peel_decompose.make_simple_lama_inpaint()
+            chosen = "lama (auto)"
+        except Exception as exc:
+            inpaint = peel_decompose.opencv_inpaint
+            chosen = f"opencv (auto; lama unavailable: {exc})"
+    else:
+        inpaint = peel_decompose.opencv_inpaint
+        chosen = "opencv"
+    print(f"[peel-scene] hole filler: {chosen}")
     background = None
     if args.reuse_background and (run / "background_clean.png").exists():
         background = str(run / "background_clean.png")

@@ -701,7 +701,11 @@ def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings) -> int:
             box={"x": 0.0, "y": 0.0, "w": w, "h": h},
             z_index=bg_z, src=rel.replace("\\", "/"),
             constraints={"horizontal": "STRETCH", "vertical": "STRETCH"},
-            meta={"role": "background", "source": "group-plate-slice", "z": bg_z,
+            # The slice is cut from background_clean (the clean inpaint plate) — see module
+            # docstring — so it is honestly sourced from the inpaint plate. Present
+            # source="inpaint" for the ownership gate; keep provenance in plate_source.
+            meta={"role": "background", "source": "inpaint",
+                  "plate_source": "group-plate-slice", "z": bg_z,
                   "source_id": f"{gid}__groupbg", "per_group_background": True,
                   "plate_delta": round(color_delta, 2), "plate_texture": round(texture, 2)},
         ))
@@ -710,6 +714,215 @@ def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings) -> int:
     for root in layers:
         visit(root, 0.0, 0.0)
     return added
+
+
+# ── Single-ownership audit (one owner per pixel) ──────────────────────────────────
+# Codia's construction contract: every pixel is owned exactly once — a region is EXACTLY
+# ONE of {native text, raster slice, kept-in-photo baked}. When a native TEXT layer is
+# emitted over a raster carrier (the clean plate, a host-raster product panel, a group
+# plate slice, or a raster slice) that ALSO carries the same content baked in, both render
+# and the result double-prints (002 "WHEYMILKSHAKE", 009 "geld geld"). This audit gives the
+# native text sole ownership by erasing its baked ink from the carrier beneath it. Erasure
+# is conservative: only uniform (non-photographic) plate regions under the text are cleaned,
+# so a genuine textured photo is never smeared. Config gate: design.single_ownership.
+_OWNERSHIP_CARRIER_ROLES = frozenset({
+    "background", "photo", "image", "product", "product-cluster", "plate",
+    "photo-fragment", "panel",
+})
+
+
+def _flatten_abs(layers):
+    """Yield ``(layer, parent_off_x, parent_off_y)`` for every layer in the tree.
+
+    ``parent_off`` is the accumulated origin of the layer's ancestors; the layer's own
+    ``box`` x/y is added by the caller (Codia layers are parent-local)."""
+    out = []
+
+    def rec(layer, ox, oy):
+        out.append((layer, ox, oy))
+        bx = float((layer.box or {}).get("x", 0) or 0)
+        by = float((layer.box or {}).get("y", 0) or 0)
+        for child in layer.children or []:
+            rec(child, ox + bx, oy + by)
+
+    for root in layers:
+        rec(root, 0.0, 0.0)
+    return out
+
+
+def _erase_baked_ink(asset_arr, region, np, tolerance=26.0, uniform_fraction=0.62,
+                     ring=4, dilate=2):
+    """Erase baked text ink inside ``region`` of a carrier asset, plate-uniform regions only.
+
+    Returns ``"cleaned"``/``"noop"``/``"textured"``. ``region`` is (x0,y0,x1,y1) in asset
+    pixels. The plate colour is the median of a ring just outside the ink box; ink is any
+    pixel that differs from it beyond ``tolerance``. Only fires when the ring is genuinely
+    uniform (so a photo under the text is left untouched)."""
+    h, w = asset_arr.shape[:2]
+    x0, y0, x1, y1 = region
+    x0 = max(0, min(w, int(round(x0)))); x1 = max(0, min(w, int(round(x1))))
+    y0 = max(0, min(h, int(round(y0)))); y1 = max(0, min(h, int(round(y1))))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return "noop"
+    rx0 = max(0, x0 - ring); ry0 = max(0, y0 - ring)
+    rx1 = min(w, x1 + ring); ry1 = min(h, y1 + ring)
+    window = asset_arr[ry0:ry1, rx0:rx1, :3].astype(np.float32)
+    ring_mask = np.ones(window.shape[:2], dtype=bool)
+    ring_mask[(y0 - ry0):(y1 - ry0), (x0 - rx0):(x1 - rx0)] = False
+    ring_px = window[ring_mask]
+    if ring_px.shape[0] < 12:
+        return "noop"
+    plate = np.median(ring_px, axis=0)
+    near_ring = np.mean(np.max(np.abs(ring_px - plate), axis=1) <= tolerance)
+    if float(near_ring) < uniform_fraction:
+        return "textured"  # ring is not a uniform plate — a photo, leave it to the raster
+    interior = asset_arr[y0:y1, x0:x1, :3].astype(np.float32)
+    ink = np.max(np.abs(interior - plate), axis=2) > tolerance
+    if not ink.any():
+        return "noop"
+    if dilate > 0:
+        try:
+            cv2, _np, _ = _lazy_cv2()
+            kernel = _np.ones((2 * dilate + 1, 2 * dilate + 1), _np.uint8)
+            ink = cv2.dilate(ink.astype(_np.uint8), kernel) > 0
+        except Exception:
+            pass
+    patch = asset_arr[y0:y1, x0:x1]
+    patch[..., :3][ink] = plate.astype(asset_arr.dtype)
+    asset_arr[y0:y1, x0:x1] = patch
+    return "cleaned"
+
+
+def _lazy_cv2():
+    import cv2
+    import numpy as np
+    return cv2, np, None
+
+
+def _audit_single_ownership(layers, run_dir, canvas, warnings, cfg):
+    """Give native text sole ownership by erasing its baked duplicate from carriers beneath."""
+    scfg = ((cfg or {}).get("design") or {}).get("single_ownership") or {}
+    if not bool(scfg.get("enabled", True)):
+        return {"enabled": False, "collapsed": 0}
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception:
+        return {"enabled": False, "collapsed": 0, "reason": "numpy/PIL unavailable"}
+    overlap_frac = float(scfg.get("min_overlap_fraction", 0.55))
+    tolerance = float(scfg.get("ink_tolerance", 26.0))
+    uniform_fraction = float(scfg.get("uniform_fraction", 0.62))
+    flat = _flatten_abs(layers)
+
+    texts = []
+    for layer, ox, oy in flat:
+        if layer.type != "text" or not str(layer.text or "").strip():
+            continue
+        meta = layer.meta or {}
+        if fallback_kind(meta):  # raster slice / masked-pixel fallback: not native ink
+            continue
+        box = layer.box or {}
+        ink = meta.get("prefit_ink_box") or box
+        ax = ox + float(ink.get("x", box.get("x", 0)) or 0)
+        ay = oy + float(ink.get("y", box.get("y", 0)) or 0)
+        aw = float(ink.get("w", box.get("w", 0)) or 0)
+        ah = float(ink.get("h", box.get("h", 0)) or 0)
+        if aw <= 0 or ah <= 0:
+            continue
+        texts.append((layer, ax, ay, aw, ah))
+
+    carriers = []
+    for layer, ox, oy in flat:
+        if not layer.src:
+            continue
+        meta = layer.meta or {}
+        role = str(meta.get("role") or "").lower()
+        is_carrier = (
+            role in _OWNERSHIP_CARRIER_ROLES
+            or str(meta.get("source") or "").lower() == "inpaint"
+            or meta.get("plate_source") or meta.get("preserved_host_raster")
+            or meta.get("per_group_background") or fallback_kind(meta) == "raster-slice"
+        )
+        if not is_carrier:
+            continue
+        box = layer.box or {}
+        cw = float(box.get("w", 0) or 0)
+        ch = float(box.get("h", 0) or 0)
+        if cw <= 0 or ch <= 0:
+            continue
+        carriers.append({
+            "layer": layer, "x": ox + float(box.get("x", 0) or 0),
+            "y": oy + float(box.get("y", 0) or 0), "w": cw, "h": ch,
+        })
+
+    # Group erasures per physical asset so each PNG is opened/written once.
+    per_asset: dict = {}
+    plan = []
+    for tlayer, ax, ay, aw, ah in texts:
+        tz = float(tlayer.z_index or 0)
+        for carrier in carriers:
+            clayer = carrier["layer"]
+            if clayer is tlayer or float(clayer.z_index or 0) >= tz:
+                continue
+            ix0 = max(ax, carrier["x"]); iy0 = max(ay, carrier["y"])
+            ix1 = min(ax + aw, carrier["x"] + carrier["w"])
+            iy1 = min(ay + ah, carrier["y"] + carrier["h"])
+            if ix1 - ix0 <= 1 or iy1 - iy0 <= 1:
+                continue
+            if (ix1 - ix0) * (iy1 - iy0) < overlap_frac * (aw * ah):
+                continue
+            plan.append((carrier, tlayer, (ix0, iy0, ix1, iy1)))
+            per_asset.setdefault(str(clayer.src), carrier)
+
+    if not plan:
+        return {"enabled": True, "collapsed": 0, "carriers_cleaned": 0}
+
+    loaded: dict = {}
+    result = {"cleaned": 0, "textured": 0, "noop": 0, "assets": []}
+    for carrier, tlayer, (ix0, iy0, ix1, iy1) in plan:
+        clayer = carrier["layer"]
+        key = str(clayer.src)
+        if key not in loaded:
+            resolved = _resolve(clayer.src, run_dir)
+            if not resolved:
+                continue
+            try:
+                with Image.open(resolved) as image:
+                    arr = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+            except Exception as exc:
+                warnings.append({"code": "single-ownership-error", "layer_id": clayer.id,
+                                 "detail": str(exc)})
+                loaded[key] = None
+                continue
+            loaded[key] = {"arr": arr, "path": resolved, "dirty": False}
+        entry = loaded[key]
+        if entry is None:
+            continue
+        arr = entry["arr"]
+        ah_px, aw_px = arr.shape[:2]
+        sx = aw_px / max(1e-6, carrier["w"]); sy = ah_px / max(1e-6, carrier["h"])
+        region = ((ix0 - carrier["x"]) * sx, (iy0 - carrier["y"]) * sy,
+                  (ix1 - carrier["x"]) * sx, (iy1 - carrier["y"]) * sy)
+        status = _erase_baked_ink(arr, region, np, tolerance=tolerance,
+                                  uniform_fraction=uniform_fraction)
+        result[status] = result.get(status, 0) + 1
+        if status == "cleaned":
+            entry["dirty"] = True
+
+    for key, entry in loaded.items():
+        if entry and entry.get("dirty"):
+            try:
+                Image.fromarray(entry["arr"]).save(entry["path"])
+                result["assets"].append(os.path.relpath(entry["path"], run_dir))
+            except Exception as exc:
+                warnings.append({"code": "single-ownership-error", "detail": str(exc)})
+    return {
+        "enabled": True,
+        "collapsed": result["cleaned"],
+        "carriers_cleaned": len(result["assets"]),
+        "textured_skipped": result["textured"],
+        "noop": result["noop"],
+    }
 
 
 def _count_layers(layers):
@@ -1033,7 +1246,12 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
                     fill={"kind": "flat", "color": band["color"]},
                     constraints={"horizontal": "STRETCH",
                                  "vertical": "STRETCH" if len(solid_bands) == 1 else "TOP"},
-                    meta={"source": "solid-plate-band", "role": "background",
+                    # These editable rects ARE the clean inpaint plate, re-expressed as a
+                    # native solid fill (Codia's flat-UI strategy). Present source="inpaint"
+                    # so the clean-plate ownership gate treats them as the plate they are;
+                    # keep the synthesis provenance in plate_source.
+                    meta={"source": "inpaint", "plate_source": "solid-plate-band",
+                          "role": "background",
                           "z": -999_999 + index, "band_color": band["color"]},
                 ))
         # A radial-glow / smooth-gradient plate is emitted as an editable native gradient
@@ -1054,7 +1272,8 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
                     box={"x": 0, "y": 0, "w": canvas["w"], "h": canvas["h"]},
                     z_index=-999_999, fill=bg_gradient,
                     constraints={"horizontal": "STRETCH", "vertical": "STRETCH"},
-                    meta={"source": "background-gradient", "role": "background",
+                    meta={"source": "inpaint", "plate_source": "background-gradient",
+                          "role": "background",
                           "z": -999_999, "gradient": bg_gradient.get("meta")},
                 ))
 
@@ -1082,6 +1301,14 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
             _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings)
         except Exception as exc:
             warnings.append({"code": "group-background-error", "detail": str(exc)})
+    # Single-ownership enforcement (one owner per pixel): erase every native text layer's
+    # baked duplicate from the raster carrier beneath it so nothing double-renders.
+    single_ownership = {"enabled": False}
+    if base_src:
+        try:
+            single_ownership = _audit_single_ownership(layers, run_dir, canvas, warnings, cfg)
+        except Exception as exc:
+            warnings.append({"code": "single-ownership-error", "detail": str(exc)})
     # Per-dimension sizing inference (Codia DimensionSpec parity). Wrapped so a geometry
     # edge case can never break the compile — worst case sizing stays empty (= fixed).
     try:
@@ -1109,6 +1336,7 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
             "editable_ratio": round(editable / max(1, total), 4),
             "native_leaf_ratio": leaf_accounting["native_leaf_ratio"],
             "leaf_accounting": leaf_accounting,
+            "single_ownership": single_ownership,
             "warnings": warnings,
             "compiler": "scene-graph-v2",
             "coordinate_space": "local",

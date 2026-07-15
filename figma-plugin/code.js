@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.1.0","build":54,"commit":"c95a94a","dirty":true,"built_at":"2026-07-15T21:47:30Z","label":"v2.1.0+b54.c95a94a-dirty","source":"git"};
+const PLUGIN_BUILD = {"version":"2.1.0","build":55,"commit":"60f28f2","dirty":true,"built_at":"2026-07-15T22:23:13Z","label":"v2.1.0+b55.60f28f2-dirty","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,
@@ -56,6 +56,26 @@ function normalizedToken(value) {
     .trim()
     .replace(/[\s-]+/g, "_")
     .toUpperCase();
+}
+
+// Plugin API BlendMode enum (plugin-typings `type BlendMode`). An invalid token in a
+// Paint object makes the whole `fills`/`effects` array assignment throw, wiping every
+// other valid paint on the node — so unknown modes must degrade to NORMAL, not pass through.
+const BLEND_MODES = [
+  "PASS_THROUGH", "NORMAL", "DARKEN", "MULTIPLY", "LINEAR_BURN", "COLOR_BURN",
+  "LIGHTEN", "SCREEN", "LINEAR_DODGE", "COLOR_DODGE", "OVERLAY", "SOFT_LIGHT",
+  "HARD_LIGHT", "DIFFERENCE", "EXCLUSION", "HUE", "SATURATION", "COLOR", "LUMINOSITY",
+];
+
+function blendModeValue(value) {
+  let token = normalizedToken(value);
+  if (!token) return null;
+  // Aliases used by render_preview.py (`ADD`) and common CSS/PS vocab.
+  if (token === "ADD" || token === "PLUS_LIGHTER") token = "LINEAR_DODGE";
+  if (token === "SUBTRACT" || token === "PLUS_DARKER") token = "LINEAR_BURN";
+  if (token === "LIGHTEN_COLOR") token = "LIGHTEN";
+  if (token === "DARKEN_COLOR") token = "DARKEN";
+  return BLEND_MODES.indexOf(token) >= 0 ? token : null;
 }
 
 function layerId(layer, fallback) {
@@ -232,7 +252,10 @@ function gradientTransform(fill, box) {
     return supplied.map(function (row) { return row.map(Number); });
   }
   // Figma's gradientTransform maps the node's *normalized* (0-1 x 0-1) bounding box into
-  // paint space. It is not a plain rotation matrix: a rotation matrix built from a bare
+  // paint space; the identity matrix is a LEFT→RIGHT linear gradient with handles at
+  // (0,0.5)→(1,0.5), and the box is normalized per-axis (any aspect ratio becomes a 1×1
+  // square) — verified against the Paint docs + community references, so t = row0·[u,v,1].
+  // It is not a plain rotation matrix: a rotation matrix built from a bare
   // angle ignores the node's actual aspect ratio, so a 45-degree gradient on a wide,
   // short layer would render far steeper (skewed toward the shorter axis) than the same
   // angle rendered directly in pixel space. render_preview.py (the QA ground truth) always
@@ -286,7 +309,7 @@ function paintFromSpec(spec, box) {
   if (!kind || kind === "FLAT" || kind === "SOLID" || spec.color) {
     const paint = solidPaint(spec.color || "#000000", pick(spec, "opacity", "alpha"));
     paint.visible = pick(spec, "visible") !== false;
-    const blend = normalizedToken(pick(spec, "blend_mode", "blendMode"));
+    const blend = blendModeValue(pick(spec, "blend_mode", "blendMode"));
     if (blend) paint.blendMode = blend;
     return paint;
   }
@@ -317,7 +340,7 @@ function paintFromSpec(spec, box) {
       gradientStops: stops,
       opacity: opacityValue(spec.opacity, 1),
       visible: spec.visible !== false,
-      blendMode: normalizedToken(pick(spec, "blend_mode", "blendMode")) || "NORMAL",
+      blendMode: blendModeValue(pick(spec, "blend_mode", "blendMode")) || "NORMAL",
     };
   }
   return null;
@@ -396,7 +419,7 @@ function effectFromSpec(spec) {
       radius: Math.max(0, finite(pick(spec, "radius", "blur"), 8)),
       spread: finite(pick(spec, "spread"), 0),
       visible: spec.visible !== false,
-      blendMode: normalizedToken(pick(spec, "blend_mode", "blendMode")) || "NORMAL",
+      blendMode: blendModeValue(pick(spec, "blend_mode", "blendMode")) || "NORMAL",
     };
   }
   if (type === "BLUR" || type === "LAYER_BLUR" || type === "BACKGROUND_BLUR") {
@@ -449,10 +472,19 @@ function applyConstraints(node, layer, context) {
   }
   const source = layer.constraints;
   if (!source) return;
-  let horizontal = normalizedToken(pick(source, "horizontal", "x")) || "LEFT";
-  let vertical = normalizedToken(pick(source, "vertical", "y")) || "TOP";
-  if (horizontal === "STRETCH") horizontal = "LEFT_RIGHT";
-  if (vertical === "STRETCH") vertical = "TOP_BOTTOM";
+  // Plugin API ConstraintType is 'MIN' | 'CENTER' | 'MAX' | 'STRETCH' | 'SCALE'
+  // (plugin-typings). LEFT/RIGHT/TOP/BOTTOM and LEFT_RIGHT/TOP_BOTTOM are REST-API
+  // vocabulary only — assigning them throws and silently dropped every constraint,
+  // including the background plate's STRETCH emitted by build_design_json.
+  const CONSTRAINT_MAP = {
+    LEFT: "MIN", TOP: "MIN", START: "MIN", MIN: "MIN",
+    RIGHT: "MAX", BOTTOM: "MAX", END: "MAX", MAX: "MAX",
+    CENTER: "CENTER", CENTRE: "CENTER",
+    STRETCH: "STRETCH", LEFT_RIGHT: "STRETCH", TOP_BOTTOM: "STRETCH",
+    SCALE: "SCALE",
+  };
+  const horizontal = CONSTRAINT_MAP[normalizedToken(pick(source, "horizontal", "x"))] || "MIN";
+  const vertical = CONSTRAINT_MAP[normalizedToken(pick(source, "vertical", "y"))] || "MIN";
   safeSet(node, "constraints", { horizontal, vertical }, context, "Constraints could not be applied");
 }
 
@@ -468,9 +500,36 @@ function applyCommon(node, layer, context) {
   }
   safeSet(node, "opacity", opacityValue(pick(layer, "opacity"), 1), context);
   const rotation = finite(pick(layer, "rotation"), 0);
-  if (rotation) safeSet(node, "rotation", rotation, context);
-  const blend = normalizedToken(pick(layer, "blend_mode", "blendMode"));
-  if (blend) safeSet(node, "blendMode", blend, context, "Blend mode " + blend + " was not supported");
+  if (rotation) {
+    // design.json contract: `rotation` is degrees, CLOCKWISE-positive, about the BOX
+    // CENTER (render_preview.py:558-563 does PIL `tile.rotate(-rotation, expand)` and
+    // re-centers the expanded tile). Figma's node.rotation is COUNTERclockwise-positive
+    // ("Identical to Math.atan2(-m10, m00)") and pivots on the node's top-left, keeping
+    // x/y fixed ("The rotation is with respect to the top-left of the object";
+    // https://developers.figma.com/docs/plugins/api/properties/nodes-rotation/). So flip
+    // the sign, then translate so the visual center stays on the box center.
+    const centerX = finite(node.x, 0) + finite(node.width, 0) / 2;
+    const centerY = finite(node.y, 0) + finite(node.height, 0) / 2;
+    if (safeSet(node, "rotation", -rotation, context)) {
+      try {
+        const t = node.relativeTransform;
+        node.x = centerX - (t[0][0] * node.width + t[0][1] * node.height) / 2;
+        node.y = centerY - (t[1][0] * node.width + t[1][1] * node.height) / 2;
+      } catch (error) {
+        context.warn("Rotation pivot correction skipped", layerId(layer) + ": " + String(error && error.message || error));
+      }
+    }
+  }
+  const rawBlend = pick(layer, "blend_mode", "blendMode");
+  const blend = blendModeValue(rawBlend);
+  // design.json stamps "NORMAL" on every layer. Forcing that onto FRAME/GROUP nodes
+  // would replace Figma's default PASS_THROUGH and isolate the container's compositing,
+  // diverging from render_preview.py, which composites children straight onto the
+  // canvas. NORMAL is already the default for leaf nodes, so only non-NORMAL is set.
+  if (blend && blend !== "NORMAL") safeSet(node, "blendMode", blend, context, "Blend mode " + blend + " was not supported");
+  else if (!blend && rawBlend && normalizedToken(rawBlend) !== "NORMAL") {
+    context.fidelity("unsupported_blend", (layer.name || layerId(layer)) + " uses blend mode " + rawBlend + ", which Figma does not support; NORMAL was used.");
+  }
   if (layer.visible === false) safeSet(node, "visible", false, context);
   if (layer.locked === true) safeSet(node, "locked", true, context);
   applyConstraints(node, layer, context);
@@ -490,7 +549,10 @@ function setGeometry(node, layer, context, useVisible) {
   safeSet(node, "x", flowChild ? 0 : b.x, context);
   safeSet(node, "y", flowChild ? 0 : b.y, context);
   try {
-    node.resize(Math.max(0.01, b.w), Math.max(0.01, b.h));
+    // resize(): "height ... Must be >= 0.01, except for LineNode which must always be
+    // given a height of exactly 0" (plugin-typings / nodes-resize docs).
+    if (node.type === "LINE") node.resize(Math.max(0.01, b.w), 0);
+    else node.resize(Math.max(0.01, b.w), Math.max(0.01, b.h));
   } catch (error) {
     context.warn("Layer size could not be applied", layerId(layer) + ": " + String(error && error.message || error));
   }
@@ -593,7 +655,11 @@ class FontResolver {
     }
   }
 
-  async resolve(style, label) {
+  async resolve(style, label, options) {
+    // options.silent: skip report accounting — used by fitTextWithCandidates' retry
+    // loop, which re-resolves the same label up to 4 times and used to double-count
+    // fonts.requested (diluting the substitution stat in the UI report).
+    const silent = Boolean(options && options.silent);
     await this.ready;
     const requests = rankedFontRequests(style);
     const requested = requests[0];
@@ -628,34 +694,104 @@ class FontResolver {
     }
     const result = chosen.fontName;
     const substituted = chosenRank !== 0 || result.family.toLowerCase() !== requested.family.toLowerCase() || (requested.style && result.style.toLowerCase() !== requested.style.toLowerCase());
-    this.context.report.fonts.requested += 1;
-    this.context.report.fonts.selections.push({
-      label: label || "Text",
-      requested: requested.family + (requested.style ? " " + requested.style : ""),
-      selected: result.family + " " + result.style,
-      rank: chosenRank >= 0 ? chosenRank + 1 : null,
-      score: chosenRank >= 0 && Number.isFinite(requests[chosenRank].score) ? requests[chosenRank].score : null,
-    });
-    if (substituted) {
-      this.context.report.fonts.substituted += 1;
-      const rankDetail = chosenRank > 0
-        ? "candidate #" + (chosenRank + 1) + (Number.isFinite(requests[chosenRank].score) ? " (score " + requests[chosenRank].score.toFixed(3) + ")" : "")
-        : chosenRank === 0 ? "closest installed style" : "generic Figma fallback";
-      this.context.warn(
-        chosenRank > 0 ? "Ranked font candidate selected" : "Font substituted",
-        (label || "Text") + ": " + requested.family + (requested.style ? " " + requested.style : "") + " → " + result.family + " " + result.style + " · " + rankDetail
-      );
+    if (!silent) {
+      this.context.report.fonts.requested += 1;
+      this.context.report.fonts.selections.push({
+        label: label || "Text",
+        requested: requested.family + (requested.style ? " " + requested.style : ""),
+        selected: result.family + " " + result.style,
+        rank: chosenRank >= 0 ? chosenRank + 1 : null,
+        score: chosenRank >= 0 && Number.isFinite(requests[chosenRank].score) ? requests[chosenRank].score : null,
+      });
+      if (substituted) {
+        this.context.report.fonts.substituted += 1;
+        const rankDetail = chosenRank > 0
+          ? "candidate #" + (chosenRank + 1) + (Number.isFinite(requests[chosenRank].score) ? " (score " + requests[chosenRank].score.toFixed(3) + ")" : "")
+          : chosenRank === 0 ? "closest installed style" : "generic Figma fallback";
+        this.context.warn(
+          chosenRank > 0 ? "Ranked font candidate selected" : "Font substituted",
+          (label || "Text") + ": " + requested.family + (requested.style ? " " + requested.style : "") + " → " + result.family + " " + result.style + " · " + rankDetail
+        );
+      }
     }
-    await this.load(result);
-    return result;
+    // loadFontAsync can still reject (corrupt local font, shared-font permissions).
+    // A rejection here used to unwind createTextLayer mid-build; degrade to any
+    // loadable default instead so the layer ships with a warning, never a throw.
+    try {
+      await this.load(result);
+      return result;
+    } catch (loadError) {
+      const emergency = [
+        { family: "Inter", style: "Regular" },
+        { family: "Roboto", style: "Regular" },
+        { family: "Arial", style: "Regular" },
+      ].concat(this.fonts.slice(0, 5).map(function (entry) { return entry.fontName; }));
+      for (let i = 0; i < emergency.length; i += 1) {
+        const candidate = emergency[i];
+        if (candidate.family === result.family && candidate.style === result.style) continue;
+        try {
+          await this.load(candidate);
+          this.context.report.fonts.substituted += 1;
+          this.context.warn(
+            "Font failed to load — default used",
+            (label || "Text") + ": " + result.family + " " + result.style + " could not be loaded (" +
+              String(loadError && loadError.message || loadError) + ") → " + candidate.family + " " + candidate.style
+          );
+          return candidate;
+        } catch (_) {}
+      }
+      // Nothing loadable at all: surface the original failure; compileLayer's
+      // per-layer catch contains it and removes the partial node.
+      throw loadError;
+    }
   }
 
   async load(fontName) {
     const key = fontName.family + "\u0000" + fontName.style;
     if (!this.loaded.has(key)) this.loaded.set(key, figma.loadFontAsync(fontName));
-    return this.loaded.get(key);
+    try {
+      return await this.loaded.get(key);
+    } catch (error) {
+      // Never cache a rejection: a cached rejected promise would rethrow for every
+      // later layer that asks for this font, even where a retry could succeed.
+      this.loaded.delete(key);
+      throw error;
+    }
   }
 }
+
+// ---------------------------------------------------------------------------
+// design.json ↔ Figma unit contract (matches src/build_design_json.py +
+// src/text_analysis.py fit_text_box + src/render_preview.py, verified against
+// the plugin API type definitions):
+//
+//   fontSize        bare number  → pixels (Figma minimum 1).
+//   lineHeight      bare number  → { unit: "PIXELS" } (fit_text_box emits px, e.g.
+//                   46.32). "N%" strings / { unit } objects → PERCENT. Absent or
+//                   "auto" → { unit: "AUTO" } (LineHeight type: PIXELS|PERCENT|AUTO).
+//   letterSpacing   bare number  → { unit: "PIXELS" } per-gap tracking, exactly what
+//                   fit_text_box/_line_advance measures. "N%"/{ unit } → PERCENT
+//                   (LetterSpacing type: PIXELS|PERCENT). Interpreting these px
+//                   values as percent is the "tracked-out UPFRONT" failure class.
+//   paragraphSpacing bare number → pixels.
+//   autoResize      "WIDTH"  → textAutoResize WIDTH_AND_HEIGHT, single-line label
+//                              grows from its alignment anchor;
+//                   "HEIGHT" → fixed width, auto height (wrapped paragraphs);
+//                   "NONE"   → fixed box, no reflow (fit_text_box had no font).
+//   preFitted/fit   preFitted:true + fit:false → Python already fitted size/tracking
+//                   to the painted box; the plugin must NOT refit, only place.
+//   rotation        degrees, CLOCKWISE-positive, about the BOX CENTER (CSS/PIL
+//                   convention; preview does tile.rotate(-rotation) + re-center).
+//                   Figma is CCW-positive about the top-left → applyCommon flips
+//                   the sign and re-anchors the center.
+//   gradient angle  0° = left→right, increasing clockwise (y-down pixel space),
+//                   aspect-corrected — see gradientTransform() below.
+//   coordinate_space "local" (schema v2): every child box is relative to its
+//                   parent layer's box; mask boxes share the PARENT-relative space
+//                   of their layer's box.
+//   constraints     REST-style tokens (LEFT/RIGHT/TOP/BOTTOM/STRETCH/…) → plugin
+//                   ConstraintType MIN/CENTER/MAX/STRETCH/SCALE via applyConstraints.
+// ---------------------------------------------------------------------------
 
 function lineHeightValue(value) {
   if (value === undefined || value === null || value === "auto") return { unit: "AUTO" };
@@ -681,10 +817,25 @@ function spacingValue(value) {
 }
 
 function textCaseValue(style) {
-  const explicit = normalizedToken(pick(style, "textCase", "text_case", "case"));
-  if (explicit) return explicit;
+  // Plugin API TextCase = 'ORIGINAL' | 'UPPER' | 'LOWER' | 'TITLE' | 'SMALL_CAPS' |
+  // 'SMALL_CAPS_FORCED' (plugin-typings). CSS-ish tokens are normalized; anything
+  // else must fall back to ORIGINAL — an invalid enum on assignment throws and used
+  // to take the whole text layer down.
+  let explicit = normalizedToken(pick(style, "textCase", "text_case", "case"));
+  if (explicit === "UPPERCASE") explicit = "UPPER";
+  if (explicit === "LOWERCASE") explicit = "LOWER";
+  if (explicit === "CAPITALIZE" || explicit === "TITLE_CASE") explicit = "TITLE";
+  if (["ORIGINAL", "UPPER", "LOWER", "TITLE", "SMALL_CAPS", "SMALL_CAPS_FORCED"].indexOf(explicit) >= 0) return explicit;
   if (style.uppercase === true) return "UPPER";
   return "ORIGINAL";
+}
+
+function textDecorationValue(value) {
+  // Plugin API TextDecoration = 'NONE' | 'UNDERLINE' | 'STRIKETHROUGH' (plugin-typings).
+  let token = normalizedToken(value);
+  if (token === "UNDERLINED") token = "UNDERLINE";
+  if (token === "LINE_THROUGH" || token === "STRIKE" || token === "STRIKE_THROUGH") token = "STRIKETHROUGH";
+  return ["NONE", "UNDERLINE", "STRIKETHROUGH"].indexOf(token) >= 0 ? token : null;
 }
 
 function alignmentValue(value, fallback) {
@@ -718,7 +869,18 @@ function normalizedRuns(layer, content) {
     const inferredEnd = run.text !== undefined ? start + String(run.text).length : content.length;
     const end = clamp(finite(pick(run, "end", "to"), inferredEnd), start, content.length);
     cursor = end;
-    return { start, end, style: Object.assign({}, run.typography || {}, run.style || {}, run) };
+    // Merge order matters: run-level direct fields are the base; the nested
+    // typography/style objects override them. Spreading `run` LAST used to inject the
+    // run's own `style` OBJECT as a property, so requestedFont() picked it up via the
+    // "style" key and produced fontStyle "[object Object]", disabling exact style
+    // matching for every rich-text run. Strip the container keys after merging.
+    const merged = Object.assign({}, run, run.typography || {}, run.style || {});
+    delete merged.typography;
+    delete merged.style;
+    delete merged.text;
+    delete merged.start;
+    delete merged.end;
+    return { start, end, style: merged };
   }).filter(function (run) { return run.end > run.start; });
 }
 
@@ -743,7 +905,7 @@ async function applyTextRuns(node, layer, content, context) {
       if (spacing) node.setRangeLetterSpacing(run.start, run.end, spacing);
       const lh = pick(style, "lineHeight", "line_height", "leading");
       if (lh !== undefined) node.setRangeLineHeight(run.start, run.end, lineHeightValue(lh));
-      const decoration = normalizedToken(pick(style, "textDecoration", "text_decoration", "decoration"));
+      const decoration = textDecorationValue(pick(style, "textDecoration", "text_decoration", "decoration"));
       if (decoration) node.setRangeTextDecoration(run.start, run.end, decoration);
       const textCase = textCaseValue(style);
       if (textCase !== "ORIGINAL") node.setRangeTextCase(run.start, run.end, textCase);
@@ -837,7 +999,8 @@ async function fitTextWithCandidates(node, layer, style, context, hasRuns) {
         fontWeight: request.weight,
         italic: request.italic,
       }),
-      layer.name || layerId(layer)
+      layer.name || layerId(layer),
+      { silent: true }
     );
     node.fontName = resolved;
     node.fontSize = initialFontSize(style, layer);
@@ -845,6 +1008,20 @@ async function fitTextWithCandidates(node, layer, style, context, hasRuns) {
     const overflow = Math.max(0, node.width - target.w) + Math.max(0, node.height - target.h);
     if (overflow < best.overflow) best = { rank, overflow, fontName: resolved, fontSize: node.fontSize };
     if (overflow <= 0.75) break;
+  }
+  if (best.rank > 0 && best.fontName && best.fontName.family) {
+    // The retry loop is silent; surface the final non-primary winner exactly once.
+    context.report.fonts.selections.push({
+      label: layer.name || layerId(layer),
+      requested: requests[0].family + (requests[0].style ? " " + requests[0].style : ""),
+      selected: best.fontName.family + " " + best.fontName.style,
+      rank: best.rank + 1,
+      score: Number.isFinite(requests[best.rank].score) ? requests[best.rank].score : null,
+    });
+    context.warn(
+      "Fit selected ranked font candidate",
+      (layer.name || layerId(layer)) + ": candidate #" + (best.rank + 1) + " fit best (overflow " + best.overflow.toFixed(2) + "px)"
+    );
   }
   node.fontName = best.fontName;
   node.fontSize = best.fontSize;
@@ -928,6 +1105,12 @@ async function fitTextToVisibleBox(node, layer, style, context, hasRuns) {
     node.resize(Math.max(1, target.w), Math.max(1, target.h));
   } else if (autoResizeHint === "WIDTH" || autoResizeHint === "WIDTH_AND_HEIGHT") {
     node.textAutoResize = multiline ? "HEIGHT" : "WIDTH_AND_HEIGHT";
+  } else if (autoResizeHint === "NONE") {
+    // fit_text_box emits "NONE" when it had no usable font metrics: keep the painted
+    // box exactly ("NONE: The size of the textbox is fixed and is independent of its
+    // content" — TextNode.textAutoResize docs) instead of letting the box grow.
+    node.textAutoResize = "NONE";
+    node.resize(Math.max(1, target.w), Math.max(1, target.h));
   } else if (multiline) {
     node.textAutoResize = "HEIGHT";
     node.resize(Math.max(1, target.w), Math.max(1, target.h));
@@ -1059,8 +1242,10 @@ async function createTextLayer(layer, parent, context) {
   node.textAlignVertical = verticalAlignmentValue(pick(style, "verticalAlign", "vertical_align"), "TOP");
   safeSet(node, "leadingTrim", normalizedToken(pick(style, "leadingTrim", "leading_trim")) || "CAP_HEIGHT", context, "Cap-height trim was not available for this font");
   node.textCase = textCaseValue(style);
-  const decoration = normalizedToken(pick(style, "textDecoration", "text_decoration", "decoration"));
+  const decoration = textDecorationValue(pick(style, "textDecoration", "text_decoration", "decoration"));
   if (decoration) node.textDecoration = decoration;
+  const paragraphSpacing = finite(pick(style, "paragraphSpacing", "paragraph_spacing"), NaN);
+  if (Number.isFinite(paragraphSpacing)) safeSet(node, "paragraphSpacing", Math.max(0, paragraphSpacing), context);
   // Text can use the same native paint model as shapes: solid, gradient, or multiple
   // layered fills. This keeps outlined/gradient text editable instead of rasterizing it.
   applyFills(node, layer, context, false);
@@ -1150,7 +1335,12 @@ function svgForLayer(layer) {
       (capSvg ? ' stroke-linecap="' + capSvg + '"' : "") + (joinSvg ? ' stroke-linejoin="' + joinSvg + '"' : "") +
       (dashSvg ? ' stroke-dasharray="' + dashSvg + '"' : "") + (pathOpacity < 1 ? ' opacity="' + pathOpacity + '"' : "") + '/>';
   }).join("");
-  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="' + vx + " " + vy + " " + vw + " " + vh + '">' + body + "</svg>";
+  // Explicit width/height matter: createNodeFromSvg is "equivalent to the SVG import
+  // feature in the editor", and FrameNode.resize afterwards would NOT scale the
+  // imported vector children — only the browser-style width/height↔viewBox mapping
+  // scales the actual geometry to the layer box.
+  return '<svg xmlns="http://www.w3.org/2000/svg" width="' + box.w + '" height="' + box.h +
+    '" viewBox="' + vx + " " + vy + " " + vw + " " + vh + '">' + body + "</svg>";
 }
 
 function maskLayerFor(mask, layer) {
@@ -1169,16 +1359,51 @@ function maskLayerFor(mask, layer) {
   return result;
 }
 
+// createNodeFromSvg is synchronous and parses the whole document up front; multi-MB
+// SVGs (runaway autotrace output) can stall the plugin sandbox for a long time.
+const SVG_IMPORT_CHAR_LIMIT = 1500000;
+
 async function createVectorLayer(layer, parent, context) {
   const svg = svgForLayer(layer);
-  if (!svg) throw new Error("Vector layer has no SVG or path geometry");
+  // Icon/vector layers routed by build_design_json usually also stage the original
+  // PNG crop under `src` — that is the sanctioned raster fallback when native SVG
+  // import cannot work. (This beats Codia's flatten-everything default: we only
+  // rasterize the single failing layer and say so in the report.)
+  const rasterSource = pick(layer, "src", "source", "asset", "asset_path", "assetPath");
+  const hasRasterFallback = Boolean(bytesForAsset(context, rasterSource));
+  async function rasterFallback(reason) {
+    context.fidelity("vector_raster_fallback", (layer.name || layerId(layer)) + ": " + reason + "; the staged PNG crop was used instead.");
+    return createImageLayer(layer, parent, context);
+  }
+  if (!svg) {
+    if (hasRasterFallback) return rasterFallback("no SVG or path geometry");
+    throw new Error("Vector layer has no SVG or path geometry");
+  }
+  if (svg.length > SVG_IMPORT_CHAR_LIMIT) {
+    if (hasRasterFallback) return rasterFallback("SVG too large to import safely (" + svg.length + " chars)");
+    throw new Error("SVG too large to import (" + svg.length + " chars, limit " + SVG_IMPORT_CHAR_LIMIT + ")");
+  }
   let node;
   try {
     node = figma.createNodeFromSvg(svg);
   } catch (error) {
-    throw new Error("SVG import failed: " + String(error && error.message || error));
+    const message = "SVG import failed: " + String(error && error.message || error);
+    if (hasRasterFallback) return rasterFallback(message);
+    throw new Error(message);
   }
   parent.appendChild(node);
+  // svgForLayer emits width/height = layer box, so generated markup arrives
+  // pre-scaled. Raw upstream <svg> strings may disagree with the box; resizing the
+  // wrapper frame would only clip, so let resize() scale the contents through SCALE
+  // constraints ("resize ... applies those constraints during resizing").
+  const target = localBox(layer, context, false);
+  if ((Math.abs(node.width - target.w) > 0.5 || Math.abs(node.height - target.h) > 0.5) && node.children) {
+    try {
+      node.children.forEach(function (child) {
+        safeSet(child, "constraints", { horizontal: "SCALE", vertical: "SCALE" }, context);
+      });
+    } catch (_) {}
+  }
   setGeometry(node, layer, context, false);
   applyCommon(node, layer, context);
   return node;
@@ -1191,13 +1416,17 @@ function bytesForAsset(context, source) {
   return raw instanceof Uint8Array ? raw : new Uint8Array(raw);
 }
 
-function imagePaint(image, layer) {
+function requestedScaleMode(layer) {
   const imageSpec = pick(layer, "image", "image_fill", "imageFill") || {};
   const requested = normalizedToken(pick(imageSpec, "scale_mode", "scaleMode") || pick(layer, "scale_mode", "scaleMode"));
-  const allowed = ["FILL", "FIT", "CROP", "TILE"];
+  return ["FILL", "FIT", "CROP", "TILE"].indexOf(requested) >= 0 ? requested : null;
+}
+
+function imagePaint(image, layer) {
+  const imageSpec = pick(layer, "image", "image_fill", "imageFill") || {};
   const paint = {
     type: "IMAGE",
-    scaleMode: allowed.indexOf(requested) >= 0 ? requested : "FILL",
+    scaleMode: requestedScaleMode(layer) || "FILL",
     imageHash: image.hash,
     opacity: opacityValue(pick(imageSpec, "opacity"), 1),
     visible: true,
@@ -1207,12 +1436,15 @@ function imagePaint(image, layer) {
     paint.scaleMode = "CROP";
     paint.imageTransform = transform;
   }
-  // ImagePaint.rotation is only valid in increments of 90 degrees (0/90/180/270); Figma
-  // throws on any other value, which would otherwise take down the whole image layer.
-  // Snap to the closest supported increment instead of passing an arbitrary angle through.
-  const rawRotation = finite(pick(imageSpec, "rotation"), 0);
-  const rotation = ((Math.round(rawRotation / 90) * 90) % 360 + 360) % 360;
-  if (rotation) paint.rotation = rotation;
+  // ImagePaint.rotation is only valid in increments of 90 degrees (0/90/180/270) and
+  // only when scaleMode is TILE/FILL/FIT — it is "automatic for CROP" (Paint docs).
+  // Figma throws on any other value, which would otherwise take down the whole image
+  // layer. Snap to the closest supported increment instead of passing an angle through.
+  if (paint.scaleMode !== "CROP") {
+    const rawRotation = finite(pick(imageSpec, "rotation"), 0);
+    const rotation = ((Math.round(rawRotation / 90) * 90) % 360 + 360) % 360;
+    if (rotation) paint.rotation = rotation;
+  }
   return paint;
 }
 
@@ -1226,7 +1458,15 @@ function createMaskGeometry(mask, layer, parent, context) {
     proxy.fill = "#ffffff";
     const svg = svgForLayer(proxy);
     if (!svg) return null;
-    const node = figma.createNodeFromSvg(svg);
+    let node;
+    try {
+      node = figma.createNodeFromSvg(svg);
+    } catch (error) {
+      // A broken mask must not take the image down with it: returning null keeps the
+      // (unmasked) image, and the caller reports the degradation.
+      if (context && context.warn) context.warn("Mask geometry import failed", String(error && error.message || error) + "; the image was left unmasked.");
+      return null;
+    }
     parent.appendChild(node);
     setGeometry(node, proxy, context, false);
     return node;
@@ -1257,7 +1497,9 @@ async function createImageLayer(layer, parent, context) {
   try {
     image = figma.createImage(bytes);
   } catch (error) {
-    throw new Error("Image could not be decoded: " + String(source) + " — " + String(error && error.message || error));
+    // createImage: "must be encoded as a PNG, JPEG, or GIF. Images have a maximum
+    // size of 4096 pixels (4K) in width and height. Invalid images will throw."
+    throw new Error("Image could not be decoded: " + String(source) + " — " + String(error && error.message || error) + " (Figma accepts PNG/JPEG/GIF up to 4096×4096)");
   }
   context.report.assets.loaded += 1;
   const mask = layer.mask || {};
@@ -1266,25 +1508,37 @@ async function createImageLayer(layer, parent, context) {
     (pick(mask, "box", "bounds") || ["x", "y", "w", "h", "width", "height", "left", "top"].some(function (key) { return mask[key] !== undefined; }));
   const shapeClipped = maskKind === "ELLIPSE" || maskKind === "CIRCLE" || maskKind === "RRECT" || maskKind === "ROUNDED_RECT";
   const needsMaskGroup = maskKind === "PATH" || mask.path || mask.svg || (maskKind === "ALPHA" && pick(mask, "src", "source", "asset"));
+  const layerBox = boxOf(layer);
+  // Inner image/mask nodes that live inside a clip/mask WRAPPER frame need
+  // frame-relative coordinates: the wrapper's origin IS the layer box, so shift
+  // local (parent-relative, schema v2) boxes by -box. Without this the image sat
+  // displaced by its own box offset inside its mask frame (the audit-flagged
+  // image-in-mask defect). The UNWRAPPED path must keep using the plain `context`:
+  // its node is a direct sibling in the parent, so parent-relative coordinates are
+  // already correct (using innerContext there collapsed plain images to 0,0).
+  // Legacy absolute boxes are handled by sourceOrigin in both cases.
   const innerContext = Object.assign({}, context, {
     sourceOrigin: childSourceOrigin(layer, context),
-    localOffset: { x: 0, y: 0 },
+    localOffset: { x: -layerBox.x, y: -layerBox.y },
   });
 
-  function buildImageShape(targetParent) {
+  function buildImageShape(targetParent, geometryContext) {
     let node;
     if (maskKind === "ELLIPSE" || maskKind === "CIRCLE") node = figma.createEllipse();
     else node = figma.createRectangle();
     targetParent.appendChild(node);
-    setGeometry(node, directMaskGeometry ? maskLayerFor(mask, layer) : layer, innerContext, false);
+    setGeometry(node, directMaskGeometry ? maskLayerFor(mask, layer) : layer, geometryContext, false);
     const paint = imagePaint(image, layer);
-    if (shapeClipped && !paint.imageTransform) paint.scaleMode = "FILL";
+    // Cover the clip shape by default, but keep an explicitly requested FIT/TILE.
+    if (shapeClipped && !paint.imageTransform && !requestedScaleMode(layer)) paint.scaleMode = "FILL";
     node.fills = [paint];
     if (maskKind === "RRECT" || maskKind === "ROUNDED_RECT") {
       node.cornerRadius = Math.max(0, finite(pick(mask, "radius", "corner_radius", "cornerRadius"), finite(pick(layer, "radius"), 16)));
     }
     applyStrokes(node, layer, context);
-    applyEffects(node, layer, context);
+    // Effects are deliberately NOT applied here: applyCommon on the returned top-level
+    // node applies them once; applying them on the inner shape too doubled drop shadows
+    // in the wrapped (mask/clip frame) paths.
     node.name = (layer.name || layerId(layer)) + " — image";
     return node;
   }
@@ -1295,18 +1549,26 @@ async function createImageLayer(layer, parent, context) {
     setGeometry(frame, layer, context, false);
     safeSet(frame, "clipsContent", true, context);
     applyRadius(frame, layer, context);
-    const imageNode = buildImageShape(frame);
+    const imageNode = buildImageShape(frame, innerContext);
     let maskNode = null;
     const maskSource = pick(mask, "src", "source", "asset", "asset_path", "assetPath");
     if (maskKind === "ALPHA" && maskSource) {
       const maskBytes = bytesForAsset(context, maskSource);
       if (maskBytes) {
-        const maskImage = figma.createImage(maskBytes);
-        maskNode = figma.createRectangle();
-        frame.appendChild(maskNode);
-        setGeometry(maskNode, maskLayerFor(mask, layer), innerContext, false);
-        maskNode.fills = [{ type: "IMAGE", scaleMode: "FILL", imageHash: maskImage.hash }];
-        context.report.assets.loaded += 1;
+        try {
+          const maskImage = figma.createImage(maskBytes);
+          maskNode = figma.createRectangle();
+          frame.appendChild(maskNode);
+          setGeometry(maskNode, maskLayerFor(mask, layer), innerContext, false);
+          maskNode.fills = [{ type: "IMAGE", scaleMode: "FILL", imageHash: maskImage.hash }];
+          context.report.assets.loaded += 1;
+        } catch (maskError) {
+          // createImage rejects non-PNG/JPEG/GIF data and images over 4096×4096; a bad
+          // mask must degrade to "no mask", not abort the image layer.
+          context.report.assets.missing += 1;
+          context.warn("Alpha mask could not be decoded", String(maskSource) + ": " + String(maskError && maskError.message || maskError) + "; the image's own transparency was used.");
+          maskNode = null;
+        }
       } else {
         context.report.assets.missing += 1;
         context.warn("Alpha mask missing", String(maskSource) + "; the image's own transparency was used.");
@@ -1317,6 +1579,10 @@ async function createImageLayer(layer, parent, context) {
     if (maskNode) {
       safeSet(maskNode, "isMask", true, context, "Mask could not be enabled");
       const group = figma.group([maskNode, imageNode], frame);
+      // "A mask node masks all of its *subsequent* siblings — siblings listed after it
+      // in the children array" (isMask docs). Pin the mask to children[0] explicitly so
+      // the content is masked regardless of how figma.group ordered the pair.
+      try { group.insertChild(0, maskNode); } catch (_) {}
       safeSet(maskNode, "isMask", true, context, "Mask could not be enabled");
       maskNode.name = (layer.name || layerId(layer)) + " — mask";
       imageNode.name = (layer.name || layerId(layer)) + " — image";
@@ -1334,18 +1600,19 @@ async function createImageLayer(layer, parent, context) {
     setGeometry(frame, layer, context, false);
     safeSet(frame, "clipsContent", true, context);
     applyRadius(frame, layer, context);
-    const node = buildImageShape(frame);
-    node.x = 0;
-    node.y = 0;
-    if ("layoutSizingHorizontal" in node) {
-      safeSet(node, "layoutSizingHorizontal", "FILL", context);
-      safeSet(node, "layoutSizingVertical", "FILL", context);
+    const node = buildImageShape(frame, innerContext);
+    if (!directMaskGeometry) {
+      node.x = 0;
+      node.y = 0;
     }
+    // Note: layoutSizing FILL is only legal on auto-layout children
+    // (layoutSizingHorizontal docs) — this clip frame is a plain frame, so the old
+    // FILL assignment threw on every clipped image and only produced warning noise.
     applyCommon(frame, layer, context);
     return frame;
   }
 
-  const node = buildImageShape(parent);
+  const node = buildImageShape(parent, context);
   applyCommon(node, layer, context);
   return node;
 }
@@ -1610,6 +1877,52 @@ function applyButtonTextLayout(node, layer, context) {
   if ("textAlignHorizontal" in node) node.textAlignHorizontal = "CENTER";
 }
 
+// Normalize a per-dimension sizing token (design.json layer.sizing.w/h, Codia
+// DimensionSpec vocabulary) to the Figma unified enum FIXED|HUG|FILL, or "" if unknown.
+function sizingToken(value) {
+  const token = normalizedToken(value);
+  if (token === "FILL") return "FILL";
+  if (token === "HUG" || token === "FIT" || token === "FIT_CONTENT" || token === "CONTENT" || token === "AUTO") return "HUG";
+  if (token === "FIXED" || token === "EXACT" || token === "ABSOLUTE") return "FIXED";
+  return "";
+}
+
+// Map a sizing token onto layoutSizingHorizontal/Vertical with the EXACT legality guards
+// from the Figma plugin docs (developers.figma.com/docs/plugins, AutoLayoutMixin —
+// "HUG is only valid on auto-layout frames and text nodes"; "FILL is only valid on
+// auto-layout children"; setting a value that doesn't apply THROWS). We pre-check so we
+// don't emit expected-illegal warnings, and still route through safeSet as a backstop so
+// no single axis can abort the layer. Must run AFTER appendChild (parent known) and, for
+// HUG on a frame, AFTER the frame's own layoutMode is set — true at every call site.
+function applyAxisSizing(node, axis, token, context) {
+  if (!token) return false;
+  const key = axis === "horizontal" ? "layoutSizingHorizontal" : "layoutSizingVertical";
+  if (!(key in node)) return false;
+  const parent = node.parent;
+  const parentAuto = Boolean(parent && ("layoutMode" in parent) && parent.layoutMode && parent.layoutMode !== "NONE") &&
+    normalizedToken(node.layoutPositioning) !== "ABSOLUTE";
+  const selfAuto = ("layoutMode" in node) && node.layoutMode && node.layoutMode !== "NONE";
+  const isText = node.type === "TEXT";
+  if (token === "FILL" && !parentAuto) return false;         // FILL only on auto-layout children
+  if (token === "HUG" && !(isText || selfAuto)) return false; // HUG only on auto-layout frames & text
+  return safeSet(node, key, token, context, "Could not set " + key);
+}
+
+// Apply design.json layer.sizing (first-class per-dimension modes) to a node. TEXT hug/
+// fill must agree with textAutoResize — a WIDTH_AND_HEIGHT text cannot FILL its width
+// (Figma throws), so a width-FILL paragraph is switched to height-only auto-resize first.
+function applyLayerSizing(node, layer, context) {
+  const sizing = layer && layer.sizing;
+  if (!sizing || typeof sizing !== "object") return;
+  const horizontal = sizingToken(pick(sizing, "w", "width", "horizontal"));
+  const vertical = sizingToken(pick(sizing, "h", "height", "vertical"));
+  if (node.type === "TEXT" && "textAutoResize" in node && horizontal === "FILL" && node.textAutoResize === "WIDTH_AND_HEIGHT") {
+    safeSet(node, "textAutoResize", "HEIGHT", context);
+  }
+  applyAxisSizing(node, "horizontal", horizontal, context);
+  applyAxisSizing(node, "vertical", vertical, context);
+}
+
 function applyChildLayout(node, layer, context) {
   const layout = layer.layout || {};
   const positioning = normalizedToken(pick(layout, "positioning", "position", "layoutPositioning", "layout_positioning"));
@@ -1627,6 +1940,8 @@ function applyChildLayout(node, layer, context) {
     const value = pick(layout, key, snake);
     if (value !== undefined) safeSet(node, key, value === null ? null : Math.max(0, finite(value, 0)), context);
   });
+  // First-class per-dimension sizing wins over the legacy layout-dict hints above.
+  applyLayerSizing(node, layer, context);
 }
 
 function applyAutoLayout(node, layer, childResults, context) {
@@ -1674,6 +1989,11 @@ function applyAutoLayout(node, layer, childResults, context) {
       node.resize(Math.max(0.01, node.width || original.w), Math.max(0.01, original.h));
       if ("primaryAxisSizingMode" in node) node.primaryAxisSizingMode = "AUTO";
     }
+    // First-class per-dimension sizing on the CONTAINER itself (Codia DimensionSpec —
+    // e.g. hug the stacking axis). Applied last so it wins over the resize()/axis-mode
+    // logic above, which resets sizing to FIXED. HUG is legal here (this node has
+    // layoutMode); FILL is guarded to only stick when this frame is itself an AL child.
+    applyLayerSizing(node, layer, context);
   } catch (error) {
     context.warn("Auto Layout partially applied", (layer.name || layerId(layer)) + ": " + String(error && error.message || error));
   }
@@ -1735,20 +2055,41 @@ async function createGroupLayer(layer, parent, context) {
     depth: context.depth + 1,
   });
   const nodes = [];
-  for (let i = 0; i < children.length; i += 1) {
-    const result = await compileLayer(children[i], staging, childContext);
-    if (result) nodes.push(result);
+  let group = null;
+  try {
+    for (let i = 0; i < children.length; i += 1) {
+      const result = await compileLayer(children[i], staging, childContext);
+      if (result) nodes.push(result);
+    }
+    if (!nodes.length) throw new Error("Group has no compilable children");
+    // Group BEFORE removing the staging frame: node.remove() deletes a node AND its
+    // descendants, so the old remove-first order handed figma.group a list of
+    // already-deleted nodes and the whole group failed to import.
+    group = figma.group(nodes, parent);
+  } finally {
+    if (staging.parent) {
+      try { staging.remove(); } catch (_) {}
+    }
   }
-  staging.remove();
-  if (!nodes.length) throw new Error("Group has no compilable children");
-  const group = figma.group(nodes, parent);
-  setGeometry(group, layer, context, false);
+  // figma.group "keeps all the grouped layers in the same absolute x/y locations"
+  // (plugin docs), so the fresh group's x/y is the children's union corner — and the
+  // children were compiled at group-LOCAL coordinates. Translate the whole group by
+  // the group's origin instead of snapping the union corner to it (which shifted
+  // content whenever the leftmost child did not start at local 0). Never resize a
+  // GROUP to the design box either: group resize scales children, which the QA
+  // preview renderer never does.
+  if (!isFlowAutoLayoutChild(layer, context)) {
+    group.x += groupBox.x;
+    group.y += groupBox.y;
+  }
   applyCommon(group, layer, context);
   return group;
 }
 
 async function compileLayer(layer, parent, context) {
-  if (context.cancelled) {
+  // context objects are shallow-copied per child scope, so a mutable `cancelled` on
+  // the root context never reached nested layers; the shared `flags` object does.
+  if (context.cancelled || (context.flags && context.flags.cancelled)) {
     const error = new Error("Import cancelled");
     error.code = "CANCELLED";
     throw error;
@@ -1761,6 +2102,10 @@ async function compileLayer(layer, parent, context) {
     total: context.total,
     message: "Building " + (layer.name || layerId(layer)) + "…",
   });
+  // Every create* function appends its node(s) to `parent` before styling them, so a
+  // mid-build failure would otherwise leave a half-styled orphan in the tree.
+  // Snapshot the child count and roll back anything this layer appended.
+  const childCountBefore = parent && Array.isArray(parent.children) ? parent.children.length : null;
   try {
     let node = null;
     if (type === "text") node = await createTextLayer(layer, parent, context);
@@ -1774,6 +2119,16 @@ async function compileLayer(layer, parent, context) {
     context.report.byType[type] = (context.report.byType[type] || 0) + 1;
     return node;
   } catch (error) {
+    if (childCountBefore !== null) {
+      try {
+        while (parent.children.length > childCountBefore) {
+          parent.children[parent.children.length - 1].remove();
+        }
+      } catch (_) {}
+    }
+    // Cancellation is not a per-layer defect: let it unwind (each level cleans its
+    // own partial nodes on the way up) so buildDocument can discard the root.
+    if (error && error.code === "CANCELLED") throw error;
     context.report.skipped += 1;
     context.error("Layer failed", (layer.name || layerId(layer)) + ": " + String(error && error.message || error));
     return null;
@@ -1878,6 +2233,10 @@ function makeContext(doc, assets, settings, handoff) {
     sourceOrigin: { x: 0, y: 0 },
     localOffset: { x: 0, y: 0 },
     cancelled: false,
+    // Shared by REFERENCE through every Object.assign child-context copy, so a
+    // cancel request reaches nested compileLayer calls (a bare boolean would be
+    // frozen into each copy).
+    flags: { cancelled: false },
     report,
     fonts: null,
     textStyles: new Map(),
@@ -1907,7 +2266,10 @@ function makeContext(doc, assets, settings, handoff) {
 }
 
 async function buildDocument(message) {
-  if (activeJob) activeJob.cancelled = true;
+  if (activeJob) {
+    activeJob.cancelled = true;
+    if (activeJob.flags) activeJob.flags.cancelled = true;
+  }
   const doc = message.design || {};
   if (!doc.canvas || !Array.isArray(doc.layers)) {
     post("build-result", { report: { ok: false, created: 0, skipped: 0, warnings: [], errors: [{ title: "Invalid document", detail: "design.json needs canvas and layers." }] } });
@@ -1926,15 +2288,19 @@ async function buildDocument(message) {
     roundtrip_token: message.roundtrip_token,
   });
   activeJob = context;
-  context.localTextStyles = await localTextStyles();
-  const existingRoots = findImportedRoots(context.docId);
-  const replacement = selectedImportedRoot(context.docId) || latestImportedRoot(existingRoots);
-  const position = rootPlacement(doc, importMode, existingRoots, replacement);
-  const canvas = doc.canvas || {};
-  const width = Math.max(1, finite(pick(canvas, "w", "width"), 1080));
-  const height = Math.max(1, finite(pick(canvas, "h", "height"), 1080));
   let root = null;
   try {
+    // Everything that touches the live document (currentPage.findAll, viewport,
+    // getLocalTextStyles) lives inside the try so a real-Figma throw from the
+    // pre-flight scan degrades into a clean build-result error instead of rejecting
+    // out of onmessage as an uncaught exception. These were previously above the try.
+    context.localTextStyles = await localTextStyles();
+    const existingRoots = findImportedRoots(context.docId);
+    const replacement = selectedImportedRoot(context.docId) || latestImportedRoot(existingRoots);
+    const position = rootPlacement(doc, importMode, existingRoots, replacement);
+    const canvas = doc.canvas || {};
+    const width = Math.max(1, finite(pick(canvas, "w", "width"), 1080));
+    const height = Math.max(1, finite(pick(canvas, "h", "height"), 1080));
     post("progress", { phase: "compile", current: 0, total: context.total, message: "Preparing Figma layers…" });
     root = figma.createFrame();
     root.name = String(doc.name || "Ad reconstruction");
@@ -1951,7 +2317,7 @@ async function buildDocument(message) {
     root.setPluginData("adDecompilerImportedAt", String(Date.now()));
     const layers = sortLayers(doc.layers);
     for (let i = 0; i < layers.length; i += 1) await compileLayer(layers[i], root, context);
-    if (context.cancelled) {
+    if (context.cancelled || context.flags.cancelled) {
       const cancelled = new Error("Import cancelled");
       cancelled.code = "CANCELLED";
       throw cancelled;
@@ -1975,8 +2341,18 @@ async function buildDocument(message) {
     // frame instead of merely leaving one duplicate. Everything from here on is
     // best-effort and reported as a warning rather than allowed to unwind the swap.
     if (importMode === "replace" && replacement && replacement !== root) {
-      replacement.remove();
-      context.report.replaced = true;
+      try {
+        replacement.remove();
+        context.report.replaced = true;
+      } catch (removeError) {
+        // The previous import can vanish (user deleted it) or resist removal while
+        // this build ran. That must never unwind into the catch below — with
+        // `replaced` still false it would delete the freshly built root too.
+        context.warn(
+          "Previous import was not removed",
+          String(removeError && removeError.message || removeError) + " — the new frame is still in place; remove the old one manually if it survived."
+        );
+      }
     }
     context.report.ok = true;
     context.report.rootId = root.id;
@@ -2020,20 +2396,43 @@ async function buildDocument(message) {
 }
 
 figma.ui.onmessage = async function (message) {
-  if (!message || !message.type) return;
-  if (message.type === "ui-ready") {
-    const saved = await figma.clientStorage.getAsync(SETTINGS_KEY).catch(function () { return null; });
-    post("init", { settings: Object.assign({}, DEFAULT_SETTINGS, saved || {}), build: PLUGIN_BUILD });
-    return;
+  // Outermost containment: no handler — including buildDocument's own setup and any
+  // future message type — may ever reject out of onmessage. An uncaught rejection here
+  // is exactly what surfaces to the user as a plugin crash. buildDocument already posts
+  // its own build-result on failure; this guard is a last-resort net for everything
+  // else (settings I/O, unexpected message shapes) so the import UI never wedges.
+  try {
+    if (!message || !message.type) return;
+    if (message.type === "ui-ready") {
+      const saved = await figma.clientStorage.getAsync(SETTINGS_KEY).catch(function () { return null; });
+      post("init", { settings: Object.assign({}, DEFAULT_SETTINGS, saved || {}), build: PLUGIN_BUILD });
+      return;
+    }
+    if (message.type === "save-settings") {
+      const settings = Object.assign({}, DEFAULT_SETTINGS, message.settings || {});
+      await figma.clientStorage.setAsync(SETTINGS_KEY, settings).catch(function () {});
+      return;
+    }
+    if (message.type === "cancel") {
+      if (activeJob) {
+        activeJob.cancelled = true;
+        if (activeJob.flags) activeJob.flags.cancelled = true;
+      }
+      return;
+    }
+    if (message.type === "build") await buildDocument(message);
+  } catch (error) {
+    // buildDocument contains its own failures; reaching here means a non-build handler
+    // or buildDocument's own pre-try setup threw. Report a clean error to the UI and
+    // notify, but never rethrow.
+    try {
+      post("build-result", {
+        report: {
+          ok: false, created: 0, skipped: 0, warnings: [],
+          errors: [{ title: "Plugin error", detail: String(error && error.message || error) }],
+        },
+      });
+    } catch (_) {}
+    try { figma.notify("Ad Decompiler hit an unexpected error", { error: true }); } catch (_) {}
   }
-  if (message.type === "save-settings") {
-    const settings = Object.assign({}, DEFAULT_SETTINGS, message.settings || {});
-    await figma.clientStorage.setAsync(SETTINGS_KEY, settings).catch(function () {});
-    return;
-  }
-  if (message.type === "cancel") {
-    if (activeJob) activeJob.cancelled = true;
-    return;
-  }
-  if (message.type === "build") await buildDocument(message);
 };

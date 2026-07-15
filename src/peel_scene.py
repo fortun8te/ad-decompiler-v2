@@ -86,6 +86,23 @@ SCENE_DEFAULTS = {
     "text_occluders": "box",     # box | off — see docs (ghost-text vs box overfill)
     "refine_alpha": False,       # matting-refine cutout EDGES (needs a matting callable)
     "refine_band_px": 3,         # width of the edge band the matting may adjust
+    # ── detection-granularity guard (element eligibility for the gate) ──
+    "require_eligible": True,    # gate needs BOTH pair members to be solid elements
+    "min_cc_frac": 0.80,         # largest connected component ≥ this fraction of mask
+    "max_hole_frac": 0.25,       # interior holes ≤ this fraction of (mask + holes)
+    # ── fill-quality knobs ──
+    "context_shadow_px": 12,     # blind this band around the hole from the inpaint
+                                 # context — occluder drop shadows / AA halos live just
+                                 # outside the detection mask and smear the fill
+    # flat-fill fast path (solid-color holes, e.g. cards/plates under products):
+    # sample a ring BEYOND the shadow band; when ≥ flat_fill_inlier_frac of ring pixels
+    # sit within ±flat_fill_tol of the ring median, the surface is flat — fill with the
+    # inlier median (crisper than any inpainter, robust to shadow/edge contamination).
+    "flat_fill_tol": 0.0,        # per-pixel max-channel deviation; 0 = off (module
+                                 # default; config.yaml enables it for pipeline runs)
+    "flat_fill_inlier_frac": 0.60,
+    "flat_fill_ring_px": 16,     # ring width sampled beyond the shadow band
+    "flat_fill_min_px": 40,      # minimum inlier samples required to trust the ring
 }
 
 
@@ -169,13 +186,27 @@ _KIND_BAND = {
 }
 
 
+def _band_of(element: "SceneElement") -> int:
+    """Semantic z band for one element: the MAX over its ``kind`` and its detected
+    ``role`` (meta) — fusion often reports kind="photo-fragment" (band 5) for what the
+    detector role-tags as a product/person cutout (band 20); the role is the stronger
+    stacking signal (a product cutout rides ON TOP of the card it sits on, a
+    photo-fragment panel sits under it)."""
+    fallback = 40 if element.is_text else 10
+    bands = [b for b in (
+        _KIND_BAND.get(str(element.kind).lower()),
+        _KIND_BAND.get(str((element.meta or {}).get("role") or "").lower()),
+    ) if b is not None]
+    return max(bands) if bands else fallback
+
+
 def derive_z_order(elements: list) -> list:
     """Assign unique integer ``z`` (higher = front) to SceneElements missing one.
 
-    Heuristic mirror of reconstruct's ownership priority: semantic band first, then a
-    strict-containment boost (a mask sitting mostly inside another is on top of it),
-    then smaller-area-in-front.  Elements that already carry distinct ``z`` values are
-    left untouched.
+    Heuristic mirror of reconstruct's ownership priority: semantic band first (max of
+    kind band and role band, see ``_band_of``), then a strict-containment boost (a mask
+    sitting mostly inside another is on top of it), then smaller-area-in-front.
+    Elements that already carry distinct ``z`` values are left untouched.
     """
     _, np, _ = _deps()
     zs = [e.z for e in elements]
@@ -191,7 +222,7 @@ def derive_z_order(elements: list) -> list:
             if inter / areas[a.id] >= 0.85 and areas[a.id] < areas[b.id]:
                 contained_in[a.id] += 1     # a rides on top of b
     ranked = sorted(elements, key=lambda e: (
-        _KIND_BAND.get(str(e.kind).lower(), 10 if not e.is_text else 40),
+        _band_of(e),
         contained_in[e.id],
         -areas[e.id],
         e.id,
@@ -266,10 +297,67 @@ def elements_from_run(run_dir: str, fused_elements: list, canvas: dict,
     return out
 
 
-# ── overlap gate ───────────────────────────────────────────────────────────────────
+# ── overlap gate + detection-granularity guard ──────────────────────────────────────
 
 def _tight_bbox(mask) -> dict:
     return peel_decompose._tight_bbox(mask)
+
+
+def mask_integrity(mask) -> dict:
+    """Fragmentation metrics for one full-canvas bool mask (computed on its tight crop).
+
+    * ``cc_frac`` — largest connected component / total mask area.  A residual
+      "photo-fragment" mask (the plate minus everything else, swiss-cheese) scores
+      ~0.5 with hundreds of components; a genuine cutout scores ~1.0 with one.
+    * ``hole_frac`` — interior holes (background regions NOT reachable from the crop
+      border) / (mask + holes).  Perforated masks make hopeless inpaint context.
+    """
+    cv2, np, _ = _deps()
+    m = np.asarray(mask, bool)
+    area = int(np.count_nonzero(m))
+    if area == 0:
+        return {"area": 0, "components": 0, "cc_frac": 0.0, "hole_frac": 1.0}
+    box = _tight_bbox(m)
+    crop = m[box["y"]:box["y"] + box["h"], box["x"]:box["x"] + box["w"]].astype(np.uint8)
+    ncc, labels = cv2.connectedComponents(crop)
+    counts = np.bincount(labels.ravel(), minlength=ncc)
+    largest = int(counts[1:].max()) if ncc > 1 else 0
+    ninv, inv_labels = cv2.connectedComponents((crop == 0).astype(np.uint8))
+    border = np.unique(np.concatenate([inv_labels[0], inv_labels[-1],
+                                       inv_labels[:, 0], inv_labels[:, -1]]))
+    inv_counts = np.bincount(inv_labels.ravel(), minlength=ninv)
+    holes = int(inv_counts[1:].sum() - sum(inv_counts[b] for b in border if b != 0))
+    return {"area": area, "components": int(ncc - 1),
+            "cc_frac": round(largest / max(1, area), 4),
+            "hole_frac": round(holes / max(1, area + holes), 4)}
+
+
+def element_eligibility(element: SceneElement, cfg: Optional[dict] = None) -> dict:
+    """Detection-granularity guard: is this element solid enough for peel to trust?
+
+    Peel is only as good as the elements it is fed.  A residual/fragmented mask (e.g.
+    the "photo panel minus persons minus product" leftovers fusion sometimes emits) can
+    neither be a trustworthy occluder footprint nor provide clean inpaint context — a
+    pair involving one must not switch peel on.  Text and background/plate kinds are
+    never eligible pair members (text stays native; the plate is the single-plate
+    path's job).
+    """
+    if element.is_text:
+        return {"eligible": False, "reason": "text"}
+    if str(element.kind).lower() in ("background", "plate"):
+        return {"eligible": False, "reason": "background-plate"}
+    opts = _options(cfg)
+    info = mask_integrity(element.mask)
+    if info["cc_frac"] < float(opts["min_cc_frac"]):
+        return {"eligible": False, "integrity": info,
+                "reason": (f"fragmented-mask (largest component {info['cc_frac']:.0%} "
+                           f"of {info['components']} pieces < "
+                           f"{float(opts['min_cc_frac']):.0%})")}
+    if info["hole_frac"] > float(opts["max_hole_frac"]):
+        return {"eligible": False, "integrity": info,
+                "reason": (f"perforated-mask (interior holes {info['hole_frac']:.0%} > "
+                           f"{float(opts['max_hole_frac']):.0%})")}
+    return {"eligible": True, "reason": "ok", "integrity": info}
 
 
 def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
@@ -279,14 +367,20 @@ def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
     at least ``peel.min_overlap_frac`` of the smaller element's area.  Peel is *needed*
     only when some qualifying pair covers a NON-TEXT under-layer — an element sitting
     on nothing but background is already handled by the single-plate path, and text
-    under-layers stay native.
+    under-layers stay native — AND (with ``peel.require_eligible``, the default) BOTH
+    pair members pass the detection-granularity guard (``element_eligibility``): two
+    distinct, solid, non-plate elements with a genuine overlap.  Qualifying pairs
+    blocked only by eligibility are counted in ``blocked_qualifying`` so the skip
+    reason can say exactly what detection failed to surface.
     """
     _, np, _ = _deps()
     opts = _options(cfg)
     min_area = int(opts["min_overlap_area"])
     min_frac = float(opts["min_overlap_frac"])
+    require_eligible = bool(opts.get("require_eligible", True))
     boxes = {e.id: _tight_bbox(e.mask) for e in elements}
     areas = {e.id: int(np.count_nonzero(e.mask)) for e in elements}
+    eligibility = {e.id: element_eligibility(e, cfg) for e in elements if not e.is_text}
     ordered = sorted(elements, key=lambda e: -e.z)
     pairs = []
     for i, top in enumerate(ordered):
@@ -302,12 +396,25 @@ def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
                 continue
             frac = inter / max(1, min(areas[top.id], areas[under.id]))
             qualifies = inter >= min_area and frac >= min_frac
+            eligible = (not top.is_text and not under.is_text
+                        and eligibility.get(top.id, {}).get("eligible", False)
+                        and eligibility.get(under.id, {}).get("eligible", False))
             pairs.append({"top": top.id, "under": under.id, "area": inter,
-                          "frac": round(frac, 5), "under_is_text": under.is_text,
-                          "qualifies": qualifies})
-    needed = any(p["qualifies"] and not p["under_is_text"] for p in pairs)
-    return {"pairs": pairs, "needed": needed,
-            "thresholds": {"min_overlap_area": min_area, "min_overlap_frac": min_frac}}
+                          "frac": round(frac, 5), "top_is_text": top.is_text,
+                          "under_is_text": under.is_text,
+                          "qualifies": qualifies, "eligible": eligible})
+    element_pairs = [p for p in pairs if p["qualifies"]
+                     and not p["top_is_text"] and not p["under_is_text"]]
+    activating = [p for p in element_pairs if p["eligible"] or not require_eligible]
+    blocked = [p for p in element_pairs if not p["eligible"]]
+    return {"pairs": pairs, "needed": bool(activating),
+            "blocked_qualifying": len(blocked),
+            "eligibility": {eid: {k: v for k, v in e.items() if k != "integrity"}
+                            for eid, e in eligibility.items()},
+            "thresholds": {"min_overlap_area": min_area, "min_overlap_frac": min_frac,
+                           "min_cc_frac": float(opts["min_cc_frac"]),
+                           "max_hole_frac": float(opts["max_hole_frac"]),
+                           "require_eligible": require_eligible}}
 
 
 # ── the layer-owner hole split ─────────────────────────────────────────────────────
@@ -427,6 +534,22 @@ def _fill_region(flat, layer_rgb, element_mask, visible, write, inpaint,
     layers (the seam-bleed failure).  Only ``write`` pixels are copied back.  When the
     layer is almost fully covered there is no usable context; degrade honestly to an
     unisolated fill and record it in the returned note.
+
+    Fill-quality passes (both isolation-preserving by construction — they only ever
+    consult ``visible`` pixels of THIS layer):
+
+    * **Shadow blinding** (``peel.context_shadow_px``): occluder drop shadows and
+      anti-aliased halos live just OUTSIDE the detection mask, so they survive in the
+      visible context ring and smear gray into the fill.  The band around the hole is
+      marked unknown for the inpaint call (but never written back), so the filler
+      reads clean context beyond it.
+    * **Flat-fill fast path** (``peel.flat_fill_tol`` > 0): sample a ring beyond the
+      shadow band; when most ring pixels agree with the ring median (inlier fraction),
+      the hole is a solid-color surface (card/plate/tube body) — fill with the inlier
+      median directly.  Crisper than any inpainter on flat surfaces, and robust to
+      minority contamination (shadows, seams) that inflate a naive std.
+
+    Returns ``{"isolated": bool, "backend": "solid" | "inpaint"}``.
     """
     _, np, _ = _deps()
     h, w = flat.shape[:2]
@@ -435,11 +558,36 @@ def _fill_region(flat, layer_rgb, element_mask, visible, write, inpaint,
     crop = flat[y0:y1, x0:x1]
     visible_crop = visible[y0:y1, x0:x1]
     write_crop = write[y0:y1, x0:x1]
+    region = layer_rgb[y0:y1, x0:x1]
 
     mask_area = max(1, int(np.count_nonzero(element_mask)))
     isolated = (int(np.count_nonzero(visible)) / mask_area) >= float(opts["min_context_frac"])
+    shadow_px = max(0, int(opts.get("context_shadow_px") or 0))
+
+    # Flat-fill applies to ELEMENT-class holes only: text holes are small, local, and
+    # sit on gradients often enough that a global median leaves a tone-mismatched
+    # fringe — the router's LaMa preserves local shading there.
+    flat_tol = float(opts.get("flat_fill_tol") or 0.0)
+    if flat_tol > 0 and isolated and not meta.get("text_occluder"):
+        inner = _dilate_px(write_crop, shadow_px) if shadow_px else write_crop
+        ring = _dilate_px(write_crop, shadow_px + int(opts["flat_fill_ring_px"])) \
+               & ~inner & visible_crop
+        samples = crop[ring].astype(np.float64)
+        if samples.shape[0] >= int(opts["flat_fill_min_px"]):
+            med = np.median(samples, axis=0)
+            inlier = np.abs(samples - med).max(axis=1) <= flat_tol
+            if (float(inlier.mean()) >= float(opts["flat_fill_inlier_frac"])
+                    and int(inlier.sum()) >= int(opts["flat_fill_min_px"])):
+                color = np.round(np.median(samples[inlier], axis=0)).astype(np.uint8)
+                region[write_crop] = color
+                return {"isolated": True, "backend": "solid"}
+
     if isolated:
         call_mask = np.logical_or(~visible_crop, write_crop)
+        if shadow_px:
+            blinded = call_mask | _dilate_px(write_crop, shadow_px)
+            if not blinded.all():        # keep SOME context; else stay unblinded
+                call_mask = blinded
     else:
         call_mask = _dilate_px(write_crop, int(opts["hole_dilate_px"]))
     meta = dict(meta, isolated_context=bool(isolated))
@@ -450,9 +598,8 @@ def _fill_region(flat, layer_rgb, element_mask, visible, write, inpaint,
     filled = np.asarray(filled, dtype=np.uint8)
     if filled.shape != crop.shape:
         raise ValueError(f"inpaint returned {filled.shape}, expected {crop.shape}")
-    region = layer_rgb[y0:y1, x0:x1]
     region[write_crop] = filled[write_crop]
-    return isolated
+    return {"isolated": isolated, "backend": "inpaint"}
 
 
 # ── the peel ───────────────────────────────────────────────────────────────────────
@@ -492,8 +639,24 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
 
     report = overlap_report(elements, cfg)
     if not report["needed"] and not force:
+        # Distinguish "nothing overlaps" from "overlaps exist but detection did not
+        # surface solid distinct elements for them" (the granularity guard, §"When
+        # peel runs" in docs/PEEL-DECOMPOSITION.md).
+        if report.get("blocked_qualifying"):
+            blocked_ids = {mid for p in report["pairs"]
+                           if p["qualifies"] and not p["under_is_text"]
+                           and not p.get("top_is_text") and not p["eligible"]
+                           for mid in (p["top"], p["under"])}
+            reasons = {eid: e["reason"]
+                       for eid, e in (report.get("eligibility") or {}).items()
+                       if not e["eligible"] and eid in blocked_ids}
+            reason = ("no-eligible-overlap: " + "; ".join(
+                f"{eid}: {why}" for eid, why in sorted(reasons.items()))
+                if reasons else "no-eligible-overlap")
+        else:
+            reason = "no-overlap"
         return ScenePeelResult(layers=[], background=None, canvas=canvas, skipped=True,
-                               skip_reason="no-overlap", overlap=report)
+                               skip_reason=reason, overlap=report)
 
     if inpaint is None:
         inpaint = peel_decompose.opencv_inpaint
@@ -548,13 +711,15 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
                 # ONLY inside this layer's own mask — a pixel outside mask(L) was
                 # never L's to begin with, so it is never synthesized into L.
                 write = _dilate_px(class_mask, dilate) & mask if dilate else class_mask
-                isolated = _fill_region(
+                fill_info = _fill_region(
                     flat, rgb, mask, visible, write, inpaint, accepts_meta,
                     {"under_id": element.id, "under_kind": element.kind,
                      "occluder_ids": class_occluders, "text_occluder": is_text_class},
                     opts)
-                if not isolated:
+                if not fill_info["isolated"]:
                     meta["low_context_fill"] = True
+                meta.setdefault("fill_backends", []).append(
+                    {"text_occluder": is_text_class, "backend": fill_info["backend"]})
         # Visible pixels are flat-image originals by construction (rgb started as a
         # copy of flat and only `write ⊆ mask` pixels were rewritten).
         rgba = np.dstack([rgb, alpha])
@@ -597,11 +762,14 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
                 if not class_mask.any():
                     continue
                 write = _dilate_px(class_mask, dilate)
-                _fill_region(flat, plate, np.ones((h, w), bool), ~_dilate_px(union, dilate),
-                             write, inpaint, accepts_meta,
-                             {"under_id": "background", "under_kind": "background",
-                              "occluder_ids": class_occluders,
-                              "text_occluder": is_text_class}, opts)
+                fill_info = _fill_region(
+                    flat, plate, np.ones((h, w), bool), ~_dilate_px(union, dilate),
+                    write, inpaint, accepts_meta,
+                    {"under_id": "background", "under_kind": "background",
+                     "occluder_ids": class_occluders,
+                     "text_occluder": is_text_class}, opts)
+                bg_meta.setdefault("fill_backends", []).append(
+                    {"text_occluder": is_text_class, "backend": fill_info["backend"]})
         bg_meta["background"] = "inpainted"
 
     result = ScenePeelResult(layers=layers, background=plate, canvas=canvas,

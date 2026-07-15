@@ -421,6 +421,121 @@ def test_elements_from_run_loads_masks_and_text_occluders(tmp_path):
     assert {e.id for e in no_text} == {"E000", "E001"}
 
 
+# ── detection-granularity guard ────────────────────────────────────────────────────
+
+def _fragmented_mask(box, step=8):
+    """A swiss-cheese residual mask (checkerboard of small tiles) — the shape fusion
+    emits for 'photo panel minus persons minus product' leftovers."""
+    m = np.zeros((H, W), bool)
+    x0, y0, x1, y1 = box
+    for y in range(y0, y1, step):
+        for x in range(x0, x1, step):
+            if ((x // step) + (y // step)) % 2 == 0:
+                m[y:min(y + step // 2, y1), x:min(x + step // 2, x1)] = True
+    return m
+
+
+def test_mask_integrity_metrics():
+    solid = peel_scene.mask_integrity(_rect_mask((20, 20, 120, 120)))
+    assert solid["components"] == 1 and solid["cc_frac"] == 1.0 and solid["hole_frac"] == 0.0
+    frag = peel_scene.mask_integrity(_fragmented_mask((20, 20, 220, 220)))
+    assert frag["components"] > 50 and frag["cc_frac"] < 0.5
+    ring = _rect_mask((20, 20, 120, 120)) & ~_rect_mask((45, 45, 95, 95))
+    donut = peel_scene.mask_integrity(ring)
+    assert donut["components"] == 1 and donut["hole_frac"] > 0.2
+    empty = peel_scene.mask_integrity(np.zeros((H, W), bool))
+    assert empty["area"] == 0 and not empty["cc_frac"]
+
+
+def test_granularity_guard_blocks_fragmented_under_layer():
+    """Peel is only as good as the elements it is fed: an occluder over a residual
+    swiss-cheese 'panel' must NOT switch peel on — the guard skips with a reason."""
+    frag = _fragmented_mask((20, 20, 220, 320))
+    circle = _circle_mask()
+    flat = np.full((H, W, 3), BG, np.uint8)
+    flat[frag] = BLUE
+    flat[circle] = RED
+    elements = [SceneElement(id="panel", mask=frag, z=0.0, kind="photo-fragment"),
+                SceneElement(id="circle", mask=circle, z=1.0, kind="product")]
+    report = peel_scene.overlap_report(elements, _cfg())
+    assert report["needed"] is False and report["blocked_qualifying"] >= 1
+    assert report["eligibility"]["panel"]["eligible"] is False
+    assert "fragmented" in report["eligibility"]["panel"]["reason"]
+    assert report["eligibility"]["circle"]["eligible"] is True
+
+    result = peel_scene.peel_scene(flat, elements, inpaint=SpyInpaint(), cfg=_cfg())
+    assert result.skipped
+    assert result.skip_reason.startswith("no-eligible-overlap")
+    assert "panel" in result.skip_reason and "fragmented" in result.skip_reason
+
+    # The guard is opt-out for research runs.
+    loose = peel_scene.overlap_report(elements, _cfg(require_eligible=False))
+    assert loose["needed"] is True
+
+
+def test_granularity_guard_passes_solid_pairs_and_ignores_text_only_activation():
+    flat, elements, _ = _scene()
+    report = peel_scene.overlap_report(elements, _cfg())
+    assert report["needed"] is True and report["blocked_qualifying"] == 0
+    assert all(e["eligible"] for e in report["eligibility"].values())
+    # Text-over-element pairs alone must not activate peel (text stays native;
+    # activation needs a genuine element-over-element pair).
+    text = SceneElement(id="t", mask=_rect_mask((40, 40, 200, 80)), z=1.0,
+                        kind="text", is_text=True)
+    under = SceneElement(id="photo", mask=_rect_mask((20, 20, 220, 320)), z=0.0,
+                         kind="photo")
+    assert peel_scene.overlap_report([under, text], _cfg())["needed"] is False
+
+
+# ── role-aware z bands ─────────────────────────────────────────────────────────────
+
+def test_role_band_puts_product_cutout_above_the_card_it_sits_on():
+    """Fusion tags product cutouts kind='photo-fragment' (band 5) but role='product'
+    (band 20); the role must win or the card is treated as the occluder (inverted z)."""
+    card = SceneElement(id="card", mask=_rect_mask((20, 20, 420, 320)), z=0.0,
+                        kind="shape", meta={"role": "shape"})
+    product = SceneElement(id="product", mask=_rect_mask((100, 100, 220, 280)), z=0.0,
+                           kind="photo-fragment", meta={"role": "product"})
+    peel_scene.derive_z_order([card, product])
+    assert product.z > card.z
+    report = peel_scene.overlap_report([card, product], _cfg())
+    assert report["needed"] is True
+    pair = next(p for p in report["pairs"] if p["qualifies"])
+    assert (pair["top"], pair["under"]) == ("product", "card")
+
+
+# ── flat-fill fast path ────────────────────────────────────────────────────────────
+
+def test_flat_fill_fills_solid_holes_exactly_without_calling_the_inpainter():
+    flat, elements, masks = _scene()
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(flat, elements, inpaint=spy,
+                                   cfg=_cfg(flat_fill_tol=6.0))
+    # Element-class holes are all flat here — only TEXT-class holes reach the
+    # inpainter (flat-fill is element-class only; text stays with the router).
+    assert all(c["meta"]["text_occluder"] for c in spy.calls)
+    left = result.layer("left")
+    hole = masks["circle"] & masks["left"]
+    assert np.all(left.rgba[:, :, :3][hole] == BLUE)       # exact, no Telea blur
+    right = result.layer("right")
+    assert np.all(right.rgba[:, :, :3][masks["circle"] & masks["right"]] == GREEN)
+    backends = {b["text_occluder"]: b["backend"] for b in left.meta["fill_backends"]}
+    assert backends == {False: "solid", True: "inpaint"}
+    assert result.meta["recomposite"]["exact"] is True
+
+
+def test_flat_fill_defers_to_the_inpainter_on_textured_context():
+    rng = np.random.default_rng(7)
+    flat = rng.integers(0, 255, (H, W, 3), np.uint8)       # loud texture everywhere
+    under = _rect_mask((20, 20, 220, 320))
+    top = _circle_mask()
+    elements = [SceneElement(id="under", mask=under, z=0.0),
+                SceneElement(id="top", mask=top, z=1.0)]
+    spy = SpyInpaint()
+    peel_scene.peel_scene(flat, elements, inpaint=spy, cfg=_cfg(flat_fill_tol=6.0))
+    assert any(c["meta"]["under_id"] == "under" for c in spy.calls)
+
+
 # ── artifacts ──────────────────────────────────────────────────────────────────────
 
 def test_write_outputs_manifest(tmp_path):
