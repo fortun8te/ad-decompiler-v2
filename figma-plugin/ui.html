@@ -611,6 +611,12 @@
       border-left: 2px solid color-mix(in srgb, var(--text-danger) 70%, var(--border));
     }
 
+    .result-actions {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+
     .result-head {
       display: flex;
       align-items: flex-start;
@@ -1550,6 +1556,9 @@
               <div class="result-copy" id="resultCopy">Ready on canvas.</div>
             </div>
           </div>
+          <div class="result-actions">
+            <button class="text-action" id="importAnotherButton" type="button">Import another image</button>
+          </div>
         </div>
       </section>
 
@@ -1634,7 +1643,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.1.0","build":51,"commit":"a8d9a3e","dirty":false,"built_at":"2026-07-15T15:08:25Z","label":"v2.1.0+b51.a8d9a3e","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.1.0","build":52,"commit":"12b2248","dirty":false,"built_at":"2026-07-15T15:11:17Z","label":"v2.1.0+b52.12b2248","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -3181,6 +3190,14 @@
       setFooter(ok ? "Import complete" : (report.cancelled ? "Cancelled" : "Import failed"));
     }
 
+    function resetForAnotherImport() {
+      $("resultSection").classList.add("hidden");
+      hideIssues();
+      $("uploadInput").value = "";
+      $("uploadZone").focus();
+      setFooter("Choose another image to process");
+    }
+
     async function postBuildReport(report) {
       recordLog("info", "Compiler report", "", { report: report });
       await flushLogs(true);
@@ -3280,6 +3297,12 @@
       cancelProcessing();
     });
     $("issueDismiss").addEventListener("click", hideIssues);
+    $("importAnotherButton").addEventListener("click", resetForAnotherImport);
+    $("connection").addEventListener("click", function () {
+      if (state.uploading || state.building) return;
+      setConnection("checking", "Checking");
+      refreshLatest({ silent: false });
+    });
     $("loadFiles").addEventListener("click", function () { $("fileInput").click(); });
     $("loadFilesFooter").addEventListener("click", function () { $("fileInput").click(); });
     $("fileInput").addEventListener("change", function (event) { loadFiles(event.target.files); });
