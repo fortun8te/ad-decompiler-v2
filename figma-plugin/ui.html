@@ -651,6 +651,9 @@
     .primary-button {
       width: 100%;
       min-height: 38px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
       border-radius: var(--radius-md);
       background: linear-gradient(180deg, var(--brand-hover) 0%, var(--brand) 48%, var(--brand-pressed) 100%);
       color: var(--text-onbrand);
@@ -1305,7 +1308,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.1.0","build":48,"commit":"d05d2f3","dirty":false,"built_at":"2026-07-15T14:34:19Z","label":"v2.1.0+b48.d05d2f3","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.1.0","build":49,"commit":"917a8ad","dirty":false,"built_at":"2026-07-15T14:37:00Z","label":"v2.1.0+b49.917a8ad","source":"git"};
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
       doc: null,
@@ -1725,7 +1728,18 @@
       $("metricImages").textContent = summary.images;
       $("metricGroups").textContent = summary.groups;
       renderImportIdentity(doc);
-      $("importButton").textContent = state.source === "bridge" ? "Import this staged design" : "Import into Figma";
+      const targetName = String(
+        (state.manifest && state.manifest.filename) ||
+        (doc && (doc.source_filename || doc.filename || doc.name)) ||
+        "this ad"
+      ).trim();
+      const safeTarget = targetName.length > 34 ? targetName.slice(0, 31) + "…" : targetName;
+      $("importButton").textContent = state.source === "bridge"
+        ? "Import “" + safeTarget + "” into Figma"
+        : "Import into Figma";
+      $("importButton").title = state.source === "bridge"
+        ? "Import “" + targetName + "” into Figma"
+        : "Import this design into Figma";
       $("importButton").disabled = false;
       setFooter(summary.total + " source layers ready");
       setPreview(doc);
