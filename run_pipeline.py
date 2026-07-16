@@ -674,7 +674,12 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         # 10 export screenshot (plugin writes it; may need the manual click)
         if stage("export"):
             exp = figma_import.export_screenshot(run_dir, cfg, wait_s=cfg.get("export_wait_s", 0))
-            _log(run_dir, f"export: {exp.get('note', exp.get('path'))}")
+            if exp.get("ok"):
+                _log(run_dir, f"export: exported → {exp.get('path')}")
+            else:
+                # Distinct pending state, logged as such (not an error): the export has not
+                # been produced by the plugin yet.
+                _log(run_dir, f"export: {exp.get('status', 'pending')} — {exp.get('note', exp.get('path'))}")
 
         # 11 diff + 12 qa — QA against the Figma render if present, else the local preview
         # A stale Figma export must not judge a newly rebuilt design. Until this run exports

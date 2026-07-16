@@ -190,6 +190,28 @@ def _reconstructed_by_id(reconstruction: dict) -> dict[str, dict]:
     return by_id
 
 
+def _merged_alias(reconstruction: dict) -> dict[str, str]:
+    """Map an observation folded away during reconstruction to its surviving owner.
+
+    Reconstruction collapses strongly-overlapping duplicate observations into a single
+    winning candidate and records the losers in the winner's ``meta.merged_observations``
+    (see reconstruct._dedupe).  A planned id that vanished this way is not truly missing:
+    it reconciles, by mapping, to the owner that absorbed its geometry.
+    """
+    alias: dict[str, str] = {}
+    for candidate in reconstruction.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        owner = candidate.get("id")
+        if owner in (None, ""):
+            continue
+        for absorbed in (candidate.get("meta") or {}).get("merged_observations") or []:
+            key = str(absorbed)
+            # First writer wins; a well-formed reconstruction folds each id at most once.
+            alias.setdefault(key, str(owner))
+    return alias
+
+
 def _hydrate_node(node: dict, material: dict | None, source_ids: set[str]) -> None:
     node_id = str(node["id"])
     planned_meta = deepcopy(node.get("meta") or {})
@@ -341,8 +363,10 @@ def _replace_with_derived_children(node: dict, children: list[dict]) -> None:
 
 
 def _apply_reconstruction_exceptions(nodes: list[dict], *, suppressed: set[str],
-                                     derived_by_parent: dict[str, list[dict]]) -> list[dict]:
+                                     derived_by_parent: dict[str, list[dict]],
+                                     absorbed: dict[str, str] | None = None) -> list[dict]:
     """Apply only explicit reconstruction exceptions without re-inferring the tree."""
+    absorbed = absorbed or {}
     kept = []
     for node in nodes:
         node_id = str(node["id"])
@@ -351,8 +375,20 @@ def _apply_reconstruction_exceptions(nodes: list[dict], *, suppressed: set[str],
             kept.append(node)
             continue
         node["children"] = _apply_reconstruction_exceptions(
-            node.get("children") or [], suppressed=suppressed, derived_by_parent=derived_by_parent
+            node.get("children") or [], suppressed=suppressed,
+            derived_by_parent=derived_by_parent, absorbed=absorbed,
         )
+        if node_id in absorbed:
+            # Reconstruction folded this planned observation into an overlapping owner
+            # candidate (recorded via ``merged_observations``).  A retained wrapper keeps
+            # planned children anchored; a bare leaf is dropped because the owner node
+            # already paints the merged region — re-drawing it would double the asset.
+            if node.get("children"):
+                _clear_material(node)
+                meta = node.setdefault("meta", {})
+                meta["scene_intent_merged_into"] = absorbed[node_id]
+                kept.append(node)
+            continue
         if node_id not in suppressed:
             kept.append(node)
             continue
@@ -391,7 +427,25 @@ def hydrate(intent: dict, reconstruction: dict) -> list[dict]:
         else:
             unexpected.append(value)
 
-    missing = sorted(planned_source_ids - reconstructed_ids)
+    # Reconcile planned ids that reconstruction folded into an overlapping owner.  A
+    # merged-away observation is not a lost element; it maps to the candidate that
+    # absorbed it.  When that owner is itself a planned node, the absorbed leaf is
+    # redundant (the owner paints the union); when it is not, the absorbed node inherits
+    # the owner's reconstructed material so its planned geometry still renders.
+    merged_alias = _merged_alias(reconstruction)
+    absorbed_into_owner: dict[str, str] = {}
+    aliased_material: dict[str, str] = {}
+    still_missing: list[str] = []
+    for value in sorted(planned_source_ids - reconstructed_ids):
+        owner = merged_alias.get(value)
+        if owner is None or owner not in reconstructed_ids:
+            still_missing.append(value)
+        elif owner in planned_tree_ids:
+            absorbed_into_owner[value] = owner
+        else:
+            aliased_material[value] = owner
+    missing = still_missing
+
     dropped = []
     suppressed = set()
     for value in planned_source_ids:
@@ -414,9 +468,15 @@ def hydrate(intent: dict, reconstruction: dict) -> list[dict]:
             pieces.append(f"unplanned reconstructed ids: {', '.join(sorted(unexpected))}")
         raise SceneIntentError("scene intent reconciliation failed; " + "; ".join(pieces))
 
+    # An absorbed node whose owner is not itself planned still needs paint: point it at
+    # the owner's reconstructed material so its planned box renders instead of going blank.
+    for absorbed_id, owner_id in aliased_material.items():
+        reconstructed.setdefault(absorbed_id, reconstructed[owner_id])
+
     hydrated = deepcopy(tree)
     hydrated = _apply_reconstruction_exceptions(
-        hydrated, suppressed=suppressed, derived_by_parent=derived_by_parent
+        hydrated, suppressed=suppressed, derived_by_parent=derived_by_parent,
+        absorbed=absorbed_into_owner,
     )
     _hydrate_tree(hydrated, reconstructed, source_ids)
     hydrated.extend(_derived_node(candidate, None, None) for candidate in derived_roots)

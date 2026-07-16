@@ -58,6 +58,16 @@ def contract_verdict(row: dict) -> dict:
     passed = bool(native_ok and residue_clean is not False and placement_ok is not False)
     if reported is not None:
         passed = bool(reported) and passed
+    # A fully-baked plate reports native_text_ratio 1.0 vacuously (0 native / 0 emitted text),
+    # which would otherwise clear the native-text bar. A run that QA hard-failed for near-total
+    # rasterization (009: no-editable-content / low-editable-ratio / low-native-leaf-ratio) is
+    # never contract-correct, whatever the vacuous ratio says.
+    _bake_rules = {"no-editable-content", "low-editable-ratio", "low-native-leaf-ratio"}
+    _bake_fail = next((str(item.get("rule")) for item in (row.get("hard_fails") or [])
+                       if isinstance(item, dict) and item.get("rule") in _bake_rules), None)
+    if _bake_fail:
+        passed = False
+        reasons.append(f"near-total rasterization ({_bake_fail})")
     return {"id": row.get("id"), "pass": passed, "native_text_ratio": ntr,
             "glyph_residue_clean": residue_clean, "placement_ok": placement_ok,
             "reasons": reasons}
@@ -261,6 +271,11 @@ def _entry(run_dir: Path, result: dict) -> dict:
     missing_artifacts = [name for name in REQUIRED_ARTIFACTS
                          if not (run_dir / name).is_file()]
     complete = not missing_artifacts
+    # Figma export is a distinct, human-gated step (the plugin must be launched in Figma
+    # desktop). Track it as its own pending state so an unattended benchmark neither counts
+    # a missing export as failure nor silently treats the run as fully export-verified.
+    figma_export_present = (run_dir / "figma_export.png").is_file()
+    figma_export_status = "exported" if figma_export_present else "awaiting-manual-import"
     runtime_ok = bool(runtime.get("acceptable")) if runtime else False
     qa_ok = bool(qa.get("ok")) and qa_evidence_complete and not merged_hard_fails
     visual_failure_rules = [
@@ -307,6 +322,8 @@ def _entry(run_dir: Path, result: dict) -> dict:
         "duration_s": result.get("duration_s"),
         "qa_ok": qa_ok and complete,
         "qa_evidence_complete": qa_evidence_complete,
+        "figma_export_present": figma_export_present,
+        "figma_export_status": figma_export_status,
         "visual_score": qa.get("visual_score"),
         "ssim": qa.get("ssim"),
         # ── CODIA CONSTRUCTION CONTRACT (the objective — leads the benchmark) ─────────
@@ -620,6 +637,10 @@ def main():
             "empty_layer_alpha_runs": sum(1 for row in runs if row["empty_layer_alpha"]),
             "low_element_recall_runs": sum(1 for row in runs if row["low_element_recall"]),
             "qa_evidence_complete_runs": sum(1 for row in runs if row["qa_evidence_complete"]),
+            "figma_exports_present": sum(1 for row in runs if row.get("figma_export_present")),
+            "figma_exports_awaiting_manual_import": sum(
+                1 for row in runs if not row.get("figma_export_present")
+            ),
             "mean_element_recall": _mean(runs, "element_recall"),
             "runs_with_hard_fails": sum(1 for row in runs if row["hard_fails"]),
             "auto_fixed_runs": sum(1 for row in runs if row.get("auto_fixed")),

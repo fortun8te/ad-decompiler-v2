@@ -1190,6 +1190,108 @@ def _cover_kept_raster_footprints(background_path, candidates, masks, cfg, union
     return covered
 
 
+def _asset_has_content(candidate, run_dir, min_alpha_px=24):
+    """True when a candidate's emitted raster/vector actually paints visible pixels.
+
+    An "emitted" image layer whose asset is a blank/near-empty PNG re-renders nothing, so
+    the plate underneath it is the only surface a viewer sees. Such an owner must be
+    treated as absent for the unclaimed-removal restore (104/107 shipped 8KB blank product
+    PNGs while the product was inpainted out of the plate).
+    """
+    _, np, Image = _deps()
+    if candidate.get("paths") or candidate.get("svg"):
+        return True
+    src = candidate.get("src")
+    if not src or str(src).startswith("data:"):
+        return False
+    path = inpaint.resolve_path(src, run_dir)
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        image = Image.open(path)
+    except Exception:
+        return False
+    if "A" in image.getbands():
+        alpha = np.asarray(image.split()[-1])
+        return int(np.count_nonzero(alpha > 16)) >= int(min_alpha_px)
+    # No alpha channel: an opaque raster always paints something.
+    return image.width * image.height >= int(min_alpha_px)
+
+
+def _removal_owner_rerenders(candidate, run_dir):
+    """Whether the candidate that owns a removal region actually re-renders over it.
+
+    A removal owner that ships a visible layer (native text, a flat shape/plate, or a
+    non-empty raster/vector asset) legitimately keeps its inpainted footprint. Everything
+    else — a drop that is not an explicit removal, a plate passthrough, a blank asset —
+    leaves the plate as the only visible surface, so its removal must be restored.
+    """
+    meta = candidate.get("meta") or {}
+    target = candidate.get("target")
+    if meta.get("plate_passthrough"):
+        return False
+    if meta.get("removal_required"):
+        # Explicit removal: overlay text repainted natively, or a source owner kept only
+        # to rebuild the plate for its split children (they re-render the pixels).
+        return True
+    if target == "text":
+        return True
+    if target == "shape":
+        return True
+    if target in ("image", "icon"):
+        return _asset_has_content(candidate, run_dir)
+    return False
+
+
+def _restore_unclaimed_removals(rgb, background_path, removal, candidates, run_dir,
+                                union, removal_ownership, cfg):
+    """Restore source pixels for removal regions no emitted layer will re-render.
+
+    ``removal`` is the final exclusive ledger (each record owns a disjoint pixel set).
+    For every record whose owning candidate does not re-render, copy the original pixels
+    back into the plate and clear that region from ``union`` + ``removal_ownership`` (both
+    mutated in place). The plate-integrity invariant is preserved: restored pixels equal
+    the source and leave the union simultaneously, so they read as out-of-mask AND
+    unchanged. Config gate ``reconstruct.restore_unclaimed_removals`` (default ON)."""
+    _, np, Image = _deps()
+    rcfg = (cfg or {}).get("reconstruct") or {}
+    if not bool(rcfg.get("restore_unclaimed_removals", True)):
+        return {"regions": 0, "restored_px": 0, "ids": []}
+    if not os.path.exists(background_path):
+        return {"regions": 0, "restored_px": 0, "ids": []}
+    by_id = {str(c.get("id")): c for c in (candidates or [])}
+    try:
+        plate = np.asarray(Image.open(background_path).convert("RGB"), dtype=np.uint8).copy()
+    except Exception:
+        return {"regions": 0, "restored_px": 0, "ids": []}
+    ph, pw = plate.shape[:2]
+    if rgb.shape[:2] != (ph, pw):
+        return {"regions": 0, "restored_px": 0, "ids": []}
+    restored_ids = []
+    restored_px = 0
+    for record in removal or []:
+        cand = by_id.get(str(record.get("id")))
+        if cand is None:
+            continue
+        if _removal_owner_rerenders(cand, run_dir):
+            continue
+        mask = record.get("mask_array")
+        if mask is None:
+            continue
+        region = np.asarray(mask) > 0
+        if region.shape != (ph, pw) or not region.any():
+            continue
+        plate[region] = rgb[region]
+        union[region] = 0
+        if removal_ownership is not None:
+            removal_ownership[region] = 0
+        restored_px += int(region.sum())
+        restored_ids.append(str(record.get("id")))
+    if restored_px:
+        Image.fromarray(plate).save(background_path)
+    return {"regions": len(restored_ids), "restored_px": restored_px, "ids": restored_ids}
+
+
 def _crop_rgba(rgb, mask, box, element_role=None):
     _, np, Image = _deps()
     h, w = rgb.shape[:2]
@@ -2865,6 +2967,27 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     for c in updated:
         if c.get("target") == "drop" and not (c.get("meta") or {}).get("removal_required"):
             continue
+        # Oversized residual shells (merge rejected them as geometric text-shells) are
+        # NOT independent objects: they are the negative space around copy or a whole
+        # card/panel that re-renders as its own flat plate slice. Every real element on
+        # top (text, product, icon) is a separate candidate that removes its OWN ink, so
+        # inpainting the entire shell footprint is redundant — and it is exactly what
+        # destroys the plate: the card interiors turn to Big-LaMa mush and any kept
+        # content inside them is erased (101: E001/E002 half-cards claimed ~75% of the
+        # removal union; the whole plate was inpainted and the product tubes were wiped).
+        # Keep the source pixels: skip the removal observation entirely. A full-canvas
+        # shell that would ALSO ship as a top image is a plate duplicate that paints over
+        # the real cutouts underneath it — drop it to a plate passthrough so it neither
+        # inpaints nor re-renders (101: E000 shipped as a "Photo" over the tube slices).
+        if (c.get("meta") or {}).get("text_shell_rejected") == "oversized-residual-shell":
+            c["meta"]["removal_skipped"] = "oversized-residual-shell"
+            if c.get("target") == "image":
+                c["target"] = "drop"
+                c.pop("src", None)
+                c.pop("mask", None)
+                c["meta"]["plate_passthrough"] = True
+                c["meta"]["raster_fallback"] = "oversized-residual-shell-plate-passthrough"
+            continue
         if _keeps_underlay(c):
             # Insets, avatars, callout chrome and other true overlays sit above a valid
             # retained photo/plate. They remain editable owners, but must not punch a
@@ -3062,6 +3185,18 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     footprints_covered = _cover_kept_raster_footprints(
         background_path, updated, masks, cfg, union=union,
     )
+    # Unclaimed-removal restore: a removal-ledger region whose owning candidate does NOT
+    # re-render into the emitted design is being erased for nothing — the plate is the
+    # ONLY surface that will ever show there, so it must hold the ORIGINAL pixels, not an
+    # inpaint hole. This covers a dropped/kept-in-background owner, a peel hole punched for
+    # an element that later stayed in the plate, and an "emitted" image layer whose asset
+    # is actually blank (104/107: products burned into the plate while their asset groups
+    # shipped empty). Restore those source pixels and shrink the union + ledger to match.
+    # Conservative: an owner that ships a NON-EMPTY raster/text/shape layer keeps its clean
+    # inpainted footprint, so products/photos stay swappable.
+    restored = _restore_unclaimed_removals(
+        rgb, background_path, removal, updated, run_dir, union, removal_ownership, cfg,
+    )
     mask_path = os.path.join(run_dir, "removal_mask.png")
     Image.fromarray(union).save(mask_path)
     # Deterministic plate-integrity gate: the plate may differ from the source ONLY
@@ -3123,6 +3258,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "mask_rejected": mask_rejected,
             "removal_capped": removal_capped,
             "kept_footprints_covered": footprints_covered,
+            "unclaimed_removals_restored": restored,
             "plate_integrity": plate_integrity,
             # Ghost-text audit evidence: repair.assess turns unresolved residue into a
             # rebuild-clean-plate repair instead of letting duplicate text ship.

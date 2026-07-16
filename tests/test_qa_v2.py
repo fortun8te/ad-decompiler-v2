@@ -341,6 +341,57 @@ def test_flattened_protected_elements_are_not_expected_as_standalone_layers(tmp_
     assert "low-element-recall" not in _rules(result)
 
 
+def _write_scene_baked_run(tmp_path, archetype, layers):
+    """A run where merge said all source text is photographic and every OCR line is kept."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (128, 96), (200, 200, 200))
+    image.save(source)
+    image.save(render)
+    (tmp_path / "merge_report.json").write_text(
+        json.dumps({"photographic_scene_text": True}), encoding="utf-8")
+    (tmp_path / "archetype.json").write_text(
+        json.dumps({"archetype": archetype}), encoding="utf-8")
+    source_ocr = {"lines": [{"id": "L0", "text": "SITE WIDE SALE", "conf": 0.99}]}
+    design = {"layers": layers,
+              "kept_in_photo": ["SITE WIDE SALE"],
+              "meta": {"editable_ratio": 0.0,
+                       "leaf_accounting": {"foreground_leaf_count": 3,
+                                           "native_leaf_count": 0,
+                                           "native_leaf_ratio": 0.0}}}
+    return pixel_diff.compare(str(source), str(render), str(tmp_path),
+                              source_ocr=source_ocr, design=design)
+
+
+def test_scene_baked_exemption_denied_for_screenshot_archetype(tmp_path):
+    # 009: a social_screenshot that baked all its copy is a failure, not a contract-correct
+    # single-photo answer — the exemption must not shield it from the editability floors.
+    result = _write_scene_baked_run(
+        tmp_path, "social_screenshot",
+        layers=[{"id": "bg", "type": "image", "meta": {"role": "background"}}])
+    assert "low-editable-ratio" in _rules(result)
+
+
+def test_scene_baked_exemption_denied_when_design_has_empty_groups(tmp_path):
+    # 021: three empty wrapper groups and no real leaves is junk, never a legitimate photo.
+    result = _write_scene_baked_run(
+        tmp_path, "caption_over_photo",
+        layers=[{"id": "bg", "type": "image", "meta": {"role": "background"}},
+                {"id": "g0", "type": "group", "children": []},
+                {"id": "g1", "type": "group", "children": []}])
+    assert "low-editable-ratio" in _rules(result)
+
+
+def test_scene_baked_exemption_still_applies_to_a_genuine_photo(tmp_path):
+    # A real photographic scene (caption_over_photo) whose text is printed in the image and
+    # whose tree is not empty junk keeps the exemption: the editability floor is waived.
+    result = _write_scene_baked_run(
+        tmp_path, "caption_over_photo",
+        layers=[{"id": "bg", "type": "image", "meta": {"role": "background"}},
+                {"id": "photo", "type": "image", "meta": {"role": "photo"}}])
+    assert "low-editable-ratio" not in _rules(result)
+
+
 def test_single_background_without_removal_work_can_legitimately_match_source(tmp_path):
     source = tmp_path / "source.png"
     render = tmp_path / "render.png"

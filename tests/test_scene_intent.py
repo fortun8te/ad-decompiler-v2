@@ -69,6 +69,52 @@ def test_scene_intent_freezes_button_structure_before_paint_hydration():
     assert frame["children"][0]["meta"]["scene_intent_id"] == "button-label"
 
 
+def test_hydrate_reconciles_a_planned_id_merged_into_an_overlapping_owner():
+    # Benchmark 091: two strongly-overlapping planned image observations; reconstruction's
+    # de-dupe folds the smaller (c_E016) into the larger owner (c_E017) and records it in
+    # ``owner.meta.merged_observations``. The planned id then vanishes from the reconstructed
+    # set. Hydration must reconcile it by that mapping (drop the redundant leaf, keep the
+    # owner that paints the union) instead of raising "missing planned ids" → legacy layout.
+    intent = scene_intent.plan([
+        {"id": "c_E017", "target": "image",
+         "box": {"x": 79, "y": 1001, "w": 915, "h": 463}},
+        {"id": "c_E016", "target": "image",
+         "box": {"x": 120, "y": 999, "w": 844, "h": 437}},
+    ], {"w": 1080, "h": 1500})
+    assert set(intent["planned_source_ids"]) == {"c_E016", "c_E017"}
+
+    hydrated = scene_intent.hydrate(intent, {
+        "candidates": [
+            {"id": "c_E017", "target": "image",
+             "box": {"x": 79, "y": 1001, "w": 915, "h": 463},
+             "fill": {"kind": "flat", "color": "#222222"},
+             "meta": {"merged_observations": ["c_E016"]}},
+        ],
+    })
+
+    ids = {node["id"] for node in hydrated}
+    assert "c_E017" in ids            # owner survives and paints the merged region
+    assert "c_E016" not in ids        # absorbed leaf dropped, not double-painted
+    owner = next(n for n in hydrated if n["id"] == "c_E017")
+    assert owner["fill"]["color"] == "#222222"
+
+
+def test_hydrate_still_rejects_a_genuinely_missing_planned_id():
+    # A planned id that was neither reconstructed nor folded into any owner is a real loss
+    # and must still trigger the legacy-layout degradation.
+    intent = scene_intent.plan([
+        {"id": "a", "target": "image", "box": {"x": 0, "y": 0, "w": 10, "h": 10}},
+        {"id": "b", "target": "image", "box": {"x": 20, "y": 20, "w": 10, "h": 10}},
+    ], {"w": 100, "h": 100})
+
+    with pytest.raises(scene_intent.SceneIntentError, match="missing planned ids: b"):
+        scene_intent.hydrate(intent, {
+            "candidates": [
+                {"id": "a", "target": "image", "box": {"x": 0, "y": 0, "w": 10, "h": 10}},
+            ],
+        })
+
+
 def test_scene_intent_rejects_unplanned_reconstruction_layers():
     intent = scene_intent.plan([
         {"id": "copy", "target": "text", "text": "Hi",

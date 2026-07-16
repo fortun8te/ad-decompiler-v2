@@ -424,6 +424,64 @@ def _norm(s):
     return "".join(ch.lower() for ch in str(s) if ch.isalnum())
 
 
+# Archetypes whose "text" is genuinely interface copy (posts, tweets, DMs, chat), never
+# printed-into-a-photograph scene text.  A screenshot that baked all its copy is a FAILURE,
+# not the contract-correct single-photo answer, so it can never earn the scene-baked
+# exemption regardless of what merge's photographic_scene_text flag says.
+_NON_PHOTOGRAPHIC_ARCHETYPES = {"social_screenshot"}
+
+
+def _read_archetype(run_dir) -> str:
+    try:
+        with open(os.path.join(run_dir, "archetype.json"), encoding="utf-8") as fh:
+            return str(json.load(fh).get("archetype") or "")
+    except Exception:
+        return ""
+
+
+def _has_empty_group(layers) -> bool:
+    """True if any group/frame node has zero leaf descendants (empty structural junk).
+
+    Empty wrapper groups are the 021 false-pass shape: a design that emitted a handful of
+    groups with NOTHING inside them is not a legitimate photographic output, so it must not
+    slip past the editability floors through the scene-baked exemption.
+    """
+    for node in layers or []:
+        if not isinstance(node, dict):
+            continue
+        children = node.get("children")
+        if isinstance(children, list) and node.get("type") in ("group", "frame"):
+            if not any(_is_leaf_present(child) for child in children):
+                return True
+            if _has_empty_group(children):
+                return True
+    return False
+
+
+def _is_leaf_present(node) -> bool:
+    if not isinstance(node, dict):
+        return False
+    children = node.get("children")
+    if isinstance(children, list) and children:
+        return any(_is_leaf_present(child) for child in children)
+    return True
+
+
+def _scene_baked_exemption_block_reason(run_dir, design) -> str:
+    """Why a photographic-scene exemption must NOT apply here (empty string = allowed).
+
+    The exemption (a 1-photo output is contract-correct when all source text is printed in
+    the scene) is only legitimate for genuinely photographic archetypes with a real, non-empty
+    layer tree.  Screenshots and empty-junk-group outputs never qualify.
+    """
+    archetype = _read_archetype(run_dir)
+    if archetype in _NON_PHOTOGRAPHIC_ARCHETYPES:
+        return f"archetype {archetype} is a screenshot, not a photographic scene"
+    if _has_empty_group((design or {}).get("layers") or []):
+        return "design contains empty group(s) — not a legitimate photographic output"
+    return ""
+
+
 def _text_recall(source_ocr, render_ocr, source_gray=None, render_gray=None):
     kept = [l for l in source_ocr.get("lines", []) if l.get("conf", 1) >= 0.5
             and len(_norm(l.get("text", ""))) >= 3]
@@ -1428,6 +1486,15 @@ def _structural_audit(
                     if l.get("conf", 1) >= 0.5 and len(_norm(l.get("text", ""))) >= 3]
         scene_baked_all_text = bool(src_norm) and all(
             any(s == k or s in k or k in s for k in kept_norm) for s in src_norm)
+    # Reconciliation (audit: 009/021): the exemption must ONLY hold for a genuinely
+    # photographic archetype whose layer tree is real. Screenshots (social/tweet/DM) and
+    # outputs full of empty junk groups must keep full editability strictness even if merge
+    # tagged the source text photographic.
+    if scene_baked_all_text:
+        _block_reason = _scene_baked_exemption_block_reason(run_dir, design)
+        if _block_reason:
+            scene_baked_all_text = False
+            supplied.setdefault("scene_baked_exemption_denied", _block_reason)
     if source_lines and editable_ratio is not None and editable_ratio < thresholds["editable_ratio_min"]:
         if scene_baked_all_text:
             supplied.setdefault("scene_baked_photo", True)

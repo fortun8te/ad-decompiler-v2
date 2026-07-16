@@ -815,7 +815,18 @@ def _dedup_overlapping_text(candidates, merge_cfg: dict, dedup_iou: float, diagn
             if oid in dropped:
                 continue
             iou, inside = _geometry_overlap(keeper.get("box", {}), other.get("box", {}))
-            if inside < overlap_thresh and iou < dedup_iou:
+            # Same normalized string overlapping in place is a near-certain duplicate, so
+            # accept a lower overlap (IoU/inside >= 0.5) for an exact match than the general
+            # content-similarity gate requires — this collapses same-string promo/ribbon text
+            # (131) that lands just under the 0.6 geometry thresholds. Different strings still
+            # need the stricter overlap.
+            exact_key = _normalize_text_key(keeper.get("text"))
+            exact_match = bool(exact_key) and _normalize_text_key(other.get("text")) == exact_key
+            geom_ok = (
+                inside >= overlap_thresh or iou >= dedup_iou
+                or (exact_match and (iou >= 0.5 or inside >= 0.5))
+            )
+            if not geom_ok:
                 continue
             containment = _token_containment(other.get("text"), keeper.get("text"))
             similarity = _text_similarity(other.get("text"), keeper.get("text"))
@@ -2493,6 +2504,19 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
         if _is_full_bleed(box, canvas):
             continue
         role = str(c["meta"].get("role") or "").lower()
+        # An oversized, low-confidence photo/residual mask is a loose plate+product
+        # merge, NOT a bounded product cutout. Letting it own scene text bakes real
+        # white-card checklist / caption / comparison copy into a raster, and the plate
+        # inpaint then erases it (066: a conf-0.405 photo-fragment spanning 75% of the
+        # canvas swallowed every comparison bullet). Product FACES are bounded and
+        # confident; card interiors are not. Require one or the other before a
+        # photo/photo-fragment mask may own printed text.
+        _conf = float(c["meta"].get("confidence") or c.get("score") or 0.0)
+        if (role in {"photo", "photo-fragment", "photo_fragment"}
+                and _box_area_frac(box, canvas) >= 0.5
+                and _conf < 0.5):
+            c["meta"]["oversized_loose_residual"] = True
+            continue
         if (role in _PRODUCT_CUTOUT_ROLES or role in _TEXT_BEARING_SHELL_ROLES
                 or c["meta"].get("contains_scene_text")):
             product_regions.append({

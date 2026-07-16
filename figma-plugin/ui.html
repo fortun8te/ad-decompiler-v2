@@ -1682,7 +1682,7 @@
   <script>
     const $ = function (id) { return document.getElementById(id); };
 
-    const PLUGIN_BUILD = {"version":"2.1.0","build":58,"commit":"07bbfa7","dirty":true,"built_at":"2026-07-16T02:21:13Z","label":"v2.1.0+b58.07bbfa7-dirty","source":"git"};
+    const PLUGIN_BUILD = {"version":"2.1.0","build":71,"commit":"27b72df","dirty":true,"built_at":"2026-07-16T14:38:21Z","label":"v2.1.0+b71.27b72df-dirty","source":"git"};
     const HISTORY_LIMIT = 40;
     const state = {
       settings: { bridge: "http://localhost:8790", importMode: "replace" },
@@ -1706,6 +1706,7 @@
       restaging: false,
       pollFailures: 0,
       roundtripReport: null,
+      autoImportedToken: null,
     };
 
     function shouldShowProcessActivity(status) {
@@ -2433,6 +2434,19 @@
         const history = await historyRequest;
         renderHistory(history && history.runs);
         renderImportIdentity(doc);
+        // Headless assist: when the staged manifest opts in (bridge figma.auto_import), run
+        // Import automatically once per staged revision so no human click is needed while the
+        // panel is open. Keyed on roundtrip_token so a re-poll of the same job never re-fires,
+        // and only when idle with a usable doc. (This does not launch the plugin — Figma has
+        // no external launch hook — so an unopened panel still needs a manual start.)
+        if (manifest && manifest.auto_import && state.doc && !state.building) {
+          const token = String(manifest.roundtrip_token || manifest.doc_id || "");
+          if (token && state.autoImportedToken !== token) {
+            state.autoImportedToken = token;
+            recordLog("info", "Auto-import", "manifest.auto_import set — starting import for " + token);
+            startImport();
+          }
+        }
         } catch (stagedError) {
           const history = await historyRequest;
           renderHistory(history && history.runs);

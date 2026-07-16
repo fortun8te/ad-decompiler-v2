@@ -1075,6 +1075,15 @@ def _stage_for_plugin(design_path, run_dir, cfg, strict=None) -> dict:
         },
         "screenshot_sibling": screenshot_sibling,
         "pruned_assets": pruned_assets,
+        # Opt-in headless assist: when set, an already-open plugin panel that is polling this
+        # bridge auto-runs Import (which auto-Exports) once per staged revision instead of
+        # waiting for the human click. It cannot LAUNCH the plugin — Figma exposes no external
+        # way to open a dev plugin — so an unattended run with no panel open still stays in the
+        # awaiting-manual-import state. Gated by figma.auto_import or AD_DECOMPILER_AUTO_IMPORT.
+        "auto_import": bool(
+            figma_cfg.get("auto_import", False)
+            or os.environ.get("AD_DECOMPILER_AUTO_IMPORT", "").strip() in {"1", "true", "yes"}
+        ),
         "summary": {
             "name": design.get("name"),
             "canvas": design.get("canvas"),
@@ -1106,8 +1115,14 @@ def export_screenshot(run_dir: str, cfg: dict | None = None, wait_s: int = 0) ->
     deadline = time.time() + wait_s
     while True:
         if os.path.exists(target):
-            return {"ok": True, "path": target}
+            return {"ok": True, "status": "exported", "path": target}
         if time.time() >= deadline:
-            return {"ok": False, "path": target,
-                    "note": "figma_export.png not found yet — run the plugin's Import+Export, then re-run QA with --resume"}
+            # A missing export is a distinct PENDING state, not an error: the Figma plugin
+            # must be launched and (if not auto-importing) clicked by a human before the PNG
+            # can land.  Callers/reporting surface this as "awaiting-manual-import" so an
+            # unattended benchmark does not read it as a failure or as evidence-complete.
+            return {"ok": False, "status": "awaiting-manual-import", "path": target,
+                    "note": "awaiting manual import — launch the ad-decompiler plugin in "
+                            "Figma desktop (Import runs Export automatically), then re-run QA "
+                            "with --resume"}
         time.sleep(1)

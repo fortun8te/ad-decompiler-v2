@@ -1090,10 +1090,16 @@ def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
     content_h = (line_count - 1) * line_height + glyph_h
     avail_h = max(1.0, _num(fitted.get("h"), content_h or 1.0))
     width_scale = min(1.0, avail_w / max(1.0, content_w))
-    # Preserve measured inter-line spacing: only the glyph portion scales.  This keeps
-    # OCR-derived baselines stable while making substituted glyphs fit the painted box.
-    glyph_room = max(1.0, avail_h - (line_count - 1) * line_height)
-    height_scale = min(1.0, glyph_room / max(1.0, glyph_h))
+    # Height fit scales the WHOLE block — glyph AND leading — by one factor, because a
+    # font's natural line spacing is proportional to its size. The earlier approach held
+    # line_height fixed and subtracted it whole (glyph_room = avail_h - gaps*line_height),
+    # then shrank only the glyph into what was left. For display headlines whose synthetic
+    # leading (~1.2*fontSize) approaches the painted per-line pitch, that left almost no
+    # room for the glyph and collapsed the size: 013's "We NEVER / do this!" (ink ~150px)
+    # shrank to ~40% of ink height. Scaling leading with the glyph keeps multi-line fits at
+    # ink height and still shrinks only when the content genuinely overflows the box.
+    # (Single-line content_h == glyph_h, so this is identical to the old path there.)
+    height_scale = min(1.0, avail_h / max(1.0, content_h))
     target_scale = min(width_scale, height_scale)
     if target_scale < 0.999:
         new_size = max(1.0, font_size * target_scale)
