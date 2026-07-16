@@ -1162,3 +1162,49 @@ def test_flux_per_hole_canvas_frac_cap():
     assert peel_scene.peel_inpaint_mode(cfg, meta) == "lama"     # 40% > 25% cap
     meta["hole_px"] = 100_000
     assert peel_scene.peel_inpaint_mode(cfg, meta) == "flux_comfy"
+
+
+# ── printed-lockup lift (013 grüns bag) ────────────────────────────────────────────
+
+
+def test_printed_lockup_product_over_plain_background_activates_peel():
+    """A hero product flagged by fusion (printed_lockup) lifts off the plate even
+    with no object-over-object pair — 013's bag after its printed logos were
+    absorbed back into the raster."""
+    bag = _rect_mask((60, 60, 180, 260))
+    flat = np.full((H, W, 3), BG, np.uint8)
+    flat[bag] = RED
+    elements = [SceneElement(id="bag", mask=bag, z=0.0, kind="photo-fragment",
+                             meta={"role": "product", "printed_lockup": True})]
+    report = peel_scene.overlap_report(elements, _cfg())
+    assert report["needed"] is True
+    assert report["lifted_products"] == ["bag"]
+
+    result = peel_scene.peel_scene(flat, elements, inpaint=SpyInpaint(), cfg=_cfg())
+    assert not result.skipped
+    assert [layer.id for layer in result.layers] == ["bag"]
+
+
+def test_printed_lockup_lift_requires_a_solid_eligible_mask():
+    """The granularity guard still gates the lift — a fragmented 'product' cannot
+    switch peel on just because fusion flagged it."""
+    frag = _fragmented_mask((20, 20, 220, 320))
+    elements = [SceneElement(id="bag", mask=frag, z=0.0, kind="photo-fragment",
+                             meta={"role": "product", "printed_lockup": True})]
+    report = peel_scene.overlap_report(elements, _cfg())
+    assert report["needed"] is False
+    assert report["lifted_products"] == []
+
+
+def test_unflagged_product_over_plain_background_still_skips():
+    """Without the fusion flag, elements over plain background stay the plate's job."""
+    bag = _rect_mask((60, 60, 180, 260))
+    flat = np.full((H, W, 3), BG, np.uint8)
+    flat[bag] = RED
+    elements = [SceneElement(id="bag", mask=bag, z=0.0, kind="photo-fragment",
+                             meta={"role": "product"})]
+    report = peel_scene.overlap_report(elements, _cfg())
+    assert report["needed"] is False
+
+    result = peel_scene.peel_scene(flat, elements, inpaint=SpyInpaint(), cfg=_cfg())
+    assert result.skipped and result.skip_reason == "no-overlap"

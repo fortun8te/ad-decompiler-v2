@@ -180,7 +180,13 @@ The gate is `overlap_report()`:
   members non-text (text-over-element alone never activates; text stays native, and
   once peel runs for a real element pair the text holes get filled as a bonus), AND
   both members pass the granularity guard (§4a). Elements over plain background are
-  already handled by the plate.
+  already handled by the plate — with one exception: a **printed-lockup product**
+  (fusion absorbed on-product label artwork into the cutout and set
+  `meta.printed_lockup`, e.g. 013's grüns bag) lifts off the plate even without an
+  object-over-object pair (`lifted_products` in the report). The single-plate path
+  left seams/haze around such hero products; peel punches them from the plate and
+  completes them, while the ink discipline (§4b) still keeps their printed
+  text/artwork unpunched. The lift is still gated by §4a eligibility.
 * No qualifying pair → `peel_scene` returns `skipped=True, skip_reason="no-overlap"`;
   qualifying pairs blocked only by the guard → `skip_reason="no-eligible-overlap: <id>:
   <why>"`. Either way the run continues exactly as today (asserted in tests).

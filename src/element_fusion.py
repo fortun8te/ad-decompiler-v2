@@ -91,6 +91,15 @@ DEFAULTS = {
     "junk_band_min_width_frac": 0.92,
     "junk_band_min_coverage": 0.10,
     "junk_band_max_score": 0.50,
+    # A logo/wordmark detection fully nested inside a product cutout is the product's
+    # own printed label ink (013: the "ü snacks" pill and bear-face lockup printed on
+    # the grüns bag), not a separate design element. Shipping it separately makes
+    # downstream reconstruction re-render it (solid-disc "badge" over the bag) and
+    # feeds the peel gate artwork-only overlap pairs. Absorb it into the parent and
+    # flag the parent (meta.printed_lockup) so peel lifts the product off the plate.
+    "absorb_printed_artwork": True,
+    "printed_artwork_min_containment": 0.95,
+    "printed_artwork_max_area_ratio": 0.5,
     "canonical_prefix": "E",
 }
 
@@ -817,6 +826,68 @@ def _suppress_junk_bands(clusters: list, opts: dict, canvas: dict) -> tuple[list
     return kept, dropped
 
 
+#: Brand lettering / lockup roles that read as printed ink when nested in a product.
+_PRINTED_ARTWORK_ROLES = frozenset({"logo", "wordmark", "brandmark", "monogram"})
+
+
+def _absorb_printed_artwork(results: list, opts: dict) -> tuple[list, list]:
+    """Fold printed-on-product artwork into its parent product (013 grüns bag).
+
+    A canonical element with a brand-artwork role (``_PRINTED_ARTWORK_ROLES``) whose
+    mask is ≥ ``printed_artwork_min_containment`` inside a *product* parent and small
+    relative to it is the product's own label ink — SAM's "logo" prompt firing on the
+    packaging print.  It is dropped as a separate element (the parent raster already
+    carries those pixels; peel's ink discipline never punches them out) and recorded
+    on the parent as ``meta.printed_lockup`` + ``meta.absorbed_decorations`` so the
+    peel gate can lift the product off the plate.  Logos over non-product surfaces
+    (floating brand marks on photos/backgrounds) are untouched — those are genuine
+    overlay layers.
+    """
+    min_containment = float(opts.get("printed_artwork_min_containment", 0.95))
+    max_ratio = float(opts.get("printed_artwork_max_area_ratio", 0.5))
+    by_id = {r["id"]: r for r in results}
+    absorbed = []
+    for r in results:
+        role = str(r.get("role") or "").lower()
+        if role not in _PRINTED_ARTWORK_ROLES:
+            continue
+        parent = by_id.get(str(r.get("parent_id") or ""))
+        rel = next((link for link in (r.get("relationships") or [])
+                    if link.get("type") == "nested-in"
+                    and link.get("target") == r.get("parent_id")), None)
+        if parent is None or rel is None:
+            continue
+        if str(parent.get("role") or "").lower() not in _PRODUCT_INSTANCE_ROLES:
+            continue
+        if float(rel.get("containment") or 0.0) < min_containment:
+            continue
+        if float(rel.get("area_ratio") or 1.0) > max_ratio:
+            continue
+        absorbed.append({
+            "id": r["id"], "role": role, "parent": parent["id"],
+            "containment": rel.get("containment"), "area_ratio": rel.get("area_ratio"),
+            "reason": "printed-on-product-artwork",
+        })
+        meta = dict(parent.get("meta") or {})
+        meta["printed_lockup"] = True
+        decorations = list(meta.get("absorbed_decorations") or [])
+        decorations.append({"id": r["id"], "role": role, "box": dict(r.get("box") or {})})
+        meta["absorbed_decorations"] = decorations
+        parent["meta"] = meta
+    if not absorbed:
+        return results, []
+    gone = {a["id"] for a in absorbed}
+    kept = [r for r in results if r["id"] not in gone]
+    for r in kept:
+        # Orphans of an absorbed element re-parent to the absorbed element's parent.
+        if str(r.get("parent_id") or "") in gone:
+            r["parent_id"] = by_id[str(r["parent_id"])].get("parent_id")
+            r["relationships"] = [link for link in (r.get("relationships") or [])
+                                  if not (link.get("type") == "nested-in"
+                                          and link.get("target") in gone)]
+    return kept, absorbed
+
+
 def _infer_canvas(sam3, residual, qwen) -> dict:
     if isinstance(sam3, dict) and isinstance(sam3.get("source"), dict):
         src = sam3["source"]
@@ -1081,6 +1152,13 @@ def fuse(
                 }
             )
 
+    # Printed-on-product artwork folds into its parent product (needs the nesting
+    # links above): the "logo" prompt firing on packaging print must not ship as a
+    # separate element (013's bag lockups) — see _absorb_printed_artwork.
+    absorbed_artwork = []
+    if opts.get("absorb_printed_artwork", True):
+        results, absorbed_artwork = _absorb_printed_artwork(results, opts)
+
     # Post-fusion glyph/chart refinement (src/icon_detect.py): ✓ / ✗ / ? list glyphs
     # become role-tagged icon elements attached to their text rows, stacked duplicate
     # fragments collapse into one icon, and a gridline-verified chart region is
@@ -1100,9 +1178,11 @@ def fuse(
         report = {
             "kind": "fusion-diagnostics",
             "suppressed_junk_bands": suppressed_bands,
+            "absorbed_printed_artwork": absorbed_artwork,
             "counts": {
                 "canonical": len(results),
                 "suppressed_junk_bands": len(suppressed_bands),
+                "absorbed_printed_artwork": len(absorbed_artwork),
             },
         }
         with open(os.path.join(run_dir, "fusion_report.json"), "w", encoding="utf-8") as fh:

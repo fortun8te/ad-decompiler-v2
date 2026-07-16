@@ -520,6 +520,8 @@ def elements_from_run(run_dir: str, fused_elements: list, canvas: dict,
         kind = str(element.get("kind") or element.get("role") or "element")
         out.append(SceneElement(id=str(element.get("id")), mask=mask, z=0.0, kind=kind,
                                 meta={"role": element.get("role"),
+                                      "printed_lockup": bool(
+                                          (element.get("meta") or {}).get("printed_lockup")),
                                       "box_only_mask": not painted}))
     derive_z_order(out)
     top_z = max([e.z for e in out], default=-1.0) + 1.0
@@ -692,7 +694,20 @@ def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
     if not require_eligible:
         activating = [p for p in activating if is_peel_object(by_id[p["top"]])]
     blocked = [p for p in element_pairs if not p["eligible"]]
-    return {"pairs": pairs, "needed": bool(activating),
+    # Printed-lockup lift (013 grüns bag): fusion absorbed on-product label artwork
+    # into a product cutout and flagged it (meta.printed_lockup).  Such a hero product
+    # has detector-confirmed internal structure sitting on the plate; the single-plate
+    # path leaves seams/haze around it, so peel activates to punch it from the plate
+    # and complete it — even with no object-over-object pair.  Ink discipline still
+    # holds once peel runs (text/artwork never punch product rasters), and the §10
+    # plan (punch caps, plate bands, iteration budget) bounds the damage as usual.
+    lifts = [e.id for e in elements
+             if not e.is_text and (e.meta or {}).get("printed_lockup")
+             and is_peel_object(e)
+             and (eligibility.get(e.id) or {}).get("as_top")
+             and (eligibility.get(e.id) or {}).get("as_under")]
+    return {"pairs": pairs, "needed": bool(activating) or bool(lifts),
+            "lifted_products": lifts,
             "blocked_qualifying": len(blocked),
             "eligibility": {eid: {k: v for k, v in e.items() if k != "integrity"}
                             for eid, e in eligibility.items()},

@@ -747,3 +747,53 @@ def test_high_score_full_bleed_photo_band_is_kept():
 
     assert len(fused) == 1
     assert fused[0]["role"] == "photo"
+
+
+# ── printed-on-product artwork absorption (013 grüns bag) ─────────────────────────
+
+
+def test_logo_nested_in_product_absorbs_and_flags_printed_lockup(tmp_path):
+    """013: SAM's 'logo' hits on the bag's printed lockup fold into the product."""
+    import json
+
+    product = _sam_el("S0", 20, 20, 60, 60, "product", 0.88, "text-prompt",
+                      prompt="product")
+    logo = _sam_el("S1", 30, 30, 20, 10, "logo", 0.83, "text-prompt", prompt="logo")
+    logo["kind"] = "icon"
+
+    fused = element_fusion.fuse({"elements": [product, logo]}, [], [], CANVAS,
+                                run_dir=str(tmp_path))
+
+    assert [e["role"] for e in fused] == ["product"]
+    parent = fused[0]
+    assert (parent.get("meta") or {}).get("printed_lockup") is True
+    decorations = parent["meta"]["absorbed_decorations"]
+    assert len(decorations) == 1 and decorations[0]["role"] == "logo"
+    report = json.load(open(tmp_path / "fusion_report.json"))
+    assert report["counts"]["absorbed_printed_artwork"] == 1
+    assert report["absorbed_printed_artwork"][0]["reason"] == "printed-on-product-artwork"
+
+
+def test_logo_over_photo_panel_stays_a_separate_element():
+    """A brand mark overlaid on a photo/background is a genuine layer — untouched."""
+    photo = _sam_el("S0", 10, 10, 80, 80, "photo", 0.9, "box-refine", residual_id="R0")
+    logo = _sam_el("S1", 30, 30, 20, 10, "logo", 0.83, "text-prompt", prompt="logo")
+    logo["kind"] = "icon"
+
+    fused = element_fusion.fuse({"elements": [photo, logo]}, [], [], CANVAS)
+
+    assert sorted(e["role"] for e in fused) == ["logo", "photo"]
+    for e in fused:
+        assert not (e.get("meta") or {}).get("printed_lockup")
+
+
+def test_partially_overlapping_logo_is_not_absorbed():
+    """A logo straddling the product edge is not printed ink — keep it separate."""
+    product = _sam_el("S0", 20, 20, 40, 40, "product", 0.88, "text-prompt",
+                      prompt="product")
+    logo = _sam_el("S1", 50, 30, 30, 10, "logo", 0.83, "text-prompt", prompt="logo")
+    logo["kind"] = "icon"
+
+    fused = element_fusion.fuse({"elements": [product, logo]}, [], [], CANVAS)
+
+    assert sorted(e["role"] for e in fused) == ["logo", "product"]
