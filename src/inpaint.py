@@ -1156,6 +1156,7 @@ def _gradient_hole_fill(rgb, mask, cfg: Optional[dict] = None):
     Av = np.stack([xs[vi] / max(1, w), ys[vi] / max(1, h), np.ones(len(vi))], axis=1).astype(np.float64)
     coeffs = []
     max_err = float(opts.get("max_validation_error", 6.0))
+    slope = 0.0
     for ch in range(3):
         b = img[ys[fi], xs[fi], ch].astype(np.float64)
         sol, *_ = np.linalg.lstsq(A, b, rcond=None)
@@ -1163,7 +1164,13 @@ def _gradient_hole_fill(rgb, mask, cfg: Optional[dict] = None):
         err = float(np.median(np.abs(pred_v - img[ys[vi], xs[vi], ch].astype(np.float64))))
         if err > max_err:
             return None
+        slope = max(slope, abs(float(sol[0])), abs(float(sol[1])))
         coeffs.append(sol)
+    # A (near-)constant plate is not a gradient — that is solid-flat's territory, and if
+    # solid-flat already declined it there was a reason (e.g. hole-interior evidence).
+    # Require a real colour ramp across the canvas before claiming the analytic fill.
+    if slope < float(opts.get("min_slope", 8.0)):
+        return None
     hy, hx = np.nonzero(hole)
     filled = img.copy()
     Ah = np.stack([hx / max(1, w), hy / max(1, h), np.ones(len(hx))], axis=1).astype(np.float64)
