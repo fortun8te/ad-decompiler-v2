@@ -975,6 +975,38 @@ def _detect_foreign_strike_ink(crop, mask, known_strike: bool = False):
     }
 
 
+def _collar_box(box: dict, image=None) -> dict:
+    """Grow a tight WORD box by a narrow exterior collar for plate sampling.
+
+    ``_painted_geometry`` estimates the background from the crop's BORDER RING. A box
+    that hugs the glyphs puts that ring on ink, so the ink/plate polarity can invert
+    (002: black all-caps words touching their crop border read as white runs). A word
+    sits INSIDE its line's plate, so a few pixels of collar reliably buys real plate.
+
+    NOT usable on the LINE path, though the same polarity inversion happens there
+    (067's red headline samples the plate white and renders invisible): a line box's
+    collar can cross a plate boundary entirely, so padding it merely moves the
+    inversion around. Measured over the 15 replayable fixtures, collaring the line
+    path rescued 7 lines (067 'WE'RE SAYING GOODBYE' #f6f6f6 -> #fb0202) but pushed 12
+    others to near-white (101 'NOT ALL TPU TUBES' #000000 -> #ffffff, 066 'OUR
+    COMPETITOR', 094 'CAFFEINE', 091 'neuton') — a net regression. The line-path fix
+    belongs in ``_ink_mask``'s existing minority-luminance guard, which already owns
+    this exact case, not in the sampling window.
+
+    The pad scales with the box so it never swallows a neighbour, and is clamped to
+    the image so the crop stays in bounds.
+    """
+    box = _clean_box(box)
+    pad = max(3.0, min(16.0, min(box["w"], box["h"]) * 0.25))
+    x0, y0 = box["x"] - pad, box["y"] - pad
+    x1, y1 = box["x"] + box["w"] + pad, box["y"] + box["h"] + pad
+    if image is not None:
+        ih, iw = image.shape[:2]
+        x0, y0 = max(0.0, x0), max(0.0, y0)
+        x1, y1 = min(float(iw), x1), min(float(ih), y1)
+    return {"x": x0, "y": y0, "w": max(1.0, x1 - x0), "h": max(1.0, y1 - y0)}
+
+
 def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, dict, str, float, Any, dict]:
     import numpy as np
 
@@ -3228,6 +3260,34 @@ def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
     return evidence
 
 
+# Connective tissue, EN + NL (the benchmark's two languages). A designer emphasises a
+# phrase, a number or a brand; a lone bold "we"/"to"/"en" mid-sentence is measurement
+# noise. Deliberately excludes anything that can carry authored emphasis on its own
+# (no nouns, no verbs, no numerals) — see _enrich_word_styles' jitter clamp.
+_FUNCTION_WORDS = {
+    # EN
+    "a", "an", "and", "as", "at", "be", "but", "by", "for", "from", "if", "in", "is",
+    "it", "of", "on", "or", "so", "than", "that", "the", "then", "to", "up", "us",
+    "we", "with", "you", "your", "our", "my", "me", "he", "she", "they", "this",
+    # NL
+    "aan", "al", "als", "bij", "dat", "de", "die", "dit", "een", "en", "er", "het",
+    "hun", "ik", "in", "is", "je", "met", "na", "naar", "niet", "nu", "of", "om",
+    "ook", "op", "te", "tot", "uit", "uw", "van", "voor", "waar", "wij", "zijn",
+}
+
+
+def _short_function_word(text: str) -> bool:
+    """True for a token that cannot plausibly carry authored bold on its own.
+
+    Either a 1-2 character token (too few glyphs for a density estimate to mean
+    anything) or a known function word.
+    """
+    token = str(text or "").strip().strip(".,:;!?'\"()[]").lower()
+    if not token:
+        return False
+    return len(token) <= 2 or token in _FUNCTION_WORDS
+
+
 def _enrich_word_styles(image, line: dict, config: dict) -> None:
     """Attach conservative, pixel-evidenced style overrides to OCR words.
 
@@ -3264,6 +3324,14 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
     # a heavy-inked regular word can't fragment an otherwise-uniform line.
     weight_delta = int(_num(config.get("word_style_weight_delta"), 260))
     weight_min_conf = _num(config.get("word_style_weight_min_ink_confidence"), 0.60)
+    # A weight flip on a SHORT FUNCTION WORD wedged between two same-weight neighbours
+    # is the residual jitter the gates above cannot see: 'we'/'to' carry so few glyphs
+    # that their density is dominated by which letters they happen to contain, and a
+    # single stray bold word mid-sentence is never authored emphasis (a designer bolds
+    # a phrase, a number or a brand — not the connective tissue). Such a flip must be
+    # corroborated by BOTH independent ink signals or it is clamped back to the line.
+    jitter_density_ratio = _num(config.get("word_style_jitter_density_ratio"), 1.5)
+    jitter_stroke_ratio = _num(config.get("word_style_jitter_stroke_ratio"), 1.25)
 
     def _styleable(candidate: Any) -> bool:
         # A lone punctuation mark or a 1-char sliver (",", "->", a stray digit) carries
@@ -3286,13 +3354,7 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
         # exported word. This prevents black all-caps words touching their crop border
         # from being misclassified as white runs (002: BUNDEL).
         probe = copy.deepcopy(word)
-        pad = max(3.0, min(16.0, min(word["box"]["w"], word["box"]["h"]) * 0.25))
-        probe["box"] = {
-            "x": word["box"]["x"] - pad,
-            "y": word["box"]["y"] - pad,
-            "w": word["box"]["w"] + 2 * pad,
-            "h": word["box"]["h"] + 2 * pad,
-        }
+        probe["box"] = _collar_box(word["box"], image)
         painted, _baseline, colour, ink_conf, mask, paint = _painted_geometry(image, probe)
         if ink_conf < min_conf:
             continue
@@ -3302,21 +3364,42 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
                 density = float(mask.mean())
         except Exception:
             density = None
+        # Stroke width normalised by the word's own painted height: an ink signal that,
+        # unlike density, does not move with glyph composition or letter-spacing. Gives
+        # the jitter clamp a second, INDEPENDENT source of evidence for a real bold.
+        stroke_ratio = None
+        try:
+            from . import handwriting
+
+            width = handwriting.stroke_width_mean(mask)
+            if width and painted.get("h", 0) > 0:
+                stroke_ratio = float(width) / float(painted["h"])
+        except Exception:
+            stroke_ratio = None
         measured_words.append(
             {"word": word, "painted": painted, "colour": colour, "ink_conf": ink_conf,
-             "mask": mask, "paint": paint, "density": density}
+             "mask": mask, "paint": paint, "density": density, "stroke_ratio": stroke_ratio}
         )
 
     densities = sorted(m["density"] for m in measured_words if m["density"] is not None)
     line_density = densities[len(densities) // 2] if densities else None
+    strokes = sorted(m["stroke_ratio"] for m in measured_words if m["stroke_ratio"] is not None)
+    line_stroke = strokes[len(strokes) // 2] if strokes else None
 
+    # Measure every word's weight up front: the jitter clamp needs a word's NEIGHBOURS'
+    # weights, which are not known while the words are still being styled one by one.
     for measured in measured_words:
+        geo = _pre_font_signals(measured["word"], measured["painted"], measured["mask"], config)
+        measured["geo"] = geo
+        measured["weight"] = int(round(_num(geo.get("weight"), base_weight)))
+
+    for position, measured in enumerate(measured_words):
         word = measured["word"]
         painted, colour = measured["painted"], measured["colour"]
         ink_conf, mask, paint = measured["ink_conf"], measured["mask"], measured["paint"]
-        geo = _pre_font_signals(word, painted, mask, config)
+        geo = measured["geo"]
         measured_size = max(1.0, _num(geo.get("font_size"), base_size))
-        measured_weight = int(round(_num(geo.get("weight"), base_weight)))
+        measured_weight = measured["weight"]
         ratio = max(measured_size, base_size) / max(1.0, min(measured_size, base_size))
         colour_changed = _colour_distance(colour, base_colour) >= colour_delta
         weight_changed = (abs(measured_weight - base_weight) >= weight_delta
@@ -3334,6 +3417,38 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
                 and ink_conf >= weight_min_conf):
             measured_weight = max(measured_weight, base_weight + 300)
             weight_changed = True
+        # JITTER CLAMP (009: 'we'/'to' rendering Bold between Regular neighbours). A
+        # short function word wedged between two neighbours that agree with each other
+        # on weight is the one case where a measured flip is more likely noise than
+        # design: too few glyphs for density to be stable, and no designer bolds a lone
+        # connective mid-sentence. Demand BOTH ink signals — density ≥1.5x the line
+        # median AND a corroborating stroke-width ratio — or clamp back to the line.
+        # Genuine emphasis is untouched: it is either not a function word (009 '121K',
+        # 067 'Sale'/'40% OFF'), or not sandwiched (a line-initial or standalone token).
+        if weight_changed and _short_function_word(word.get("text")):
+            neighbours = [measured_words[i]["weight"] for i in (position - 1, position + 1)
+                          if 0 <= i < len(measured_words)]
+            sandwiched = len(neighbours) == 2 and neighbours[0] == neighbours[1]
+            if sandwiched:
+                dense_enough = bool(
+                    line_density and measured["density"]
+                    and measured["density"] >= line_density * jitter_density_ratio
+                )
+                stroke_enough = bool(
+                    line_stroke and measured["stroke_ratio"]
+                    and measured["stroke_ratio"] >= line_stroke * jitter_stroke_ratio
+                )
+                if not (dense_enough and stroke_enough):
+                    measured_weight = base_weight
+                    weight_changed = False
+                    word.setdefault("style_debug", {})["weight_jitter_clamped"] = {
+                        "measured": measured["weight"], "clamped_to": base_weight,
+                        "neighbour_weight": neighbours[0],
+                        "density_ratio": (round(measured["density"] / line_density, 3)
+                                          if line_density and measured["density"] else None),
+                        "stroke_ratio": (round(measured["stroke_ratio"] / line_stroke, 3)
+                                         if line_stroke and measured["stroke_ratio"] else None),
+                    }
         # A per-word size override needs an independent reason to believe the word is a
         # genuinely different run (a contrasting colour or a real weight change), not just
         # a different measured height. A single, emphasised token can stand alone; a word

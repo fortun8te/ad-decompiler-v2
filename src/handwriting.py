@@ -226,6 +226,50 @@ def stroke_width_cv(mask) -> Optional[float]:
     return round(float(ridge.std()) / mean, 4)
 
 
+def stroke_width_mean(mask) -> Optional[float]:
+    """Mean stroke width (px) across an ink mask, or ``None``.
+
+    Same distance-transform ridge estimate as :func:`stroke_width_cv`, but returns the
+    absolute width rather than its scatter: on the medial ridge the distance-to-
+    background is half the local stroke width, so the ridge mean doubled is the stroke
+    width.  Unlike ink DENSITY (ink pixels / box area) this does not move when a word's
+    glyph composition or letter-spacing changes, which makes the ratio of a word's
+    stroke width to its line's median an evidence source for a real weight change that
+    is independent of density.
+    """
+    try:
+        import numpy as np
+
+        m = np.asarray(mask, dtype=bool)
+    except Exception:
+        return None
+    if m.ndim != 2 or int(m.sum()) < 40 or min(m.shape) < 4:
+        return None
+    try:
+        import cv2
+
+        dist = cv2.distanceTransform(m.astype("uint8"), cv2.DIST_L2, 3)
+    except Exception:
+        try:
+            from scipy import ndimage
+
+            dist = ndimage.distance_transform_edt(m)
+        except Exception:
+            return None
+    import numpy as np
+
+    d = np.asarray(dist, dtype=np.float32)
+    ink_d = d[m]
+    ink_d = ink_d[ink_d > 0]
+    if ink_d.size < 20:
+        return None
+    thresh = float(np.percentile(ink_d, 60.0))
+    ridge = ink_d[ink_d >= max(thresh, 0.5)]
+    if ridge.size < 8:
+        ridge = ink_d
+    return round(float(ridge.mean()) * 2.0, 4)
+
+
 def baseline_wobble(mask) -> Optional[float]:
     """Relative vertical scatter of per-column ink bottoms (baseline roughness).
 

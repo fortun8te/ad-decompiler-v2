@@ -875,6 +875,90 @@ def test_word_style_enrichment_uses_strong_pixel_difference_without_guessing_fam
     assert word["style_evidence"]["source"] == "word-pixels"
 
 
+def _jitter_line(words, base_weight=400):
+    base = {
+        "fontFamily": "Inter", "fontSize": 30, "fontWeight": base_weight,
+        "fontStyle": "Regular", "color": "#111111",
+    }
+    return {
+        "text": " ".join(w for w, _ in words), "style": base,
+        "words": [{"text": w, "box": {"x": 40 * i, "y": 5, "w": 34, "h": 30}}
+                  for i, (w, _) in enumerate(words)],
+    }
+
+
+def _patch_jitter(monkeypatch, weights, density=None, stroke=None):
+    """Drive _enrich_word_styles with per-word weight/density/stroke measurements."""
+    def fake_geo(image, word):
+        return ({"x": word["box"]["x"], "y": word["box"]["y"],
+                 "w": word["box"]["w"], "h": word["box"]["h"]},
+                None, "#111111", 1.0,
+                np.ones((30, 34), dtype=bool),
+                {"fill": {"kind": "flat", "color": "#111111"}})
+
+    def fake_signals(word, painted, mask, config):
+        return {"font_size": 30, "weight": weights[word["text"]], "shear_angle": 0}
+
+    monkeypatch.setattr(text_analysis, "_painted_geometry", fake_geo)
+    monkeypatch.setattr(text_analysis, "_pre_font_signals", fake_signals)
+    # Density comes off the mask mean; patch the mask-derived signals per word instead.
+    if density is not None:
+        monkeypatch.setattr(text_analysis, "_collar_box", lambda box, image=None: box)
+
+
+def test_009_short_function_word_bold_between_regular_neighbours_is_clamped(monkeypatch):
+    """009: a lone Bold 'we'/'to' mid-sentence is measurement noise, not emphasis.
+
+    Uniform ink (every word the same density/stroke) means the flip has no corroboration,
+    so the function word must be clamped back to the line's weight.
+    """
+    line = _jitter_line([("Schrijf", 400), ("we", 700), ("zien", 400)])
+    _patch_jitter(monkeypatch, {"Schrijf": 400, "we": 700, "zien": 400})
+    text_analysis._enrich_word_styles(np.zeros((40, 200, 3), dtype=np.uint8), line, {})
+    we = line["words"][1]
+    assert "weight" not in (we.get("style_evidence") or {}).get("changed", []), \
+        "spurious mid-line bold on a function word must not survive"
+    assert (we.get("style_debug") or {}).get("weight_jitter_clamped")
+
+
+def test_009_real_bold_121K_is_not_a_function_word_and_survives(monkeypatch):
+    """009's genuine '121K' bold must be untouchable by the jitter clamp."""
+    assert not text_analysis._short_function_word("121K")
+    line = _jitter_line([("12-05-2026", 300), ("121K", 700), ("weergaven", 300)],
+                        base_weight=300)
+    _patch_jitter(monkeypatch, {"12-05-2026": 300, "121K": 700, "weergaven": 300})
+    text_analysis._enrich_word_styles(np.zeros((40, 200, 3), dtype=np.uint8), line, {})
+    bold = line["words"][1]
+    assert bold["style"]["fontWeight"] == 700
+    assert "weight" in bold["style_evidence"]["changed"]
+
+
+def test_025_genuine_emphasis_words_are_not_function_words():
+    """The clamp can never reach authored emphasis: none of it is connective tissue."""
+    for token in ("Sale", "40%", "OFF", "121K", "2GET", "FREE", "Hydration", "Cadence"):
+        assert not text_analysis._short_function_word(token), token
+
+
+def test_function_word_bold_survives_when_it_is_not_sandwiched(monkeypatch):
+    """A line-INITIAL function word has no left neighbour, so the clamp stays out.
+
+    067's 'our Sale with 40% OFF' opens on a genuinely bold 'our'; only a word wedged
+    between two agreeing neighbours is treated as jitter.
+    """
+    line = _jitter_line([("our", 700), ("Sale", 700), ("with", 400)])
+    _patch_jitter(monkeypatch, {"our": 700, "Sale": 700, "with": 400})
+    text_analysis._enrich_word_styles(np.zeros((40, 200, 3), dtype=np.uint8), line, {})
+    assert line["words"][0]["style"]["fontWeight"] == 700
+
+
+def test_function_word_bold_survives_when_neighbours_disagree(monkeypatch):
+    """Neighbours that disagree on weight are not a uniform line; the clamp stays out."""
+    line = _jitter_line([("BUY", 700), ("to", 700), ("save", 400)])
+    _patch_jitter(monkeypatch, {"BUY": 700, "to": 700, "save": 400})
+    text_analysis._enrich_word_styles(np.zeros((40, 200, 3), dtype=np.uint8), line, {})
+    assert line["words"][1]["style"]["fontWeight"] == 700
+
+
 def test_word_size_enrichment_does_not_fire_on_per_100g_pattern(monkeypatch):
     # Benchmark 002 "weird scaling": the line "per 100g" was fragmented into
     # per=12.5px + 100g=31px because a per-word size override fired on noisy

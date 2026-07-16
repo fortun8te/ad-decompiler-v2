@@ -48,7 +48,9 @@ DEFAULTS = {
 }
 
 _TEXTISH = {"text"}
-_RASTERISH = {"image", "photo", "raster"}
+# NOTE: there is deliberately no raster/shape/group class here. ``order_children``
+# splits siblings into text vs everything-else and nothing finer; sub-classifying art
+# re-sorts it against itself and hides overlapping cutouts. See order_children.
 # Names that carry no information for a designer scanning the layer list.
 _JUNK_NAMES = {"", "group", "layer", "frame", "rect", "rectangle", "vector",
                "node", "element", "shape", "untitled"}
@@ -187,14 +189,16 @@ def order_children(roots: list[dict], z_key: Optional[Callable] = None,
     "text nodes reachable and editable at the top of their groups".  Ordering is
     STABLE within each class, so an upstream z that already separates overlapping
     art is preserved; this only fixes the text/raster relationship.
+
+    Exactly TWO classes exist — text and everything-else — because that is the
+    only distinction this pass is entitled to make.  Ranking art into sub-classes
+    (image vs shape vs group) would re-sort ART AMONGST ITSELF and break the
+    stability promise above: a full-bleed plate would sort above an overlapping
+    cutout and hide it.  Layout already owns the paint order within the art
+    (``_node_z``); all this pass adds is that copy floats above it.
     """
     def _rank(node: dict) -> int:
-        target = str(node.get("target") or "").lower()
-        if target in _TEXTISH:
-            return 2
-        if _is_group(node):
-            return 1
-        return 0 if target in _RASTERISH else 1
+        return 1 if str(node.get("target") or "").lower() in _TEXTISH else 0
 
     reordered = []
 

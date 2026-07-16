@@ -4584,16 +4584,13 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
     # role-aware names win and leaves restructure to name only what it creates (its own
     # Header/Body/Footer bands).
     #
-    # structure.order_children is held off by default: its rank puts every raster (0)
-    # behind every shape (1), which reorders ART AMONGST ITSELF rather than only lifting
-    # text above rasters as its contract states — a full-bleed plate (shape) sorts ABOVE
-    # an overlapping cutout (image) and hides it. Layout already owns z (``_node_z``), so
-    # the safe composition is: take structure's tree shaping, keep layout's paint order.
-    # An explicit ``structure.text_above_rasters`` in config still wins.
-    structure_cfg = dict(cfg) if isinstance(cfg, dict) else {}
-    structure_opts = dict(structure_cfg.get("structure") or {})
-    structure_opts.setdefault("text_above_rasters", False)
-    structure_cfg["structure"] = structure_opts
+    # structure.order_children ranks text above everything else and nothing else, so it
+    # lifts copy to the top of its group while art keeps the relative paint order layout
+    # already assigned it (``_node_z``). It ranked rasters (0) below shapes (1) until the
+    # rank was corrected, which reordered ART AMONGST ITSELF and could sort a full-bleed
+    # plate above an overlapping cutout; the mitigation that held it off by default is
+    # gone with the cause.
+    structure_cfg = cfg
     # structure.dedupe_sibling_names reads only ``node["name"]``; layout carries its
     # designer-facing names on ``meta.semantic_name``. Publish them onto ``name`` first or
     # every named band ("Header"/"Body"/"Footer") is seen as unnamed and overwritten with

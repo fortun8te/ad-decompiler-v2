@@ -35,6 +35,38 @@ def test_stroke_width_cv_is_low_for_a_uniform_stroke():
     assert cv is not None and cv < 0.35, cv
 
 
+def test_stroke_width_mean_tracks_the_authored_stroke_width():
+    """A 6px-wide bar measures ~4.7px: the percentile ridge includes some off-centre
+    pixels, so the estimate reads slightly UNDER the true width. That bias is constant
+    and cancels in the word/line-median RATIO the jitter clamp actually consumes, so the
+    contract is proportionality, not calibration."""
+    width = handwriting.stroke_width_mean(_typeset_mask())
+    assert width is not None
+    assert 4.0 <= width <= 7.0, width
+
+
+def test_stroke_width_mean_separates_a_bold_run_from_a_regular_one():
+    """The signal the word-weight jitter clamp leans on: heavier ink, wider strokes.
+
+    It must move with the STROKE, not with how much of the box is inked, which is what
+    makes it independent corroboration for a density-driven weight flip.
+    """
+    def bars(stroke_px):
+        m = np.zeros((40, 200), bool)
+        for x in range(10, 190, 24):
+            m[8:32, x:x + stroke_px] = True
+        return m
+
+    regular = handwriting.stroke_width_mean(bars(4))
+    bold = handwriting.stroke_width_mean(bars(10))
+    assert regular is not None and bold is not None
+    assert bold > regular * 1.5, (regular, bold)
+
+
+def test_stroke_width_mean_is_none_for_a_degenerate_mask():
+    assert handwriting.stroke_width_mean(np.zeros((3, 3), bool)) is None
+
+
 def test_baseline_wobble_ignores_a_slanted_baseline():
     # An italic/oblique run sits on a straight but SLANTED baseline. Wobble must measure
     # roughness, not slant, or every oblique typeset line reads as hand-lettered.

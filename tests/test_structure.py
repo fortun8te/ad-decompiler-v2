@@ -188,6 +188,39 @@ def test_ordering_is_stable_within_a_class():
     assert [n["id"] for n in out[0]["children"]] == ["img_b", "img_a", "t_b", "t_a"]
 
 
+def _shape(id_, x, y, w, h, name=None):
+    return {"id": id_, "target": "shape", "box": {"x": x, "y": y, "w": w, "h": h},
+            "name": name, "children": [], "meta": {}}
+
+
+def test_a_full_bleed_plate_never_sorts_above_an_overlapping_cutout():
+    """The rank must not reorder ART AMONGST ITSELF.
+
+    A full-bleed plate (shape) painted FIRST and a product cutout (image) painted
+    over it: ranking rasters below shapes lifted the plate above the cutout and hid
+    it. Only the text/non-text split is this pass's business.
+    """
+    roots = [_group("g", 0, 0, 1080, 1080, [
+        _shape("plate", 0, 0, 1080, 1080, name="Background plate"),
+        _image("cutout", 200, 200, 400, 400, name="Product"),
+    ])]
+    out = structure.order_children(roots, report={})
+    assert [n["id"] for n in out[0]["children"]] == ["plate", "cutout"]
+
+
+def test_incoming_art_z_survives_while_text_still_floats_up():
+    """Art of every kind keeps its incoming relative order; only text moves."""
+    roots = [_group("g", 0, 0, 1080, 1080, [
+        _text("caption", 0, 900, 500, 40, "buy now"),
+        _shape("plate", 0, 0, 1080, 1080),
+        _image("photo", 0, 0, 800, 800),
+        _group("badge", 50, 50, 100, 100, [_shape("chip", 50, 50, 100, 100)]),
+    ])]
+    out = structure.order_children(roots, report={})
+    # plate/photo/badge hold their incoming order; only the text is lifted to the top.
+    assert [n["id"] for n in out[0]["children"]] == ["plate", "photo", "badge", "caption"]
+
+
 # ── names ───────────────────────────────────────────────────────────────────────
 
 def test_002_root_group_named_Group_is_renamed_after_its_copy():

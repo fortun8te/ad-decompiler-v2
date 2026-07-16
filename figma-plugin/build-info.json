@@ -1,9 +1,9 @@
 {
   "version": "2.1.0",
-  "build": 80,
-  "commit": "a9edfdd",
+  "build": 81,
+  "commit": "e727a43",
   "dirty": true,
-  "built_at": "2026-07-16T22:30:48Z",
-  "label": "v2.1.0+b80.a9edfdd-dirty",
+  "built_at": "2026-07-16T23:13:44Z",
+  "label": "v2.1.0+b81.e727a43-dirty",
   "source": "git"
 }
