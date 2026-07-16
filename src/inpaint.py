@@ -1218,6 +1218,54 @@ def _gradient_hole_fill(rgb, mask, cfg: Optional[dict] = None):
     return filled, remaining, info
 
 
+def _gradient_components_fill(rgb, mask, cfg: Optional[dict] = None):
+    """Per-connected-component gradient fill over a (possibly scattered) union mask.
+
+    Reconstruct's regional pass hands inpaint_array ONE union of many disjoint holes
+    (every removed text line + element at once). A ring around that union spans the
+    whole canvas, so the single-fit gradient never validated and the union fell to the
+    generative backend wholesale — 013's plate kept readable LaMa ghost-glyphs of the
+    headline. Fitting per component keeps each ring local. Components that validate
+    fill analytically; the remainder stays on the generative route.
+    """
+    cv2, np, _ = _deps()
+    opts = ((cfg or {}).get("inpaint") or {}).get("gradient_fill") or {}
+    if opts.get("enabled", True) is False:
+        return None
+    hole = (np.asarray(mask) > 0).astype(np.uint8)
+    n, labels = cv2.connectedComponents(hole, connectivity=8)
+    if n <= 2:  # 0/1 components: single-hole path
+        return _gradient_hole_fill(rgb, mask, cfg)
+    max_components = int(opts.get("max_components", 48))
+    if n - 1 > max_components:
+        return _gradient_hole_fill(rgb, mask, cfg)
+    filled = np.asarray(rgb, dtype=np.uint8).copy()
+    remaining = hole.copy() * 255
+    total = int(hole.sum())
+    done_px = 0
+    comp_opts = dict(cfg or {})
+    comp_opts["inpaint"] = dict((cfg or {}).get("inpaint") or {})
+    comp_opts["inpaint"]["gradient_fill"] = {**opts, "min_hole_fraction": 0.0}
+    fills = 0
+    for label in range(1, n):
+        comp = (labels == label).astype(np.uint8) * 255
+        comp_px = int(np.count_nonzero(comp))
+        if comp_px < int(opts.get("min_component_px", 400)):
+            continue
+        one = _gradient_hole_fill(filled, comp, comp_opts)
+        if one is None:
+            continue
+        filled, _, _ = one
+        remaining[comp > 0] = 0
+        done_px += comp_px
+        fills += 1
+    if fills == 0:
+        return None
+    info = {"kind": "linear-per-component", "components_filled": fills,
+            "filled_fraction": round(done_px / max(1, total), 4)}
+    return filled, remaining, info
+
+
 def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: bool = False):
     """Inpaint RGB pixels and guarantee that pixels outside ``mask`` stay byte-identical."""
     cv2, np, Image = _deps()
@@ -1272,7 +1320,7 @@ def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: boo
     # check and routes to the generative backend as before.
     gradient_info = None
     if np.any(generative_mask):
-        grad = _gradient_hole_fill(flat_source, generative_mask, cfg)
+        grad = _gradient_components_fill(flat_source, generative_mask, cfg)
         if grad is not None:
             flat_source, generative_mask, gradient_info = grad
             if not np.any(generative_mask):
@@ -1523,6 +1571,24 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             backend_diagnostics["backend_class"] = "analytic"
             backend_diagnostics["backend_route"] = {
                 "requested": requested, "selected": used, "selected_class": "analytic",
+                "strict_acceptance": bool((cfg.get("inpaint") or {}).get("strict_acceptance", False)),
+                "opencv_fallback_used": False, "fallback_reason": None,
+            }
+        elif requested == "big-lama" and (
+                grad_region := _gradient_hole_fill(crop_rgb, crop_mask, cfg)) is not None:
+            # Robust trimmed-gradient rescue: the affine gate above rejects a region
+            # whose ring is contaminated by undetected foreground (013's headline ring
+            # clips gummy bears), sending a smooth wash to Big-LaMa — which left
+            # readable ghost glyphs of "We NEVER do this!" in the shipped plate. The
+            # IRLS-trimmed quadratic fit validates on the plate's own pixels and fills
+            # exactly; regions that genuinely aren't washes fail validation and keep LaMa.
+            generated = grad_region[0]
+            used = "gradient-flat"
+            backend_diagnostics["backend_choice"] = used
+            backend_diagnostics["backend_class"] = "analytic"
+            backend_diagnostics["gradient_flat"] = grad_region[2]
+            backend_diagnostics["backend_route"] = {
+                "requested": "big-lama", "selected": used, "selected_class": "analytic",
                 "strict_acceptance": bool((cfg.get("inpaint") or {}).get("strict_acceptance", False)),
                 "opencv_fallback_used": False, "fallback_reason": None,
             }

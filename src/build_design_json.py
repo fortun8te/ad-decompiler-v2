@@ -463,6 +463,35 @@ def _surface_fill(candidate):
     return None
 
 
+def _crop_staged_to_box(staged_rel, run_dir, box, layer_id, warnings):
+    """Crop a canvas-sized staged asset down to its layer box.
+
+    qwen-layered decomposition emits FULL-CANVAS RGBA layers; staging one verbatim
+    under an element whose box is a fraction of the canvas makes every renderer
+    (preview + Figma) squash the whole canvas into the box — 013's headline band
+    rendered the entire 1080x1920 bear-fragment layer inside a 1066x269 rect as a
+    dark smear. When the staged image is markedly larger than the box and the box
+    fits inside it in canvas coordinates, crop to the box region.
+    """
+    if not staged_rel:
+        return staged_rel
+    try:
+        from PIL import Image
+        path = os.path.join(run_dir, staged_rel)
+        with Image.open(path) as img:
+            bw = max(1, int(round(float(box.get("w", 1) or 1))))
+            bh = max(1, int(round(float(box.get("h", 1) or 1))))
+            bx = int(round(float(box.get("x", 0) or 0)))
+            by = int(round(float(box.get("y", 0) or 0)))
+            if (img.width >= bw * 1.5 and img.height >= bh * 1.5
+                    and bx + bw <= img.width and by + bh <= img.height
+                    and bx >= 0 and by >= 0):
+                img.crop((bx, by, bx + bw, by + bh)).save(path)
+    except Exception as exc:
+        warnings.append({"code": "asset-crop-failed", "layer_id": layer_id, "detail": str(exc)})
+    return staged_rel
+
+
 def _apply_glass_fill(fill, fill_opacity):
     """Fold a glass fill-opacity into the fill dict (fill-only alpha, not layer opacity)."""
     if fill_opacity is None or not isinstance(fill, dict):
@@ -1034,7 +1063,9 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         # inpaint erase the real product (benchmark 002: 1025x1418 panel emptied).
         raster_src = candidate.get("src")
         if raster_src:
-            staged = _stage_asset(raster_src, f"{layer_id}__hostbg", run_dir, warnings)
+            staged = _crop_staged_to_box(
+                _stage_asset(raster_src, f"{layer_id}__hostbg", run_dir, warnings),
+                run_dir, box, layer_id, warnings)
             if staged:
                 host_mask = (dict(candidate.get("mask"))
                              if isinstance(candidate.get("mask"), dict) else None)
@@ -1183,14 +1214,26 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         )
 
     if target == "shape":
+        shape_src = None
+        if candidate.get("src"):
+            shape_src = _crop_staged_to_box(
+                _stage_asset(candidate.get("src"), layer_id, run_dir, warnings),
+                run_dir, box, layer_id, warnings)
+        shape_fill = _apply_glass_fill(candidate.get("fill"), glass_fill_opacity)
+        if shape_src and shape_fill is not None:
+            # A raster src defines the appearance; painting a detector-estimated flat
+            # fill UNDER it double-renders (013: dark #0a723d fill showed through the
+            # asset's transparent majority as a solid smudge band). Keep the estimate
+            # as provenance only.
+            common["meta"]["detected_fill"] = shape_fill
+            shape_fill = None
         return Layer(
             type="shape",
             shape_kind=candidate.get("shape_kind") or "rect",
             path=candidate.get("path"),
             svg=candidate.get("svg"),
-            src=_stage_asset(candidate.get("src"), layer_id, run_dir, warnings)
-                if candidate.get("src") else None,
-            fill=_apply_glass_fill(candidate.get("fill"), glass_fill_opacity),
+            src=shape_src,
+            fill=shape_fill,
             stroke=candidate.get("stroke"),
             radius=candidate.get("radius") or source_style.get("radius"),
             style=source_style,
