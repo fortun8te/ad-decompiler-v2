@@ -2223,6 +2223,103 @@ def _apply_platform_ui_font_prior(prepared: list[dict], cfg: Optional[dict],
     }
 
 
+def _unify_block_families(enriched: list[dict], prepared: list[dict],
+                          render_fit_options: dict, font_options: dict) -> list[dict]:
+    """Same-block font coherence: lines of ONE text block share one family.
+
+    Document consensus (below) deliberately caps fit regression so a genuine display
+    face survives the body font — but that per-line independence lets two lines of the
+    SAME headline ship different families (benchmark 094: "Caffeine-Free Energy" in
+    Lato 800 beside "Boost" in Carlito 700). Within a block, visual coherence outranks
+    a small per-line fit delta: refit minority lines to the block's dominant family
+    with a looser regression allowance. Same weight guard as doc consensus (a bold
+    line never adopts a regular representative), and a line already in exact-font
+    territory keeps its match — blocks mixing a true display face with body copy are
+    separated by _make_blocks' style clustering before this runs.
+    """
+    opts = (font_options or {}).get("block_unify") or {}
+    if opts.get("enabled", True) is False:
+        return []
+    try:
+        from src import font_fit
+    except Exception:
+        return []
+    by_line_id = {id(item.get("line")): item for item in prepared}
+    blocks: dict[str, list[dict]] = {}
+    for line in enriched:
+        bid = line.get("block_id")
+        if bid and (line.get("style") or {}).get("fontFamily"):
+            blocks.setdefault(str(bid), []).append(line)
+    max_regression = _num(opts.get("max_fit_regression"), 0.18)
+    strong_keep = _num(opts.get("strong_keep"), 0.72)
+    max_weight_delta = _num(opts.get("max_weight_delta"), 200)
+    min_score = _num(render_fit_options.get("min_score"), 0.30)
+    changes: list[dict] = []
+    for bid, lines in blocks.items():
+        if len(lines) < 2:
+            continue
+        fams = {str((l.get("style") or {}).get("fontFamily")) for l in lines}
+        if len(fams) < 2:
+            continue
+        # Dominant family by ink area x fit among the block's own lines.
+        weight: dict[str, float] = {}
+        rep: dict[str, dict] = {}
+        for l in lines:
+            style = l.get("style") or {}
+            fam = str(style.get("fontFamily"))
+            box = l.get("painted_box") or l.get("box") or {}
+            area = max(1.0, _num(box.get("w"), 1.0) * _num(box.get("h"), 1.0))
+            fit = _num(((l.get("meta") or {}).get("render_fit") or {}).get("score"), 0.2)
+            weight[fam] = weight.get(fam, 0.0) + area * max(fit, 0.05)
+            cand = next((c for c in (style.get("fontCandidates") or [])
+                         if isinstance(c, dict) and str(c.get("family")) == fam and c.get("path")), None)
+            if cand and fam not in rep:
+                rep[fam] = cand
+        target = max(weight, key=weight.get)
+        cand = rep.get(target)
+        path = str((cand or {}).get("path") or "")
+        if not path or not os.path.exists(path):
+            continue
+        for l in lines:
+            style = l.get("style") or {}
+            if str(style.get("fontFamily")) == target:
+                continue
+            own = _num(((l.get("meta") or {}).get("render_fit") or {}).get("score"), 0.0)
+            if own >= strong_keep:
+                continue
+            rep_weight = (cand or {}).get("weight")
+            line_weight = style.get("fontWeight")
+            if (isinstance(rep_weight, (int, float)) and isinstance(line_weight, (int, float))
+                    and abs(int(rep_weight) - int(line_weight)) >= max_weight_delta):
+                continue
+            item = by_line_id.get(id(l))
+            mask = item.get("font_mask") if item else None
+            if mask is None:
+                continue
+            try:
+                fit = font_fit.fit_line(l.get("text", ""), path, mask,
+                                        _num(style.get("fontSize"), 16.0), render_fit_options)
+            except Exception:
+                continue
+            new_score = _num((fit or {}).get("score"), 0.0)
+            if fit is None or (own - new_score) > max_regression:
+                continue
+            if own >= min_score and new_score < min_score:
+                continue
+            previous = str(style.get("fontFamily"))
+            new_size = _num(fit.get("fontSize"), _num(style.get("fontSize"), 16.0))
+            style["fontFamily"] = target
+            style["fontSize"] = round(new_size, 2)
+            style["letterSpacing"] = 0.0
+            meta = l.setdefault("meta", {})
+            meta.setdefault("render_fit", {})["score"] = new_score
+            meta["block_font_unified"] = {"from": previous, "to": target,
+                                          "own": round(own, 3), "new": round(new_score, 3)}
+            changes.append({"block": bid, "line": l.get("id"), "from": previous,
+                            "to": target, "own": round(own, 3), "new": round(new_score, 3)})
+    return changes
+
+
 def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
                           font_options: dict) -> Optional[dict]:
     """Document-level font family consensus across all matched lines.
@@ -3205,6 +3302,9 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
 
     _assign_roles(enriched, canvas)
     blocks = _make_blocks(enriched, canvas, config)
+    block_unify = _unify_block_families(enriched, prepared, render_fit_options, font_options)
+    if block_unify:
+        result["block_font_unification"] = block_unify
     sections = _make_sections(blocks, canvas)
     styles = _assign_style_ids(enriched, blocks)
 

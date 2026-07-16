@@ -2955,6 +2955,17 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                 c.get("target") == "drop" and c.get("text")
                 and (c.get("meta") or {}).get("removal_required")):
             dilate = max(dilate, int(rcfg.get("text_removal_dilate", 4)))
+            # Fixed floors under-cover DISPLAY text: a 120px headline has 12-18px
+            # stroke stems, and a 4px dilation of a slightly-tight ink mask leaves
+            # whole stems standing in the plate (094: leftover "B" stem rendered as
+            # a stray vertical bar beside the re-placed node; 002: orphan stroke
+            # after "BUNDEL"). Scale the floor with glyph height, capped so body
+            # text is untouched and a banner headline can't nuke its surroundings.
+            _tb = c.get("ink_box") or c.get("visible_box") or c.get("box") or {}
+            _th = float(_tb.get("h", 0) or 0)
+            if _th > 48:
+                dilate = max(dilate, min(int(rcfg.get("display_text_dilate_max", 14)),
+                                         int(round(_th * float(rcfg.get("display_text_dilate_frac", 0.08))))))
         # Comparison cards place bright editable copy over textured/translucent photo
         # surfaces. OCR ink masks are slightly tighter than the antialiased glyph fringe;
         # a two-pixel default leaves readable duplicate halos after reconstruction.
