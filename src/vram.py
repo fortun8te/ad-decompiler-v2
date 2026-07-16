@@ -328,15 +328,27 @@ def restore_vlm(cfg: Optional[dict] = None, run_dir: Optional[str] = None, *,
     args = [tool, "load", model, "-y"]
     if ttl > 0:
         args += ["--ttl", str(ttl)]
-    try:
-        result = subprocess.run(args, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=180)
-    except Exception as exc:  # pragma: no cover - subprocess/env specific
-        _emit(log_fn, f"vram: lms load error ({exc})")
-        return False
-    ok = result.returncode == 0
-    _emit(log_fn, f"vram: lms load {model} {'ok' if ok else 'failed'}")
-    return ok
+    # The load hangs exactly when the just-used Flux is still resident in ComfyUI —
+    # measured on 016: `lms load` sat the full 180s and died, then the SECOND harness
+    # round (after Comfy had been freed) loaded in seconds. Free Comfy first, use a
+    # tight timeout, and retry once after another explicit free.
+    free_comfy_vram(cfg, log_fn=log_fn, min_used_mib=8000.0, throttle_s=0.0)
+    for attempt in (1, 2):
+        try:
+            result = subprocess.run(args, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=75)
+        except subprocess.TimeoutExpired:
+            _emit(log_fn, f"vram: lms load timed out (attempt {attempt}/2)")
+            if attempt == 1:
+                free_comfy_vram(cfg, log_fn=log_fn, min_used_mib=0.0, throttle_s=0.0)
+            continue
+        except Exception as exc:  # pragma: no cover - subprocess/env specific
+            _emit(log_fn, f"vram: lms load error ({exc})")
+            return False
+        ok = result.returncode == 0
+        _emit(log_fn, f"vram: lms load {model} {'ok' if ok else 'failed'}")
+        return ok
+    return False
 
 
 # ── Flux GGUF quant selection by available VRAM ─────────────────────────────────────
