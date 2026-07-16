@@ -52,6 +52,11 @@ RULE_TO_CATEGORY = {
     "unexplained-raster-fallback": "sam",
     "duplicate-ownership": "staging",
     "local-ssim": "layout",
+    # The worst measured local window is a placement/geometry failure, not "staging"
+    # (002 filed the worst local mismatch under staging while layout scored zero).
+    "local-ssim-worst-region": "layout",
+    "local-ssim-worst-window": "layout",
+    "low-text-recall": "ocr",
     "edge-fidelity": "layout",
     "color-fidelity": "text",
     "duplicate-text": "staging",
@@ -107,13 +112,33 @@ def _write_json(path: str, data: dict) -> None:
     os.replace(temporary, path)
 
 
+_ATTEMPT_START_MARKERS = (
+    "resuming from the requested stage",   # resumed pass (config changed / --resume)
+    "] normalize →",                       # fresh full pipeline pass
+    "] normalize ->",
+)
+
+
 def _tail_log(run_dir: str, limit: int = LOG_TAIL_LINES) -> list[str]:
+    """Tail of pipeline.log scoped to the CURRENT attempt.
+
+    A resumed pipeline appends to the same pipeline.log, so a plain tail can cite hours-
+    old events from a previous pass as evidence for the current failure (002: the critic
+    blamed 07:02/07:04 OpenCV peel events for an 11:19 layout resume). Evidence is cut
+    at the last attempt-start marker; the plain tail is the fallback when no marker
+    exists (truncated/rotated logs, unit fixtures).
+    """
     path = os.path.join(run_dir, "pipeline.log")
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
-            return [line.rstrip("\n") for line in handle.readlines()[-limit:]]
+            lines = [line.rstrip("\n") for line in handle.readlines()]
     except OSError:
         return []
+    start = 0
+    for index, line in enumerate(lines):
+        if any(marker in line for marker in _ATTEMPT_START_MARKERS):
+            start = index
+    return lines[start:][-limit:]
 
 
 def _category_for_stage(stage: str | None) -> str:
@@ -225,6 +250,39 @@ def _score_categories(
             _bump(scores["sam"], 0.3, f"layer {lid} noisy alpha score {score:.2f}")
         else:
             _bump(scores["staging"], 0.2, f"layer {lid} score {score:.2f}")
+
+    # Measured per-layer region evidence (region_ssim / ink IoU from pixel_diff).
+    # Category attribution must agree with the repairs these rows drive: a collapsed
+    # text region is a text/layout failure, a collapsed decoration is layout — not
+    # "staging" (002: layout scored ZERO while the critic recommended price/BUNDEL
+    # geometry repairs).
+    text_roles = {"text", "headline", "subheadline", "body", "cta", "price", "text-block"}
+    for layer in qa.get("per_layer") or []:
+        if not isinstance(layer, dict):
+            continue
+        region = layer.get("region_ssim")
+        if not isinstance(region, (int, float)) or region >= 0.35:
+            continue
+        lid = layer.get("id", "?")
+        role = str(layer.get("role") or layer.get("type") or "layer")
+        if layer.get("type") == "text" or role in text_roles:
+            _bump(scores["text"], 0.3, f"layer {lid} region_ssim {region:.2f}")
+            ink = layer.get("ink_iou")
+            if isinstance(ink, (int, float)) and ink < 0.4:
+                _bump(scores["layout"], 0.3,
+                      f"layer {lid} ink_iou {ink:.2f} (placement/geometry)")
+        elif role in ("shape", "underline", "strikethrough", "decoration", "arrow"):
+            _bump(scores["layout"], 0.25, f"layer {lid} region_ssim {region:.2f}")
+        else:
+            _bump(scores["sam"], 0.25, f"layer {lid} region_ssim {region:.2f}")
+
+    contract = qa.get("contract") if isinstance(qa.get("contract"), dict) else {}
+    if contract.get("placement_ok") is False:
+        ink_iou = contract.get("placement_ink_iou")
+        evidence = "contract placement_ok false"
+        if isinstance(ink_iou, (int, float)):
+            evidence += f" (placement ink IoU {ink_iou:.2f})"
+        _bump(scores["layout"], 0.4, evidence)
 
     for hf in hard_fails:
         if not isinstance(hf, dict):

@@ -5,9 +5,15 @@ Three defects from the benchmark forensics (002 product bundle, 009 social scree
   * DOUBLE-RENDER — a native TEXT layer AND a baked raster carrier under it print the same
     content, doubling it (002 "WHEYMILKSHAKE", 009 "geld geld"). The single-ownership audit
     gives the native text sole ownership by erasing its baked duplicate from the carrier.
-  * GHOST SILHOUETTES — a low-confidence opaque raster kept in the plate (removal cap)
-    leaves a silhouette in background_clean even though it re-renders on top. The cover pass
-    fills its footprint with the plate colour.
+  * GHOST SILHOUETTES — an opaque raster that still ships as a re-rendered layer
+    (``keep_in_background`` + ``target == "image"``) leaves a silhouette in background_clean
+    even though it's hidden underneath that layer. The cover pass fills its footprint with the
+    plate colour. NOTE (2026-07-16, post-002-forensics correction): a removal-capped /
+    ``plate_passthrough`` raster does NOT re-render on top — it is dropped entirely (no src,
+    no mask, target="drop"), so its plate pixels ARE the only representation. Covering those
+    is what caused the 002 catastrophic seam (an entire 46%-of-canvas panel painted with a
+    ring-median colour). Plate-passthrough footprints are therefore NEVER covered — see
+    ``test_cover_pass_skips_plate_passthrough`` in test_reconstruct.py.
   * FLAT UI PLATES — Codia ships flat/banded UI as SOLID rects, never a generative inpaint.
     Flat mask holes are solid-filled analytically; only genuine photo holes inpaint.
 
@@ -207,20 +213,23 @@ def _capped_scene(tmp_path):
     return source, candidates
 
 
-def test_capped_raster_footprint_is_covered_in_clean_plate(tmp_path):
-    """A capped (kept-in-plate) low-confidence raster must not leave a ghost silhouette
-    in background_clean — its footprint is filled with the surrounding plate colour."""
+def test_capped_raster_footprint_is_never_covered_plate_owned(tmp_path):
+    """A removal-capped raster is dropped (target="drop", no src/mask) and never
+    re-rendered, so its plate pixels are the sole representation — the cover pass must
+    NEVER touch a plate_passthrough footprint (covering it repaints real plate content
+    with a guessed colour; this is the exact 002 seam-catastrophe mechanism). See the
+    module docstring's GHOST SILHOUETTES note and test_reconstruct.py's
+    test_cover_pass_skips_plate_passthrough for the unit-level invariant."""
     source, candidates = _capped_scene(tmp_path)
     result = reconstruct.reconstruct(str(source), {"lines": []}, candidates,
                                      str(tmp_path), {"inpaint": {"mode": "opencv"}})
     assert result["stats"]["removal_capped"] == 1
-    assert result["stats"]["kept_footprints_covered"] >= 1
+    assert result["stats"]["kept_footprints_covered"] == 0
     plate = np.asarray(Image.open(tmp_path / result["background"]).convert("RGB"))
     footprint = plate[8:42, 8:100]
-    # The blue blob silhouette is gone — the footprint now matches the light plate
-    # (blob was (30,90,160); plate is ~(238,232,220)).
-    assert footprint[:, :, 0].mean() > 200  # red no longer the blob's 30
-    assert footprint[:, :, 1].mean() > 200  # green no longer the blob's 90
+    # The blue blob is plate-owned and untouched by the cover pass — it remains
+    # (blob was (30,90,160); a covered plate would read ~(238,232,220) instead).
+    assert footprint[:, :, 2].mean() > 120  # blue channel still shows the blob
 
 
 def test_cover_footprints_config_gate(tmp_path):

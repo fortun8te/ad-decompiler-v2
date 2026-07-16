@@ -392,6 +392,19 @@ _DEFAULT_SCORE_MIN = {
     "connector": 0.78, "leader": 0.78, "callout_leader": 0.78, "leader_line": 0.78,
     "string": 0.78, "thread": 0.78, "string_leader": 0.78, "leader_string": 0.78,
     "callout_string": 0.78,
+    # Hand-drawn "weird" decoration marks (H11/H17): scribbled-out strokes crossing text,
+    # organic brush-stroke banners, arrows. These are irregular by construction, so the
+    # render-back gate is loosened to the same tier as connector strokes — a genuinely
+    # failed trace still honestly falls back to a raster/alpha chip.
+    "scribble": 0.76, "scribble_strike": 0.76, "scribble_strikethrough": 0.76,
+    "scratch_out": 0.76, "redaction_scribble": 0.76, "hand_strike": 0.76,
+    "brush": 0.78, "brush_stroke": 0.78, "brushstroke": 0.78, "brush_banner": 0.78,
+    "paint_stroke": 0.78, "marker_stroke": 0.78,
+    # Starburst / sunburst seal badges (H11) fit to a real regular-star polygon; a clean
+    # analytic star always beats a wobbly trace, so the fitter gates separately and this
+    # entry only bounds the fallback trace when the star fit is rejected.
+    "starburst": 0.80, "star": 0.80, "sunburst": 0.80, "seal": 0.80, "star_badge": 0.80,
+    "circle_badge": 0.80, "badge_circle": 0.80, "price_badge": 0.80,
     "line": 0.80, "divider": 0.80,
     # Chart/diagram strokes and markers: same tier as connectors — prefer editable
     # vectors when the render-back gate passes; never force a photo-style reject bar.
@@ -408,6 +421,14 @@ _DEFAULT_MAX_PATHS = {
     "connector": 24, "leader": 24, "callout_leader": 24, "leader_line": 24,
     "string": 24, "thread": 24, "string_leader": 24, "leader_string": 24,
     "callout_string": 24,
+    # A scribble is a small handful of overlapping strokes; a brush banner one organic
+    # blob; a starburst one star polygon (fallback trace can be a bit richer).
+    "scribble": 24, "scribble_strike": 24, "scribble_strikethrough": 24,
+    "scratch_out": 24, "redaction_scribble": 24, "hand_strike": 24,
+    "brush": 20, "brush_stroke": 20, "brushstroke": 20, "brush_banner": 20,
+    "paint_stroke": 20, "marker_stroke": 20,
+    "starburst": 30, "star": 30, "sunburst": 30, "seal": 30, "star_badge": 30,
+    "circle_badge": 12, "badge_circle": 12, "price_badge": 12,
     "line": 14, "divider": 14,
     "axis": 8, "axis_line": 8, "axis-line": 8, "gridline": 8,
     "plot_line": 16, "plot-line": 16, "data_line": 16, "data-line": 16,
@@ -773,9 +794,30 @@ def _rrect_d(x, y, w, h, r):
     )
 
 
+def _star_d(cx, cy, r_outer, r_inner, points, rotation=0.0):
+    """Regular N-point star polygon path (outer tip / inner valley alternating).
+
+    ``rotation`` is the angle (radians) of the first outer tip, measured from +x. The
+    same clean vertex geometry a designer would draw with Figma's star tool — a real
+    star beats a dozen-Bézier trace of a starburst seal.
+    """
+    n = max(3, int(points))
+    verts = []
+    for i in range(n):
+        a_out = rotation + 2.0 * math.pi * i / n
+        a_in = rotation + 2.0 * math.pi * (i + 0.5) / n
+        verts.append((cx + r_outer * math.cos(a_out), cy + r_outer * math.sin(a_out)))
+        verts.append((cx + r_inner * math.cos(a_in), cy + r_inner * math.sin(a_in)))
+    body = "".join(f"L{x:.2f} {y:.2f}" for x, y in verts[1:])
+    return f"M{verts[0][0]:.2f} {verts[0][1]:.2f}{body}Z"
+
+
 def _primitive_d(prim):
     if prim["kind"] == "ellipse":
         return _ellipse_d(prim["cx"], prim["cy"], prim["rx"], prim["ry"])
+    if prim["kind"] == "star":
+        return _star_d(prim["cx"], prim["cy"], prim["r_outer"], prim["r_inner"],
+                       prim["points"], prim.get("rotation", 0.0))
     return _rrect_d(prim["x"], prim["y"], prim["w"], prim["h"], prim.get("radius", 0.0))
 
 
@@ -834,6 +876,135 @@ def _fit_primitive(mask, min_iou=0.94, allow_plain_rect=False):
                     "w": float(bw), "h": float(bh), "radius": round(float(r), 2),
                     "iou": round(rr_iou, 4)}
     return best
+
+
+def _fit_star_polygon(mask, min_iou=0.90, min_points=5, max_points=24):
+    """Fit a regular N-point star (starburst seal) to a spiky silhouette.
+
+    A starburst is exactly what ``_fit_primitive`` rejects (sparse area fraction, no
+    ellipse/rrect match), yet it is one of the cleanest shapes to author natively — a
+    Figma star with a point count and two radii. The fit casts rays from the silhouette
+    centroid to build a radial profile r(theta), counts the evenly-spaced tips, then
+    refines the geometry to maximize IoU. Returns a primitive dict (kind="star") or None.
+    """
+    np = _require_np()
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 60:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    bw, bh = x1 - x0 + 1, y1 - y0 + 1
+    if min(bw, bh) < 12:
+        return None
+    local = mask[y0:y1 + 1, x0:x1 + 1]
+    area = float(local.sum())
+    fill_frac = area / float(bw * bh)
+    # A star's convex hull is far larger than its ink: a near-solid blob (disc, rrect)
+    # or a near-empty ring is not a star. Bracket the ink fraction to the spiky regime.
+    if not (0.30 <= fill_frac <= 0.80):
+        return None
+    ys_l, xs_l = np.nonzero(local)
+    cx = float(xs_l.mean())
+    cy = float(ys_l.mean())
+
+    n_ang = 360
+    angles = np.linspace(0.0, 2.0 * math.pi, n_ang, endpoint=False)
+    # Max foreground radius along each ray (0 where the ray leaves the silhouette early).
+    dxs = np.cos(angles)
+    dys = np.sin(angles)
+    max_r = float(math.hypot(bw, bh))
+    steps = np.arange(0.0, max_r, 0.5)
+    profile = np.zeros(n_ang, dtype=np.float32)
+    h_l, w_l = local.shape
+    for k, (dx, dy) in enumerate(zip(dxs, dys)):
+        px = cx + steps * dx
+        py = cy + steps * dy
+        inside = (px >= 0) & (px < w_l) & (py >= 0) & (py < h_l)
+        if not inside.any():
+            continue
+        pxi = px[inside].astype(np.int32)
+        pyi = py[inside].astype(np.int32)
+        fg = local[pyi, pxi]
+        hit = np.nonzero(fg)[0]
+        if len(hit):
+            profile[k] = float(steps[inside][hit[-1]])
+    if float(profile.max()) <= 0.0:
+        return None
+
+    # Circularly smooth, then count peaks (tips) as evenly-spaced maxima above the mean.
+    kern = np.ones(5, dtype=np.float32) / 5.0
+    sm = np.convolve(np.concatenate([profile[-4:], profile, profile[:4]]), kern, "same")[4:-4]
+    thresh = 0.5 * (float(sm.max()) + float(sm.min()))
+    peaks = []
+    for k in range(n_ang):
+        v = sm[k]
+        if v < thresh:
+            continue
+        if v >= sm[(k - 1) % n_ang] and v >= sm[(k + 1) % n_ang]:
+            peaks.append(k)
+    # Merge adjacent plateau indices into single peaks.
+    merged = []
+    for k in peaks:
+        if merged and (k - merged[-1][-1]) <= 3:
+            merged[-1].append(k)
+        else:
+            merged.append([k])
+    if merged and len(merged) > 1 and (n_ang - merged[-1][-1] + merged[0][0]) <= 3:
+        merged[0] = merged.pop() + merged[0]
+    tips = [grp[int(np.argmax(sm[grp]))] for grp in merged]
+    n_pts = len(tips)
+    if not (min_points <= n_pts <= max_points):
+        return None
+    # Tips must be roughly evenly spaced (regular star), else it is an organic blob.
+    tip_ang = np.sort(np.array([angles[t] for t in tips]))
+    gaps = np.diff(np.concatenate([tip_ang, [tip_ang[0] + 2 * math.pi]]))
+    if float(gaps.std()) > (2.0 * math.pi / n_pts) * 0.45:
+        return None
+
+    r_outer = float(np.percentile(profile[profile > 0], 88))
+    valleys = [profile[(t + n_ang // (2 * n_pts)) % n_ang] for t in tips]
+    r_inner = float(np.median([v for v in valleys if v > 0]) if any(valleys) else r_outer * 0.5)
+    r_inner = max(1.0, min(r_inner, r_outer * 0.92))
+    rotation = float(angles[tips[int(np.argmax([profile[t] for t in tips]))]])
+
+    yy, xx = np.mgrid[0:h_l, 0:w_l]
+
+    def star_iou(ro, ri, rot):
+        # Point-in-polygon via matplotlib-free ray param: rebuild vertices, test winding.
+        verts = []
+        for i in range(n_pts):
+            ao = rot + 2 * math.pi * i / n_pts
+            ai = rot + 2 * math.pi * (i + 0.5) / n_pts
+            verts.append((cx + ro * math.cos(ao), cy + ro * math.sin(ao)))
+            verts.append((cx + ri * math.cos(ai), cy + ri * math.sin(ai)))
+        vx = np.array([p[0] for p in verts])
+        vy = np.array([p[1] for p in verts])
+        inside = np.zeros((h_l, w_l), dtype=bool)
+        j = len(vx) - 1
+        px = xx.astype(np.float32)
+        py = yy.astype(np.float32)
+        for i in range(len(vx)):
+            cond = ((vy[i] > py) != (vy[j] > py)) & (
+                px < (vx[j] - vx[i]) * (py - vy[i]) / (vy[j] - vy[i] + 1e-9) + vx[i])
+            inside ^= cond
+            j = i
+        union = float(np.logical_or(inside, local).sum())
+        return float(np.logical_and(inside, local).sum()) / union if union else 0.0
+
+    best_iou = 0.0
+    best = (r_outer, r_inner, rotation)
+    for ro_f in (0.95, 1.0, 1.05):
+        for ri_f in (0.8, 1.0, 1.2):
+            cand = star_iou(r_outer * ro_f, min(r_outer * 0.92, r_inner * ri_f), rotation)
+            if cand > best_iou:
+                best_iou = cand
+                best = (r_outer * ro_f, min(r_outer * 0.92, r_inner * ri_f), rotation)
+    if best_iou < min_iou:
+        return None
+    ro, ri, rot = best
+    return {"kind": "star", "cx": round(x0 + cx, 2), "cy": round(y0 + cy, 2),
+            "r_outer": round(ro, 2), "r_inner": round(ri, 2),
+            "points": n_pts, "rotation": round(rot, 4), "iou": round(best_iou, 4)}
 
 
 def _detect_gradient(png_path, cfg):
@@ -900,6 +1071,41 @@ def _detect_gradient(png_path, cfg):
             worst = max(worst, dev)
         return worst <= band_tol
 
+    def monotonic_enough(projection):
+        """Accept a soft radial wash whose colour fades monotonically to a plateau.
+
+        The 2-stop linear-in-radius model overshoots a heavy-blur blob's flat tail, so
+        ``smooth_enough`` mis-flags a genuine radial as banded. A real blob's binned
+        colour means are *monotonic* along the radius (each channel only rises or only
+        falls, allowing a small wobble); a stepped flag reverses direction. This accepts
+        the former and still rejects the latter, so an H8-style soft blob with no hard
+        edge is emitted as a native radial instead of falling through to a raster/trace.
+        """
+        lo, hi = float(projection.min()), float(projection.max())
+        if hi - lo <= 1e-6:
+            return False
+        edges = np.linspace(lo, hi, 13)
+        idx = np.clip(np.digitize(projection, edges) - 1, 0, 11)
+        means, populated = [], 0
+        for b in range(12):
+            sel = idx == b
+            if int(sel.sum()) < 20:
+                means.append(None)
+                continue
+            means.append(colors[sel].mean(axis=0))
+            populated += 1
+        seq = [m for m in means if m is not None]
+        if populated < 6 or len(seq) < 6:
+            return False
+        wobble = float(gz.get("monotonic_wobble", 6.0))
+        for ch in range(3):
+            vals = [float(m[ch]) for m in seq]
+            up = all(vals[i + 1] - vals[i] >= -wobble for i in range(len(vals) - 1))
+            down = all(vals[i + 1] - vals[i] <= wobble for i in range(len(vals) - 1))
+            if not (up or down):
+                return False
+        return True
+
     linear = None
     design = np.column_stack((np.ones(len(x), dtype=np.float32), x, y))
     coeff, _, _, _ = np.linalg.lstsq(design, colors, rcond=None)
@@ -937,15 +1143,57 @@ def _detect_gradient(png_path, cfg):
 
     radial = None
     normalizer = max(1.0, float(math.hypot((w - 1) / 2.0, (h - 1) / 2.0)))
-    radius = (np.hypot(x * sx, y * sy) / normalizer).astype(np.float32)
-    design_r = np.column_stack((np.ones(len(radius), dtype=np.float32), radius))
-    coeff_r, _, _, _ = np.linalg.lstsq(design_r, colors, rcond=None)
-    prediction_r = design_r @ coeff_r
-    radial_r2 = 1.0 - float(np.square(colors - prediction_r).sum()) / total
+    cx0, cy0 = (w - 1) / 2.0, (h - 1) / 2.0
+
+    # A soft radial blob (H8 orange/yellow wash) is rarely centred on the crop. Search a
+    # coarse grid of candidate centres (in half-extent units) and keep the one whose
+    # radial regression best explains the colour field; fall back to the crop centre.
+    # ``fit_center`` (default on) can be disabled for parity with the old fixed centre.
+    fit_center = gz.get("fit_center", True) is not False
+
+    def _radial_at(ox, oy):
+        rad = (np.hypot((x - ox) * sx, (y - oy) * sy) / normalizer).astype(np.float32)
+        dz = np.column_stack((np.ones(len(rad), dtype=np.float32), rad))
+        cf, _, _, _ = np.linalg.lstsq(dz, colors, rcond=None)
+        pr = dz @ cf
+        r2 = 1.0 - float(np.square(colors - pr).sum()) / total
+        return r2, (ox, oy, rad, cf, pr)
+
+    best_r2, best = _radial_at(0.0, 0.0)
+    if fit_center:
+        # Coarse grid, then a finer local refinement around the winner so an off-centre
+        # blob (H8) whose true centre lies between coarse nodes still fits tightly.
+        for oy in (-0.6, -0.3, 0.0, 0.3, 0.6):
+            for ox in (-0.6, -0.3, 0.0, 0.3, 0.6):
+                r2, cand = _radial_at(ox, oy)
+                if r2 > best_r2:
+                    best_r2, best = r2, cand
+        bx, by = best[0], best[1]
+        for _ in range(2):
+            step = 0.15 if _ == 0 else 0.07
+            improved = False
+            for oy in (by - step, by, by + step):
+                for ox in (bx - step, bx, bx + step):
+                    r2, cand = _radial_at(ox, oy)
+                    if r2 > best_r2 + 1e-6:
+                        best_r2, best, bx, by, improved = r2, cand, ox, oy, True
+            if not improved:
+                break
+    ox, oy, radius, coeff_r, prediction_r = best
+    radial_r2 = best_r2
     if (radial_r2 >= radial_min_r2
             and float(np.linalg.norm(coeff_r[1])) >= min_range * 0.55):
         low_r, high_r = np.percentile(radius, (2, 98))
-        if high_r - low_r >= 0.35 and smooth_enough(radius, prediction_r):
+        if high_r - low_r >= 0.35 and (
+                smooth_enough(radius, prediction_r) or monotonic_enough(radius)):
+            # Pixel-space centre + radius so the emitted SVG paint is exact even when the
+            # blob is off-centre; normalized centre is kept for reconstruct parity. The
+            # regression maps normalized radius 1.0 -> ``normalizer`` px from the fitted
+            # centre, so the SVG gradient ``r`` MUST equal ``normalizer`` for the stop
+            # positions to align with the fitted colours.
+            cx_px = cx0 + ox * sx
+            cy_px = cy0 + oy * sy
+            r_px = normalizer
             radial = {
                 "kind": "radial",
                 "stops": [
@@ -953,7 +1201,9 @@ def _detect_gradient(png_path, cfg):
                     {"position": 1, "color": _rgb_hex(coeff_r[0] + coeff_r[1])},
                 ],
                 "meta": {"r2": round(radial_r2, 4), "range": round(range_norm, 2),
-                         "center": [0.5, 0.5]},
+                         "center": [round(0.5 + ox / 2.0, 4), round(0.5 + oy / 2.0, 4)],
+                         "cx": round(cx_px, 2), "cy": round(cy_px, 2),
+                         "r": round(max(1.0, r_px), 2)},
             }
 
     # Prefer radial only when it explains materially more variance (reconstruct parity).
@@ -976,10 +1226,12 @@ def _gradient_svg(d, w, h, grad, winding=None):
             f'x2="{meta.get("x2", w)}" y2="{meta.get("y2", 0)}">{stops}</linearGradient>'
         )
     else:
-        radius = math.hypot((w - 1) / 2.0, (h - 1) / 2.0)
+        cx = float(meta.get("cx", (w - 1) / 2.0))
+        cy = float(meta.get("cy", (h - 1) / 2.0))
+        radius = float(meta.get("r", math.hypot((w - 1) / 2.0, (h - 1) / 2.0)))
         defs = (
             f'<radialGradient id="vg" gradientUnits="userSpaceOnUse" '
-            f'cx="{(w - 1) / 2.0:.2f}" cy="{(h - 1) / 2.0:.2f}" r="{radius:.2f}">'
+            f'cx="{cx:.2f}" cy="{cy:.2f}" r="{radius:.2f}">'
             f"{stops}</radialGradient>"
         )
     rule = ' fill-rule="evenodd"' if winding == "EVENODD" else ""
@@ -1494,6 +1746,56 @@ def _flat_primitive_result(png_path, cfg, role, n_colors):
     return None
 
 
+# Roles whose crop should be tried as a regular-star polygon before ordinary tracing.
+_STAR_ROLES = frozenset({
+    "starburst", "star", "sunburst", "seal", "star_badge", "star-badge", "badge_star",
+})
+
+
+def _star_primitive_result(png_path, cfg, role, n_colors):
+    """Prefer a clean regular-star polygon for starburst / sunburst seal crops.
+
+    Fires only for star-ish roles and only when the fitted star passes the same
+    render-back gate as every trace; otherwise the caller falls through to VTracer so a
+    genuinely irregular badge still reconstructs faithfully. The star is emitted as one
+    flat-fill path (native star geometry) plus a ``primitive`` dict carrying point count
+    and radii so a downstream Figma emitter can build a real STAR node.
+    """
+    pz = _vz_cfg(cfg).get("primitives") or {}
+    if pz.get("enabled", True) is False:
+        return None
+    np = _require_np()
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            rgba = np.asarray(im.convert("RGBA"), dtype=np.uint8)
+    except Exception:
+        return None
+    h, w = rgba.shape[:2]
+    mask, _strategy = _foreground_mask(rgba)
+    if not mask.any() or bool(mask.all()):
+        return None
+    pixels = rgba[:, :, :3][mask].astype("float32")
+    if pixels.shape[0] < 60:
+        return None
+    # A seal is a solid one-colour shape; a photographic/gradient badge is not a star fit.
+    if float(pixels.std(axis=0).max()) > float(pz.get("star_max_color_std", 40.0)):
+        return None
+    prim = _fit_star_polygon(mask, float(pz.get("star_min_iou", 0.90)))
+    if not prim:
+        return None
+    fill = _rgb_hex(np.median(pixels, axis=0))
+    svg = _contour_paths_to_svg([{"d": _primitive_d(prim), "fill": fill}], w, h)
+    result, _ = _evaluate_trace(
+        svg, png_path, "analytic-star", cfg, role, n_colors,
+        preset_note=f"star points={prim['points']} iou={prim['iou']}",
+    )
+    if result and result["ok"]:
+        result["primitive"] = prim
+        return result
+    return None
+
+
 _CLEANUP_ENGINES = ("vtracer", "potrace", "contour")
 
 
@@ -1638,6 +1940,17 @@ def vectorize_crop(png_path_or_array, cfg: Optional[dict] = None, role: Optional
                 preset_note="single-stroke",
             )
             if result and consider(result):
+                return result
+
+        # A flat shape with a simple gradient paint must become one silhouette + native
+        # gradient, never ten stacked colour bands; a flat near-circle / rounded-rect
+        # becomes the clean analytic primitive.  Both are gated exactly like traces.
+        # A starburst / sunburst seal fits a real regular-star polygon before we ever
+        # trace it — a clean N-point star beats a wobbly VTracer path. Only star-ish
+        # roles pay the fitting cost, and the star is gated exactly like every trace.
+        if str(role or "").lower().replace("-", "_") in _STAR_ROLES:
+            result = _star_primitive_result(png_path, cfg, role, n_colors)
+            if result is not None:
                 return result
 
         # A flat shape with a simple gradient paint must become one silhouette + native

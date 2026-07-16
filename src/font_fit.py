@@ -126,10 +126,14 @@ def fit_options(config: Optional[dict]) -> dict:
     """Normalize ``text_analysis.render_fit`` (bool or mapping, default ON)."""
     raw = (config or {}).get("render_fit", True)
     if isinstance(raw, bool):
-        return {"enabled": raw}
+        return {"enabled": raw, "score_letter_spacing_zero": True}
     if isinstance(raw, dict):
         out = dict(raw)
         out.setdefault("enabled", True)
+        # Candidate ranking and emit-time refits render at the emitted tracking (0),
+        # so their fit score must judge the natural-advance width. classify_source
+        # keeps the comparative tracking-optimized score (its own options path).
+        out.setdefault("score_letter_spacing_zero", True)
         return out
     return {"enabled": False}
 
@@ -279,6 +283,16 @@ def fit_line(text: str, font_path: str, source_mask, initial_size: float,
     tracking = 0.0
     gaps = max(1, len(text) - 1)
     iterations = max(1, min(6, int(_num(options.get("iterations"), DEFAULT_FIT_ITERATIONS))))
+    # The pipeline ALWAYS emits letterSpacing 0 (Codia parity, contract §2/§7): every
+    # text node renders at its font's natural advance width, so that is the width the
+    # fit score must judge. Solving a per-gap tracking and scoring the *tracked* render
+    # rewards a wrong-WIDTH face (a wide humanist sans squeezed with negative tracking)
+    # exactly as much as the right-width one — which is how 002's squared/condensed
+    # KRACHTSPORT headline matched wide Lato (tracked score 0.62) over a squared display
+    # grotesque (Archivo 0.56) yet rendered at ink IoU ~0.19 once tracking was forced
+    # back to 0. Score every candidate at the emitted tracking (0) so natural advance
+    # width is decisive; the solved ``letterSpacing`` is retained only as a diagnostic.
+    score_at_zero = bool(options.get("score_letter_spacing_zero", False))
     result = None
     for _ in range(iterations):
         rendered = _render_tracked_mask(text, font_path, size, tracking)
@@ -294,7 +308,8 @@ def fit_line(text: str, font_path: str, source_mask, initial_size: float,
         tracking = (target_w - natural.shape[1]) / gaps
         tracking = max(-_MAX_NEG_TRACKING_EM * size, min(_MAX_POS_TRACKING_EM * size, tracking))
     else:
-        final = _render_tracked_mask(text, font_path, size, tracking)
+        score_tracking = 0.0 if score_at_zero else tracking
+        final = _render_tracked_mask(text, font_path, size, score_tracking)
         if final is not None:
             result = {
                 "fontSize": round(size, 2),

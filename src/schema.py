@@ -323,13 +323,25 @@ class Layer:
     path: Optional[str] = None                  # SVG d-string when shape_kind=path (VTracer/Potrace)
     svg: Optional[str] = None                   # complete multi-path SVG; preferred for icons/logos
     fill: Optional[dict] = None                 # {kind:flat|linear|radial,color|stops|angle}
+    #   opacity: 0..1  — FILL-ONLY alpha (Figma per-paint opacity), distinct from the
+    #   layer-level `opacity` above. Use this for glass/translucent fills so a stroke or
+    #   text on the SAME node stay fully opaque. Threaded by build_design_json from a
+    #   glass candidate's meta.fill_opacity; solidPaint()/paintFromSpec() in
+    #   figma-plugin/code.js read it as the native SOLID paint opacity.
     stroke: Optional[dict] = None
     radius: Any = None
     # image
     src: Optional[str] = None                   # relative asset path (cutout/qwen png)
     mask: Optional[dict] = None                 # {kind:ellipse|rrect|path, radius?, path?}
     # effects (shared)
-    effects: list = field(default_factory=list) # [{type:drop-shadow|blur,...}]
+    effects: list = field(default_factory=list) # [{type:drop-shadow|inner-shadow|blur|background-blur,...}]
+    #   Each entry: {type, radius: px, offset:{x,y} (shadow only), spread: px (shadow
+    #   only), color:"#RRGGBBAA" (shadow only), opacity: 0..1 (shadow only), visible: bool}.
+    #   "background-blur" -> figma-plugin/code.js effectFromSpec() maps 1:1 to a native
+    #   Figma BACKGROUND_BLUR effect (glass/frosted panels). `radius` is FIGMA-space
+    #   (== 2.273 * PIL sigma; see glass_detect.sigma_to_figma_radius). It has no
+    #   spread/blendMode field (Figma's BackgroundBlurEffect has none). render_preview
+    #   converts it back to a PIL sigma before its backdrop-blur approximation.
     # provenance (agent + QA read this; NOT exported to Figma)
     # meta["fallback"] == "raster-slice" marks a confidence-gated source-pixel slice;
     # meta["fallback_editable"] keeps the failed editable attempt for future repair.

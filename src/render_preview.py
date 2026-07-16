@@ -199,6 +199,25 @@ def _stroke_spec(layer):
 def _shape_tile(layer, size, run_dir=None):
     from PIL import Image, ImageDraw
     width, height = size
+    meta = layer.get("meta") or {}
+    if meta.get("native_decoration") and isinstance(meta.get("line"), dict):
+        # The production Figma node keeps the authored SVG. Windows benchmark workers
+        # may not have libcairo, so render this evidence-backed one-segment path directly
+        # for preview/QA instead of silently omitting it.
+        line = meta["line"]
+        absolute = meta.get("absolute_box") or layer.get("box") or {}
+        x0 = _number(line.get("x0")) - _number(absolute.get("x"))
+        y0 = _number(line.get("y0")) - _number(absolute.get("y"))
+        x1 = _number(line.get("x1")) - _number(absolute.get("x"))
+        y1 = _number(line.get("y1")) - _number(absolute.get("y"))
+        color, stroke_width = _stroke_spec(layer)
+        stroke_width = max(1, round(_number(line.get("thickness"), stroke_width or 2)))
+        tile = Image.new("RGBA", size, (0, 0, 0, 0))
+        ImageDraw.Draw(tile).line(
+            (x0, y0, x1, y1), fill=_color(color or _layer_fill(layer) or "#000000"),
+            width=stroke_width,
+        )
+        return tile
     svg = layer.get("svg")
     is_vector_path = bool(svg or (layer.get("shape_kind") == "path" and layer.get("path")))
     if is_vector_path:
@@ -787,8 +806,43 @@ def _prepare_layer_draw(layer, run_dir, offset=(0, 0)):
     return tile, x, y, mode, clip
 
 
+def _background_blur_radius(effects):
+    """Figma-space radius of a visible background-blur effect, if any (0 if none)."""
+    best = 0.0
+    for effect in effects or []:
+        if not isinstance(effect, dict) or effect.get("visible") is False:
+            continue
+        kind = str(effect.get("type", effect.get("kind", ""))).lower().replace("_", "-")
+        if kind != "background-blur":
+            continue
+        best = max(best, max(0.0, _number(effect.get("radius", effect.get("blur", 8)))))
+    return best
+
+
+def _apply_backdrop_blur(canvas, region, figma_radius):
+    """Blur an already-composited canvas region in place (glass backdrop approximation).
+
+    Converts the Figma-space blur radius to a PIL Gaussian sigma via the measured
+    2.272728 scale factor (see src/glass_detect.py) before filtering — feeding the raw
+    Figma radius straight into GaussianBlur over-blurs by ~2.27x.
+    """
+    from PIL import ImageFilter
+    from src.glass_detect import figma_radius_to_sigma
+    x0, y0, x1, y1 = region
+    sigma = figma_radius_to_sigma(figma_radius)
+    if x1 <= x0 or y1 <= y0 or sigma <= 0:
+        return
+    patch = canvas.crop((x0, y0, x1, y1)).filter(ImageFilter.GaussianBlur(sigma))
+    canvas.paste(patch, (x0, y0))
+
+
 def _draw_layer(canvas, layer, run_dir, offset=(0, 0)):
     tile, x, y, mode, clip = _prepare_layer_draw(layer, run_dir, offset)
+    blur_radius = _background_blur_radius(layer.get("effects") or [])
+    if blur_radius > 0:
+        cx0, cy0 = max(0, x), max(0, y)
+        cx1, cy1 = min(canvas.width, x + tile.width), min(canvas.height, y + tile.height)
+        _apply_backdrop_blur(canvas, (cx0, cy0, cx1, cy1), blur_radius)
     _blend(canvas, tile, (x, y), mode, clip)
 
 

@@ -461,6 +461,9 @@ def _normalize(item: dict, source: str, canvas: dict, base_dirs: list[str], ordi
         "raw_provenance": prov,
         "asset": item.get("png") or item.get("src") or item.get("asset_src"),
         "structural": structural,
+        # Detector-provided metadata (overlay corner_radius / fill / text_ids, …)
+        # rides along so the canonical element can keep it (overlay-cv proposals).
+        "meta": dict(item.get("meta") or {}) or None,
     }
 
 
@@ -807,9 +810,16 @@ def fuse(
         path = os.path.join(run_dir, rel) if run_dir else None
         if path:
             _write_mask(mask, box, path)
+        member_meta = {}
+        for member in cluster["members"]:
+            if member.get("meta"):
+                member_meta = {**member["meta"], **member_meta}
+        if winner.get("meta"):
+            member_meta.update(winner["meta"])
         results.append(
             {
                 "id": cid,
+                **({"meta": member_meta} if member_meta else {}),
                 "box": box,
                 "kind": winner["kind"],
                 "role": winner["role"],

@@ -292,6 +292,106 @@ def is_actionable(repair: dict) -> bool:
     return bool(stage and action and (stage, action) in ACTIONABLE and resume_stage_for(repair))
 
 
+# Actions whose resume performs real, state-changing I/O even with an identical config
+# (re-staging inbox/assets, re-importing after a compiler report). Everything else needs a
+# concrete config delta to be worth a rerun.
+_SELF_CONCRETE_ACTIONS = {
+    ("figma", "restage-inbox"),
+    ("figma", "fix-compiler-report"),
+    ("reconstruct", "restage-assets"),
+}
+
+
+def plan_is_concrete(choice: dict) -> bool:
+    """Actionability gate (admission): a plan must specify a concrete, checkable change.
+
+    The 002 failure class: a VLM opinion became ``layout/refit-geometry`` whose ONLY
+    config change was ``harness.target_id`` — no dx/dy, no box, no font, no measurable
+    delta — a guaranteed no-op rerun that then poisoned the plateau logic. A targeted
+    plan (target_id set, or a VLM-sourced opinion) must patch something real beyond the
+    target id; untargeted whole-stage reruns stay admissible (the plan-fingerprint
+    memory already blocks their replays on unchanged inputs)."""
+    patches = {key: value for key, value in (choice.get("patches") or {}).items()
+               if key != "harness"}
+    if any(value for value in patches.values()):
+        return True
+    if (choice.get("stage"), choice.get("action")) in _SELF_CONCRETE_ACTIONS:
+        return True
+    params = choice.get("params") or {}
+    if params.get("source") == "vlm_critique":
+        return False
+    return not choice.get("target_id")
+
+
+def _layer_local_scores(qa: Optional[dict]) -> dict:
+    """Blended per-layer local scores from qa.per_layer (region_ssim + ink/colour)."""
+    out: dict[str, float] = {}
+    for row in (qa or {}).get("per_layer") or []:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        value = row.get("region_ssim")
+        if not isinstance(value, (int, float)):
+            value = row.get("score")
+        if not isinstance(value, (int, float)):
+            continue
+        value = max(0.0, min(1.0, float(value)))
+        ink_iou = row.get("ink_iou")
+        region_color = row.get("region_color")
+        if isinstance(ink_iou, (int, float)):
+            value = 0.7 * value + 0.3 * max(0.0, min(1.0, float(ink_iou)))
+        elif isinstance(region_color, (int, float)):
+            value = 0.85 * value + 0.15 * max(0.0, min(1.0, float(region_color)))
+        out[str(row["id"])] = value
+    return out
+
+
+def _repair_measured_badness(repair: dict, layer_scores: dict) -> float:
+    """Measured badness of what a repair targets (0 when it carries no local evidence)."""
+    worst = None
+    params = repair.get("params") or {}
+    regions = list(params.get("regions") or [])
+    region = params.get("region")
+    if isinstance(region, dict):
+        regions.append(region)
+    for entry in regions:
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("local_score")
+        if not isinstance(value, (int, float)):
+            value = entry.get("region_ssim")
+        if isinstance(value, (int, float)):
+            worst = value if worst is None else min(worst, value)
+    target = repair.get("target_id")
+    if target is not None and str(target) in layer_scores:
+        value = layer_scores[str(target)]
+        worst = value if worst is None else min(worst, value)
+    if worst is None:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - float(worst)))
+
+
+_RANK_SEVERITY = {"high": 3, "medium": 2, "low": 1}
+
+
+def rank_repairs(repairs: list, qa: Optional[dict] = None) -> list:
+    """Deterministic, measured evidence outranks VLM opinions; worst measured first.
+
+    Order: severity desc → deterministic (metric/tool) before VLM-critique-sourced at
+    the same severity (VLM opinions are tiebreakers, never the primary driver) →
+    measured local badness desc → original order (stable)."""
+    layer_scores = _layer_local_scores(qa)
+
+    def key(indexed):
+        index, repair = indexed
+        params = repair.get("params") or {}
+        vlm = 1 if params.get("source") == "vlm_critique" else 0
+        severity = _RANK_SEVERITY.get(str(repair.get("severity") or "").lower(), 0)
+        badness = _repair_measured_badness(repair, layer_scores)
+        return (-severity, vlm, -badness, index)
+
+    return [repair for _, repair in sorted(enumerate(repairs or []), key=key)]
+
+
 def has_actionable_repairs(repairs: list) -> bool:
     """True when QA still has medium/high severity actionable repairs."""
     for repair in repairs or []:
@@ -303,13 +403,17 @@ def has_actionable_repairs(repairs: list) -> bool:
 
 
 def load_repair_candidates(run_dir: str, cfg: Optional[dict] = None) -> list:
-    """Prefer critic-filtered repairs; fall back to QA/repair assess list."""
+    """Prefer critic-filtered repairs; fall back to QA/repair assess list.
+
+    Either list is re-ranked against the measured per-layer QA evidence so deterministic
+    measured failures outrank VLM opinions and the worst measured layer is first."""
     run_dir = os.path.abspath(run_dir)
+    qa = _load_json(os.path.join(run_dir, "qa.json"), {})
     critic = _load_json(os.path.join(run_dir, "critic.json"), {})
     filtered = critic.get("filtered_repairs")
     if isinstance(filtered, list) and filtered:
-        return filtered
-    return load_repairs(run_dir, cfg)
+        return rank_repairs(filtered, qa)
+    return rank_repairs(load_repairs(run_dir, cfg), qa)
 
 
 def recommended_resume(repairs: list) -> Optional[dict]:
@@ -327,6 +431,7 @@ def recommended_resume(repairs: list) -> Optional[dict]:
             "target_id": repair.get("target_id"),
             "reason": repair.get("reason"),
             "severity": repair.get("severity"),
+            "params": dict(repair.get("params") or {}),
             "patches": config_patches_for(repair),
         }
     return None
@@ -406,6 +511,34 @@ def _repair_id(repair: dict) -> tuple:
 def _save_harness_summary(run_dir: str, summary: dict) -> dict:
     _write_json(os.path.join(run_dir, "harness.json"), summary)
     return summary
+
+
+def _repair_plan_fingerprint(run_dir: str, choice: dict) -> tuple[str, dict]:
+    """Fingerprint a repair plus the artifacts it would consume.
+
+    If neither the plan nor its stage inputs changed, repeating the repair cannot add
+    information. Persisting this across harness invocations prevents identical OCR/SAM/
+    reconstruction reruns from burning another full pass after a plateau or interruption.
+    """
+    resume = str(choice.get("resume") or "")
+    inputs = {
+        "ocr": ("normalized.png",),
+        "text": ("ocr_raw.json", "normalized.png"),
+        "sam": ("residual.json", "qwen.json", "ocr.json"),
+        "elements": ("residual.json", "qwen.json", "ocr.json"),
+        "reconstruct": ("merged.json", "ocr.json"),
+        "layout": ("reconstruction.json",),
+        "design": ("layout.json", "reconstruction.json"),
+        "figma": ("design.json",),
+    }.get(resume, ("qa.json",))
+    evidence = {name: _artifact_fingerprint(os.path.join(run_dir, name)) for name in inputs}
+    payload = {
+        "stage": choice.get("stage"), "action": choice.get("action"),
+        "target_id": choice.get("target_id"), "resume": resume,
+        "patches": choice.get("patches") or {}, "inputs": evidence,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest(), payload
 
 
 def load_repairs(run_dir: str, cfg: Optional[dict] = None) -> list:
@@ -630,23 +763,92 @@ def execute_repairs(
     exhausted: set[tuple] = set(blocked_repairs or ())
     working_cfg = copy.deepcopy(cfg)
     working_cfg.setdefault("runtime", {})["auto_repair"] = False
+    admission_path = os.path.join(run_dir, "harness_admission.json")
+    admission = _load_json(admission_path, {"seen": {}, "skipped": []})
+    seen_plans = admission.get("seen") if isinstance(admission.get("seen"), dict) else {}
+    seen_classes = (admission.get("classes")
+                    if isinstance(admission.get("classes"), dict) else {})
 
     for iteration in range(1, max(0, int(max_iterations)) + 1):
-        repairs = load_repair_candidates(run_dir, working_cfg)
-        candidates = [repair for repair in repairs if _repair_id(repair) not in exhausted]
-        choice = recommended_resume(candidates)
-        if not choice:
-            stopped = "all_repairs_failed" if repairs and exhausted else "no_actionable_repairs"
-            return _save_harness_summary(run_dir, {
-                "run_dir": run_dir,
-                "iterations": iteration - 1,
-                "qa_ok": _qa_accepts(_load_json(os.path.join(run_dir, "qa.json"), {})),
-                "stopped": stopped,
-                "attempts": attempts,
-            })
+        # Admission screen (GB3): rejecting a non-concrete / already-failed / unchanged
+        # plan must move to the NEXT candidate WITHIN this iteration, not burn the whole
+        # iteration budget. With repair_iterations=1 the old `continue` let a single
+        # rejected top candidate exhaust the round before any concrete repair ran. Only a
+        # real pipeline rerun (below the while) counts against max_iterations.
+        while True:
+            repairs = load_repair_candidates(run_dir, working_cfg)
+            candidates = [repair for repair in repairs if _repair_id(repair) not in exhausted]
+            choice = recommended_resume(candidates)
+            if not choice:
+                stopped = "all_repairs_failed" if repairs and exhausted else "no_actionable_repairs"
+                return _save_harness_summary(run_dir, {
+                    "run_dir": run_dir,
+                    "iterations": iteration - 1,
+                    "qa_ok": _qa_accepts(_load_json(os.path.join(run_dir, "qa.json"), {})),
+                    "stopped": stopped,
+                    "attempts": attempts,
+                })
 
-        resume = choice["resume"]
-        patches = choice.get("patches") or {}
+            resume = choice["resume"]
+            patches = choice.get("patches") or {}
+
+            # Actionability gate BEFORE spending a rerun: a plan whose only config change is
+            # harness.target_id (no dx/dy, no box, no font, no measurable delta) is a
+            # guaranteed no-op and is rejected at admission.
+            if not plan_is_concrete(choice):
+                exhausted.add((choice.get("stage"), choice.get("action"), choice.get("target_id")))
+                rejected = {
+                    "iteration": iteration, "resume": resume,
+                    "repair": {key: choice.get(key) for key in ("stage", "action", "target_id")},
+                    "reason": "not-actionable-no-concrete-change",
+                    "detail": ("plan specifies no concrete, checkable change beyond a target "
+                               "id — rejected before spending a pipeline rerun"),
+                }
+                attempts.append({**rejected, "admission_rejected": True})
+                admission.setdefault("rejected", []).append(rejected)
+                _write_json(admission_path, admission)
+                continue
+
+            # Semantic no-repeat for VLM opinions: two equivalent whole-image opinions (same
+            # operator class, different target — the €63 vs €49 case) must not each burn a
+            # pass once the class is proven non-improving.
+            choice_params = choice.get("params") or {}
+            vlm_class = None
+            if choice_params.get("source") == "vlm_critique":
+                vlm_class = f"vlm:{resume}:{choice.get('action')}"
+                prior = seen_classes.get(vlm_class)
+                if isinstance(prior, dict) and not prior.get("qa_improved"):
+                    exhausted.add((choice.get("stage"), choice.get("action"),
+                                   choice.get("target_id")))
+                    skipped = {
+                        "iteration": iteration, "resume": resume,
+                        "repair": {key: choice.get(key)
+                                   for key in ("stage", "action", "target_id")},
+                        "reason": "equivalent-vlm-opinion-already-failed",
+                        "class": vlm_class,
+                    }
+                    attempts.append({**skipped, "admission_skipped": True})
+                    admission.setdefault("skipped", []).append(skipped)
+                    _write_json(admission_path, admission)
+                    continue
+
+            plan_fingerprint, plan_payload = _repair_plan_fingerprint(run_dir, choice)
+            if plan_fingerprint in seen_plans:
+                exhausted.add((choice.get("stage"), choice.get("action"), choice.get("target_id")))
+                skipped = {
+                    "iteration": iteration, "resume": resume,
+                    "repair": {key: choice.get(key) for key in ("stage", "action", "target_id")},
+                    "reason": "unchanged-repair-plan-and-inputs",
+                    "plan_fingerprint": plan_fingerprint,
+                }
+                attempts.append({**skipped, "admission_skipped": True})
+                admission.setdefault("skipped", []).append(skipped)
+                _write_json(admission_path, admission)
+                continue
+
+            # Admissible, concrete plan — leave the screen and spend one iteration on it.
+            break
+
         iter_cfg = deep_merge(working_cfg, patches)
         iter_cfg["run_dir"] = run_dir
         iter_cfg.setdefault("runtime", {})["auto_repair"] = False
@@ -687,6 +889,16 @@ def execute_repairs(
             "qa_ok": qa_fresh and _qa_accepts(qa, allow_summary=True),
         }
         attempts.append(attempt)
+        seen_plans[plan_fingerprint] = {
+            "plan": plan_payload, "qa_fresh": qa_fresh, "qa_improved": qa_improved,
+        }
+        admission["seen"] = seen_plans
+        if vlm_class:
+            seen_classes[vlm_class] = {
+                "qa_improved": qa_improved, "target_id": choice.get("target_id"),
+            }
+            admission["classes"] = seen_classes
+        _write_json(admission_path, admission)
         if qa_improved or (qa_fresh and _qa_accepts(qa, allow_summary=True)):
             working_cfg = iter_cfg
 

@@ -752,6 +752,47 @@ def test_brushstroke_banner_shape_pairs_editable_text():
     assert "ALMOST SOLD OUT" in (shell["meta"].get("shell_text_snippet") or "")
 
 
+def test_generic_broad_residual_is_not_promoted_to_text_shell():
+    """002 regression: white residual negative-space slabs are not banners/badges."""
+    canvas = {"w": 1080, "h": 1920}
+    elements = [{
+        "id": "E_plate", "box": {"x": 102, "y": 336, "w": 876, "h": 147},
+        "kind": "shape", "area": 96_830, "coverage": 0.047, "role": "shape",
+        "provenance": {"sources": ["residual", "sam3:box-refine"]},
+    }]
+    ocr = {"lines": [{
+        "id": "headline", "text": "KRACHTSPORT BUNDEL", "conf": 0.98,
+        "role": "headline", "box": {"x": 150, "y": 360, "w": 780, "h": 84},
+    }]}
+    merged = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    shell = merged["c_E_plate"]
+    text = merged["c_headline"]
+
+    assert shell["meta"].get("geometric_text_shell") is not True
+    assert shell["meta"].get("role") == "shape"
+    assert shell["target"] == "drop"
+    assert shell["meta"]["suppression_reason"] == "residual-negative-space-around-text"
+    assert text["meta"].get("shell_text_host") is None
+
+
+def test_explicit_broad_banner_can_still_host_editable_text():
+    """A detector-named banner is not rejected merely because it spans the canvas."""
+    canvas = {"w": 1080, "h": 1920}
+    elements = [{
+        "id": "E_banner", "box": {"x": 102, "y": 336, "w": 876, "h": 147},
+        "kind": "shape", "area": 96_830, "coverage": 0.047, "role": "banner",
+        "provenance": {"sources": ["residual", "sam3:box-refine"]},
+    }]
+    ocr = {"lines": [{
+        "id": "headline", "text": "ALMOST SOLD OUT", "conf": 0.98,
+        "role": "headline", "box": {"x": 150, "y": 360, "w": 780, "h": 84},
+    }]}
+    merged = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+
+    assert merged["c_E_banner"]["meta"].get("text_bearing_shell") is True
+    assert merged["c_headline"]["meta"].get("shell_text_host") == "c_E_banner"
+
+
 def test_starburst_seal_shape_pairs_editable_text():
     """028-style starburst seal: square irregular badge + inset offer copy."""
     canvas = {"w": 1080, "h": 1350}
@@ -997,6 +1038,59 @@ def test_thin_leader_near_text_not_guide_dropped_without_role():
     assert merged["c_L0"]["meta"].get("suppression_reason") != "guide_artifact"
     assert merged["c_c1"]["target"] == "text"
     assert merged["c_P0"]["target"] == "image"
+
+
+def test_dense_wide_plate_is_not_thin_stroke_geometry():
+    """002 regression: a dense 5:1 slab must not become an arrow/callout leader."""
+    box = {"x": 100, "y": 88, "w": 881, "h": 159}
+
+    assert merge_layers._is_thin_stroke_geometry(box, fill_frac=0.76) is False
+    assert merge_layers._is_thin_stroke_geometry(
+        {"x": 200, "y": 210, "w": 110, "h": 18}, fill_frac=0.14,
+    ) is True
+
+
+def test_verified_arrow_replaces_price_placeholder_and_rules_survive_dedup():
+    price = {
+        "id": "c_B5", "target": "text", "text": "€63 J €49",
+        "box": {"x": 340, "y": 540, "w": 390, "h": 70},
+        "text_runs": [{"start": 6, "end": 9, "style": {"fontWeight": 700}}],
+        "meta": {"source": "ocr", "role": "price", "pairs_with": "c_arrow"},
+    }
+    arrow = {
+        "id": "c_arrow", "target": "icon", "kind": "icon",
+        "box": {"x": 505, "y": 545, "w": 58, "h": 58},
+        "meta": {"source": "element", "role": "arrow", "pairs_with": "c_B5"},
+    }
+    old = {
+        "id": "c_old", "target": "text", "text": "€63",
+        "box": {"x": 338, "y": 536, "w": 148, "h": 76},
+        "meta": {"source": "ocr", "role": "price", "native_decoration_shapes": [{
+            "kind": "strikethrough", "x0": 346, "y0": 603,
+            "x1": 475, "y1": 548, "color": "#e1491b", "thickness": 4,
+        }]},
+    }
+    new = {
+        "id": "c_new", "target": "text", "text": "€49",
+        "box": {"x": 586, "y": 536, "w": 154, "h": 76},
+        "meta": {"source": "ocr", "role": "price", "native_decoration_shapes": [{
+            "kind": "underline", "x0": 595, "y0": 606,
+            "x1": 734, "y1": 606, "color": "#e1491b", "thickness": 5,
+        }]},
+    }
+
+    assert merge_layers._normalize_price_placeholder_with_verified_arrow([price, arrow]) == 1
+    assert price["text"] == "€63 €49"
+    assert price["text_runs"][0]["start"] == 4
+    deduped = merge_layers._dedup_overlapping_text(
+        [price, old, new], {}, 0.5, [],
+    )
+    decorated = merge_layers._materialize_native_price_decorations(deduped)
+
+    assert [item["id"] for item in deduped] == ["c_B5"]
+    rules = [item for item in decorated if (item.get("meta") or {}).get("native_decoration")]
+    assert {item["meta"]["role"] for item in rules} == {"strikethrough", "underline"}
+    assert all(item.get("svg") for item in rules)
 
 
 # ── 007-like product label vs left-column overlay ─────────────────────────────────────

@@ -154,6 +154,20 @@ SCENE_DEFAULTS = {
     # (printed ink / wordmarks stay on the product raster).
     "punch_text_into_photos": False,
     "punch_artwork_into_photos": False,
+    # ── background plate routing (H7/H13: text directly on a busy/dark photo) ──
+    # auto: measure the visible plate's local texture; photographic plates route
+    # their holes as PHOTO fills (no solid-median patches on dark photos, Flux band
+    # eligible). plate/photo force the classification.
+    "background_kind": "auto",
+    "background_photo_sigma": 7.0,   # median local stddev above this = photo plate
+    # ── under-layer ownership (H10: chart slice must not bake the product in) ──
+    # Baking original pixels into a peeled UNDER-LAYER ghosts the occluder into
+    # that layer's RGBA (move it in Figma → the occluder appears twice). Large
+    # unfillable holes in under-LAYERS therefore abandon (transparent, covered by
+    # the occluder in composite) unless this is explicitly enabled. The BACKGROUND
+    # plate is exempt: it is never emitted as a movable layer, so bake stays its
+    # honest fallback there.
+    "bake_under_layers": False,
 }
 
 #: Archetypes whose plates are Codia-style solid/banded chrome — peel holes prefer
@@ -503,6 +517,9 @@ def mask_integrity(mask) -> dict:
 #: oversized holes under them are abandoned (transparent) rather than LaMa-hazed.
 _PHOTO_KINDS = frozenset({
     "photo", "photo-fragment", "person", "product", "image", "cutout",
+    # Slice-policy graphics (H10): a chart/screenshot slice is textured content —
+    # never solid-paint a hole in it, and never bake an overlapping product into it.
+    "chart", "graph", "screenshot",
 })
 
 #: Product cutouts that carry printed label ink — OCR/wordmarks must not punch these
@@ -734,6 +751,37 @@ def _is_photo_kind(kind) -> bool:
     return str(kind or "").lower() in _PHOTO_KINDS
 
 
+def background_plate_kind(flat, bg_visible, opts) -> str:
+    """Classify the background plate: ``"photo"`` (textured/full-bleed photo) vs
+    ``"background"`` (flat chrome).
+
+    H7/H13: text and overlays sitting DIRECTLY on a busy or dark photo must route
+    their plate holes as photo fills — a locally-flat ring on a dark photo would
+    otherwise pass the solid-median test and leave a flat painted patch. Measured
+    as the median windowed stddev (max channel) over the visible plate pixels.
+    """
+    cv2, np, _ = _deps()
+    img = np.asarray(flat, np.float32)
+    vis = np.asarray(bg_visible, bool)
+    if not vis.any():
+        return "background"
+    h, w = img.shape[:2]
+    scale = 512.0 / max(h, w)
+    if scale < 1.0:
+        img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                         interpolation=cv2.INTER_AREA)
+        vis = cv2.resize(vis.astype(np.uint8), (img.shape[1], img.shape[0]),
+                         interpolation=cv2.INTER_NEAREST) > 0
+        if not vis.any():
+            return "background"
+    mean = cv2.blur(img, (5, 5))
+    sq = cv2.blur(img * img, (5, 5))
+    std = np.sqrt(np.clip(sq - mean * mean, 0.0, None)).max(axis=2)
+    sigma = float(np.median(std[vis]))
+    return "photo" if sigma > float(opts.get("background_photo_sigma") or 7.0) \
+        else "background"
+
+
 def _is_plate_kind(kind) -> bool:
     return str(kind or "").lower() in _PLATE_KINDS
 
@@ -816,6 +864,11 @@ def _photo_hole_decision(write, element_mask, meta, opts) -> Optional[str]:
     """
     if meta.get("text_occluder"):
         return None
+    if meta.get("background"):
+        # The plate is never emitted as a movable layer AND has no alpha channel:
+        # baking would ghost the peeled overlay into background.png and abandoning
+        # is impossible — plate holes are always filled (flux band → LaMa).
+        return None
     if not _is_photo_kind(meta.get("under_kind")):
         return None
     write_area = int(write.sum()) if hasattr(write, "sum") else 0
@@ -839,7 +892,15 @@ def _photo_hole_decision(write, element_mask, meta, opts) -> Optional[str]:
     if not oversized:
         return None
     mode = str(opts.get("large_photo_hole") or "bake").strip().lower()
-    return "abandon" if mode == "abandon" else "bake"
+    decision = "abandon" if mode == "abandon" else "bake"
+    if (decision == "bake" and not meta.get("background")
+            and not bool(opts.get("bake_under_layers", False))):
+        # Ownership contract (H10): baking flat pixels into a peeled UNDER-LAYER
+        # bakes its occluder (e.g. a product over a chart) into that layer's RGBA.
+        # A transparent hole is covered by the occluder in composite and honest
+        # when the layer is moved. Only the background plate may bake.
+        decision = "abandon"
+    return decision
 
 
 def _should_abandon_hole(write, element_mask, meta, opts) -> bool:
@@ -1173,6 +1234,11 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
             pseudo = SceneElement(id="background", mask=np.ones((h, w), bool), z=-1.0)
             occluder_map, occ_order = _direct_occluder_map(pseudo, list(elements))
             bg_visible = ~_dilate_px(union, dilate)
+            bg_kind = str(opts.get("background_kind") or "auto").strip().lower()
+            if bg_kind not in ("photo", "plate", "background"):
+                bg_kind = background_plate_kind(flat, bg_visible, opts)
+            under_kind = "photo" if bg_kind == "photo" else "background"
+            bg_meta["plate_kind"] = under_kind
             for is_text_class in (False, True):
                 class_mask = np.zeros((h, w), bool)
                 class_occluders = []
@@ -1193,7 +1259,8 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
                     fill_info = _fill_region(
                         flat, plate, np.ones((h, w), bool), bg_visible,
                         write_cc, inpaint, accepts_meta,
-                        {"under_id": "background", "under_kind": "background",
+                        {"under_id": "background", "under_kind": under_kind,
+                         "background": True,
                          "occluder_ids": class_occluders,
                          "text_occluder": is_text_class,
                          "hole_px": int(np.count_nonzero(write_cc))}, opts, cfg=cfg)

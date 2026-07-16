@@ -59,6 +59,7 @@ _ROLE_LABELS = {
     "asset-group": "Group", "text": "Text",
     "message-bubble": "Message", "message": "Message", "bubble": "Message",
     "message-row": "Message row", "reply-quote": "Reply", "quote": "Reply",
+    "ui-label": "Label", "ui_label": "Label", "ui-text": "Label",
     "header-cluster": "Header", "stat-pill": "Stat", "stat-stack": "Stats",
     "stat-row": "Stats", "benefit-stack": "Benefits", "pill": "Stat",
     "rating-strip": "Rating", "rating": "Rating", "logo-strip": "Logo strip",
@@ -199,14 +200,63 @@ def _explicit_designer_name(candidate) -> Optional[str]:
     return None
 
 
+_MAX_LAYER_NAME_LEN = 40
+
+
 def _with_snippet(label: str, text) -> str:
-    snippet = _clean_snippet(text, 28)
+    # Keep the whole "Label / snippet" name within the ~40-char designer budget: long
+    # role labels (e.g. "Disclaimer") get a shorter snippet than short ones ("Body"),
+    # but never grow past the 28-char snippet cap already proven safe for short labels.
+    budget = min(28, max(8, _MAX_LAYER_NAME_LEN - len(label) - 3))
+    snippet = _clean_snippet(text, budget)
     if not snippet:
         return label
     # Avoid "Headline / Headline" when copy equals the role word.
     if snippet.casefold() == label.casefold():
         return label
     return f"{label} / {snippet}"
+
+
+_GENERIC_GROUP_ROLES = frozenset({"", "shape", "group", "asset-group", "band", "residual"})
+_GROUP_CONTENT_DECOR_LABELS = frozenset({
+    "Shape", "Decoration", "Arrow", "Underline", "Strikethrough", "Dot",
+})
+
+
+def _group_content_name(candidate) -> Optional[str]:
+    """Derive a group name from what its children actually are.
+
+    Element-fusion sometimes wraps a mixed bag of children (product photos, a
+    price, a CTA line) in a container whose own role is a low-confidence
+    catch-all like "shape" or "group" (see benchmark 002: an E-series residual
+    group of 3 products + 2 prices + a subheadline was literally named "Shape",
+    which collided with a sibling image also named "Shape" and produced the
+    designer-facing "Shape / 2"). Rank the children's role labels by frequency,
+    preferring content-bearing roles (Product, Price, Headline, ...) over purely
+    decorative ones (Shape, Arrow, Underline, ...), and join the top two so the
+    name reads like what the group is FOR, e.g. "Product + Price".
+    """
+    children = candidate.get("children") or []
+    if not children:
+        return None
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for child in children:
+        target = child.get("target")
+        role = _role_token(child)
+        label = _role_label(role, target) if role else _TARGET_FALLBACK.get(target or "", None)
+        if not label or label == "Layer":
+            continue
+        if label not in counts:
+            order.append(label)
+        counts[label] = counts.get(label, 0) + 1
+    content = {label: n for label, n in counts.items() if label not in _GROUP_CONTENT_DECOR_LABELS}
+    pool = content or counts
+    if not pool:
+        return None
+    ranked = sorted(pool.items(), key=lambda kv: (-kv[1], order.index(kv[0])))
+    top_labels = [label for label, _ in ranked[:2]]
+    return top_labels[0] if len(top_labels) == 1 else " + ".join(top_labels)
 
 
 def _name(candidate):
@@ -283,13 +333,21 @@ def _name(candidate):
     if target == "group":
         if role in {"button", "cta"}:
             return _with_snippet(label, text)
+        if role in _GENERIC_GROUP_ROLES:
+            content_name = _group_content_name(candidate)
+            if content_name:
+                return content_name
         return label if label != "Layer" else "Group"
 
     if meta.get("wordmark"):
         return _with_snippet("Logo", text or candidate.get("text"))
 
     if meta.get("substitution") or meta.get("low_fidelity"):
-        return _with_snippet("Text", text)
+        # This candidate was demoted from editable text to a raster image because OCR/
+        # fitting confidence was too low to trust (see the "text-fidelity-fallback"
+        # warning below). Flag it in the name so a designer opening the file knows this
+        # layer is a pixel fallback, not a mistakenly-non-editable headline.
+        return _with_snippet("Text (fallback)", text)
 
     # Text-bearing brushstroke / seal / outline-pill plates.
     if meta.get("text_bearing_shell") or meta.get("plate_shell"):
@@ -403,6 +461,15 @@ def _surface_fill(candidate):
     if style.get("color"):
         return {"kind": "flat", "color": style["color"]}
     return None
+
+
+def _apply_glass_fill(fill, fill_opacity):
+    """Fold a glass fill-opacity into the fill dict (fill-only alpha, not layer opacity)."""
+    if fill_opacity is None or not isinstance(fill, dict):
+        return fill
+    fill = dict(fill)
+    fill["opacity"] = float(fill_opacity)
+    return fill
 
 
 # ── Mixed-weight lines → sibling TEXT nodes (Codia §2a) ───────────────────────────
@@ -577,15 +644,25 @@ def _split_weight_run_siblings_unsafe(candidate: dict) -> list[dict]:
     if cursor < len(text):
         segments.append((cursor, len(text), None))
 
+    # MEASURED word geometry beats the proportional advance model: OCR word boxes see
+    # real gaps (benchmark 002: an arrow sits between "€63" and "€49", so equal-advance
+    # placement squeezed both prices toward the center). Fractions were recorded against
+    # the source line box and survive rebasing, so they apply to the current local box.
+    measured = _measured_segment_fractions(
+        (candidate.get("meta") or {}).get("word_geometry") or [], segments, text)
+
     out = []
     for index, (start, end, run_style) in enumerate(segments):
         segment_text = text[start:end].strip()
         if not segment_text:
             continue
-        # Proportional advance mapping absorbs the proxy font's width error.
-        lead = text[start:end].index(segment_text[0])
-        frac_x = _line_advance(font, text[:start + lead], 0.0) / total_adv
-        frac_w = _line_advance(font, text[start:end].strip(), 0.0) / total_adv
+        if measured is not None:
+            frac_x, frac_w = measured[index]
+        else:
+            # Proportional advance mapping absorbs the proxy font's width error.
+            lead = text[start:end].index(segment_text[0])
+            frac_x = _line_advance(font, text[:start + lead], 0.0) / total_adv
+            frac_w = _line_advance(font, text[start:end].strip(), 0.0) / total_adv
         piece = dict(candidate)
         piece.pop("text_runs", None)
         piece["id"] = f"{candidate.get('id') or 'text'}__w{index}"
@@ -606,10 +683,176 @@ def _split_weight_run_siblings_unsafe(candidate: dict) -> list[dict]:
             "h": float(vis.get("h", 0) or 0)}
         meta = dict(candidate.get("meta") or {})
         meta["weight_split"] = {"of": str(candidate.get("id") or ""), "segment": index,
-                                "segments": len(segments)}
+                                "segments": len(segments),
+                                "placement": "word-geometry" if measured is not None
+                                else "advance-proportional"}
         piece["meta"] = meta
         out.append(piece)
     return out if len(out) > 1 else [candidate]
+
+
+def _measured_segment_fractions(word_geometry: list, segments: list, text: str):
+    """Map each split segment onto measured OCR word spans; None when unmatchable.
+
+    Words are matched sequentially by token so an OCR-only glyph (the recovered price
+    separator "J" that a verified arrow replaced) is skipped without disturbing the
+    match. Fail-closed: every non-empty segment must resolve to a contiguous word run,
+    otherwise the caller keeps the proportional-advance fallback for ALL segments.
+    """
+    if not word_geometry:
+        return None
+    try:
+        words = [(str(w["text"]).strip(), float(w["fx"]), float(w["fw"]))
+                 for w in word_geometry]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if any((not t) or fw <= 0 for t, _fx, fw in words):
+        return None
+    fractions = []
+    cursor = 0
+    for start, end, _style in segments:
+        tokens = text[start:end].split()
+        if not tokens:
+            fractions.append((0.0, 0.0))  # dropped by the caller (empty segment)
+            continue
+        # Skip source-only words (e.g. the removed separator glyph) before the segment.
+        first = cursor
+        while first < len(words) and words[first][0] != tokens[0]:
+            first += 1
+        if first + len(tokens) > len(words):
+            return None
+        if any(words[first + i][0] != token for i, token in enumerate(tokens)):
+            return None
+        last = first + len(tokens) - 1
+        fx = words[first][1]
+        fw = (words[last][1] + words[last][2]) - fx
+        if fw <= 0:
+            return None
+        fractions.append((fx, fw))
+        cursor = last + 1
+    return fractions
+
+
+def _flatten_with_offsets(children: list, offx: float = 0.0, offy: float = 0.0):
+    """Yield (layer, abs_offset_x, abs_offset_y) for every node in the tree.
+
+    Child boxes are stored RELATIVE to their parent group's box origin, so a node's
+    absolute canvas position is the running sum of its ancestors' box origins. The
+    offset yielded for a node is the frame its OWN box lives in (i.e. the parent's
+    accumulated origin); add the node's box.x/y to get the node's absolute position.
+    """
+    for layer in children:
+        yield layer, offx, offy
+        kids = getattr(layer, "children", None)
+        if kids:
+            box = getattr(layer, "box", None) or {}
+            try:
+                cx = offx + float(box.get("x", 0) or 0)
+                cy = offy + float(box.get("y", 0) or 0)
+            except (TypeError, ValueError):
+                cx, cy = offx, offy
+            yield from _flatten_with_offsets(kids, cx, cy)
+
+
+def _reanchor_decorations(children: list) -> int:
+    """Re-project native text decorations onto their owner's EMITTED geometry.
+
+    Contract (audit 002 finding): a decoration attached to a text node is positioned
+    RELATIVE to that node's final geometry, never at absolute source coordinates. The
+    merge stage records endpoint fractions against the source word/node box
+    (meta.anchor); here they are re-applied to the owner's compiled ink box
+    (meta.prefit_ink_box — the box preview and the Figma plugin fit glyphs into).
+
+    A decoration and its owner do NOT necessarily share a parent: layout routinely
+    lifts price strikes/underlines to the root while the owning word nodes sink into a
+    text-stack group (benchmark 002). So the owner is resolved across the WHOLE tree,
+    and every box is projected into absolute canvas space (accumulating parent-group
+    origins) before the endpoint fractions are applied — otherwise the decoration
+    lands a group-offset away from the glyphs it should cross. Returns count moved.
+    """
+    nodes = list(_flatten_with_offsets(children))
+    texts = [(layer, ox, oy) for layer, ox, oy in nodes
+             if getattr(layer, "type", None) == "text"]
+    moved = 0
+    for layer, dox, doy in nodes:
+        meta = layer.meta or {}
+        anchor = meta.get("anchor")
+        if not meta.get("native_decoration") or not isinstance(anchor, dict):
+            continue
+        owner_id = str(anchor.get("owner_id") or meta.get("decoration_owner_id") or "")
+        if not owner_id:
+            continue
+        candidates = [(t, ox, oy) for t, ox, oy in texts
+                      if t.id == owner_id or str(t.id).startswith(f"{owner_id}__w")]
+        if not candidates:
+            continue
+        word_text = anchor.get("word_text")
+        owner = None
+        if word_text:
+            owner = next((c for c in candidates
+                          if str(c[0].text or "").strip() == str(word_text).strip()), None)
+        if owner is None and len(candidates) == 1:
+            owner = candidates[0]
+        if owner is None:
+            continue
+        owner_layer, oox, ooy = owner
+        # prefit_ink_box is the tight glyph ink, but recorded in the PRE-move frame
+        # (== visible_box origin). Layout translates the emitted node from visible_box
+        # to box without resizing (benchmark 002: €63 moved +25,+45). The rendered
+        # geometry lives at `box`, so shift the ink by (box - visible_box) to land on
+        # the FINAL glyphs. Without this, the decoration tracks the stale source ink.
+        ometa = owner_layer.meta or {}
+        fbox = dict(owner_layer.box or {})
+        vbox = dict(owner_layer.visible_box or {})
+        prefit = dict(ometa.get("prefit_ink_box") or {})
+        if prefit and fbox and vbox:
+            try:
+                dx = float(fbox.get("x", 0) or 0) - float(vbox.get("x", 0) or 0)
+                dy = float(fbox.get("y", 0) or 0) - float(vbox.get("y", 0) or 0)
+            except (TypeError, ValueError):
+                dx = dy = 0.0
+            ink = {"x": float(prefit.get("x", 0) or 0) + dx,
+                   "y": float(prefit.get("y", 0) or 0) + dy,
+                   "w": prefit.get("w"), "h": prefit.get("h")}
+        else:
+            # No reliable pre-move frame: anchor to the final emitted box directly.
+            ink = fbox or vbox or prefit
+        try:
+            # Owner ink -> absolute canvas coordinates (add owner's ancestor offset).
+            ax, ay = oox + float(ink["x"]), ooy + float(ink["y"])
+            aw, ah = float(ink["w"]), float(ink["h"])
+            fx0, fy0 = float(anchor["fx0"]), float(anchor["fy0"])
+            fx1, fy1 = float(anchor["fx1"]), float(anchor["fy1"])
+            thickness = max(1.0, float((meta.get("line") or {}).get("thickness", 2.0)))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if aw <= 0 or ah <= 0:
+            continue
+        # Absolute endpoints of the decoration across the owner's final ink box.
+        x0, y0 = ax + fx0 * aw, ay + fy0 * ah
+        x1, y1 = ax + fx1 * aw, ay + fy1 * ah
+        old_line = dict(meta.get("line") or {})
+        pad = max(1.0, thickness)
+        bx, by = min(x0, x1) - pad, min(y0, y1) - pad
+        bw = max(1.0, abs(x1 - x0) + pad * 2)
+        bh = max(1.0, abs(y1 - y0) + pad * 2)
+        colour = str((layer.stroke or {}).get("color") or "#e1491b")
+        # Store the box in the decoration's OWN frame (absolute minus its parent offset).
+        layer.box = {"x": round(bx - dox, 2), "y": round(by - doy, 2),
+                     "w": round(bw, 2), "h": round(bh, 2)}
+        layer.svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{bw:.2f}" height="{bh:.2f}" '
+            f'viewBox="0 0 {bw:.2f} {bh:.2f}"><path d="M {x0 - bx:.2f} {y0 - by:.2f} '
+            f'L {x1 - bx:.2f} {y1 - by:.2f}" fill="none" stroke="{colour}" '
+            f'stroke-width="{thickness:.2f}" stroke-linecap="round"/></svg>'
+        )
+        meta["line"] = {"x0": round(x0, 2), "y0": round(y0, 2),
+                        "x1": round(x1, 2), "y1": round(y1, 2), "thickness": thickness}
+        meta["reanchored_to"] = owner_layer.id
+        if old_line:
+            meta["source_line"] = old_line
+        moved += 1
+    return moved
 
 
 # Codia's text boxes are LOOSE: a 56px font sits in a ~129px box, 72px in ~165px
@@ -684,9 +927,14 @@ def _semantic_z(candidate, target):
         "overlay": 40, "chrome": 50, "ui": 50,
     }.get(band)
     if band_z is not None:
+        # Editable marketing copy must paint above chrome/product hosts. Group z
+        # scopes child z, so a text child at 8 cannot escape a sibling chrome group
+        # at 50 unless the text stack itself is lifted as well below.
+        if target == "text":
+            return max(band_z, 60)
         return band_z
     if target == "text":
-        return 40
+        return 60
     if target == "icon":
         return 35
     if target == "image":
@@ -708,6 +956,16 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
     source_effects = candidate.get("effects")
     if source_effects is None:
         source_effects = source_style.get("effects")
+    # Glass/translucent chips: glass_detect.detect_glass may attach fill_opacity (0..1)
+    # and background_blur_radius (FIGMA-space px) onto the candidate's meta. Fold into
+    # the fill's own opacity (NOT layer opacity) + an appended background-blur effect.
+    # Absence of these == solid fallback (no separate code path).
+    glass_fill_opacity = meta.get("fill_opacity", candidate.get("fill_opacity"))
+    glass_blur_radius = meta.get("background_blur_radius", candidate.get("background_blur_radius"))
+    if glass_blur_radius is not None:
+        source_effects = list(source_effects or [])
+        source_effects.append({"type": "background-blur",
+                               "radius": float(glass_blur_radius), "visible": True})
     if candidate.get("z_index") is not None:
         z_raw = candidate.get("z_index")
     elif candidate.get("z") is not None:
@@ -726,6 +984,11 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
     # genuinely explicit text z-orders (>1), but promote the fusion placeholder
     # to the normal front text band.
     text_placeholder_z = target == "text" and z_raw in (None, 0, 1, "0", "0.0", "1", "1.0")
+    if target == "text" and not text_placeholder_z and z_raw is not None:
+        try:
+            text_placeholder_z = float(z_raw) <= 15.0
+        except (TypeError, ValueError):
+            pass
     z_index = float(_semantic_z(candidate, target) if text_placeholder_z or z_raw in (None, 0, "0", "0.0") else z_raw)
     if meta.get("substitution"):
         warnings.append({"code": "text-fidelity-fallback", "layer_id": layer_id, **meta["substitution"]})
@@ -795,10 +1058,45 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
                           "preserved_host_raster": True},
                 ))
         children.sort(key=lambda child: child.z_index)
+        role = str((candidate.get("meta") or {}).get("role") or "").lower()
+        if children and role in {
+            "text-stack", "text-row", "stat-stack", "stat-column", "copy-stack",
+        }:
+            z_index = max(float(z_index), max(float(child.z_index) for child in children))
+            common["z_index"] = z_index
+            common["meta"]["z"] = z_index
+            # Text boxes are deliberately generous to survive font substitution, but
+            # layout groups were sized from the original tight ink boxes. A FRAME-sized
+            # group therefore clips its own enlarged children (002 lost half of BUNDEL).
+            # Expand the transparent text container to the compiled child union while
+            # shifting children when the union extends left/up, preserving absolute
+            # positions and keeping the group non-painting/editable.
+            group_box = common["box"]
+            min_x = min([0.0] + [float((child.box or {}).get("x", 0) or 0) for child in children])
+            min_y = min([0.0] + [float((child.box or {}).get("y", 0) or 0) for child in children])
+            max_x = max(
+                [float(group_box.get("w", 0) or 0)]
+                + [float((child.box or {}).get("x", 0) or 0)
+                   + float((child.box or {}).get("w", 0) or 0) for child in children]
+            )
+            max_y = max(
+                [float(group_box.get("h", 0) or 0)]
+                + [float((child.box or {}).get("y", 0) or 0)
+                   + float((child.box or {}).get("h", 0) or 0) for child in children]
+            )
+            if min_x < 0 or min_y < 0 or max_x > float(group_box.get("w", 0) or 0) or max_y > float(group_box.get("h", 0) or 0):
+                group_box["x"] = float(group_box.get("x", 0) or 0) + min_x
+                group_box["y"] = float(group_box.get("y", 0) or 0) + min_y
+                group_box["w"] = max_x - min_x
+                group_box["h"] = max_y - min_y
+                for child in children:
+                    child.box["x"] = float((child.box or {}).get("x", 0) or 0) - min_x
+                    child.box["y"] = float((child.box or {}).get("y", 0) or 0) - min_y
+                common["meta"]["expanded_to_child_union"] = True
         return Layer(
             type="group",
             children=children,
-            fill=candidate.get("fill"),
+            fill=_apply_glass_fill(candidate.get("fill"), glass_fill_opacity),
             stroke=candidate.get("stroke"),
             radius=candidate.get("radius") or source_style.get("radius"),
             style=source_style,
@@ -892,7 +1190,7 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
             svg=candidate.get("svg"),
             src=_stage_asset(candidate.get("src"), layer_id, run_dir, warnings)
                 if candidate.get("src") else None,
-            fill=candidate.get("fill"),
+            fill=_apply_glass_fill(candidate.get("fill"), glass_fill_opacity),
             stroke=candidate.get("stroke"),
             radius=candidate.get("radius") or source_style.get("radius"),
             style=source_style,
@@ -1046,6 +1344,9 @@ def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings, plate_rg
         if layer.type != "group" or not layer.children:
             return
         gid = str(layer.id or "group")
+        role = str((layer.meta or {}).get("role") or "").lower()
+        if role in {"text-stack", "text-row", "copy-stack", "stat-stack", "stat-column"}:
+            return
         if any(str(child.id or "").endswith(("__hostbg", "__groupbg"))
                for child in layer.children):
             return  # already self-contained (host raster / earlier pass)
@@ -1708,6 +2009,13 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
                     "detail": str(exc),
                 })
     layers.sort(key=lambda layer: layer.z_index)
+    # Decoration-follows-text contract: strikes/underlines ride their owner text node's
+    # FINAL geometry, never absolute source coordinates (wrapped: geometry repair must
+    # never break the compile — worst case a decoration stays at source coordinates).
+    try:
+        _reanchor_decorations(layers)
+    except Exception as exc:
+        warnings.append({"code": "decoration-reanchor-error", "detail": str(exc)})
     # Background-per-group (Codia region construction; config background.per_group).
     if base_src and bool(((cfg or {}).get("background") or {}).get("per_group", True)):
         try:

@@ -89,6 +89,20 @@ def test_overlay_text_mask_is_constrained_to_quad_not_rectangle():
     assert np.count_nonzero(mask[10:16, 15:35]) > 0
 
 
+def test_glyph_tight_black_text_uses_exterior_plate_not_white_as_ink():
+    rgb = np.full((30, 60, 3), 255, dtype=np.uint8)
+    # Simulate a cap-height OCR box whose top/bottom borders are contaminated by ink.
+    rgb[10:20, 14:46] = 0
+    rgb[12:18, 18:42] = 255
+
+    mask = inpaint.text_ink_mask(rgb, {"x": 14, "y": 10, "w": 32, "h": 10})
+    local = mask[10:20, 14:46]
+
+    assert np.count_nonzero(local[:, :4]) > 0
+    # The white counter remains plate; it is not inverted into a box-sized mask.
+    assert np.count_nonzero(local[2:-2, 4:-4]) < local[2:-2, 4:-4].size * 0.25
+
+
 def test_build_union_mask_excludes_kept_regions_so_they_are_never_erased_or_regenerated():
     """Guards the "editable regions vs. real background" invariant: an entity that is
     staying visible in the photo (keep_in_background / is_background) must never be

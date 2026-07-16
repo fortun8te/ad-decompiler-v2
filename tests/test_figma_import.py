@@ -319,6 +319,30 @@ def test_alpha_mask_missing_source_is_warned(tmp_path):
     assert finding["severity"] == "warn"  # plugin degrades, does not reject
 
 
+def test_alpha_mask_no_source_with_embedded_alpha_is_not_warned(tmp_path):
+    # A SAM3/cutout RGBA image whose alpha channel IS the mask (mask.kind == alpha, no
+    # separate src) is the intended, lossless representation — the plugin renders the image
+    # with its embedded transparency. This must NOT surface as a degradation, or every
+    # cutout trips a spurious preflight warning and blocks a green round trip.
+    run = _run_dir_with_asset(tmp_path, "cutout.png", Image.new("RGBA", (10, 10), (255, 0, 0, 128)))
+    pf = figma_import.compiler_preflight(_design([
+        {"id": "logo", "type": "image", "src": "assets/cutout.png",
+         "box": {"x": 0, "y": 0, "w": 10, "h": 10}, "mask": {"kind": "alpha"}},
+    ]), str(run), {})
+    assert "alpha-mask-missing" not in _codes(pf)
+
+
+def test_alpha_mask_no_source_without_embedded_alpha_is_warned(tmp_path):
+    # No separate mask AND no alpha channel on the image = genuinely no mask data; the layer
+    # would paint as an opaque rectangle, which the human must be told about.
+    run = _run_dir_with_asset(tmp_path, "flat.png", Image.new("RGB", (10, 10), "red"))
+    pf = figma_import.compiler_preflight(_design([
+        {"id": "logo", "type": "image", "src": "assets/flat.png",
+         "box": {"x": 0, "y": 0, "w": 10, "h": 10}, "mask": {"kind": "alpha"}},
+    ]), str(run), {})
+    assert "alpha-mask-missing" in _codes(pf)
+
+
 def test_path_mask_without_geometry_is_warned(tmp_path):
     run = _run_dir_with_asset(tmp_path, "photo.png", Image.new("RGBA", (10, 10), "red"))
     pf = figma_import.compiler_preflight(_design([
@@ -510,6 +534,57 @@ def test_screenshot_sibling_present_by_default(tmp_path):
     manifest = json.loads((inbox / "inbox.json").read_text(encoding="utf-8"))
     assert manifest["screenshot_sibling"]["ok"] is True
     assert any(f["path"] == "assets/_screenshot_proof.png" for f in manifest["files"])
+
+
+def test_screenshot_sibling_is_converted_to_srgb(tmp_path):
+    # The raw source screenshot frequently carries a non-sRGB capture profile Figma ignores
+    # (it assumes sRGB), so its colours shift on import. Staging must bake the proof into
+    # sRGB — untagged — so the preflight's color-profile warning does not fire on the proof
+    # and what Figma shows matches what QA scored.
+    run = tmp_path / "run"
+    run.mkdir()
+    # A non-sRGB ICC profile: 'srgb' does not appear in its bytes, so it trips nonsrgb_icc.
+    prof = b"NOTSRGB-display-p3-fake-profile" + b"\x00" * 32
+    Image.new("RGB", (100, 100), "blue").save(run / "original.png", icc_profile=prof)
+    design_path = _write_design(run, _design([
+        {"id": "bg", "type": "shape", "fill": "#fff", "box": {"x": 0, "y": 0, "w": 100, "h": 100}},
+    ], id="srgb-demo"))
+    inbox = tmp_path / "inbox"
+    result = figma_import.import_design(
+        str(design_path), str(run), {"figma": {"mode": "plugin", "inbox": str(inbox)}})
+    assert result["ok"] is True
+    proof = inbox / "runs" / "srgb-demo" / "assets" / "_screenshot_proof.png"
+    with Image.open(proof) as im:
+        icc = im.info.get("icc_profile")
+    assert not (icc and b"srgb" not in bytes(icc).lower())  # no non-sRGB profile remains
+    manifest = json.loads((inbox / "inbox.json").read_text(encoding="utf-8"))
+    assert not any(w["code"] == "color-profile" for w in manifest["summary"]["warnings"])
+
+
+def test_staging_prunes_unreferenced_assets(tmp_path):
+    # Across harness rounds run_dir/assets accumulates superseded slices/masks the final
+    # design no longer references. Staging must copy only referenced assets so the plugin
+    # inbox is self-evidently the current attempt's asset set.
+    run = _run_with_screenshot(tmp_path)
+    assets = run / "assets"
+    assets.mkdir(exist_ok=True)
+    Image.new("RGBA", (10, 10), "red").save(assets / "used.png")
+    Image.new("RGBA", (10, 10), "blue").save(assets / "stale_orphan.png")
+    design_path = _write_design(run, _design([
+        {"id": "img", "type": "image", "src": "assets/used.png",
+         "box": {"x": 0, "y": 0, "w": 10, "h": 10}},
+    ], id="prune-demo"))
+    inbox = tmp_path / "inbox"
+    result = figma_import.import_design(
+        str(design_path), str(run), {"figma": {"mode": "plugin", "inbox": str(inbox)}})
+    assert result["ok"] is True
+    assert result["pruned_assets"] >= 1
+    staged_assets = inbox / "runs" / "prune-demo" / "assets"
+    assert (staged_assets / "used.png").is_file()
+    assert not (staged_assets / "stale_orphan.png").exists()
+    manifest = json.loads((inbox / "inbox.json").read_text(encoding="utf-8"))
+    assert "stale_orphan.png" in " ".join(manifest["pruned_assets"])
+    assert not any("stale_orphan" in f["path"] for f in manifest["files"])
 
 
 def test_screenshot_sibling_absent_when_config_off(tmp_path):

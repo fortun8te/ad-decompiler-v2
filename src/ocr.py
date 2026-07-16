@@ -1017,6 +1017,115 @@ def _geometry_metrics(lines: Iterable[dict]) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Canonical disagreement set + product-region ownership
+#
+# One source of truth for "which OCR lines disagree across backends".  Every
+# consumer (cross-check metrics, repair triggers, QA) must derive its count from
+# these helpers so the numbers can never drift apart again.
+#
+# Two independent forces used to produce three different counts:
+#   * ``metrics.cross_check.disagreements`` was computed once in run_ocr and never
+#     refreshed, so it stayed at the pre-judge value while the live ``meta.disagreement``
+#     flags dropped as vlm_ocr_judge confirmed lines (see refresh_cross_check).
+#   * repair/QA counted every live flag, including text baked into product rasters
+#     (packaging labels, nutrition panels) that is not part of the editable ad
+#     contract (see disagreement_lines / product_region_boxes).
+_PRODUCT_ELEMENT_ROLES = {"product", "image", "photo", "photo-fragment", "packshot", "packaging"}
+_PRODUCT_ELEMENT_KINDS = {"photo-fragment", "photo", "raster", "image"}
+_OWNED_MIN_CONTAINMENT = 0.6
+
+
+def product_region_boxes(elements) -> list[dict]:
+    """Bounding boxes of element-owned raster/product regions.
+
+    These rasters carry text (labels, ingredient panels) that is intentionally
+    baked into a swappable product image; OCR of that text must not feed editable
+    -ad QA.  Accepts the pipeline's ``elements.json`` list (role/kind at the top
+    level or under ``meta``)."""
+    boxes: list[dict] = []
+    for element in elements or []:
+        if not isinstance(element, dict):
+            continue
+        meta = element.get("meta") or {}
+        role = str(element.get("role") or meta.get("role") or "").lower()
+        kind = str(element.get("kind") or meta.get("kind") or "").lower()
+        if role not in _PRODUCT_ELEMENT_ROLES and kind not in _PRODUCT_ELEMENT_KINDS:
+            continue
+        box = element.get("box") or element.get("bbox")
+        if isinstance(box, dict) and _float(box.get("w")) > 0 and _float(box.get("h")) > 0:
+            boxes.append(box)
+    return boxes
+
+
+def _containment_fraction(inner: dict, outer: dict) -> float:
+    """Fraction of ``inner``'s area contained inside ``outer`` (0..1)."""
+    try:
+        ix0 = max(_float(outer["x"]), _float(inner["x"]))
+        iy0 = max(_float(outer["y"]), _float(inner["y"]))
+        ix1 = min(_float(outer["x"]) + _float(outer["w"]), _float(inner["x"]) + _float(inner["w"]))
+        iy1 = min(_float(outer["y"]) + _float(outer["h"]), _float(inner["y"]) + _float(inner["h"]))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    area = _float(inner.get("w")) * _float(inner.get("h"))
+    return inter / area if area > 0 else 0.0
+
+
+def line_in_product_region(line: dict, product_boxes: list[dict],
+                           min_frac: float = _OWNED_MIN_CONTAINMENT) -> bool:
+    box = line.get("box") if isinstance(line, dict) else None
+    if not isinstance(box, dict) or not product_boxes:
+        return False
+    return any(_containment_fraction(box, pb) >= min_frac for pb in product_boxes)
+
+
+def disagreement_lines(ocr, *, product_boxes: Optional[list[dict]] = None,
+                       elements: Optional[list] = None, exclude_owned: bool = True) -> list[dict]:
+    """Canonical editable-ad disagreement set: live ``meta.disagreement`` flags minus
+    lines that sit inside an element-owned product/raster region.
+
+    ``ocr`` may be the OCR result dict or a raw list of lines.  Pass ``product_boxes``
+    (or ``elements``) to enable the ownership exclusion; with neither, every live flag
+    is returned (still a single, consistent definition)."""
+    lines = (ocr.get("lines") if isinstance(ocr, dict) else ocr) or []
+    flagged = [ln for ln in lines
+               if isinstance(ln, dict) and (ln.get("meta") or {}).get("disagreement")]
+    if not exclude_owned:
+        return flagged
+    if product_boxes is None:
+        product_boxes = product_region_boxes(elements or [])
+    if not product_boxes:
+        return flagged
+    return [ln for ln in flagged if not line_in_product_region(ln, product_boxes)]
+
+
+def refresh_cross_check(ocr: dict) -> dict:
+    """Recompute ``metrics.cross_check`` counts from the live lines.
+
+    run_ocr computes cross-check once; later stages (vlm_ocr_judge, vlm_proofread)
+    pop ``meta.disagreement`` as they confirm/correct readings.  Call this after any
+    such mutation so the stored metric equals the live flag count instead of drifting."""
+    if not isinstance(ocr, dict):
+        return ocr
+    metrics = ocr.get("metrics")
+    cross = metrics.get("cross_check") if isinstance(metrics, dict) else None
+    if not isinstance(cross, dict):
+        return ocr
+    lines = ocr.get("lines") or []
+    cross["disagreements"] = sum(
+        1 for ln in lines if isinstance(ln, dict) and (ln.get("meta") or {}).get("disagreement"))
+    cross["consensus_lines"] = sum(
+        1 for ln in lines if len((ln.get("meta") or {}).get("support_engines") or []) > 1)
+    agreements = [_float((ln.get("meta") or {}).get("agreement", 1.0))
+                  for ln in lines if isinstance(ln, dict)]
+    cross["mean_text_agreement"] = round(sum(agreements) / len(agreements), 4) if agreements else None
+    present = cross.get("successful_engines") or []
+    cross["consensus_ratio"] = (
+        round(cross["consensus_lines"] / len(lines), 4) if lines and len(present) > 1 else None)
+    return ocr
+
+
 def _cross_check_metrics(lines: list[dict], configured: list[str], successful: list[str]) -> dict:
     disagreements = sum(1 for line in lines if (line.get("meta") or {}).get("disagreement"))
     agreements = [float((line.get("meta") or {}).get("agreement", 1.0)) for line in lines]
@@ -1190,6 +1299,51 @@ def _text_similarity(a: Any, b: Any) -> float:
     if aa == bb:
         return 1.0
     return SequenceMatcher(None, aa, bb).ratio()
+
+
+def _restore_dropped_punctuation(text: str, alternatives: Iterable[str]) -> str:
+    """Splice back interior punctuation the selected reading dropped.
+
+    OCR engines fuse per-region: the line ``text`` comes from the highest-scoring
+    engine while the word tokens (and the peer readings) may come from another. When
+    the winning engine drops a separator that a closely-agreeing engine preserved —
+    easyocr reading ``UPFRONT.NL`` as ``UPFRONTNL`` while doctr kept the ``.`` — the
+    period vanishes from the emitted line even though a peer clearly saw it.
+
+    This aligns ``text`` against the most-similar alternative reading and restores
+    *only* characters the winner is missing that are pure punctuation (never letters
+    or digits, so a peer's own misreads — e.g. doctr's ``UPERONT`` — are not adopted).
+    The winner's spelling wins every conflict; only dropped separators are re-inserted.
+    General across ``.``/``-``/``/``/``:`` etc.; not a period special-case.
+    """
+    base = str(text or "")
+    if not base:
+        return base
+    best_alt, best_ratio = None, 0.0
+    for alt in alternatives:
+        alt = str(alt or "")
+        if not alt or _text_key(alt) == _text_key(base):
+            continue
+        ratio = SequenceMatcher(None, base, alt).ratio()
+        if ratio > best_ratio:
+            best_ratio, best_alt = ratio, alt
+    # Require a genuinely close reading so unrelated peers can never inject glyphs.
+    if best_alt is None or best_ratio < 0.85:
+        return base
+    out: list[str] = []
+    matcher = SequenceMatcher(None, base, best_alt)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "insert":
+            segment = best_alt[j1:j2]
+            # Only restore a separator the winner dropped, and only when it sits
+            # between kept content (an interior/trailing separator, not a leading one).
+            if (segment and out and i1 < len(base)
+                    and all(not ch.isalnum() and not ch.isspace() for ch in segment)):
+                out.append(segment)
+        else:
+            # equal / replace / delete: always keep the winner's own characters.
+            out.append(base[i1:i2])
+    return "".join(out)
 
 
 def _targeted_retry(img_path: str, lines: list, engine: str, cfg: dict,
@@ -1452,7 +1606,35 @@ def _reconcile(primary_lines, challenger_sets, iou_thresh=0.42, cfg=None):
                 source = max(word_sources, key=lambda line: _calibrated_confidence(line, cfg))
                 winner["words"] = copy.deepcopy(source["words"])
 
-        best_calibrated = max(_calibrated_confidence(members[index], cfg) for index in agreeing_indices)
+        # Restore any interior separator the winning engine dropped but a closely
+        # agreeing peer (or the borrowed word tokens) preserved — e.g. easyocr's
+        # ``UPFRONTNL`` regains the ``.`` from doctr's ``UPFRONT.NL`` — without
+        # adopting the peer's own letter misreads. Keeps the emitted line text and
+        # its word tokens punctuation-consistent.
+        if agreeing_indices:
+            peer_texts = [
+                members[index].get("text", "") for index in agreeing_indices
+                if index != winner_index
+            ]
+            peer_texts.extend(
+                " ".join(str(word.get("text") or "") for word in (winner.get("words") or []))
+                for _ in (0,) if winner.get("words")
+            )
+            reconciled = _restore_dropped_punctuation(str(winner.get("text") or ""), peer_texts)
+            if reconciled != str(winner.get("text") or ""):
+                winner["text"] = reconciled
+
+        # A singleton/orphan winner can have no peer above the agreement
+        # threshold.  Treat the winner itself as the only supporting reading
+        # instead of crashing the whole benchmark on max(empty).
+        if agreeing_indices:
+            best_calibrated = max(
+                _calibrated_confidence(members[index], cfg) for index in agreeing_indices
+            )
+        else:
+            best_calibrated = _calibrated_confidence(winner, cfg)
+            if 0 <= winner_index < len(engines):
+                supporting_engines = [engines[winner_index]]
         support_bonus = min(0.16, max(0, len(supporting_engines) - 1) * 0.055)
         winner["conf"] = round(min(1.0, best_calibrated + (1.0 - best_calibrated) * support_bonus), 4)
         provenance = []

@@ -303,6 +303,53 @@ def _promote_geometric_text_shells(candidates: list, canvas: dict, cfg: dict, di
             for t in hosts
         ).strip()
         stroke_outline = _is_stroke_outline_plate(shell)
+        # Residual segmentation often returns the *negative space around copy* as one
+        # large, dense component.  Treating that component as a banner/badge changes a
+        # harmless source slice into a semantic parent and causes the reconstruction
+        # stage to erase/repaint most of the ad (002's white headline/product slabs).
+        # Real wide banners are still eligible when a detector names their role; this
+        # guard only rejects generic residual shells with implausibly broad geometry.
+        canvas_area = (
+            float((canvas or {}).get("w", 0) or 0)
+            * float((canvas or {}).get("h", 0) or 0)
+        )
+        shell_w = float(shell_box.get("w", 0) or 0)
+        shell_h = float(shell_box.get("h", 0) or 0)
+        area_frac = shell_area / canvas_area if canvas_area > 0 else 0.0
+        width_frac = (
+            shell_w / float((canvas or {}).get("w", 0) or 1)
+            if float((canvas or {}).get("w", 0) or 0) > 0 else 0.0
+        )
+        provenance_sources = {
+            str(source).lower()
+            for source in ((meta.get("provenance") or {}).get("sources") or [])
+        }
+        generic_residual = role in {"", "shape", "photo"} and any(
+            "residual" in source for source in provenance_sources
+        )
+        if not stroke_outline and (
+            area_frac >= 0.35
+            or (generic_residual and area_frac >= 0.05 and width_frac >= 0.70)
+        ):
+            diagnostics.setdefault("scene_text_contract", []).append({
+                "id": shell.get("id"),
+                "action": "reject-geometric-text-shell",
+                "reason": "oversized-residual-shell",
+                "area_frac": round(area_frac, 4),
+                "width_frac": round(width_frac, 4),
+                "text_ids": [t.get("id") for t in hosts],
+            })
+            # A broad but non-giant residual strip around copy is negative space,
+            # not an independent visual layer. Shipping it as a confidence raster
+            # slice duplicates the original glyphs underneath the native headline.
+            # Keep giant regions neutral (they may host product cutouts), but suppress
+            # this narrow text-plate signature and let the clean plate + TEXT own it.
+            if generic_residual and area_frac < 0.35 and width_frac >= 0.70:
+                meta["residual_text_plate"] = True
+                meta["keep_in_background"] = True
+                meta["suppression_reason"] = "residual-negative-space-around-text"
+                shell["target"] = "drop"
+            continue
         new_role = _classify_shell_role(
             shell_box, role, stroke_outline=stroke_outline, snippet=snippet,
         )
@@ -774,7 +821,13 @@ def _dedup_overlapping_text(candidates, merge_cfg: dict, dedup_iou: float, diagn
                 "iou": round(iou, 3),
                 "inside_frac": round(inside, 3),
             }
-            keeper.setdefault("meta", {}).setdefault("deduped_text_ids", []).append(oid)
+            keeper_meta = keeper.setdefault("meta", {})
+            keeper_meta.setdefault("deduped_text_ids", []).append(oid)
+            decorations = (other.get("meta") or {}).get("native_decoration_shapes") or []
+            if decorations:
+                keeper_meta.setdefault("native_decoration_shapes", []).extend(
+                    copy.deepcopy(decorations)
+                )
     if diagnostics is not None:
         diagnostics.extend(dropped[oid] for oid in dropped)
     if not dropped:
@@ -975,6 +1028,48 @@ def _word_aligned_text_runs(line: dict) -> list[dict]:
     return runs
 
 
+def _word_geometry_fractions(line) -> list[dict]:
+    """Per-word geometry as FRACTIONS of the line box (coordinate-space independent).
+
+    Fractions survive every later rebasing (layout parents relativize x/y, never scale),
+    so the design compiler can recover each word's measured span inside whatever local
+    box the candidate ends up with. Fail-closed: any missing/degenerate geometry
+    returns [] and downstream keeps the old proportional-advance behavior.
+    """
+    if "\n" in str(line.get("text") or ""):
+        return []
+    words = line.get("words") or []
+    if len(words) < 2:
+        return []
+    box = line.get("box") or {}
+    try:
+        lx, ly = float(box.get("x")), float(box.get("y"))
+        lw, lh = float(box.get("w")), float(box.get("h"))
+    except (TypeError, ValueError):
+        return []
+    if lw <= 1.0 or lh <= 1.0:
+        return []
+    out = []
+    for word in words:
+        if not isinstance(word, dict):
+            return []
+        token = str(word.get("text") or "").strip()
+        wbox = word.get("box") or {}
+        try:
+            wx, wy = float(wbox.get("x")), float(wbox.get("y"))
+            ww, wh = float(wbox.get("w")), float(wbox.get("h"))
+        except (TypeError, ValueError):
+            return []
+        if not token or ww <= 0 or wh <= 0:
+            return []
+        out.append({
+            "text": token,
+            "fx": round((wx - lx) / lw, 6), "fw": round(ww / lw, 6),
+            "fy": round((wy - ly) / lh, 6), "fh": round(wh / lh, 6),
+        })
+    return out
+
+
 def _text_candidate(line):
     meta = dict(line.get("meta") or {})
     if line.get("baseline"):
@@ -999,6 +1094,9 @@ def _text_candidate(line):
         "hierarchy": line.get("hierarchy"),
         "style_id": line.get("repeated_style_id") or line.get("style_id"),
     })
+    word_geometry = _word_geometry_fractions(line)
+    if word_geometry:
+        meta["word_geometry"] = word_geometry
     style = dict(line.get("style") or {})
     candidate = {
         "id": f"c_{line['id']}",
@@ -1180,10 +1278,23 @@ def _text_sources(ocr, diagnostics=None):
         if block.get("line_height") is not None:
             block_style["lineHeight"] = block["line_height"]
         block_style["lineCount"] = max(1, len(members), str(block.get("text") or "").count("\n") + 1)
+        # Single-line blocks inherit their line's word boxes so downstream word-level
+        # geometry (weight-run sibling split, decoration anchoring) can place each
+        # word at its MEASURED position instead of a proportional font-advance guess
+        # (benchmark 002: "€63 €49" has an arrow-sized gap the advance model cannot see).
+        if len(members) == 1 and members[0].get("words") and not block.get("words"):
+            block["words"] = copy.deepcopy(members[0]["words"])
         if members and members[0].get("baseline"):
             block.setdefault("meta", {})["baseline_first"] = dict(members[0]["baseline"])
         if members and members[-1].get("baseline"):
             block.setdefault("meta", {})["baseline_last"] = dict(members[-1]["baseline"])
+        decoration_shapes = []
+        for member in members:
+            decoration_shapes.extend(copy.deepcopy(
+                (member.get("meta") or {}).get("native_decoration_shapes") or []
+            ))
+        if decoration_shapes:
+            block.setdefault("meta", {})["native_decoration_shapes"] = decoration_shapes
         block["style"] = block_style
         text_runs = _line_aligned_text_runs(str(block.get("text") or ""), members)
         if text_runs:
@@ -1351,6 +1462,193 @@ def _drop_redundant_arrow_icons(candidates: list, diagnostics=None) -> list:
     return candidates
 
 
+_PRICE_PLACEHOLDER_RE = re.compile(
+    r"([€$£]\s*\d+(?:[.,]\d+)?)\s+([A-Za-z|])\s+([€$£]\s*\d+(?:[.,]\d+)?)",
+)
+
+
+def _normalize_price_placeholder_with_verified_arrow(candidates: list) -> int:
+    """Remove an OCR placeholder glyph only when a verified arrow owns that slot."""
+    arrows = [c for c in candidates if _is_arrow_icon_candidate(c)]
+    changed = 0
+    for text in candidates:
+        if text.get("target") != "text":
+            continue
+        meta = text.get("meta") or {}
+        if str(meta.get("role") or "").lower() != "price":
+            continue
+        raw = str(text.get("text") or "")
+        match = _PRICE_PLACEHOLDER_RE.search(raw)
+        if not match:
+            continue
+        arrow = next((candidate for candidate in arrows if (
+            (candidate.get("meta") or {}).get("pairs_with") == text.get("id")
+            or meta.get("pairs_with") == candidate.get("id")
+            or _inside_frac(candidate.get("box") or {}, text.get("box") or {}) >= 0.35
+        )), None)
+        if arrow is None:
+            continue
+        replacement = f"{match.group(1)} {match.group(3)}"
+        normalized = raw[:match.start()] + replacement + raw[match.end():]
+        right_start = normalized.find(match.group(3), match.start())
+        right_end = right_start + len(match.group(3))
+        adjusted_runs = []
+        for run in text.get("text_runs") or []:
+            if not isinstance(run, dict):
+                continue
+            try:
+                start, end = int(run.get("start", 0)), int(run.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            if end <= match.start(3) or start >= match.end(3):
+                continue
+            adjusted = copy.deepcopy(run)
+            adjusted["start"], adjusted["end"] = right_start, right_end
+            adjusted_runs.append(adjusted)
+        text["text"] = normalized
+        text["text_runs"] = adjusted_runs
+        meta["price_separator_recovered"] = {
+            "removed_ocr_glyph": match.group(2),
+            "arrow_id": arrow.get("id"),
+            "source": "verified-overlapping-arrow",
+        }
+        changed += 1
+    return changed
+
+
+def _decoration_anchor(owner: dict, x0: float, y0: float, x1: float, y1: float) -> Optional[dict]:
+    """Bind a text decoration to the word (or whole node) it decorates.
+
+    Returns endpoint FRACTIONS relative to the anchor box, so the design compiler can
+    re-project the decoration onto the emitted text node's FINAL geometry instead of
+    trusting absolute source coordinates (benchmark 002: the €63 strike stayed at the
+    source x while the split word node moved, so the diagonal crossed the wrong glyphs).
+    """
+    obox = owner.get("box") or {}
+    try:
+        ox, oy = float(obox.get("x")), float(obox.get("y"))
+        ow, oh = float(obox.get("w")), float(obox.get("h"))
+    except (TypeError, ValueError):
+        return None
+    if ow <= 1.0 or oh <= 1.0:
+        return None
+    anchor_box = (ox, oy, ow, oh)
+    word_text = None
+    span0, span1 = min(x0, x1), max(x0, x1)
+    best_overlap = 0.0
+    for word in (owner.get("meta") or {}).get("word_geometry") or []:
+        try:
+            wx = ox + float(word["fx"]) * ow
+            ww = float(word["fw"]) * ow
+            wy = oy + float(word["fy"]) * oh
+            wh = float(word["fh"]) * oh
+        except (KeyError, TypeError, ValueError):
+            continue
+        overlap = max(0.0, min(span1, wx + ww) - max(span0, wx))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            anchor_box = (wx, wy, ww, wh)
+            word_text = str(word.get("text") or "")
+    if word_text is not None and best_overlap < 0.5 * max(1.0, span1 - span0):
+        # The decoration does not clearly belong to a single word — anchor to the node.
+        anchor_box = (ox, oy, ow, oh)
+        word_text = None
+    ax, ay, aw, ah = anchor_box
+    if aw <= 1.0 or ah <= 1.0:
+        return None
+    return {
+        "owner_id": str(owner.get("id") or ""),
+        "word_text": word_text,
+        "fx0": round((x0 - ax) / aw, 6), "fy0": round((y0 - ay) / ah, 6),
+        "fx1": round((x1 - ax) / aw, 6), "fy1": round((y1 - ay) / ah, 6),
+    }
+
+
+def _decoration_shape_candidate(owner: dict, rule: dict, index: int) -> Optional[dict]:
+    try:
+        x0, y0 = float(rule["x0"]), float(rule["y0"])
+        x1, y1 = float(rule["x1"]), float(rule["y1"])
+        thickness = max(1.0, float(rule.get("thickness", 2.0)))
+    except (KeyError, TypeError, ValueError):
+        return None
+    pad = max(1.0, thickness)
+    bx, by = min(x0, x1) - pad, min(y0, y1) - pad
+    bw, bh = max(1.0, abs(x1 - x0) + pad * 2), max(1.0, abs(y1 - y0) + pad * 2)
+    lx0, ly0, lx1, ly1 = x0 - bx, y0 - by, x1 - bx, y1 - by
+    colour = str(rule.get("color") or "#e1491b")
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{bw:.2f}" height="{bh:.2f}" '
+        f'viewBox="0 0 {bw:.2f} {bh:.2f}"><path d="M {lx0:.2f} {ly0:.2f} '
+        f'L {lx1:.2f} {ly1:.2f}" fill="none" stroke="{colour}" '
+        f'stroke-width="{thickness:.2f}" stroke-linecap="round"/></svg>'
+    )
+    return {
+        "id": f"{owner.get('id')}__decoration_{index}",
+        "target": "shape",
+        "kind": "shape",
+        "shape_kind": "path",
+        "svg": svg,
+        "box": {"x": bx, "y": by, "w": bw, "h": bh},
+        "z": 100.0 + index * 0.01,
+        # Preview uses the SVG alpha as a mask and the node fill as paint; Figma uses
+        # the SVG stroke directly. Keep both representations source-colour accurate.
+        "fill": {"kind": "flat", "color": colour},
+        "stroke": {"color": colour, "width": thickness, "cap": "ROUND"},
+        "meta": {
+            "source": "native-price-decoration",
+            "role": str(rule.get("kind") or "annotation"),
+            "native_decoration": True,
+            "decoration_owner_id": owner.get("id"),
+            "line": {"x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                     "thickness": thickness},
+            "confidence": float(rule.get("confidence", 1.0) or 1.0),
+            "z_band": "overlay",
+            "external_overlay": True,
+            "separate_layer": True,
+            "removal_required": True,
+            "anchor": _decoration_anchor(owner, x0, y0, x1, y1),
+        },
+    }
+
+
+def _materialize_native_price_decorations(candidates: list) -> list:
+    additions = []
+    accepted_rules: list[tuple[dict, int]] = []
+
+    def same_rule(a: dict, b: dict) -> bool:
+        if str(a.get("kind") or "") != str(b.get("kind") or ""):
+            return False
+        direct = max(abs(float(a.get(k, 0) or 0) - float(b.get(k, 0) or 0))
+                     for k in ("x0", "y0", "x1", "y1"))
+        reverse = max(
+            abs(float(a.get(ak, 0) or 0) - float(b.get(bk, 0) or 0))
+            for ak, bk in (("x0", "x1"), ("y0", "y1"),
+                           ("x1", "x0"), ("y1", "y0"))
+        )
+        return min(direct, reverse) <= 2.0
+
+    for owner in candidates:
+        if owner.get("target") != "text":
+            continue
+        for rule in (owner.get("meta") or {}).get("native_decoration_shapes") or []:
+            candidate = _decoration_shape_candidate(owner, rule, len(additions))
+            if candidate is None:
+                continue
+            duplicate = next(((prior, index) for prior, index in accepted_rules
+                              if same_rule(prior, rule)), None)
+            if duplicate is not None:
+                prior, index = duplicate
+                if float(rule.get("confidence", 0) or 0) > float(prior.get("confidence", 0) or 0):
+                    candidate["id"] = additions[index]["id"]
+                    additions[index] = candidate
+                    accepted_rules.remove(duplicate)
+                    accepted_rules.append((rule, index))
+                continue
+            accepted_rules.append((rule, len(additions)))
+            additions.append(candidate)
+    return candidates + additions
+
+
 def _box_fill_fraction(candidate: dict) -> float | None:
     """Mask fill density inside the candidate box (None when area is unknown)."""
     box = candidate.get("box") or {}
@@ -1398,7 +1696,11 @@ def _is_thin_stroke_geometry(box: dict, fill_frac: float | None = None) -> bool:
     if w <= 0 or h <= 0:
         return False
     aspect = max(w, h) / max(1.0, min(w, h))
-    if aspect >= 2.2:
+    # Aspect ratio alone is not stroke evidence: a dense headline/product plate can
+    # easily be 5:1.  Permit the aspect shortcut only for genuinely thin geometry or
+    # when the mask itself is sparse.
+    minor = min(w, h)
+    if aspect >= 2.2 and (minor <= 32.0 or (fill_frac is not None and fill_frac <= 0.32)):
         return True
     if fill_frac is not None and fill_frac <= 0.32 and max(w, h) >= 18.0:
         return True
@@ -2459,6 +2761,7 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     candidates = _preserve_callout_leaders(
         candidates, canvas, cfg, diagnostics["callout_groups"],
     )
+    _normalize_price_placeholder_with_verified_arrow(candidates)
     # Circular endpoint dots on leaders (Wavy beach) — never guide-drop; pair with leader.
     candidates = _preserve_leader_endpoint_dots(
         candidates, diagnostics.setdefault("leader_dots", []),
@@ -2519,6 +2822,7 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     # harness/VLM-critic list is applied.
     merge_cfg = cfg.get("merge") or {}
     kept = _dedup_overlapping_text(kept, merge_cfg, dedup_iou, diagnostics["text_dedup"])
+    kept = _materialize_native_price_decorations(kept)
     ids_before_cfg = {c.get("id") for c in kept}
     kept = _dedup_text_candidates(kept, merge_cfg, dedup_iou)
     already_recorded = {entry["dropped"] for entry in diagnostics["text_dedup"]}

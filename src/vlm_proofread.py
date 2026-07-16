@@ -60,8 +60,10 @@ def _multi_pass_answer(
     for _ in range(max(1, passes)):
         try:
             answers.append(_ask_vlm(crop, base_url, model, timeout_s, max_tokens))
-        except Exception:
-            return None, "vlm_error"
+        except Exception as exc:
+            note, detail = vlm_client.classify_vlm_exception(exc)
+            vlm_client._log_vlm_failure("vlm_proofread", note, detail, timeout_s)
+            return None, note
     if len({vlm_client.consensus_key(answer) for answer in answers}) != 1:
         return None, "vlm_disagreement"
     return answers[0], None
@@ -89,6 +91,30 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     vcfg = (cfg or {}).get("vlm") or {}
     if not vcfg.get("enabled", False):
         return ocr_result
+    judge_cfg = vcfg.get("ocr_judge") or {}
+    judge_proofread_cfg = judge_cfg.get("proofread") or {}
+    # The ensemble judge already includes a prioritized, budgeted proofread pass.
+    # Running this legacy low-confidence sweep afterwards asks the same model about
+    # dozens of product-label fragments again (44 extra calls on fixture 002).  Keep an
+    # explicit escape hatch for experiments, but make the normal path single-owner.
+    if (
+        ocr_result.get("vlm_ocr_judge")
+        and judge_cfg.get("enabled")
+        and judge_proofread_cfg.get("enabled")
+        and not vcfg.get("legacy_proofread_after_judge", False)
+    ):
+        result = dict(ocr_result)
+        result["vlm_proofread"] = {
+            "model": str(vcfg.get("model", _DEFAULT_MODEL)),
+            "skipped": True,
+            "skip_reason": "covered-by-budgeted-ocr-judge",
+            "lines_checked": 0,
+            "lines_corrected": 0,
+            "lines_disagreed": 0,
+            "lines_errored": 0,
+            "ensemble_disagreement_checked": 0,
+        }
+        return result
     lines = ocr_result.get("lines") or []
     if not lines:
         return ocr_result
@@ -126,7 +152,8 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
 
     try:
         from PIL import Image
-        image = Image.open(image_path)
+        image = Image.open(image_path).convert("RGB")
+        image.load()
     except Exception:
         return ocr_result
 
@@ -177,7 +204,7 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
             disagreements += 1
             notes.append({"line_id": line.get("id"), "note": "vlm_disagreement", "ocr_text": original})
             continue
-        if note == "vlm_error":
+        if note in vlm_client.VLM_ERROR_NOTES:
             errors += 1
             continue
         if answer is not None and _looks_plausible(original, answer) and answer != original:

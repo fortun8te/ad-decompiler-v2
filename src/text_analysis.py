@@ -272,7 +272,13 @@ def _clean_ink_mask(mask):
 
 
 def _ink_mask(crop):
-    """Return (mask, confidence) using border-estimated background contrast."""
+    """Return (mask, confidence) using border-estimated background contrast.
+
+    Glyph-tight OCR boxes can contaminate the border estimate with ink. In that
+    case the contrast mask selects the white plate and text colour inference flips
+    black copy to white-on-white (002's KRACHTSPORT headline). Prefer the minority
+    luminance class when the estimated border is demonstrably closer to that class.
+    """
     import numpy as np
 
     if crop is None or crop.size == 0:
@@ -294,8 +300,24 @@ def _ink_mask(crop):
     if ratio < 0.002 or ratio > 0.68:
         mask = _minority_luminance_mask(crop)
         ratio = float(mask.mean())
+    else:
+        minority = _minority_luminance_mask(crop)
+        if minority is not None and minority.any() and (~minority).any():
+            majority = ~minority
+            dist_minority = float(np.linalg.norm(
+                np.median(crop[minority].astype(np.float32), axis=0) - bg,
+            ))
+            dist_majority = float(np.linalg.norm(
+                np.median(crop[majority].astype(np.float32), axis=0) - bg,
+            ))
+            if dist_minority + 12.0 < dist_majority:
+                mask = minority
+                ratio = float(mask.mean())
     mask = _clean_ink_mask(mask)
     ratio = float(mask.mean())
+    if mask.any() and (~mask).any():
+        plate = np.median(crop[~mask].astype(np.float32), axis=0)
+        delta = np.sqrt(np.sum((crop.astype(np.float32) - plate) ** 2, axis=2))
     contrast = float(np.median(delta[mask])) if mask.any() else 0.0
     confidence = min(1.0, max(0.0, contrast / 80.0))
     if not 0.002 <= ratio <= 0.68:
@@ -793,6 +815,85 @@ def _native_text_decoration(mask, text: str) -> tuple[Optional[str], Optional[di
         }
     except Exception:
         return None, None
+
+
+def _native_colored_price_rules(image, line: dict) -> list[dict]:
+    """Recover authored coloured strike/underline rules around a price as vectors.
+
+    OCR commonly merges the separator arrow into a price line while the smaller
+    per-price observations are later deduped.  Saturated red rules are strong pixel
+    evidence and should survive that dedup as editable line shapes, not disappear into
+    a raster slice.  The detector is intentionally narrow: a currency token plus one
+    long, saturated red component that is either diagonal through the text or horizontal
+    at its lower edge.
+    """
+    if image is None or not re.search(r"[€$£]\s*\d", str(line.get("text") or "")):
+        return []
+    try:
+        import cv2
+        import numpy as np
+
+        box = _clean_box(line.get("box"))
+        ih, iw = image.shape[:2]
+        x0 = max(0, min(iw, int(math.floor(box["x"]))))
+        y0 = max(0, min(ih, int(math.floor(box["y"]))))
+        x1 = max(x0, min(iw, int(math.ceil(box["x"] + box["w"]))))
+        y1 = max(y0, min(ih, int(math.ceil(box["y"] + box["h"]))))
+        crop = image[y0:y1, x0:x1]
+        if crop.size == 0 or min(crop.shape[:2]) < 4:
+            return []
+        rgb = crop.astype(np.int16)
+        red = (
+            (rgb[:, :, 0] >= 120)
+            & (rgb[:, :, 0] - rgb[:, :, 1] >= 45)
+            & (rgb[:, :, 0] - rgb[:, :, 2] >= 45)
+        ).astype(np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(red, 8)
+        rules = []
+        for idx in range(1, count):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            cw = int(stats[idx, cv2.CC_STAT_WIDTH])
+            ch = int(stats[idx, cv2.CC_STAT_HEIGHT])
+            if area < 12 or max(cw, ch) < max(18, int(crop.shape[1] * 0.30)):
+                continue
+            ys, xs = np.nonzero(labels == idx)
+            points = np.column_stack([xs.astype(np.float32), ys.astype(np.float32)])
+            centre = points.mean(axis=0)
+            covariance = np.cov(points - centre, rowvar=False)
+            values, vectors = np.linalg.eigh(covariance)
+            axis = vectors[:, int(np.argmax(values))]
+            if axis[0] < 0:
+                axis = -axis
+            projection = (points - centre) @ axis
+            p0 = centre + axis * float(projection.min())
+            p1 = centre + axis * float(projection.max())
+            span = float(projection.max() - projection.min())
+            if span < max(18.0, crop.shape[1] * 0.30):
+                continue
+            angle = math.degrees(math.atan2(float(p1[1] - p0[1]), float(p1[0] - p0[0])))
+            relative_y = float(centre[1]) / max(1.0, crop.shape[0] - 1)
+            if abs(angle) <= 12.0 and relative_y >= 0.72:
+                kind = "underline"
+            elif 10.0 <= abs(angle) <= 45.0 and 0.20 <= relative_y <= 0.85:
+                kind = "strikethrough"
+            else:
+                continue
+            colour = _rgb_hex(np.median(crop[labels == idx].astype(np.float32), axis=0))
+            thickness = max(2.0, min(8.0, area / max(1.0, span)))
+            rules.append({
+                "kind": kind,
+                "x0": round(float(x0 + p0[0]), 2),
+                "y0": round(float(y0 + p0[1]), 2),
+                "x1": round(float(x0 + p1[0]), 2),
+                "y1": round(float(y0 + p1[1]), 2),
+                "color": colour,
+                "thickness": round(thickness, 2),
+                "confidence": round(min(1.0, span / max(1.0, crop.shape[1])), 4),
+                "source": "saturated-price-rule",
+            })
+        return sorted(rules, key=lambda item: (item["kind"], item["x0"], item["y0"]))
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -2211,6 +2312,16 @@ def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
     tolerance = _num(opts.get("tolerance"), 0.10)
     if class_consistent:
         tolerance = max(tolerance, _num(opts.get("consistent_tolerance"), 0.18))
+    # Absolute cap on how much fit a line may LOSE by folding into the consensus
+    # family, independent of the (deliberately loose) class-consistent tolerance.
+    # The loosened tolerance is meant to gather a *scattered* sans zoo whose members
+    # all fit the winner about equally (002's body labels regress <=0.045 or improve);
+    # it must never fold a line whose own face fits markedly better — the squared
+    # display headline "KRACHTSPORT BUNDEL" fits Archivo at 0.478 but the body's Lato
+    # at only 0.315 (a 0.163 regression), which is exactly the wrong-font headline the
+    # audit flagged. Cap the regression so genuine display faces survive while every
+    # near-tie body line still unifies.
+    max_fit_regression = _num(opts.get("max_fit_regression"), 0.10)
     strong_keep = _num(opts.get("strong_keep"), 0.72)
     min_score = _num(render_fit_options.get("min_score"), 0.30)
     try:
@@ -2275,6 +2386,7 @@ def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
         adopt = (
             fit is not None
             and new_score >= max(min_score, own - tolerance)
+            and (own - new_score) <= max_fit_regression
             and not (own >= min_score and new_score < min_score)
         )
         previous = line_family
@@ -2386,7 +2498,19 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
             continue
         word = raw_word
         word["box"] = _clean_box(word.get("box"))
-        painted, _baseline, colour, ink_conf, mask, paint = _painted_geometry(image, word)
+        # Word boxes are even tighter than line boxes. Sample a narrow exterior collar
+        # for plate polarity/colour, while preserving the original OCR geometry on the
+        # exported word. This prevents black all-caps words touching their crop border
+        # from being misclassified as white runs (002: BUNDEL).
+        probe = copy.deepcopy(word)
+        pad = max(3.0, min(16.0, min(word["box"]["w"], word["box"]["h"]) * 0.25))
+        probe["box"] = {
+            "x": word["box"]["x"] - pad,
+            "y": word["box"]["y"] - pad,
+            "w": word["box"]["w"] + 2 * pad,
+            "h": word["box"]["h"] + 2 * pad,
+        }
+        painted, _baseline, colour, ink_conf, mask, paint = _painted_geometry(image, probe)
         if ink_conf < min_conf:
             continue
         geo = _pre_font_signals(word, painted, mask, config)
@@ -2893,6 +3017,9 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
         line["ink_confidence"] = ink_confidence
         masks[line["id"]] = mask
         decoration, decoration_evidence = _native_text_decoration(mask, line.get("text", ""))
+        colored_price_rules = _native_colored_price_rules(image, line)
+        if colored_price_rules:
+            line.setdefault("meta", {})["native_decoration_shapes"] = colored_price_rules
         font_mask = mask
         if decoration_evidence and mask is not None:
             try:

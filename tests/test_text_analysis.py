@@ -111,6 +111,64 @@ def test_enriches_painted_geometry_colour_baseline_and_style(tmp_path):
     assert result["blocks"] and result["styles"] and result["sections"]
 
 
+def test_glyph_tight_black_text_on_white_stays_dark(tmp_path):
+    """002 regression: tight OCR borders must not invert black copy to white."""
+    image = Image.new("RGB", (520, 70), "white")
+    draw = ImageDraw.Draw(image)
+    font = _font(40)
+    bbox = _draw_text(draw, (10, 12), "KRACHTSPORT BUNDEL", font, (0, 0, 0))
+    x0, y0, x1, y1 = bbox
+    tight = (x0 + 2, y0 + 2, x1 - 2, y1 - 2)
+    path = tmp_path / "tight.png"
+    image.save(path)
+    result = text_analysis.analyze_text(
+        str(path),
+        {"engine": "synthetic", "source": {"path": str(path), "w": 520, "h": 70},
+         "lines": [_line("L1", "KRACHTSPORT BUNDEL", tight)]},
+        {},
+    )
+    r, g, b = result["lines"][0]["style"]["colorRGB"]
+    assert r < 40 and g < 40 and b < 40
+
+
+def test_glyph_tight_white_text_on_dark_stays_light(tmp_path):
+    image = Image.new("RGB", (400, 70), (20, 20, 20))
+    draw = ImageDraw.Draw(image)
+    font = _font(40)
+    bbox = _draw_text(draw, (10, 12), "WHITE COPY", font, (250, 250, 250))
+    x0, y0, x1, y1 = bbox
+    tight = (x0 + 2, y0 + 2, x1 - 2, y1 - 2)
+    path = tmp_path / "tight_light.png"
+    image.save(path)
+    result = text_analysis.analyze_text(
+        str(path),
+        {"engine": "synthetic", "source": {"path": str(path), "w": 400, "h": 70},
+         "lines": [_line("L0", "WHITE COPY", tight)]},
+        {},
+    )
+    r, g, b = result["lines"][0]["style"]["colorRGB"]
+    assert r > 200 and g > 200 and b > 200
+
+
+def test_saturated_price_strike_and_underline_become_vector_evidence():
+    image = np.full((100, 360, 3), 255, dtype=np.uint8)
+    # Diagonal strike through the old price and horizontal underline below the new.
+    import cv2
+    cv2.line(image, (25, 66), (145, 30), (225, 73, 27), 4, cv2.LINE_AA)
+    cv2.line(image, (205, 78), (335, 78), (225, 73, 27), 5, cv2.LINE_AA)
+
+    strike = text_analysis._native_colored_price_rules(image, {
+        "text": "€63", "box": {"x": 10, "y": 15, "w": 150, "h": 70},
+    })
+    underline = text_analysis._native_colored_price_rules(image, {
+        "text": "€49", "box": {"x": 190, "y": 15, "w": 160, "h": 70},
+    })
+
+    assert [item["kind"] for item in strike] == ["strikethrough"]
+    assert [item["kind"] for item in underline] == ["underline"]
+    assert strike[0]["color"].lower().startswith("#e")
+
+
 def test_groups_paragraph_lines_and_reuses_style_id(tmp_path):
     image = Image.new("RGB", (720, 420), "white")
     draw = ImageDraw.Draw(image)

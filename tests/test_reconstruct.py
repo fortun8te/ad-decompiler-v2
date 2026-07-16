@@ -70,6 +70,33 @@ def test_promote_wide_shape_hosting_ocr_becomes_banner_shell():
     assert candidates[1]["meta"]["shell_text_host"] == "c_E_banner"
 
 
+def test_reconstruct_does_not_repromote_broad_residual_rejected_by_merge():
+    """002 regression: reconstruct must not undo merge's residual-shell gate."""
+    candidates = [
+        {
+            "id": "c_E003", "target": "shape",
+            "box": {"x": 55, "y": 502, "w": 1025, "h": 1418},
+            "meta": {
+                "role": "shape", "confidence": 0.405,
+                "provenance": {"sources": ["residual", "sam3:box-refine-fallback"]},
+            },
+        },
+        {
+            "id": "c_price", "target": "text", "text": "€63 → €49",
+            "box": {"x": 350, "y": 540, "w": 380, "h": 80},
+            "meta": {"role": "price"},
+        },
+    ]
+
+    assert _promote_ocr_overlapping_shells(
+        candidates, {}, canvas={"w": 1080, "h": 1920},
+    ) == 0
+    assert candidates[0]["target"] == "shape"
+    assert candidates[0]["meta"]["role"] == "shape"
+    assert candidates[0]["meta"]["text_shell_rejected"] == "oversized-residual-shell"
+    assert candidates[1]["meta"].get("shell_text_host") is None
+
+
 def test_inpaint_used_opencv_detects_regional_fallback():
     # Regional inpaint reports per-region backends; any opencv-* region is a fallback.
     assert _inpaint_used_opencv({"backend_counts": {"flux-comfy": 2, "opencv-telea": 1}}) is True
@@ -1232,3 +1259,158 @@ def test_f10_slice_budget_truncation_is_recorded(tmp_path, monkeypatch):
     # Auditable on disk too.
     on_disk = json.loads((run_dir / "fallback.json").read_text(encoding="utf-8"))
     assert on_disk["truncated"]["un_sliced_count"] == 5
+
+
+# ── Plate integrity invariant (out-of-mask pixels bit-identical) ──────────────────
+
+
+def test_plate_integrity_ok_when_only_masked_pixels_change():
+    from src.inpaint_quality import plate_integrity
+    rng = np.random.default_rng(7)
+    source = rng.integers(0, 255, size=(64, 64, 3), dtype=np.uint8)
+    union = np.zeros((64, 64), dtype=np.uint8)
+    union[10:30, 10:30] = 255
+    plate = source.copy()
+    plate[12:28, 12:28] = 200  # change strictly inside the union
+    report = plate_integrity(source, plate, union)
+    assert report["ok"] is True
+    assert report["out_of_mask_changed_ratio"] == 0.0
+    assert report["out_of_mask_exact_ratio"] == 1.0
+
+
+def test_plate_integrity_flags_out_of_mask_change():
+    from src.inpaint_quality import plate_integrity
+    source = np.full((64, 64, 3), 230, dtype=np.uint8)
+    union = np.zeros((64, 64), dtype=np.uint8)
+    union[0:8, 0:8] = 255
+    plate = source.copy()
+    plate[40:, :] = (210, 51, 4)  # 002 signature: repainted far outside the mask
+    report = plate_integrity(source, plate, union)
+    assert report["ok"] is False
+    assert report["out_of_mask_changed_ratio"] > 0.3
+    assert report["mean_changed_distance"] > 50
+
+
+def test_reconstruct_raises_on_out_of_mask_plate_change(tmp_path, monkeypatch):
+    """The reconstruct-level gate must fail loudly, not ship a corrupted plate."""
+    from src import inpaint as inpaint_mod
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    source = np.full((64, 64, 3), 230, dtype=np.uint8)
+    src_path = run_dir / "normalized.png"
+    Image.fromarray(source).save(src_path)
+
+    def corrupt_inpaint_once(image_path, mask, output_path, cfg=None):
+        bad = source.copy()
+        bad[:, :] = (210, 51, 4)  # whole-plate repaint, ignoring the mask
+        Image.fromarray(bad).save(output_path)
+        return {"ok": True, "path": output_path, "backend": "test", "masked_fraction": 0.01}
+
+    monkeypatch.setattr(inpaint_mod, "inpaint_once", corrupt_inpaint_once)
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    mask[5:10, 5:10] = 255
+    Image.fromarray(mask).save(run_dir / "m.png")
+    candidates = [{
+        "id": "c1", "target": "image", "box": {"x": 5, "y": 5, "w": 5, "h": 5},
+        "mask": {"src": "m.png"}, "meta": {"role": "product", "confidence": 0.9},
+    }]
+    try:
+        reconstruct.reconstruct(str(src_path), {"lines": []}, candidates, str(run_dir),
+                                {"inpaint": {"mode": "opencv"}})
+    except RuntimeError as exc:
+        assert "plate integrity violated" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected plate-integrity RuntimeError")
+
+
+# ── Kept-raster footprint cover pass safety gates ─────────────────────────────────
+
+
+def _cover_setup(tmp_path, size=(100, 100)):
+    h, w = size
+    plate = np.full((h, w, 3), 240, dtype=np.uint8)
+    path = tmp_path / "background_clean.png"
+    Image.fromarray(plate).save(path)
+    return str(path)
+
+
+def test_cover_pass_skips_plate_passthrough(tmp_path):
+    path = _cover_setup(tmp_path)
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[50:100, 0:100] = 255  # giant footprint
+    candidates = [{
+        "id": "cap", "target": "drop",
+        "meta": {"keep_in_background": True, "removal_capped": {"cap": 0.25},
+                 "plate_passthrough": True},
+    }]
+    union = np.zeros((100, 100), dtype=np.uint8)
+    covered = reconstruct._cover_kept_raster_footprints(
+        path, candidates, {"cap": mask}, {}, union=union)
+    assert covered == 0
+    out = np.asarray(Image.open(path).convert("RGB"))
+    assert (out == 240).all()
+    assert not union.any()
+
+
+def test_cover_pass_respects_fraction_cap(tmp_path):
+    path = _cover_setup(tmp_path)
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[40:100, :] = 255  # 60% of the canvas
+    candidates = [{"id": "big", "target": "image", "meta": {"keep_in_background": True}}]
+    covered = reconstruct._cover_kept_raster_footprints(
+        path, candidates, {"big": mask}, {}, union=np.zeros((100, 100), np.uint8))
+    assert covered == 0
+    out = np.asarray(Image.open(path).convert("RGB"))
+    assert (out == 240).all()
+
+
+def test_cover_pass_covers_small_uniform_footprint_and_expands_union(tmp_path):
+    path = _cover_setup(tmp_path)
+    plate = np.asarray(Image.open(path).convert("RGB")).copy()
+    plate[45:55, 45:55] = (10, 10, 10)  # silhouette to hide
+    Image.fromarray(plate).save(path)
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[45:55, 45:55] = 255
+    candidates = [{"id": "s", "target": "image", "meta": {"keep_in_background": True}}]
+    union = np.zeros((100, 100), dtype=np.uint8)
+    covered = reconstruct._cover_kept_raster_footprints(
+        path, candidates, {"s": mask}, {}, union=union)
+    assert covered == 1
+    out = np.asarray(Image.open(path).convert("RGB"))
+    assert (np.abs(out[50, 50].astype(int) - 240) <= 2).all()
+    # Every covered pixel must be declared in the union (integrity contract).
+    changed = (np.abs(out.astype(int) - 240).max(axis=2) > 2)
+    assert not (changed & (union == 0)).any()
+
+
+def test_removal_cap_becomes_plate_passthrough(tmp_path):
+    """A capped low-confidence raster is plate-owned: dropped, src stripped."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    h = w = 100
+    source = np.full((h, w, 3), 230, dtype=np.uint8)
+    source[20:80, 20:80] = 255  # big white panel (the raster), not edge-touching
+    src_path = run_dir / "normalized.png"
+    Image.fromarray(source).save(src_path)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[20:80, 20:80] = 255  # 36% of canvas
+    mask_path = run_dir / "panel_mask.png"
+    Image.fromarray(mask).save(mask_path)
+    candidates = [{
+        "id": "panel", "target": "image", "box": {"x": 20, "y": 20, "w": 60, "h": 60},
+        "mask": {"src": "panel_mask.png"},
+        "meta": {"role": "shape", "confidence": 0.405, "promote_element": True},
+    }]
+    result = reconstruct.reconstruct(
+        str(src_path), {"lines": []}, candidates, str(run_dir),
+        {"inpaint": {"mode": "opencv"}})
+    assert result["stats"]["removal_capped"] == 1
+    capped = next(c for c in result["candidates"] if c["id"] == "panel")
+    assert capped["target"] == "drop"
+    assert not capped.get("src")
+    assert capped["meta"]["plate_passthrough"] is True
+    # The plate keeps the original panel pixels (no removal, no cover repaint).
+    plate = np.asarray(Image.open(run_dir / "background_clean.png").convert("RGB"))
+    assert (plate == source).all()
+    assert result["stats"]["plate_integrity"]["ok"] is True

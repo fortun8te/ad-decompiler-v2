@@ -571,6 +571,52 @@ def test_radial_gradient_disk_gets_ellipse_silhouette_and_radial_fill(tmp_path):
     assert "<radialGradient" in result["svg"]
 
 
+def _soft_blob_crop(path, w=200, h=320, cx_frac=0.42, cy_frac=0.38, sigma_frac=0.42):
+    """H8-style crop: fully-opaque white bg with a soft, heavily-blurred off-center
+    orange->white radial blob and NO hard edge (the whole crop is alpha=255)."""
+    from PIL import ImageFilter
+
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    cx, cy = w * cx_frac, h * cy_frac
+    sigma = min(w, h) * sigma_frac
+    rr = np.hypot(xx - cx, yy - cy)
+    t = np.exp(-(rr ** 2) / (2 * sigma ** 2))[..., None]  # gaussian falloff, fades to bg
+    orange = np.array([255, 140, 30], np.float32)
+    white = np.array([255, 255, 255], np.float32)
+    rgb = (orange[None, None] * t + white[None, None] * (1 - t)).astype(np.uint8)
+    img = Image.fromarray(np.dstack([rgb, np.full((h, w), 255, np.uint8)]))
+    img.filter(ImageFilter.GaussianBlur(radius=8)).save(path)
+
+
+def test_soft_blur_blob_emits_native_radial_gradient_not_raster(tmp_path):
+    # H8: a soft radial gradient blob with no hard edge must fire as a NATIVE radial
+    # gradient fill (multi-stop/off-center support), never a traced/sliced raster.
+    source = tmp_path / "blob.png"
+    _soft_blob_crop(source)
+
+    grad = vectorize._detect_gradient(str(source), {})
+    assert grad is not None and grad["kind"] == "radial"
+    # The center is fitted from the color field (blob is off-center, not the crop center).
+    center = grad["meta"]["center"]
+    assert abs(center[0] - 0.42) < 0.08 and abs(center[1] - 0.38) < 0.08
+    assert grad["meta"]["r2"] >= 0.90
+
+    result = vectorize.vectorize_crop(str(source), {}, role="shape")
+    assert result["ok"] is True
+    assert result["engine"] == "analytic-gradient"
+    assert result["gradient_fill"]["kind"] == "radial"
+    assert len(result["paths"]) == 1  # one silhouette, not stacked color bands / slices
+    assert "<radialGradient" in result["svg"]  # true native paint for Figma import
+
+
+def test_flat_solid_crop_is_not_a_gradient(tmp_path):
+    # Negative guard: a nearly-flat solid fill must NOT be mistaken for a soft blob.
+    source = tmp_path / "solid.png"
+    solid = np.full((80, 80, 4), (250, 250, 250, 255), np.uint8)
+    Image.fromarray(solid).save(source)
+    assert vectorize._detect_gradient(str(source), {}) is None
+
+
 def test_near_circle_icon_prefers_analytic_ellipse_primitive(tmp_path):
     source = tmp_path / "disk.png"
     icon = Image.new("RGBA", (48, 48), (0, 0, 0, 0))

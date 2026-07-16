@@ -1,11 +1,22 @@
 """CPU-only tests for the advisory VLM semantic grouping pass (mocked — no LM Studio)."""
 import json
 
+import pytest
 from PIL import Image
 
 from src import vlm_layout_group
 
 CANVAS = {"w": 400, "h": 600}
+
+
+@pytest.fixture(autouse=True)
+def _reset_group_fail_cache():
+    # The grouping negative cache is process-local; these tests reuse an
+    # identical synthetic image+element-summary across scenarios, so a failure
+    # cached by one test must not short-circuit the next.
+    vlm_layout_group.reset_fail_cache()
+    yield
+    vlm_layout_group.reset_fail_cache()
 
 
 def _roots():

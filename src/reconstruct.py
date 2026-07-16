@@ -8,6 +8,7 @@ union mask to :mod:`src.inpaint`.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 from typing import Optional
@@ -108,7 +109,11 @@ def _classify_shell_role_from_box(shell_box: dict, current_role: str) -> str:
     return "badge"
 
 
-def _promote_ocr_overlapping_shells(candidates: list, cfg: Optional[dict] = None) -> int:
+def _promote_ocr_overlapping_shells(
+    candidates: list,
+    cfg: Optional[dict] = None,
+    canvas: Optional[dict] = None,
+) -> int:
     """Skip vectorize/raster-chip paths for shells that clearly host OCR text.
 
     Merge normally flags ``text_bearing_shell``; this is a reconstruct-time safety net so
@@ -153,6 +158,39 @@ def _promote_ocr_overlapping_shells(candidates: list, cfg: Optional[dict] = None
             _inside_frac(shell_box, t.get("box") or {}) >= 0.85
             for t in hosts
         ):
+            continue
+        # Mirror merge's residual-shell admission gate.  This safety-net runs after
+        # merge, so it must not undo merge's deliberate rejection and turn a huge
+        # residual negative-space component into a badge/banner again (002).  Once
+        # promoted, photo-shape detection is skipped and the region becomes a giant
+        # inpaint hole; keeping it neutral lets the photo override + removal cap retain
+        # the exact source panel instead.
+        canvas_area = (
+            float((canvas or {}).get("w", 0) or 0)
+            * float((canvas or {}).get("h", 0) or 0)
+        )
+        shell_area = (
+            float(shell_box.get("w", 0) or 0)
+            * float(shell_box.get("h", 0) or 0)
+        )
+        area_frac = shell_area / canvas_area if canvas_area > 0 else 0.0
+        width_frac = (
+            float(shell_box.get("w", 0) or 0)
+            / float((canvas or {}).get("w", 0) or 1)
+            if float((canvas or {}).get("w", 0) or 0) > 0 else 0.0
+        )
+        provenance_sources = {
+            str(source).lower()
+            for source in ((meta.get("provenance") or {}).get("sources") or [])
+        }
+        generic_residual = role in {"", "shape", "photo"} and any(
+            "residual" in source for source in provenance_sources
+        )
+        if canvas_area > 0 and (
+            area_frac >= 0.35
+            or (generic_residual and area_frac >= 0.05 and width_frac >= 0.70)
+        ):
+            meta["text_shell_rejected"] = "oversized-residual-shell"
             continue
         new_role = _classify_shell_role_from_box(shell_box, role)
         if role and role != new_role:
@@ -394,6 +432,12 @@ _CAP_EXEMPT_ROLES = frozenset({
     "panel", "image-panel", "photo-panel", "comparison-column", "comparison-panel",
 })
 
+# Thin-stroke marks whose SAM mattes chronically miss rim detail; their removal masks
+# get unioned with a measured ink-contrast mask (see the cutout_ink_union block).
+_LINE_ART_ROLES = frozenset({
+    "logo", "brand", "wordmark", "platform-logo", "icon", "badge", "seal", "stamp",
+})
+
 
 def _keeps_underlay(candidate: dict) -> bool:
     """True for overlay layers whose already-valid underlying plate must not be erased."""
@@ -482,6 +526,14 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
         edge_margin = max(3.0, min(canvas_w, canvas_h) * .012)
         edge_count = sum((x0 <= edge_margin, y0 <= edge_margin,
                           x1 >= canvas_w - edge_margin, y1 >= canvas_h - edge_margin))
+        # Price strikes/underlines are already evidence-backed editable SVG paths.
+        # They are deliberately thin and often contained by a broad residual host, so
+        # the generic fragment/photo flattening rules below must never absorb them.
+        if meta.get("native_decoration") and target == "shape":
+            meta["layer_disposition"] = "foreground_vector"
+            meta["z_band"] = "overlay"
+            out.append(c)
+            continue
         # A low-confidence residual-only photo fragment is texture/debris, not an
         # independently editable image.  Exporting it creates tiny alpha islands (and
         # sometimes holes) over a still-present scene plate.  Keep it in the plate until
@@ -601,10 +653,21 @@ def _mask_path(candidate):
 
 
 def _candidate_mask(candidate, rgb, run_dir, ocr_lines=None, cfg: Optional[dict] = None):
-    _, np, _ = _deps()
+    cv2, np, _ = _deps()
     h, w = rgb.shape[:2]
     meta = candidate.get("meta") or {}
     rcfg = (cfg or {}).get("reconstruct") or {}
+    if meta.get("native_decoration") and isinstance(meta.get("line"), dict):
+        line = meta["line"]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        try:
+            p0 = (int(round(float(line["x0"]))), int(round(float(line["y0"]))))
+            p1 = (int(round(float(line["x1"]))), int(round(float(line["y1"]))))
+            thickness = max(1, int(math.ceil(float(line.get("thickness", 2.0)))))
+            cv2.line(mask, p0, p1, 255, thickness=thickness, lineType=cv2.LINE_AA)
+            return mask
+        except (KeyError, TypeError, ValueError):
+            return mask
     substitution = meta.get("substitution") if isinstance(meta.get("substitution"), dict) else {}
     exact_text_fallback = bool(
         candidate.get("text") and meta.get("fallback") and substitution.get("from") == "text"
@@ -789,6 +852,9 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         solid_first = default_solid_first
     default_passes = 0 if solid_first else (1 if solid_fill else 3)
     max_passes = max(0, int(audit_cfg.get("reinpaint_max_passes", default_passes)))
+    fill_dilate = max(0, int(audit_cfg.get(
+        "solid_fill_dilate", 4 if solid_first else 2,
+    )))
 
     def _residue(plate_arr, ink, ink_color):
         nonlocal plate_f32
@@ -819,21 +885,55 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
             residue = t["residue"]
             if not np.any(residue):
                 continue
-            binary = residue.astype(np.uint8)
-            ring = (cv2.dilate(binary * 255, ring_k) > 0) & (binary == 0)
+            # On a flat plate the full glyph footprint (plus antialias halo) is the
+            # owned repair region. Using residue alone leaves readable fringe pixels.
+            seed = (t["ink"] if solid_first else residue).astype(np.uint8)
+            if fill_dilate:
+                fill_k = np.ones((2 * fill_dilate + 1, 2 * fill_dilate + 1), np.uint8)
+                fill_area = cv2.dilate(seed * 255, fill_k) > 0
+            else:
+                fill_area = seed > 0
+            binary = fill_area.astype(np.uint8)
+            ring = (cv2.dilate(binary * 255, ring_k) > 0) & (~fill_area)
+            # Sample the already-cleaned plate (so text inside a removed button does
+            # not reintroduce the button's source colour), then exclude pixels close
+            # to the known glyph colour. Tight/crowded display copy otherwise makes
+            # the ring median black and the "repair" repaints the ghost black.
             exterior = plate_u8[ring]
+            if exterior.shape[0] >= 8 and t.get("ink_color") is not None:
+                ink_rgb = np.asarray(t["ink_color"], dtype=np.float32).reshape(3)
+                away_from_ink = np.abs(
+                    exterior.astype(np.float32) - ink_rgb,
+                ).mean(axis=1) > max(ink_tolerance, 32.0)
+                filtered = exterior[away_from_ink]
+                if filtered.shape[0] >= 8:
+                    exterior = filtered
             # Glyph residue near edges / crowded ink can leave <8 ring samples at the
             # default radius (009 "krijgen"); expand sampling before giving up.
             expand_r = ring_radius
             while exterior.shape[0] < 8 and expand_r < max_ring:
                 expand_r = min(max_ring, expand_r + max(2, ring_radius // 2))
                 ring_k_exp = np.ones((2 * expand_r + 1, 2 * expand_r + 1), np.uint8)
-                ring = (cv2.dilate(binary * 255, ring_k_exp) > 0) & (binary == 0)
+                ring = (cv2.dilate(binary * 255, ring_k_exp) > 0) & (~fill_area)
                 exterior = plate_u8[ring]
+                if exterior.shape[0] >= 8 and t.get("ink_color") is not None:
+                    ink_rgb = np.asarray(t["ink_color"], dtype=np.float32).reshape(3)
+                    filtered = exterior[
+                        np.abs(exterior.astype(np.float32) - ink_rgb).mean(axis=1)
+                        > max(ink_tolerance, 32.0)
+                    ]
+                    if filtered.shape[0] >= 8:
+                        exterior = filtered
             if exterior.shape[0] < 8:
                 continue
             fill = np.median(exterior.astype(np.float32), axis=0).astype(np.uint8)
-            plate_u8[binary > 0] = fill
+            plate_u8[fill_area] = fill
+            fill_u8 = fill_area.astype(np.uint8) * 255
+            owner = int(t["item"].get("removal_owner") or 0)
+            if owner:
+                ledger[(fill_area) & (ledger == 0)] = owner
+            np.maximum(union, fill_u8, out=union)
+            np.maximum(expand_total, fill_u8, out=expand_total)
             t["resolved"] = True
             t["flag"]["resolved"] = True
             t["flag"]["resolved_by"] = "solid-plate-fill"
@@ -971,7 +1071,14 @@ def _build_removal_ledger(observations: list, canvas: tuple[int, int]):
     def priority(item):
         target = str(item.get("target") or "")
         role = str(item.get("role") or "").lower()
+        meta = item.get("meta") or {}
         target_rank = {"text": 40, "icon": 30, "shape": 20, "image": 10}.get(target, 0)
+        # A verified arrow or authored price rule overlaps OCR by design. It must own
+        # those source pixels before the broad price text mask, otherwise only a tiny
+        # sliver reaches its asset/fallback and the mark disappears from the export.
+        if role in {"arrow", "callout_leader", "leader", "leader_line", "connector",
+                    "underline", "strikethrough", "annotation"} or meta.get("native_decoration"):
+            target_rank = 60
         if role in {"product", "person", "foreground", "cutout"}:
             target_rank += 5
         box = item.get("box") or {}
@@ -1003,14 +1110,31 @@ def _build_removal_ledger(observations: list, canvas: tuple[int, int]):
     return records, union, ledger, owner_index
 
 
-def _cover_kept_raster_footprints(background_path, candidates, masks, cfg):
+def _cover_kept_raster_footprints(background_path, candidates, masks, cfg, union=None):
     """Fill kept-in-plate opaque-raster footprints with plate colour (no ghost silhouette).
 
-    Targets exactly the rasters the removal cap left in the plate (``meta.removal_capped``)
-    and any explicit ``meta.keep_in_background`` opaque raster that still re-renders on top.
-    Those pixels are hidden by the re-rendered asset, so replacing them with the surrounding
-    plate colour is loss-free for the composite and removes the silhouette QA sees in
-    background_clean. Config gate ``reconstruct.cover_kept_footprints`` (default ON)."""
+    Targets ONLY opaque rasters that genuinely still re-render on top of the plate
+    (``meta.keep_in_background`` with an emitted ``target == "image"`` layer). Those pixels
+    are hidden by the re-rendered asset, so replacing them with the surrounding plate
+    colour is loss-free for the composite and removes the silhouette QA sees in
+    background_clean.
+
+    Plate-owned candidates (``meta.plate_passthrough`` / removal-capped drops) are NEVER
+    covered: they are not re-rendered, so the original source pixels ARE the plate.
+    Covering them repaints huge out-of-mask regions with the ring median — on 002 this
+    painted the entire 46%-of-canvas white product panel orange, with a hard seam at the
+    footprint's dilated boundary (y≈499) and edge (x≈53).
+
+    Safety gates (both configurable under ``reconstruct.*``):
+      * ``cover_footprint_max_fraction`` (default 0.10) — a footprint bigger than this
+        cannot plausibly be "one flat plate colour"; skip it.
+      * the exterior ring must be near-uniform (``cover_footprint_uniform_fraction``,
+        default 0.70 within ``cover_footprint_tolerance``, default 12) — otherwise the
+        median fill invents a colour that matches nothing.
+
+    Every covered pixel is OR'ed into ``union`` (when given) so the plate-integrity
+    invariant — plate differs from source only inside removal_mask.png — stays true.
+    Config gate ``reconstruct.cover_kept_footprints`` (default ON)."""
     cv2, np, Image = _deps()
     rcfg = (cfg or {}).get("reconstruct") or {}
     if not bool(rcfg.get("cover_kept_footprints", True)):
@@ -1020,10 +1144,11 @@ def _cover_kept_raster_footprints(background_path, candidates, masks, cfg):
     targets = []
     for c in candidates or []:
         meta = c.get("meta") or {}
-        # Full-canvas plates are dropped to target="drop" upstream, so the image filter
-        # already excludes them; we only cover opaque rasters that re-render on top.
-        if not (meta.get("removal_capped") or (meta.get("keep_in_background")
-                                               and c.get("target") == "image")):
+        if meta.get("plate_passthrough"):
+            continue
+        # Only opaque rasters that still ship as layers re-render over their own
+        # footprint; those are the only ones whose plate pixels are provably hidden.
+        if not (meta.get("keep_in_background") and c.get("target") == "image"):
             continue
         mask = masks.get(c.get("id"))
         if mask is not None and np.count_nonzero(mask):
@@ -1037,25 +1162,35 @@ def _cover_kept_raster_footprints(background_path, candidates, masks, cfg):
     ph, pw = plate.shape[:2]
     dilate = max(1, int(rcfg.get("cover_footprint_dilate", 3)))
     ring_radius = max(4, int(rcfg.get("cover_footprint_ring", 12)))
+    max_fraction = float(rcfg.get("cover_footprint_max_fraction", 0.10))
+    uniform_fraction = float(rcfg.get("cover_footprint_uniform_fraction", 0.70))
+    tolerance = float(rcfg.get("cover_footprint_tolerance", 12.0))
     covered = 0
     for mask in targets:
         binary = (np.asarray(mask) > 0).astype(np.uint8)
         if binary.shape != (ph, pw):
             binary = cv2.resize(binary, (pw, ph), interpolation=cv2.INTER_NEAREST)
         binary = cv2.dilate(binary, np.ones((2 * dilate + 1,) * 2, np.uint8))
+        if float(np.count_nonzero(binary)) / max(1, binary.size) > max_fraction:
+            continue
         ring = (cv2.dilate(binary, np.ones((2 * ring_radius + 1,) * 2, np.uint8)) > 0) & (binary == 0)
         exterior = plate[ring]
         if exterior.shape[0] < 16:
             continue
-        fill = np.median(exterior.astype(np.float32), axis=0).astype(np.uint8)
-        plate[binary > 0] = fill
+        fill = np.median(exterior.astype(np.float32), axis=0)
+        near = np.max(np.abs(exterior.astype(np.float32) - fill), axis=1) <= tolerance
+        if float(np.mean(near)) < uniform_fraction:
+            continue
+        plate[binary > 0] = fill.astype(np.uint8)
+        if union is not None:
+            np.maximum(union, binary * 255, out=union)
         covered += 1
     if covered:
         Image.fromarray(plate).save(background_path)
     return covered
 
 
-def _crop_rgba(rgb, mask, box):
+def _crop_rgba(rgb, mask, box, element_role=None):
     _, np, Image = _deps()
     h, w = rgb.shape[:2]
     x0 = max(0, int(round(box.get("x", 0))))
@@ -1064,19 +1199,35 @@ def _crop_rgba(rgb, mask, box):
     y1 = min(h, int(round(box.get("y", 0) + box.get("h", 0))))
     if x1 <= x0 or y1 <= y0:
         return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-    rgba = np.dstack([rgb[y0:y1, x0:x1], mask[y0:y1, x0:x1]])
-    return Image.fromarray(rgba.astype(np.uint8))
+    # Refine the raw binary SAM mask into a production alpha (feather + colour
+    # decontamination + background-fringe suppression) instead of pasting the hard
+    # mask straight in — a binary alpha paste is the exact source of the doubled-
+    # contour/white-halo defect (002 audit finding #5, edge precision 0.5526).
+    try:
+        from src import matting
+        out = matting.refine(rgb, mask, box={"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0},
+                             element_role=element_role)
+        return Image.fromarray(out.rgba)
+    except Exception:
+        rgba = np.dstack([rgb[y0:y1, x0:x1], mask[y0:y1, x0:x1]])
+        return Image.fromarray(rgba.astype(np.uint8))
 
 
 def _source_rgba(candidate, rgb, mask, run_dir):
     """Prefer a model-provided clean RGBA layer, correctly cropped to its tight box."""
     _, np, Image = _deps()
     cluster_meta = candidate.get("meta") or {}
+    role = str(cluster_meta.get("role") or "").lower()
+    if role in {"arrow", "callout_leader", "leader", "leader_line", "connector"}:
+        # Peeling can estimate a white/grey foreground for a black mark when the mark
+        # overlaps OCR. SAM already supplies the verified matte; retain the original
+        # authored pixels inside it instead of trusting the colour-hallucinated peel.
+        return _crop_rgba(rgb, mask, candidate.get("box", {}), element_role=role)
     if (is_intentional_raster_cluster(cluster_meta.get("role"))
             or cluster_meta.get("intentional_raster_cluster")):
         # Do not use a transparent Qwen/SAM crop here: the original full crop is the
         # fidelity contract for an inseparable cluster.
-        return _crop_rgba(rgb, mask, candidate.get("box", {}))
+        return _crop_rgba(rgb, mask, candidate.get("box", {}), element_role=role)
     path = inpaint.resolve_path(candidate.get("src"), run_dir)
     box = candidate.get("box", {})
     if path:
@@ -1091,7 +1242,7 @@ def _source_rgba(candidate, rgb, mask, run_dir):
         target = (max(1, int(round(box.get("w", image.width)))),
                   max(1, int(round(box.get("h", image.height)))))
         return image if image.size == target else image.resize(target, Image.Resampling.LANCZOS)
-    return _crop_rgba(rgb, mask, box)
+    return _crop_rgba(rgb, mask, box, element_role=role)
 
 
 def _apply_owned_alpha(image, owned_mask, box):
@@ -2335,7 +2486,9 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     candidates = prefer_decomposed_charts(candidates)
 
     canonical = deduplicate(candidates, float(rcfg.get("dedup_iou", 0.86)))
-    text_shells_promoted = _promote_ocr_overlapping_shells(canonical, cfg)
+    text_shells_promoted = _promote_ocr_overlapping_shells(
+        canonical, cfg, canvas={"w": w, "h": h},
+    )
     photo_policy = (((cfg.get("scene") or {}).get("preset") or {}).get("photo_regions") or {})
     if photo_policy.get("suppress_descendants", True):
         canonical = _suppress_baked_raster_text(
@@ -2427,6 +2580,11 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             updated.append(c)
             continue
         if target in ("drop", "text"):
+            updated.append(c)
+            continue
+        if (c.get("meta") or {}).get("native_decoration"):
+            # Already an evidence-backed SVG/path. Preserve it verbatim; style
+            # extraction from its thin removal mask would flatten or reclassify it.
             updated.append(c)
             continue
         mask = masks.get(cid)
@@ -2574,12 +2732,19 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         _DISTINCT_CUTOUT_ROLES = {
             "product", "person", "foreground", "cutout", "avatar", "profile",
             "profile_photo", "logo", "brand", "wordmark",
+            "arrow", "callout_leader", "leader", "leader_line", "connector",
+            "underline", "strikethrough", "annotation",
         }
-        if (not np.any(owned) and not is_text_fallback
+        mask_px = int(np.count_nonzero(mask))
+        owned_px = int(np.count_nonzero(owned))
+        ownership_fraction = owned_px / max(1, mask_px)
+        if (not is_text_fallback
                 and role in _DISTINCT_CUTOUT_ROLES
-                and _verified_semantic_mask(c["meta"])):
+                and _verified_semantic_mask(c["meta"])
+                and ownership_fraction < .55):
             owned = (mask > 0).astype(np.uint8) * 255
             c["meta"]["ownership_rescued"] = "distinct-verified-cutout"
+            c["meta"]["ownership_fraction_before_rescue"] = round(ownership_fraction, 4)
             c["meta"]["ownership_cutout"] = True
         # Do retain broad photo frames for the layout regression contract, but
         # never export an empty semantic cutout (product/person/icon) merely
@@ -2767,6 +2932,19 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                 "confidence": float(_cap_conf),
                 "reason": "low-confidence-opaque-raster-exceeds-removal-cap",
             }
+            # A capped raster is PLATE-OWNED, full stop. It must not also ship as a
+            # layer: re-emitting it (directly, or as a group-host "__hostbg" slice cut
+            # by build_design_json from candidate src) bakes the plate + every extracted
+            # element back into one screenshot fragment. That shipped 002's 1025x1418
+            # conf-0.405 host raster with pale product silhouettes doubled under the
+            # real cutouts. Drop the target and strip src so no downstream stage can
+            # re-emit these pixels; the clean plate (which keeps the original pixels
+            # here, minus the extracted elements' own removals) is the single owner.
+            c["target"] = "drop"
+            c.pop("src", None)
+            c.pop("mask", None)
+            c["meta"]["plate_passthrough"] = True
+            c["meta"]["raster_fallback"] = "removal-capped-plate-passthrough"
             removal_capped += 1
             continue
         dilate = inpaint.resolve_mask_dilate(c, cfg)
@@ -2795,6 +2973,31 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         _role = str((c.get("meta") or {}).get("role") or "").lower()
         if c.get("target") == "image" and _role in _CAP_EXEMPT_ROLES:
             dilate = max(dilate, int(rcfg.get("cutout_rim_dilate", 3)))
+        # Line-art marks (logo/icon/badge/seal/wordmark) have thin strokes and scalloped
+        # rims that SAM mattes routinely under-cover — 002's logo left a ring-shaped ink
+        # ghost in the clean plate up to ~17px outside the matte (hidden only because the
+        # replacement logo rendered on top). Dilation alone cannot reach that far without
+        # damaging neighbours, so union the matte with the measured high-contrast ink
+        # inside the candidate box. Config gate ``reconstruct.cutout_ink_union`` (ON).
+        if (c.get("target") in ("image", "icon")
+                and _role in _LINE_ART_ROLES
+                and candidate_mask is not None
+                and bool(rcfg.get("cutout_ink_union", True))):
+            ink = inpaint.text_ink_mask(rgb, box, allow_box_fallback=False)
+            ink_px = int(np.count_nonzero(ink))
+            matte_px = int(np.count_nonzero(candidate_mask))
+            # Guard against a textured plate turning "ink" into most of the box.
+            box_px = max(1, int(round(box.get("w", 1))) * int(round(box.get("h", 1))))
+            if ink_px and ink_px <= box_px * float(rcfg.get(
+                    "cutout_ink_union_max_box_fraction", 0.85)):
+                candidate_mask = np.maximum(
+                    np.asarray(candidate_mask, dtype=np.uint8), ink.astype(np.uint8),
+                )
+                added = int(np.count_nonzero(candidate_mask)) - matte_px
+                if added > 0:
+                    c.setdefault("meta", {})["cutout_ink_union"] = {
+                        "added_px": added, "matte_px": matte_px,
+                    }
         observation = {
             "id": c.get("id"),
             "target": c.get("target"),
@@ -2846,10 +3049,33 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     # raster is re-rendered opaquely on top, its plate pixels are never seen — cover its
     # footprint with the surrounding plate colour so the clean plate has no silhouette.
     footprints_covered = _cover_kept_raster_footprints(
-        background_path, updated, masks, cfg,
+        background_path, updated, masks, cfg, union=union,
     )
     mask_path = os.path.join(run_dir, "removal_mask.png")
     Image.fromarray(union).save(mask_path)
+    # Deterministic plate-integrity gate: the plate may differ from the source ONLY
+    # inside the just-saved removal union. Every writer composites through its mask and
+    # every deliberate post-pass expands the union it mutates under, so any out-of-mask
+    # change is a compositing/ownership bug — fail LOUDLY instead of shipping a broken
+    # plate hidden under a raster fallback (002's orange-panel plate shipped silently).
+    from .inpaint_quality import plate_integrity as _plate_integrity_check
+    integrity_cfg = rcfg.get("plate_integrity") if isinstance(
+        rcfg.get("plate_integrity"), dict) else {}
+    plate_final = np.asarray(Image.open(background_path).convert("RGB"), dtype=np.uint8)
+    plate_integrity = _plate_integrity_check(
+        rgb, plate_final, union,
+        changed_tolerance=int(integrity_cfg.get("changed_tolerance", 0)),
+    )
+    max_changed = float(integrity_cfg.get("max_out_of_mask_change", 0.0005))
+    if (bool(integrity_cfg.get("enforce", True))
+            and float(plate_integrity.get("out_of_mask_changed_ratio", 1.0)) > max_changed):
+        raise RuntimeError(
+            "plate integrity violated: "
+            f"{plate_integrity.get('out_of_mask_changed_ratio'):.4%} of pixels outside "
+            f"removal_mask.png changed in background_clean.png (limit {max_changed:.4%}; "
+            f"edge_retention={plate_integrity.get('edge_retention')}). A plate writer "
+            "modified pixels it does not own — see reconstruct/inpaint compositing."
+        )
     removal_ownership_path = os.path.join(run_dir, "removal_ownership.png")
     removal_scale = max(1, 65535 // max(1, len(removal_owner_index)))
     Image.fromarray((removal_ownership * removal_scale).astype(np.uint16)).save(
@@ -2886,6 +3112,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "mask_rejected": mask_rejected,
             "removal_capped": removal_capped,
             "kept_footprints_covered": footprints_covered,
+            "plate_integrity": plate_integrity,
             # Ghost-text audit evidence: repair.assess turns unresolved residue into a
             # rebuild-clean-plate repair instead of letting duplicate text ship.
             "text_residual": text_residual,
@@ -3092,6 +3319,19 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
         if rid in forced and not reasons:
             reasons = ["forced by repair (reconstruct.focus_regions)"]
         if not reasons:
+            continue
+        found = _find_layer_node(design.get("layers") or [], rid)
+        node = found[2] if found else {}
+        if (node.get("meta") or {}).get("native_decoration"):
+            # This path is already a direct fit to saturated source pixels. Region SSIM
+            # is invalid for a thin overlay because the crop is dominated by unrelated
+            # price glyphs; slicing would destroy the very editability this fallback is
+            # meant to protect.
+            report["skipped"].append({
+                "id": rid,
+                "reason": "evidence-backed-native-decoration",
+                "failing_reasons": list(reasons),
+            })
             continue
         # Codia: never raster-slice readable OCR/native TEXT to boost fidelity.
         is_text_layer = str(row.get("type") or "") == "text"

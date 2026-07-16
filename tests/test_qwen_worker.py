@@ -145,6 +145,51 @@ def test_flux_inpaint_returns_none_when_workflow_missing(monkeypatch):
     assert qwen_worker.flux_inpaint(rgb, mask, cfg) is None
 
 
+def test_flux_inpaint_timeout_interrupts_and_clears_queue(monkeypatch):
+    """GB1: a Flux job we stop waiting on must be interrupted + dequeued so it
+    does not keep pinning ~16 GB and wedge the next run's /prompt."""
+    posts = []
+
+    class _Resp:
+        def __init__(self, json_data=None):
+            self._json = json_data or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._json
+
+    class _Fake:
+        def get(self, url, **kwargs):
+            if url.endswith("/system_stats"):
+                return _Resp({"ok": 1})
+            if "/history/" in url:
+                return _Resp({})          # never contains prompt_id → times out
+            return _Resp({})
+
+        def post(self, url, **kwargs):
+            posts.append((url, kwargs.get("json")))
+            if url.endswith("/upload/image"):
+                return _Resp({"name": "flux_uploaded.png"})
+            if url.endswith("/prompt"):
+                return _Resp({"prompt_id": "pidZZZ"})
+            return _Resp({})
+
+    monkeypatch.setattr(qwen_worker, "_requests", lambda: _Fake())
+    rgb, mask = _mask_pair()
+    cfg = {"inpaint": {"comfy": {
+        "workflow": "workflows/flux_fill_inpaint_api.json", "timeout_s": 0,
+    }}}
+    out = qwen_worker.flux_inpaint(rgb, mask, cfg)
+    assert out is None
+    urls = [u for u, _ in posts]
+    assert any(u.endswith("/interrupt") for u in urls), urls
+    queue_calls = [j for u, j in posts if u.endswith("/queue")]
+    assert queue_calls and queue_calls[0].get("clear") is True
+    assert "pidZZZ" in (queue_calls[0].get("delete") or [])
+
+
 def test_flux_inpaint_full_cycle_returns_decoded_plate(monkeypatch):
     import io
 

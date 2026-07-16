@@ -1,0 +1,484 @@
+device: cuda
+archetype:
+  preset: auto
+  observations: {}
+vlm:
+  enabled: true
+  # Concurrent independent crop requests. LM Studio continuous-batches these
+  # (lms ps "parallel: 4"); sequential for-loops left those slots idle.
+  parallelism: 4
+  base_url: http://127.0.0.1:1234/v1
+  model: google/gemma-4-e4b
+  confidence_threshold: 0.85
+  ocr_judge:
+    enabled: true
+    # Cap disagreement arbitration (mirrors proofread.max_regions). Dense ad
+    # 002 spent ~223s VLM-judging 72 OCR lines; many were product-label
+    # microcopy that never becomes a layer. Priority-sort brand/price/CTA/
+    # large lines first, then stop at max_lines. Does not touch numeric_verify
+    # or font_judge (those remain separately budgeted / uncapped here).
+    max_lines: 12
+    proofread:
+      enabled: true
+      max_conf: 0.80
+      brand_tokens: true
+      max_regions: 8
+      # One proofread pass: the doctr+easyocr ensemble already reconciles, so the
+      # 2nd VLM pass added ~15s/image for marginal correction gain. Numeric/short
+      # tokens still get a dedicated verify pass in text_analysis.
+      passes: 1
+      min_similarity: 0.6
+  anomaly:
+    enabled: true
+    max_calls: 1
+runtime:
+  require_active_models: true
+  auto_retry:
+    sam_disable_compile: true
+  vram:
+    # 16 GB (RTX 5080) cannot hold gemma-4-12b (~7.5 GB, resident in LM Studio) + SAM3
+    # (~3 GB) + Flux Fill Q6 GGUF (9.2 GB) + t5xxl fp8 (4.5 GB) at once. gc + empty_cache
+    # run between stages; the VLM is unloaded for the heavy ComfyUI Flux inpaint and
+    # reloaded after (gemma-4-12b reloads in ~5 s).
+    empty_cache_between_stages: true
+    unload_ocr_before_sam: true
+    evict_vlm_for_inpaint: true         # `lms unload` the VLM before Flux inpaint
+    reload_vlm_after_inpaint: true       # `lms load` it back once inpaint completes
+    # Defer unload/quant until a region actually routes to flux-comfy. Final4 ads
+    # (002/009/016) were analytic/LaMa-only yet still paid ~8–12s unload+reload.
+    lazy_flux_prep: true
+  harness:
+    enabled: true
+    max_rounds: 2                        # F13b: reverted 3->2. The extra round chased OCR
+    repair_iterations: 1                 # F13b: reverted 2->1. noise (002 spent 4 passes /
+    epsilon: 0.005                       # 163s for text_recall +0.019, QA still failed).
+    plateau_rounds: 1                    # F13c: reverted 2->1. stop after one no-gain round
+    reward: phase2                       # phase2 metric ladder (local SSIM + LPIPS + text
+                                         # + VLM critique repairs) | legacy composite
+ocr:
+  primary: doctr
+  challengers: ["easyocr"]
+  lang: "en+nl"
+  retry_2x:
+    enabled: true
+    scale: 2.0
+    max_regions: 8
+    edge_recover: true
+    edge_margin: 0
+    edge_extend_factor: 4.0
+    edge_conf_tolerance: 0.08
+  # Drop fused lines whose tokens are a fuzzy subsequence of an overlapping longer
+  # reading (partial duplicates like "geld" inside "geld terug tot €100.") — they
+  # otherwise paint twice as ghost text.
+  dedup_contained: true
+  # Short numeric tokens (counts/prices/times) with engine disagreement or low
+  # confidence get a bounded charset-constrained VLM re-read (fixes 66→99).
+  numeric_verify:
+    enabled: true
+    max_regions: 4
+    min_conf: 0.90
+text_analysis:
+  cap_height_ratio: 0.72
+  # Snap near-horizontal OCR baseline wobble to exactly 0°; multi-line blocks
+  # only rotate when every member line agrees on the same larger angle.
+  rotation_snap_deg: 2.5
+  font_matching:
+    enabled: true
+    max_fonts: 64
+    max_lines: 16
+    top_k: 5
+    font_dirs: []
+    # Document-level family consensus: vote across lines (ink area x fit score),
+    # re-fit outliers against the winner; adopt only when the consensus fit is
+    # within `tolerance` of the line's own fit (fit is the cross-class guard).
+    consensus:
+      enabled: true
+      min_lines: 3
+      min_share: 0.30
+      tolerance: 0.10
+      strong_keep: 0.72
+    # Classify source ink serif/sans/script and hard-filter candidate fonts by
+    # class before shape matching (a swash face must never match sans body copy).
+    class_gate: true
+    class_gate_min_confidence: 0.5
+  # Render the recognized text with each top candidate and optimize fontSize /
+  # letterSpacing against the source ink mask; candidates whose best fit stays
+  # below min_score are rejected (and the line falls back to masked pixels).
+  render_fit:
+    enabled: true
+    max_candidates: 3
+    min_score: 0.30
+sam3:
+  enabled: true
+  checkpoint: C:/models/sam3.pt
+  load_from_hf: false
+  confidence: 0.45
+  resolution: 1008
+  compile: false
+  small_icon:
+    enabled: true
+    min_score: 0.30
+    max_coverage: 0.05
+    min_aspect: 0.6
+    max_aspect: 1.7
+    # Small wide pills ("BEST SELLER"/price badges) get an intermediate bar between the
+    # square small-icon rescue (0.30) and the generic text-prompt bar (confidence).
+    wide_max_aspect: 3.2
+    wide_min_score: 0.38
+  # Second geometric pass for small residual regions whose tight box-refine failed:
+  # one padded re-prompt on the shared image embedding (bounded by max_regions).
+  small_region_refine:
+    enabled: true
+    max_regions: 8
+    pad_frac: 0.35
+    min_score: 0.30
+    max_coverage: 0.02
+  # Skip synonym text-prompts for a role once enough high-score hits exist
+  # (e.g. skip "product package" after "product" already found 2). Box-refine
+  # of residuals is unchanged; fusion still collapses any remaining dupes.
+  role_prompt_early_exit:
+    enabled: true
+    min_hits: 2
+    min_score: 0.55
+  prompts:
+  - prompt: person
+    role: person
+    kind: photo-fragment
+  - prompt: product
+    role: product
+    kind: photo-fragment
+  - prompt: product package
+    role: product
+    kind: photo-fragment
+  - prompt: logo
+    role: logo
+    kind: icon
+  - prompt: icon
+    role: icon
+    kind: icon
+  - prompt: arrow
+    role: arrow
+    kind: icon
+  - prompt: badge
+    role: badge
+    kind: icon
+  - prompt: button
+    role: button
+    kind: shape
+  - prompt: illustration
+    role: illustration
+    kind: photo-fragment
+  - prompt: profile picture
+    role: avatar
+    kind: icon
+  - prompt: avatar
+    role: avatar
+    kind: icon
+  - prompt: verified badge
+    role: verified
+    kind: icon
+  - prompt: verified checkmark
+    role: verified
+    kind: icon
+  - prompt: circular logo
+    role: logo
+    kind: icon
+element_fusion:
+  mask_iou: 0.68
+  bbox_iou: 0.78
+  containment: 0.92
+  # Must stay >= similar_area_ratio (0.70). Lower values reopen the duplicate-ownership
+  # gap: contained near-equal masks were neither merged nor parent-linked (see the
+  # nested_max_area_ratio comment in src/element_fusion.py DEFAULTS).
+  nested_max_area_ratio: 0.70
+  # Overlap / z-order robustness (benchmark 009 duplicate/fragment leaks):
+  containment_dilate_px: 2
+  link_residual_refine: true
+  absorb_fragments: true
+  absorb_containment: 0.90
+  sliver_absorb: true
+  sliver_containment: 0.75
+  sliver_max_thickness: 10
+  sliver_min_aspect: 4.0
+  residual_family_advisory: true
+qwen:
+  enabled: false
+  required: false
+  mode: comfyui
+  workflow: workflows/qwen_layered_8_api.json
+  layers: 8
+backend_url: http://127.0.0.1:8188
+vectorize:
+  color_engine: vtracer
+  binary_engine: potrace              # missing -> single-note degrade to vtracer-binarized
+  preprocess:
+    upscale_kernel: lanczos           # nearest|bilinear|bicubic|lanczos for pre-trace upscale
+    icon_upscale_below: 128           # icon-ish crops below this min side get an extra 2x
+    icon_upscale_factor: 2.0
+    fringe_snap: true                 # snap semi-transparent AA fringe to 0/255 alpha
+    alpha_snap: 128
+  cleanup:                            # post-trace simplification; render-back gate re-checked,
+    enabled: true                     # rolled back per-crop on any fidelity loss
+    min_area: 2.0                     # drop traced noise paths/subpaths below this px^2
+    simplify_tolerance: 0.6           # Douglas-Peucker / curve-demotion tolerance (px)
+    fill_tolerance: 10                # merge fills within this per-channel distance
+    merge_fills: true                 # merge consecutive same-fill paths into one
+    max_score_drop: 0.03
+  gradient:                           # native gradient fill detection before tracing
+    enabled: true
+    min_range: 18
+    min_r2: 0.86
+    radial_min_r2: 0.91
+    smoothness_tolerance: 10.0        # rejects stepped multi-band "flag" fills
+  primitives:                         # analytic ellipse / rounded-rect silhouettes
+    enabled: true
+    min_iou: 0.94
+    max_color_std: 14
+reconstruct:
+  dedup_iou: 0.86
+  mask_dilate: 2
+  # Ghost cleanup: flat/UI archetypes solid-fill first (skip generative reinpaint).
+  # Photo scenes get 1 reinpaint pass then solid fill. Never bake OCR into a raster
+  # slice for SSIM (force_raster default off). Omit solid_fill_first to auto-detect
+  # from archetype (on for social_screenshot / product_on_flat / …).
+  text_residual:
+    enabled: true
+    solid_fill_residue: true
+    reinpaint: true
+  promote_text_shells: true  # reconstruct safety net: OCR-hosting logo/badge → TEXT+plate
+  style_extraction:
+    gradient_min_range: 18
+    gradient_min_r2: 0.86
+    max_stroke_width: 8
+    detect_shadows: true
+inpaint:
+  mode: flux_comfy
+  # Big-LaMa remains a safety net if ComfyUI/Flux is unavailable, but the low-quality
+  # OpenCV fallback is now surfaced to acceptance QA (reconstruction stats.opencv_fallback_used
+  # -> inpaint-degraded-opencv), so a silent smear can no longer pass.
+  allow_fallback: true
+  opencv_radius: 5
+  opencv_method: auto
+  regional:
+    enabled: true
+    # Route by local background complexity, not "Flux for everything". Flat/low-entropy
+    # holes go to the analytic plate model (when the exterior ring is uniform) or Big-LaMa;
+    # only genuinely complex/photographic local backgrounds go to Flux Fill. 2025-26
+    # evidence (RePainter, OmniPaint) shows diffusion inpainters hallucinate phantom objects
+    # into large removal masks on plain backgrounds, while LaMa interpolates flat/gradient
+    # plates perfectly at ~50x the speed. Text / badge / chip / UI chrome holes always stay
+    # off Flux (it regenerates glyph residue). On flat archetypes (social_screenshot,
+    # product_on_flat, …) UI chrome gets a looser analytic gate so we skip LaMa/Flux entirely.
+    # Set force_flux: true to opt back into always-Flux for non-text holes.
+    force_flux: false
+    min_context: 64
+    max_context: 96
+    min_crop: 256
+    alignment: 16
+    ring_radius: 24
+    dominant_plate_fraction: 0.55
+    dominant_plate_tolerance: 12
+    flat_residual_p90: 10
+    flat_gradient_p90: 10
+    # Flat/UI chrome analytic overrides (applied only for text/shape/icon on flat archetypes)
+    ui_analytic_residual_p90: 25
+    ui_analytic_dominant_fraction: 0.40
+    ui_analytic_max_canvas_fraction: 0.35
+    flux_residual_p90: 18
+    flux_gradient_p90: 18
+    flux_max_canvas_fraction: 0.045
+    photo_prompt: ""
+    plate_prompt: "clean plain seamless background, empty, no text, no objects"
+    nested_containment: 0.88
+    duplicate_overlap: 0.65
+  comfy:
+    enabled: true
+    base_url: http://127.0.0.1:8188
+    workflow: workflows/flux_fill_inpaint_api.json
+    # A/B 2026-07-15 (runs/flux-settings-ab: fixtures 009/041/052, 5 crops x 5 variants,
+    # guidance {3.5,30} x steps {8,20} x prompt {empty,descriptive}): on the photo/complex
+    # holes that actually route to Flux under the complexity router, g3.5/s8/empty-prompt
+    # won (mean seam 59.9 vs 62.6 for g30; cleanest water fill in the montages). steps 20
+    # gave no consistent gain at 2x latency, and a descriptive prompt HURT photo holes
+    # (it survives only as regional.plate_prompt for non-photo complex holes). On large
+    # plain-background holes EVERY variant hallucinated (052: an open book) — fixed by
+    # routing (regional.force_flux: false), not by settings.
+    steps: 8
+    cfg: 1.0
+    guidance: 3.5
+    denoise: 1.0
+    seed: 0
+    attempts: 2
+    prompt: ""
+    negative_prompt: ""
+    probe_timeout_s: 2
+    timeout_s: 600
+    required: true
+    comfy_dir: C:/Users/micha/AppData/Local/Comfy-Desktop/ComfyUI-Installs/ComfyUI/ComfyUI
+    # Pick the Flux Fill GGUF by whole-GPU free VRAM measured at inpaint time (after the
+    # VLM is evicted): Q6_K when >=10 GB free, Q5_K_S when >=7.5 GB, else Q4_K_S. All three
+    # exist in models/unet/. models.unet_gguf below is the explicit fallback used when
+    # vram_adaptive_quant is false.
+    vram_adaptive_quant: true
+    quant_vram_thresholds:
+      high_min_free_mib: 10240           # >=10 GB free -> Q6_K
+      mid_min_free_mib: 7680             # >=7.5 GB free -> Q5_K_S; else Q4_K_S
+    quant_ladder:
+      high: flux1-fill-dev-Q6_K.gguf
+      mid: flux1-fill-dev-Q5_K_S.gguf
+      low: flux1-fill-dev-Q4_K_S.gguf
+    models:
+      unet_gguf: flux1-fill-dev-Q6_K.gguf
+      t5xxl: t5xxl_fp8_e4m3fn.safetensors
+      clip_l: clip_l.safetensors
+      vae: ae.safetensors
+layout:
+  min_container_frac: 0.002
+  max_container_frac: 0.82
+  # Deterministic XY-cut nesting: only whitespace no element crosses can split bands.
+  nesting:
+    enabled: true
+    min_nodes: 6
+    max_depth: 2
+    min_gap_frac: 0.05
+    min_gap_px: 18
+  # Near-repeat component candidates (metadata only; exact repeats already instantiate).
+  repeats:
+    enabled: true
+    min_leaf_instances: 3
+    size_tolerance: 0.12
+  # Advisory VLM semantic grouping/naming on top of the deterministic tree.
+  # Structurally invalid answers (lost/duplicated elements, overlapping groups) are
+  # rejected whole; the deterministic tree is never moved or resized by the VLM.
+  #
+  # Runs on gemma-4-e4b: the fast e4b generates the nested-grouping JSON in ~15s
+  # (measured, with image), so the advisory pass lands within the 24s timeout and
+  # actually applies — unlike the 12B, which timed out even text-only at 40s and
+  # never applied. Adds semantic groups/names on top of the deterministic tree;
+  # structurally invalid answers are rejected whole and the tree is never moved.
+  vlm_grouping:
+    enabled: true
+    min_elements: 4
+    max_elements: 40
+    max_groups: 12
+    max_depth: 3
+    overlap_tolerance: 0.10
+    capture_tolerance: 0.70
+    max_image_side: 768
+    timeout_s: 24
+    max_tokens: 900
+upscale:
+  enabled: true
+preview: true
+figma:
+  enabled: true
+  mode: plugin
+  inbox: C:/Users/micha/figma-inbox
+  bridge_port: 8790
+  qa_ocr: true
+  export_wait_s: 0
+qa:
+  visual_pass_ssim: 0.84
+  # Phase-2 harness reward ladder (runtime.harness.reward: phase2). Weights come from
+  # the archetype preset (qa.reward_weights, set at runtime by archetype.apply_preset);
+  # qa.reward.weights would override them explicitly. The two *_min floors are
+  # anti-degenerate acceptance-gate defaults; archetype thresholds
+  # (lpips_similarity_min / reward_local_ssim_min) take precedence and, like every QA
+  # threshold, are never lowered mid-loop.
+  reward:
+    lpips:
+      enabled: true
+      net: squeeze                       # squeeze (~5 MB, CPU-fast) | alex | vgg
+      max_edge: 256
+    lpips_similarity_min: 0.20
+    local_ssim_min: 0.30
+    critique:                            # VLM diff critique (original vs preview) — the
+      enabled: true                      # primary repair driver; degrades to tool-only
+      max_items: 8                       # repairs when LM Studio is down/evicted
+      timeout_s: 45
+      max_tokens: 900
+# Codia-style confidence-gated raster-slice fallback. After the local preview render,
+# every emitted layer's region is compared against the source (crop SSIM; ink-IoU and
+# a ghost-ink gate for text). A failing layer is replaced by a pixel-exact image slice
+# of the ORIGINAL source pixels whose alpha is exactly the pixels the removal ledger
+# inpainted out for that layer — the slice covers the hole and nothing else, so there
+# is no double rendering and no background leakage. The failed editable attempt stays
+# in meta.fallback_editable for future repair; slices honestly reduce editable_ratio
+# and are reported in qa.structural.raster_slices. Defaults live in
+# src/schema.py::RASTER_SLICE_FALLBACK_DEFAULTS.
+fallback:
+  enabled: true
+  region_ssim_min: 0.58
+  region_color_min: 0.75
+  text_ink_iou_min: 0.30
+  text_ink_iou_soft: 0.55
+  text_ink_excess_max: 0.75
+  min_region_px: 120
+  max_layer_canvas_fraction: 0.40
+  max_slices: 8
+peel:
+  enabled: true             # occlusion-attributed decomposition (docs/PEEL-DECOMPOSITION.md).
+                            # Quality VALIDATED clean (052 tube-under-logo, 002 card-under-
+                            # products, byte-verified reveals). Element holes use LaMa
+                            # (never Flux — SAM still resident). Text-occluder holes use
+                            # Telea by default (peel.text_inpaint) — LaMa on batched OCR
+                            # boxes was the dominant peel cost on dense ads.
+  min_overlap_area: 400     # px^2 gate threshold (raised: token overlaps don't justify peel)
+  min_overlap_frac: 0.02    # fraction of the smaller element's area
+  hole_dilate_px: 2         # anti-alias fringe ring
+  context_pad_px: 24        # inpaint context crop padding
+  min_context_frac: 0.05    # below -> unisolated fill + meta.low_context_fill
+  text_occluders: box       # box | off
+  refine_alpha: false       # BiRefNet cutout-edge refinement (needs matting callable)
+  refine_band_px: 3
+  # detection-granularity guard: peel activates only on pairs of DISTINCT SOLID
+  # non-plate elements — residual swiss-cheese masks skip with a reason.
+  require_eligible: true
+  min_cc_frac: 0.85         # largest connected component >= 85% of the mask
+  max_hole_frac: 0.25       # interior holes <= 25% of (mask + holes)
+  max_components: 24        # >24 CCs → fragmented residual (blocks smear paths)
+  # fill quality: archetype-aware ladder (flat → LaMa → fail-closed flat; never Flux).
+  # product_on_flat / UI: solid plates under products + clean orange background.
+  # lifestyle_overlay: LaMa on photos; abandon huge photo holes.
+  context_shadow_px: 12     # context band around the hole hidden from the filler
+  flat_fill_tol: 8.0        # per-pixel max-channel deviation from ring median; 0 = off
+  flat_fill_inlier_frac: 0.60
+  flat_fill_ring_px: 16     # ring sampled beyond the shadow band
+  flat_fill_min_px: 40
+  flat_fill_min_visible_frac: 0.12  # thin-rim guard (016); 002 cards stay above this
+  flat_fill_max_area: 0     # 0 = no cap (large product holes on cards may solid-fill)
+  flat_fill_max_frac: 0.0
+  flat_fill_allow_background: true   # local solid fill on peel/background CCs (002/016)
+  flat_fill_bg_max_area: 250000
+  flat_fill_bg_max_frac: 0.55
+  flat_fill_text: true               # solid-fill text holes on flat cards (not photos)
+  text_hole_dilate_px: 4             # extra AA bleed vs hole_dilate_px for OCR boxes
+  fill_cc_split: true                # per-CC fills so multi-color plates don't smear
+  fill_cc_min_area: 64
+  inpaint_feather_px: 2              # soft edge on generative write-back
+  per_occluder_area: 6000
+  # Big photo/product holes: prefer Flux Fill (SAM unloaded at peel boundary).
+  # Past flux_max_hole_px we bake original pixels instead of LaMa haze.
+  abandon_hole_frac: 0.15
+  abandon_photo_min_area: 12000
+  max_generative_photo_hole_px: 8000   # LaMa ceiling when allow_flux is false
+  allow_flux: true
+  flux_min_hole_px: 4000
+  flux_max_hole_px: 220000
+  large_photo_hole: bake     # bake | abandon (only past flux_max / Flux off)
+  # Hard generative budget — never Big-LaMa/Flux on near-full-canvas bg (002 ~1.8M).
+  max_generative_canvas_frac: 0.12
+  max_generative_hole_px: 220000
+  max_generative_bg_hole_px: 80000
+  large_bg_hole: bake
+  large_hole: bake
+  context_pad_large_px: 64
+  photo_context_shadow_px: 4
+  fail_closed_to_flat: true
+  fail_closed_residue: 8.0
+  punch_text_into_photos: false      # OCR ink on products stays on the raster
+  punch_artwork_into_photos: false   # logos/wordmarks on products stay on the raster
+  # Text-occluder fills: Telea is docs-conservative (never Flux). Set lama to restore
+  # the previous slower path. Non-text holes below telea_max_hole_px also use Telea.
+  text_inpaint: telea       # telea | lama
+  telea_max_hole_px: 2500

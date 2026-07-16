@@ -156,6 +156,17 @@ def test_reconcile_uses_engine_calibration_and_exact_text_support():
     assert 0 < consensus["confidence"] < fused[0]["conf"]
 
 
+def test_reconcile_orphan_winner_does_not_crash_on_empty_agreement_set():
+    primary = _line("KRACHTSPORT", 0.82, _box(10, 10, 180, 28), "doctr")
+    challenger = _line("UNRELATED", 0.79, _box(10, 10, 180, 28), "easyocr")
+
+    fused = ocr._reconcile([primary], [[challenger]], cfg={})
+
+    assert len(fused) == 1
+    assert fused[0]["text"] in {"KRACHTSPORT", "UNRELATED"}
+    assert fused[0]["meta"]["support_engines"]
+
+
 def test_targeted_retry_collapses_word_fragments_into_one_line(tmp_path):
     image_path = tmp_path / "source.png"
     Image.new("RGB", (400, 180), "white").save(image_path)

@@ -259,9 +259,12 @@ def test_gate_passes_where_lpips_unavailable_keeps_legacy_behaviour(tmp_path, mo
     assert summary["reward"]["gate"]["ok"] is True
 
 
-# ── critique → primary repair driver ─────────────────────────────────────────────────
+# ── critique → tiebreaker, never the primary driver (finding 1) ──────────────────────
 
-def test_vlm_critique_repairs_are_prepended_as_primary_driver(tmp_path, monkeypatch):
+def test_deterministic_high_severity_outranks_vlm_critique(tmp_path, monkeypatch):
+    # Finding 1: a HIGH-severity deterministic (metric) repair must stay ahead of a VLM
+    # critique opinion. The old harness PREPENDED critique as the "primary driver", which
+    # let a vague medium VLM opinion outrank measured HIGH failures (the 002 no-op).
     input_path, run_dir = _seed(tmp_path, {"ok": False, "ssim": 0.5, "hard_fails": [],
                                            "repairs": []})
     cfg = {"qa": {"reward": {"critique": {"enabled": True}}}}
@@ -276,11 +279,30 @@ def test_vlm_critique_repairs_are_prepended_as_primary_driver(tmp_path, monkeypa
     merged = harness_loop._apply_vlm_critique(run_dir, cfg, dict(critic_output))
 
     assert merged["vlm_critique"]["count"] == 1
+    # Deterministic HIGH metric repair wins the top slot; the VLM critique is a tiebreaker.
     first = merged["filtered_repairs"][0]
-    assert (first["stage"], first["action"]) == ("text-analysis", "refit-text-box")
-    assert first["target_id"] == "c_B18"
-    # The metric repair remains as fallback (VLM is never the sole authority).
-    assert {"ocr"} <= {r["stage"] for r in merged["filtered_repairs"]}
+    assert (first["stage"], first["action"]) == ("ocr", "rerun")
+    # The critique repair is still present (VLM contributes, but never as sole authority).
+    assert any(r.get("params", {}).get("source") == "vlm_critique"
+               for r in merged["filtered_repairs"])
+
+
+def test_vlm_critique_status_distinguishes_timeout_from_empty(tmp_path, monkeypatch):
+    # GB2: a VLM timeout/transport error must not read as "inspected and found nothing".
+    input_path, run_dir = _seed(tmp_path, {"ok": False, "repairs": []})
+    cfg = {"qa": {"reward": {"critique": {"enabled": True}}}}
+
+    monkeypatch.setattr(qa_reward, "run_critique",
+                        lambda rd, c, **k: {"items": [], "error": "vlm_error"})
+    errored = harness_loop._apply_vlm_critique(run_dir, cfg, {"filtered_repairs": []})
+    assert errored["vlm_critique"]["status"] == "error"
+    assert errored["vlm_critique"]["inconclusive"] is True
+
+    monkeypatch.setattr(qa_reward, "run_critique",
+                        lambda rd, c, **k: {"items": [], "error": None})
+    empty = harness_loop._apply_vlm_critique(run_dir, cfg, {"filtered_repairs": []})
+    assert empty["vlm_critique"]["status"] == "empty"
+    assert empty["vlm_critique"]["inconclusive"] is False
 
 
 def test_critique_disabled_or_legacy_leaves_critic_output_untouched(tmp_path, monkeypatch):

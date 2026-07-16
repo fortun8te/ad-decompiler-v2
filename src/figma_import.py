@@ -643,9 +643,21 @@ def _check_mask(layer, lid, run_dir, findings, assets_meta, cache, thresholds):
     if kind == "ALPHA":
         msrc = _pick(mask, "src", "source", "asset", "asset_path", "assetPath")
         if not msrc:
+            # An alpha mask with no separate source means "clip to the image's own alpha".
+            # For a SAM3/cutout RGBA image that already carries a real alpha channel this is
+            # the intended, lossless representation: figma-plugin/code.js renders the image
+            # with its embedded transparency (needsMaskGroup is false for ALPHA-without-src),
+            # so nothing is lost — it is not a degradation and must not warn. Only warn when
+            # the host image ALSO lacks an alpha channel, i.e. there is genuinely no mask
+            # data anywhere and the layer would paint as an opaque rectangle.
+            lsrc = _pick(layer, "src", "source", "asset", "asset_path", "assetPath")
+            lmeta = _asset_meta(run_dir, lsrc, cache) if lsrc else None
+            if lmeta and not lmeta.get("corrupt") and lmeta.get("has_alpha"):
+                return
             findings.append(_finding(
                 "alpha-mask-missing", "warn", lid,
-                detail="alpha mask has no source; the image's own transparency is used instead"))
+                detail="alpha mask has no source and the image carries no alpha channel; "
+                       "it will paint as an opaque rectangle"))
             return
         meta = _asset_meta(run_dir, msrc, cache)
         if meta is None:
@@ -798,6 +810,45 @@ def _file_sha256(path):
         return hashlib.sha256(fh.read()).hexdigest()
 
 
+def _copy_as_srgb(source, dest):
+    """Copy ``source`` -> ``dest``, converting a non-sRGB ICC image to sRGB.
+
+    Figma ignores embedded ICC profiles and treats every image fill as sRGB, so an
+    asset carrying (say) a Display-P3 or untagged-wide profile shows shifted colors in
+    Figma versus the pixels our own preview/QA scored. Baking the profile into sRGB at
+    stage time makes what Figma displays match what we measured, and removes the
+    ``color-profile`` preflight warning at the source rather than merely reporting it.
+
+    Returns True when a colour conversion was applied; falls back to a byte copy (never
+    raises) so a missing ImageCms / odd profile can never break staging.
+    """
+    try:
+        from PIL import Image
+        with Image.open(source) as im:
+            icc = im.info.get("icc_profile")
+            if icc and b"srgb" not in bytes(icc).lower():
+                import io
+                from PIL import ImageCms
+                src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+                srgb_profile = ImageCms.createProfile("sRGB")
+                has_alpha = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+                out_mode = "RGBA" if has_alpha else "RGB"
+                converted = ImageCms.profileToProfile(
+                    im, src_profile, srgb_profile, outputMode=out_mode)
+                # Save WITHOUT any embedded icc_profile: an untagged PNG is assumed sRGB by
+                # Figma, and our probe treats "no profile" as sRGB. (profileToProfile leaves
+                # the freshly-created sRGB profile in .info, whose description does not
+                # contain the literal "srgb" token the probe looks for, so it must be
+                # stripped or it would re-trip the same warning.)
+                converted.info.pop("icc_profile", None)
+                converted.save(dest, format="PNG", icc_profile=None)
+                return True
+    except Exception:
+        pass
+    shutil.copyfile(source, dest)
+    return False
+
+
 def _screenshot_source_path(run_dir, figma_cfg):
     """Pick the flat, original-looking screenshot to park next to the rebuild.
 
@@ -845,8 +896,9 @@ def _stage_screenshot_sibling(design: dict, run_dir: str, figma_cfg: dict) -> di
     dest = os.path.join(assets_dir, asset_name)
     try:
         os.makedirs(assets_dir, exist_ok=True)
-        if not os.path.isfile(dest) or _file_sha256(dest) != _file_sha256(source):
-            shutil.copyfile(source, dest)
+        # Always convert-through sRGB (cheap): the proof is the raw source screenshot,
+        # which frequently carries a non-sRGB capture profile Figma would ignore.
+        _copy_as_srgb(source, dest)
     except OSError as exc:
         return {"ok": False, "reason": "asset-copy-failed", "error": str(exc)}
     src_rel = "assets/" + asset_name
@@ -958,8 +1010,29 @@ def _stage_for_plugin(design_path, run_dir, cfg, strict=None) -> dict:
     with open(os.path.join(temp_root, "design.json"), "w", encoding="utf-8") as fh:
         json.dump(design, fh, indent=2)
     assets = os.path.join(run_dir, "assets")
+    pruned_assets = []
     if os.path.isdir(assets):
-        shutil.copytree(assets, os.path.join(temp_root, "assets"))
+        # Inbox hygiene: stage ONLY the assets the current design.json references, not the
+        # whole run_dir/assets pile. Across harness rounds the run's assets dir accumulates
+        # superseded slices/masks/host variants (old arrow/decoration/host files) that the
+        # final design no longer points at; copying them verbatim left the plugin inbox full
+        # of stale files beside the current ones. Keep a file iff its basename appears in the
+        # (screenshot-sibling-mutated) design text — this cannot drop a referenced asset
+        # (the name is always present when referenced) and purges everything else, so the
+        # staged folder is self-evidently the current attempt's asset set.
+        design_text = json.dumps(design)
+        staged_assets = os.path.join(temp_root, "assets")
+        os.makedirs(staged_assets, exist_ok=True)
+        for root, _dirs, names in os.walk(assets):
+            for name in names:
+                src_path = os.path.join(root, name)
+                rel = os.path.relpath(src_path, assets)
+                if name in design_text:
+                    dest_path = os.path.join(staged_assets, rel)
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    shutil.copyfile(src_path, dest_path)
+                else:
+                    pruned_assets.append(rel.replace(os.sep, "/"))
     for filename in ("preview.png", "qa.json"):
         source = os.path.join(run_dir, filename)
         if os.path.exists(source):
@@ -1001,6 +1074,7 @@ def _stage_for_plugin(design_path, run_dir, cfg, strict=None) -> dict:
             "strict": strict_mode,
         },
         "screenshot_sibling": screenshot_sibling,
+        "pruned_assets": pruned_assets,
         "summary": {
             "name": design.get("name"),
             "canvas": design.get("canvas"),
@@ -1019,6 +1093,7 @@ def _stage_for_plugin(design_path, run_dir, cfg, strict=None) -> dict:
             "preflight": {"ok": preflight["ok"], "errors": preflight["error_count"],
                           "warnings": preflight["warn_count"], "strict": strict_mode},
             "screenshot_sibling": screenshot_sibling,
+            "pruned_assets": len(pruned_assets),
             "action": "In Figma desktop: run the ad-decompiler plugin → Import latest."}
 
 

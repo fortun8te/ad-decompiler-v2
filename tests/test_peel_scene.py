@@ -719,8 +719,9 @@ def test_abandon_oversized_photo_holes_leaves_transparent():
                    and not c["meta"].get("text_occluder") for c in spy.calls)
 
 
-def test_large_photo_holes_bake_by_default_instead_of_lama_haze():
-    """Past Flux max (or Flux off): bake original pixels, no generative fill."""
+def test_large_photo_holes_bake_only_when_explicitly_enabled():
+    """Past Flux max (or Flux off): bake keeps original pixels — but ONLY with
+    bake_under_layers, because baking ghosts the occluder into the layer."""
     flat = np.full((H, W, 3), BG, np.uint8)
     under = _rect_mask((10, 10, 450, 350))
     top = _rect_mask((40, 40, 280, 280))  # ~57k px hole
@@ -733,6 +734,7 @@ def test_large_photo_holes_bake_by_default_instead_of_lama_haze():
         flat, elements, inpaint=spy,
         cfg=_cfg(allow_flux=False, max_generative_photo_hole_px=8000,
                  abandon_photo_min_area=12000, large_photo_hole="bake",
+                 bake_under_layers=True,
                  per_occluder_area=1, flat_fill_tol=0.0))
     panel = result.layer("panel")
     hole = top & under
@@ -743,6 +745,33 @@ def test_large_photo_holes_bake_by_default_instead_of_lama_haze():
     assert any(b["backend"] == "baked" for b in panel.meta["fill_backends"])
     assert not any(c["meta"].get("under_id") == "panel"
                    and not c["meta"].get("text_occluder") for c in spy.calls)
+
+
+def test_under_layer_never_bakes_occluder_by_default():
+    """Ownership contract (H10): a chart/photo slice must NOT carry the product
+    that overlapped it. Default: unfillable large holes in an UNDER-LAYER go
+    transparent (abandon) even when large_photo_hole says bake — the occluder
+    covers the hole in composite, and moving the layer reveals honesty, not a ghost."""
+    flat = np.full((H, W, 3), BG, np.uint8)
+    under = _rect_mask((10, 10, 450, 350))
+    top = _rect_mask((40, 40, 280, 280))
+    flat[under] = BLUE
+    flat[top] = RED
+    elements = [SceneElement(id="chart", mask=under, z=0.0, kind="chart"),
+                SceneElement(id="product", mask=top, z=1.0, kind="product")]
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(allow_flux=False, max_generative_photo_hole_px=8000,
+                 abandon_photo_min_area=12000, large_photo_hole="bake",
+                 per_occluder_area=1, flat_fill_tol=0.0))
+    chart = result.layer("chart")
+    hole = top & under
+    # No RED occluder pixel survives in the chart layer's visible RGBA.
+    assert np.all(chart.rgba[:, :, 3][hole] == 0)
+    assert chart.meta.get("abandoned_fill") is True
+    assert not np.any((chart.rgba[:, :, 3] > 0)
+                      & np.all(chart.rgba[:, :, :3] == RED, axis=2))
 
 
 def test_flux_band_photo_holes_call_inpaint_not_bake():
@@ -775,6 +804,100 @@ def test_peel_inpaint_mode_routes_photo_band_to_flux():
         cfg, {"under_kind": "shape", "hole_px": 20000}) == "lama"
     assert peel_scene.peel_inpaint_mode(
         cfg, {"under_kind": "photo", "hole_px": 20000, "text_occluder": True}) == "lama"
+
+
+# ── H7/H13: text / overlays sitting DIRECTLY on a busy or DARK photo (make-or-break) ─
+# The risk this guards: a locally-flat ring on a dark photo passes the solid-median
+# test and leaves a flat painted patch under the peeled text.  The background plate
+# must be classified "photo" so its holes route to the injected inpainter, never a
+# solid patch.
+
+def _photo_bg(seed=7):
+    """A photographic (high local-variance) background plate."""
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 256, (H, W, 3), dtype=np.uint8)
+
+
+def test_background_plate_kind_flags_photo_and_rejects_flat_chrome():
+    opts = dict(peel_scene.SCENE_DEFAULTS)
+    vis = np.ones((H, W), bool)
+    flat_gray = np.full((H, W, 3), (200, 200, 200), np.uint8)
+    dark_flat = np.full((H, W, 3), (8, 8, 10), np.uint8)          # near-black chrome
+    dark_photo = np.random.default_rng(3).integers(0, 90, (H, W, 3), dtype=np.uint8)
+    assert peel_scene.background_plate_kind(flat_gray, vis, opts) == "background"
+    assert peel_scene.background_plate_kind(dark_flat, vis, opts) == "background"
+    assert peel_scene.background_plate_kind(_photo_bg(), vis, opts) == "photo"
+    # The specific H7 sleep-mask risk: a DARK but textured photo is still a photo.
+    assert peel_scene.background_plate_kind(dark_photo, vis, opts) == "photo"
+
+
+def test_flat_fill_is_denied_on_photo_under_kind():
+    """The H7 guard at the routing level: no solid patch may ever land on a photo
+    plate, regardless of policy/caps."""
+    write = _rect_mask((40, 40, 120, 120))
+    element_mask = np.ones((H, W), bool)
+    visible = ~write
+    opts = dict(peel_scene.SCENE_DEFAULTS, flat_fill_tol=8.0,
+                flat_fill_allow_background=True, flat_fill_text=True)
+    assert not peel_scene._flat_fill_allowed(
+        write, element_mask, visible,
+        {"under_kind": "photo", "background": True, "text_occluder": True}, opts)
+    # Same hole on a flat chrome background IS eligible (proves the gate is kind-driven).
+    assert peel_scene._flat_fill_allowed(
+        write, element_mask, visible,
+        {"under_kind": "background", "background": True, "text_occluder": True}, opts)
+
+
+def _h7_scene():
+    """Photographic background + an activating element pair (card+badge) + a text
+    headline sitting DIRECTLY on the photo (no backing plate) — the H7 construct."""
+    flat = _photo_bg()
+    card = _rect_mask((240, 40, 420, 180))
+    badge = _rect_mask((360, 120, 420, 180))       # sits on the card → activates peel
+    text = _rect_mask((30, 250, 200, 285))         # on the photo background, not the card
+    flat[card] = (20, 120, 60)
+    flat[badge] = (200, 40, 50)
+    flat[text] = (250, 250, 250)
+    elements = [
+        SceneElement(id="card", mask=card, z=0.0, kind="card"),
+        SceneElement(id="badge", mask=badge, z=1.0, kind="icon"),
+        SceneElement(id="hdr", mask=text, z=2.0, kind="text", is_text=True),
+    ]
+    return flat, elements, {"card": card, "badge": badge, "text": text}
+
+
+def test_h7_text_on_photo_plate_routes_to_inpaint_not_solid():
+    flat, elements, masks = _h7_scene()
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(flat_fill_allow_background=True, flat_fill_text=True))
+    assert not result.skipped                       # the element pair activated peel
+    assert result.meta.get("plate_kind") == "photo"
+
+    # Every background hole (both the element-class card/badge underfill and the
+    # text-class headline hole) was routed to the injected inpainter — NEVER a solid
+    # patch on the photo.
+    backends = {(b["text_occluder"], b["backend"])
+                for b in result.meta.get("fill_backends", [])}
+    assert (True, "inpaint") in backends            # text hole → inpaint, not solid
+    assert not any(b["backend"] == "solid" for b in result.meta.get("fill_backends", []))
+
+    # The inpaint call for the text hole carried the correct ownership meta.
+    bg_text = [c["meta"] for c in spy.calls
+               if c["meta"].get("background") and c["meta"].get("text_occluder")]
+    assert bg_text and bg_text[0]["under_kind"] == "photo"
+    assert bg_text[0]["under_id"] == "background"
+
+    # Out-of-mask invariant: any background pixel with nothing over it is byte-identical.
+    union = masks["card"] | masks["badge"] | masks["text"]
+    assert np.array_equal(result.background[~union], flat[~union])
+
+    # Recomposite reproduces the input exactly (text footprint excluded — native text
+    # renders on top; no ghost text is baked into the plate).
+    rc = result.meta["recomposite"]
+    assert rc["exact"] is True and rc["max_abs_diff"] == 0
+    assert rc["text_excluded_px"] == int(masks["text"].sum())
 
 
 def test_small_photo_holes_still_call_inpaint():

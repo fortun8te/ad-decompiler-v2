@@ -3,591 +3,431 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>pipeline</title>
+<title>bench · ad-decompiler</title>
 <style>
   :root {
-    --bg: #0a0a0a;
-    --card: #111111;
-    --surface: #161616;
-    --accent: #6b9eff;
-    --accent-dim: #4a74c4;
-    --amber: #c9902e;
-    --rose: #d4545c;
-    --ok: #6a9e78;
-    --muted: #6b6b6b;
-    --text: #e8e8e8;
-    --text-dim: #a3a3a3;
-    --hairline: rgba(255, 255, 255, 0.08);
-    --hairline-strong: rgba(255, 255, 255, 0.16);
+    --bg: #0c0d0f;
+    --ink: #c6ccd2;
+    --dim: #82898f;
+    --faint: #4a5057;
+    --line: #1d2126;
+    --cell: #1a1e23;
+    --done: #59616b;
+    --run: #e8edf2;
+    --err: #e5534b;
+    --stall: #d29922;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    font-feature-settings: "tnum" 1;
-    -webkit-font-smoothing: antialiased;
-    min-height: 100%;
-  }
+  html { color-scheme: dark; }
   body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 14px 14px 28px; }
+  .row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .dim { color: var(--dim); }
+  .faint { color: var(--faint); }
+  .err { color: var(--err); }
+  .ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
+
+  header .path { flex: 1; min-width: 120px; }
+  #summary { margin-top: 2px; }
+
+  /* matrix */
+  #grid { margin-top: 4px; }
+  .m {
     display: grid;
-    place-items: center;
-    padding: 40px 24px;
-  }
-  .shell {
-    width: min(640px, 100%);
-    background: var(--card);
-    border: 1px solid var(--hairline);
-    border-radius: 6px;
-    padding: 20px 20px 18px;
-  }
-
-  /* —— live header —— */
-  .live {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 14px;
-    padding-bottom: 14px;
-    border-bottom: 1px solid var(--hairline);
-  }
-  .live-ad {
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text);
-    letter-spacing: -0.015em;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
-  .live-ad span {
-    color: var(--muted);
-    font-weight: 400;
-  }
-  .ticker {
-    display: none;
-  }
-  .feed {
-    margin: 0 0 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    min-height: 0;
-    max-height: 72px;
-    overflow: hidden;
-    font-variant-numeric: tabular-nums;
-  }
-  .feed-row {
-    display: block;
-    font-size: 11px;
-    line-height: 1.35;
-    color: #5c5c5c;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .feed-row .t { display: none; }
-  .feed-row .msg {
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .feed-row .msg em {
-    font-style: normal;
-    color: var(--accent);
-  }
-  .feed-row.fresh .msg { color: var(--text-dim); }
-  .feed-row.error .msg { color: var(--rose); }
-  .feed-row.done .msg em { color: var(--ok); }
-  .feed-empty {
-    font-size: 11px;
-    color: #484848;
-    padding: 2px 0;
-  }
-  .pulse-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: #3a3a3a;
-    flex-shrink: 0;
-  }
-  .pulse-dot.on {
-    background: var(--accent);
-    animation: pulse 1.8s ease-in-out infinite;
-  }
-  .pulse-dot.stall { background: var(--amber); animation: none; }
-  .live-meta {
-    display: flex;
+    grid-template-columns: minmax(70px, 120px) minmax(0, 1fr) 34px 44px 40px;
+    gap: 0 10px;
     align-items: center;
-    gap: 8px;
-    flex-shrink: 0;
-  }
-  .chip {
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-dim);
-    background: var(--surface);
-    border: 1px solid var(--hairline);
-    border-radius: 4px;
-    padding: 3px 8px;
-    line-height: 1.2;
-  }
-  .chip.stage { color: var(--accent); }
-  .chip.stall { color: var(--amber); }
-  .chip.fail { color: var(--rose); }
-  .nums {
-    font-size: 11px;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .nums b { color: var(--text-dim); font-weight: 500; }
-
-  /* —— benchmark capsule —— */
-  .section-label {
-    font-size: 10px;
-    font-weight: 500;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
-    margin-bottom: 10px;
-  }
-  .capsule {
-    margin-bottom: 18px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid var(--hairline);
-  }
-  .heat {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-  }
-  .dot {
-    width: 12px;
-    height: 12px;
-    border-radius: 2px;
-    background: transparent;
-    box-shadow: inset 0 0 0 1px var(--hairline-strong);
+    padding: 3px 4px;
+    margin: 0 -4px;
     cursor: pointer;
-    appearance: none;
-    -webkit-appearance: none;
-    border: 0;
-    padding: 0;
-    margin: 0;
-    outline: none;
-    box-sizing: border-box;
+    border-left: 2px solid transparent;
   }
-  .dot:focus { outline: none; }
-  .dot:hover { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); }
-  .dot.l1 { background: #2a3340; box-shadow: none; }
-  .dot.l2 { background: #364a66; box-shadow: none; }
-  .dot.l3 { background: #45608a; box-shadow: none; }
-  .dot.l4 { background: #5578b0; box-shadow: none; }
-  .dot.l5 { background: var(--accent); box-shadow: none; }
-  .dot.active {
-    background: var(--accent);
-    box-shadow: none;
-    animation: pulse 1.8s ease-in-out infinite;
-  }
-  .dot.stalled { background: var(--amber); box-shadow: none; animation: none; }
-  .dot.failed { background: var(--rose); box-shadow: none; animation: none; }
-  .dot.selected {
-    box-shadow: inset 0 0 0 1px #f0f0f0;
-  }
-  .dot.selected.l5,
-  .dot.selected.active,
-  .dot.selected.l1,
-  .dot.selected.l2,
-  .dot.selected.l3,
-  .dot.selected.l4,
-  .dot.selected.stalled,
-  .dot.selected.failed {
-    box-shadow: 0 0 0 1px #f0f0f0;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.55; }
-  }
+  .m:hover { background: #121418; }
+  .m.sel { background: #14171b; border-left-color: var(--faint); }
+  .m.live { border-left-color: var(--run); }
+  .m .id { font-size: 11px; }
+  .m.st-pending .id { color: var(--faint); }
+  .m.st-failed .id { color: var(--err); }
+  .m.st-stalled .id { color: var(--stall); }
+  .num { text-align: right; font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .num.q { color: var(--faint); }
+  .track { display: grid; grid-template-columns: repeat(18, 1fr); gap: 2px; min-width: 0; }
+  .c { height: 9px; background: var(--cell); }
+  .c.done { background: var(--done); }
+  .c.active { background: var(--run); animation: pulse 1.4s ease-in-out infinite; }
+  .c.stalled { background: var(--stall); }
+  .c.failed { background: var(--err); }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  #empty { color: var(--faint); padding: 12px 0; }
 
-  .bench-foot {
-    display: flex;
-    justify-content: space-between;
-    margin-top: 12px;
-    padding: 0 2px;
-    font-size: 11px;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-  }
+  /* live + feed */
+  #live { margin-top: 2px; }
+  #liveLine { font-size: 11px; }
+  #feed { margin-top: 6px; font-size: 11px; color: var(--faint); }
+  #feed div { display: flex; gap: 8px; }
+  #feed .t { flex: 0 0 auto; }
+  #feed .k-error { color: var(--err); }
+  #feed .last { color: var(--dim); }
 
-  /* —— per-ad stage row —— */
-  .stage-row {
-    display: flex;
-    gap: 3px;
-    margin-bottom: 8px;
-  }
-  .scell {
-    width: 14px;
-    height: 14px;
-    border-radius: 2px;
-    border: 1px solid var(--hairline-strong);
-    background: transparent;
-    flex: 0 0 14px;
-    cursor: default;
-  }
-  .scell.done {
-    border-color: var(--accent-dim);
-    background: var(--accent-dim);
-  }
-  .scell.active {
-    border-color: var(--accent);
-    background: var(--accent);
-    animation: pulse 1.8s ease-in-out infinite;
-  }
-  .scell.stalled {
-    border-color: var(--amber);
-    background: var(--amber);
-    animation: none;
-  }
-  .scell.failed {
-    border-color: var(--rose);
-    background: var(--rose);
-  }
-  .stage-names {
-    display: flex;
-    justify-content: space-between;
-    font-size: 9px;
-    color: #484848;
-    margin-bottom: 18px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid var(--hairline);
-    letter-spacing: 0.02em;
-  }
-
-  /* —— detail / compare —— */
-  .detail {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-  }
-  .detail-body {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 0;
-  }
-  .detail-id {
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text);
-    letter-spacing: -0.015em;
+  /* inspect */
+  #inspect { margin-top: 4px; }
+  .shots { display: flex; gap: 8px; margin-top: 6px; }
+  .shot { flex: 1; min-width: 0; }
+  .shot .box {
+    aspect-ratio: 4 / 5;
+    background: #101215;
+    border: 1px solid var(--line);
+    display: grid; place-items: center;
+    color: var(--faint); font-size: 10px; text-align: center; padding: 6px;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
-  .detail-line {
-    font-size: 11px;
-    color: var(--text-dim);
-    font-variant-numeric: tabular-nums;
+  .shot .box.has-img { cursor: zoom-in; padding: 0; }
+  .shot .box img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .shot .lbl { font-size: 10px; color: var(--faint); margin-bottom: 3px; }
+  .nav { margin-top: 6px; display: flex; gap: 6px; align-items: baseline; }
+  .nav button {
+    appearance: none; border: 1px solid var(--line); background: transparent;
+    color: var(--dim); font: 11px ui-monospace, monospace;
+    padding: 2px 8px; cursor: pointer;
   }
-  .detail-line em {
-    font-style: normal;
-    color: var(--accent);
+  .nav button:hover:not(:disabled) { color: var(--ink); border-color: var(--faint); }
+  .nav button:disabled { opacity: 0.35; cursor: default; }
+  .nav .n { margin-left: auto; color: var(--faint); font-size: 11px; }
+
+  footer { margin-top: 12px; color: var(--faint); font-size: 10px; }
+
+  /* lightbox */
+  #lb {
+    display: none; position: fixed; inset: 0; z-index: 10;
+    background: rgba(8, 9, 11, 0.92);
+    align-items: center; justify-content: center; padding: 20px; cursor: zoom-out;
   }
-  .detail-hint {
-    font-size: 10px;
-    color: #484848;
-  }
-  .compare {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-  }
-  .frame {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    min-width: 0;
-  }
-  .frame-label {
-    font-size: 10px;
-    font-weight: 500;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-  .frame-shot {
-    aspect-ratio: 1;
-    width: 100%;
-    border-radius: 4px;
-    border: 1px solid var(--hairline);
-    background: #0c0c0c;
-    overflow: hidden;
-    position: relative;
-  }
-  .frame-shot.has-img {
-    cursor: zoom-in;
-  }
-  .frame-shot.has-img:hover {
-    border-color: var(--hairline-strong);
-  }
-  .frame-shot img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-  }
-  .frame-shot .empty {
-    position: absolute;
-    inset: 0;
-    display: grid;
-    place-items: center;
-    color: #3a3a3a;
-    font-size: 10px;
-    text-align: center;
-    padding: 12px;
-    line-height: 1.35;
-  }
-  .lightbox {
-    display: none;
-    position: fixed;
-    inset: 0;
-    z-index: 50;
-    background: rgba(0, 0, 0, 0.88);
-    align-items: center;
-    justify-content: center;
-    padding: 28px;
-    cursor: zoom-out;
-  }
-  .lightbox.open { display: flex; }
-  .lightbox-inner {
-    max-width: min(920px, 96vw);
-    max-height: 92vh;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    cursor: default;
-  }
-  .lightbox-label {
-    font-size: 11px;
-    font-weight: 500;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
-    text-align: center;
-  }
-  .lightbox img {
-    max-width: 100%;
-    max-height: calc(92vh - 28px);
-    object-fit: contain;
-    border-radius: 4px;
-    background: #0a0a0a;
-    display: block;
-  }
-  .nav-done {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-  }
-  .nav-done button {
-    appearance: none;
-    border: 1px solid var(--hairline);
-    background: transparent;
-    color: var(--text-dim);
-    font: inherit;
-    font-size: 11px;
-    font-weight: 500;
-    border-radius: 4px;
-    padding: 5px 10px;
-    cursor: pointer;
-  }
-  .nav-done button:hover {
-    color: var(--text);
-    border-color: var(--hairline-strong);
-    background: var(--surface);
-  }
-  .nav-done button:disabled {
-    opacity: 0.35;
-    cursor: default;
-  }
-  .nav-done .gap { flex: 1; }
-  .nav-done .count {
-    font-size: 10px;
-    color: #484848;
-    font-variant-numeric: tabular-nums;
+  #lb.open { display: flex; }
+  #lb img { max-width: 96vw; max-height: 92vh; object-fit: contain; }
+
+  @media (max-width: 560px) {
+    .m { grid-template-columns: minmax(60px, 90px) minmax(0, 1fr) 40px; }
+    .m .time, .m .q { display: none; }
+    .shots { flex-direction: column; }
+    .shot .box { aspect-ratio: auto; max-height: 46vh; min-height: 80px; }
+    .shot .box img { height: auto; max-height: 46vh; }
   }
 </style>
 </head>
 <body>
-  <div class="shell" id="shell">
-    <div class="live">
-      <div class="live-ad" id="liveAd"><span>waiting</span></div>
-      <div class="live-meta">
-        <span class="pulse-dot" id="pulseDot" title="live sync"></span>
-        <span class="chip" id="liveChip">idle</span>
-        <span class="nums" id="liveNums"><b>0.0%</b> · 00:00</span>
-      </div>
+<div class="wrap">
+
+  <header class="row">
+    <span class="path ellip dim" id="rootPath">—</span>
+    <span id="phase" class="faint">waiting</span>
+    <span id="conn" class="faint">connecting</span>
+  </header>
+  <div id="summary" class="dim">—</div>
+  <hr />
+
+  <div id="grid"></div>
+  <div id="empty" hidden>no runs — watching for pipeline.log files</div>
+  <hr />
+
+  <div id="live">
+    <div class="row">
+      <span id="lvId">—</span>
+      <span id="lvStage" class="dim">idle</span>
+      <span id="lvMeta" class="faint"></span>
     </div>
-    <div class="feed" id="feed"><div class="feed-empty">waiting for activity</div></div>
+    <div id="liveLine" class="faint ellip">—</div>
+    <div id="feed"></div>
+  </div>
+  <hr />
 
-    <div class="section-label" id="benchLabel">benchmark</div>
-    <div class="capsule">
-      <div class="heat" id="heat"></div>
-      <div class="bench-foot">
-        <span id="benchCount">0 / 0</span>
-        <span id="benchPct">0.0%</span>
-      </div>
+  <div id="inspect">
+    <div class="row">
+      <span id="cmpId" class="dim">select a run</span>
+      <span id="cmpSub" class="faint"></span>
     </div>
-
-    <div class="section-label" id="stageLabel">stages</div>
-    <div class="stage-row" id="stageRow"></div>
-    <div class="stage-names"><span>normalize</span><span>qa</span></div>
-
-    <div class="detail" id="detail">
-      <div class="detail-body">
-        <div class="detail-id" id="detailId">select an ad</div>
-        <div class="detail-line" id="detailLine">click a finished dot to inspect original vs reconstruct</div>
-        <div class="detail-hint">sequential batch · one live ad · done ads keep both frames</div>
-      </div>
-      <div class="compare">
-        <div class="frame">
-          <div class="frame-label">original</div>
-          <div class="frame-shot" id="shotOriginal"><div class="empty">—</div></div>
-        </div>
-        <div class="frame">
-          <div class="frame-label">reconstructed</div>
-          <div class="frame-shot" id="shotPreview"><div class="empty">—</div></div>
-        </div>
-      </div>
-      <div class="nav-done">
-        <button type="button" id="btnPrev" disabled>prev done</button>
-        <button type="button" id="btnNext" disabled>next done</button>
-        <span class="gap"></span>
-        <span class="count" id="doneNav">0 done</span>
-      </div>
+    <div class="shots">
+      <div class="shot"><div class="lbl">original</div><div class="box" id="shotO">—</div></div>
+      <div class="shot"><div class="lbl">rebuild</div><div class="box" id="shotP">—</div></div>
+    </div>
+    <div class="nav">
+      <button id="btnPrev" disabled>‹</button>
+      <button id="btnNext" disabled>›</button>
+      <span class="n" id="doneNav"></span>
     </div>
   </div>
 
-  <div class="lightbox" id="lightbox" aria-hidden="true">
-    <div class="lightbox-inner">
-      <div class="lightbox-label" id="lightboxLabel"></div>
-      <img id="lightboxImg" alt="" />
-    </div>
-  </div>
+  <footer id="footUpdated">—</footer>
+</div>
+
+<div id="lb"><img id="lbImg" alt="" /></div>
 
 <script>
+"use strict";
+
 const DEFAULT_STAGES = [
   "normalize","ocr","text","residual","qwen","sam","elements","peel",
   "merge","structure","reconstruct","layout","design","preview","figma",
   "export","diff","qa"
 ];
 
-const heat = document.getElementById("heat");
-const stageRow = document.getElementById("stageRow");
-const liveAd = document.getElementById("liveAd");
-const liveChip = document.getElementById("liveChip");
-const liveNums = document.getElementById("liveNums");
-const pulseDot = document.getElementById("pulseDot");
-const feedEl = document.getElementById("feed");
-const benchLabel = document.getElementById("benchLabel");
-const benchCount = document.getElementById("benchCount");
-const benchPct = document.getElementById("benchPct");
-const stageLabel = document.getElementById("stageLabel");
-const detailId = document.getElementById("detailId");
-const detailLine = document.getElementById("detailLine");
-const shotOriginal = document.getElementById("shotOriginal");
-const shotPreview = document.getElementById("shotPreview");
-const btnPrev = document.getElementById("btnPrev");
-const btnNext = document.getElementById("btnNext");
-const doneNav = document.getElementById("doneNav");
+const $ = (id) => document.getElementById(id);
+const els = {
+  rootPath: $("rootPath"), phase: $("phase"), conn: $("conn"), summary: $("summary"),
+  grid: $("grid"), empty: $("empty"),
+  lvId: $("lvId"), lvStage: $("lvStage"), lvMeta: $("lvMeta"), liveLine: $("liveLine"),
+  feed: $("feed"),
+  cmpId: $("cmpId"), cmpSub: $("cmpSub"), shotO: $("shotO"), shotP: $("shotP"),
+  btnPrev: $("btnPrev"), btnNext: $("btnNext"), doneNav: $("doneNav"),
+  footUpdated: $("footUpdated"),
+  lb: $("lb"), lbImg: $("lbImg"),
+};
 
 let stages = DEFAULT_STAGES.slice();
 let state = null;
 let selectedId = null;
-let pinned = false;          // user clicked a dot — don't auto-jump
+let pinned = false;
 let lastRev = -1;
 let lastGeneration = -1;
+let lastRecvAt = 0;
+let sseMode = "connecting";
+const rowSigs = new Map();
 
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 function shortId(id) {
   if (!id) return "";
-  // 066_attached_c683... -> 066_attached
   const parts = String(id).split("_");
-  if (parts.length >= 2 && /^\d+/.test(parts[0])) {
-    return parts.slice(0, 2).join("_");
-  }
-  return id.length > 22 ? id.slice(0, 20) + "…" : id;
+  if (parts.length >= 2 && /^\d+/.test(parts[0])) return parts.slice(0, 2).join("_");
+  return id.length > 18 ? id.slice(0, 16) + "…" : id;
 }
-
-function fmtElapsed(s) {
-  s = Math.max(0, Math.floor(s || 0));
-  return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+function fmtDur(s) {
+  s = Math.max(0, Math.round(s || 0));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h) return h + ":" + String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
+  return String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
 }
-
-/** Live-tick only while running/stalled; freeze done/partial/failed at server elapsed_s. */
 function elapsedFor(run) {
   if (!run) return 0;
-  const liveTick = run.status === "running" || run.status === "stalled";
-  if (liveTick && run.started_at) {
-    return Math.max(0, Date.now() / 1000 - run.started_at);
-  }
+  const ticking = run.status === "running" || run.status === "stalled";
+  if (ticking && run.started_at) return Math.max(0, Date.now() / 1000 - run.started_at);
   return Number(run.elapsed_s || 0);
 }
-
-function ensureStageCells() {
-  if (stageRow.children.length === stages.length) return;
-  stageRow.innerHTML = "";
-  stages.forEach(() => {
-    const el = document.createElement("div");
-    el.className = "scell";
-    stageRow.appendChild(el);
-  });
-}
-
-function runsList() {
-  return (state && state.benchmark && state.benchmark.runs) || [];
-}
-
-function runById(id) {
-  return runsList().find(r => r.id === id) || null;
-}
-
-function doneRuns() {
-  return runsList().filter(r => r.complete);
-}
+function runsList() { return (state && state.benchmark && state.benchmark.runs) || []; }
+function runById(id) { return runsList().find((r) => r.id === id) || null; }
+function doneRuns() { return runsList().filter((r) => r.complete); }
 
 function selectAd(id, fromUser) {
   if (!id) return;
-  selectedId = id;
-  if (fromUser) pinned = true;
+  if (fromUser && selectedId === id && pinned) { pinned = false; }
+  else { selectedId = id; if (fromUser) pinned = true; }
   render(true);
 }
-
 function stepDone(delta) {
   const done = doneRuns();
   if (!done.length) return;
-  let idx = done.findIndex(r => r.id === selectedId);
+  let idx = done.findIndex((r) => r.id === selectedId);
   if (idx < 0) idx = delta > 0 ? -1 : 0;
   idx = (idx + delta + done.length) % done.length;
   selectAd(done[idx].id, true);
 }
+els.btnPrev.addEventListener("click", () => stepDone(-1));
+els.btnNext.addEventListener("click", () => stepDone(1));
 
-btnPrev.addEventListener("click", () => stepDone(-1));
-btnNext.addEventListener("click", () => stepDone(1));
+function followLiveIfNeeded() {
+  const live = state && state.live;
+  if (!live || live.image_id === "runtime-smoke") return;
+  const gen = state.generation || 0;
+  if (gen !== lastGeneration) {
+    if (lastGeneration >= 0) pinned = false;
+    lastGeneration = gen;
+  }
+  if (!pinned || !selectedId) selectedId = live.image_id;
+}
 
-function setShot(el, run, file, emptyMsg, cacheKeyRef) {
+function renderHeader() {
+  const bench = state && state.benchmark;
+  els.rootPath.textContent = (bench && bench.root) || "—";
+  els.rootPath.title = (bench && bench.root) || "";
+
+  const phase = (state && state.phase) || "waiting";
+  const runs = runsList();
+  const anyActive = runs.some((r) => r.status === "running" || r.status === "stalled");
+  const allDone = runs.length > 0 && runs.every((r) => r.complete);
+  let label = "waiting";
+  if (phase === "smoke") label = "smoke";
+  else if (anyActive) label = "running";
+  else if (allDone) label = "complete";
+  else if (runs.length) label = "idle";
+  els.phase.textContent = label;
+}
+
+function renderConn() {
+  const age = lastRecvAt ? (Date.now() - lastRecvAt) / 1000 : Infinity;
+  if (age > 15) { els.conn.textContent = "no data"; els.conn.className = "err"; }
+  else if (sseMode === "live") { els.conn.textContent = "sse"; els.conn.className = "faint"; }
+  else if (sseMode === "poll") { els.conn.textContent = "poll"; els.conn.className = "faint"; }
+  else { els.conn.textContent = "connecting"; els.conn.className = "faint"; }
+}
+
+function renderSummary() {
+  const runs = runsList();
+  const done = doneRuns();
+  const failed = runs.filter((r) => r.status === "failed");
+  if (!runs.length) { els.summary.textContent = "—"; return; }
+
+  const parts = [done.length + "/" + runs.length + " done"];
+  if (failed.length) parts.push('<span class="err">' + failed.length + " failed</span>");
+
+  const avg = done.length ? done.reduce((a, r) => a + (r.elapsed_s || 0), 0) / done.length : null;
+  if (avg != null) parts.push("avg " + fmtDur(avg));
+
+  const pendingCt = runs.filter((r) => r.status === "pending").length;
+  const lv = state.live && state.live.image_id !== "runtime-smoke" ? runById(state.live.image_id) : null;
+  const liveFrac = lv && !lv.complete && (lv.status === "running" || lv.status === "stalled")
+    ? 1 - (lv.percent || 0) / 100 : 0;
+  const remaining = pendingCt + liveFrac;
+  if (avg != null && remaining > 0.01) parts.push("eta ~" + fmtDur(avg * remaining));
+
+  const withQa = done.filter((r) => r.qa && typeof r.qa.ssim === "number");
+  if (withQa.length) {
+    const mSsim = withQa.reduce((a, r) => a + r.qa.ssim, 0) / withQa.length;
+    const mRec = withQa.reduce((a, r) => a + (r.qa.text_recall || 0), 0) / withQa.length;
+    parts.push("ssim " + mSsim.toFixed(3));
+    parts.push("recall " + (mRec * 100).toFixed(0) + "%");
+  }
+  els.summary.innerHTML = parts.join('<span class="faint"> · </span>');
+}
+
+function cellState(run, name) {
+  if (run.complete || (run.done || []).includes(name)) return "done";
+  if (run.active === name) {
+    if (run.failed) return "failed";
+    if (run.stalled) return "stalled";
+    return "active";
+  }
+  return "";
+}
+
+function buildGrid() {
+  els.grid.innerHTML = "";
+  rowSigs.clear();
+  runsList().forEach((run) => {
+    const row = document.createElement("div");
+    row.className = "m";
+    row.dataset.id = run.id;
+    row.addEventListener("click", () => selectAd(run.id, true));
+    els.grid.appendChild(row);
+  });
+}
+
+function renderGrid() {
+  const runs = runsList();
+  els.empty.hidden = runs.length > 0;
+  if (!runs.length) { els.grid.innerHTML = ""; rowSigs.clear(); return; }
+
+  const liveId = state && state.live ? state.live.image_id : null;
+  const rows = els.grid.querySelectorAll(".m");
+  const idsMatch = rows.length === runs.length &&
+    [...rows].every((el, i) => el.dataset.id === runs[i].id);
+  if (!idsMatch) buildGrid();
+
+  const rows2 = els.grid.querySelectorAll(".m");
+  runs.forEach((run, i) => {
+    const row = rows2[i];
+    const isLive = run.id === liveId;
+    const isSel = run.id === selectedId;
+    const sig = [run.status, run.active, (run.done || []).length, run.complete,
+      run.failed, run.stalled, Math.round(run.percent || 0),
+      run.qa && run.qa.ssim, isSel, isLive].join("|");
+    if (rowSigs.get(run.id) === sig) return;
+    rowSigs.set(run.id, sig);
+
+    row.className = "m st-" + run.status + (isLive ? " live" : "") + (isSel ? " sel" : "");
+    const secs = run.stage_secs || {};
+    const cells = stages.map((name) => {
+      const st = cellState(run, name);
+      let tip = name + " · " + (st || "pending");
+      if (st === "done" && secs[name] != null) tip += " · " + secs[name] + "s";
+      return '<div class="c ' + st + '" title="' + esc(tip) + '"></div>';
+    }).join("");
+
+    row.innerHTML =
+      '<div class="id ellip" title="' + esc(run.id + " · " + run.status) + '">' + esc(shortId(run.id)) + "</div>" +
+      '<div class="track">' + cells + "</div>" +
+      '<div class="num">' + Number(run.percent || 0).toFixed(0) + "%</div>" +
+      '<div class="num time" data-time-for="' + esc(run.id) + '">' + fmtDur(elapsedFor(run)) + "</div>" +
+      '<div class="num q">' + (run.qa && typeof run.qa.ssim === "number" ? run.qa.ssim.toFixed(2) : "·") + "</div>";
+  });
+}
+
+function renderLive() {
+  const live = state && state.live;
+  const phase = (state && state.phase) || "waiting";
+
+  if (!live) {
+    els.lvId.textContent = "—";
+    els.lvStage.textContent = phase === "smoke" ? "smoke starting" : "idle";
+    els.lvStage.className = "faint";
+    els.lvMeta.textContent = "";
+    els.liveLine.textContent = "—";
+    renderFeed();
+    return;
+  }
+  const isSmoke = live.image_id === "runtime-smoke";
+  els.lvId.textContent = shortId(live.image_id);
+  els.lvId.title = live.image_id;
+
+  let stageText = live.active || "…", cls = "dim";
+  if (live.failed && !live.complete) { stageText = "failed · " + (live.active || "?"); cls = "err"; }
+  else if (live.stalled) { stageText = (live.active || "…") + " · stalled"; cls = "err"; }
+  else if (live.complete) { stageText = "complete"; cls = "faint"; }
+  els.lvStage.textContent = stageText;
+  els.lvStage.className = cls;
+
+  const idx = live.active ? stages.indexOf(live.active) + 1 : (live.complete ? stages.length : 0);
+  els.lvMeta.textContent = fmtDur(elapsedFor(live)) + " · " +
+    Number(live.percent || 0).toFixed(0) + "%" +
+    (isSmoke ? "" : " · " + idx + "/" + stages.length);
+  els.liveLine.textContent = live.last_line || "—";
+  els.liveLine.title = live.last_line || "";
+  renderFeed();
+}
+
+function renderFeed() {
+  const items = ((state && state.feed) || []).slice(-6);
+  const sig = items.map((e) => (e.t || "") + (e.text || "")).join("\n");
+  if (els.feed.dataset.sig === sig) return;
+  els.feed.dataset.sig = sig;
+  els.feed.innerHTML = items.map((e, i) => {
+    const cls = (e.kind === "error" ? "k-error" : "") + (i === items.length - 1 ? " last" : "");
+    return '<div class="' + cls + '"><span class="t">' + esc(e.t || "··:··:··") + "</span>" +
+      '<span class="ellip" title="' + esc(e.text || "") + '">' +
+      (e.ad ? esc(shortId(e.ad)) + " " : "") + esc(e.text || "") + "</span></div>";
+  }).join("");
+}
+
+const shotCache = { o: "", p: "" };
+function setShot(el, run, file, emptyMsg, key) {
   if (!run || !file) {
     el.classList.remove("has-img");
     el.removeAttribute("data-full");
-    el.removeAttribute("data-label");
-    if (cacheKeyRef.key !== "empty:" + emptyMsg) {
-      el.innerHTML = '<div class="empty">' + emptyMsg + "</div>";
-      cacheKeyRef.key = "empty:" + emptyMsg;
+    if (shotCache[key] !== "e:" + emptyMsg) {
+      el.textContent = emptyMsg;
+      shotCache[key] = "e:" + emptyMsg;
     }
     return;
   }
-  const key = run.id + ":" + file + ":" + Math.floor(run.mtime || 0);
-  if (key === cacheKeyRef.key) return;
-  cacheKeyRef.key = key;
+  const sig = run.id + ":" + file + ":" + Math.floor(run.mtime || 0);
+  if (sig === shotCache[key]) return;
+  shotCache[key] = sig;
   el.innerHTML = "";
   const src = "/asset/" + encodeURIComponent(run.id) + "/" + file + "?t=" + Math.floor(run.mtime || Date.now());
   const img = document.createElement("img");
@@ -595,314 +435,132 @@ function setShot(el, run, file, emptyMsg, cacheKeyRef) {
   img.src = src;
   img.onerror = () => {
     el.classList.remove("has-img");
-    el.removeAttribute("data-full");
-    el.innerHTML = '<div class="empty">missing</div>';
-    cacheKeyRef.key = "missing:" + key;
+    el.textContent = "missing";
+    shotCache[key] = "m:" + sig;
   };
   el.classList.add("has-img");
   el.dataset.full = src;
-  el.dataset.label = (file === "preview.png" ? "reconstructed" : "original") + " · " + shortId(run.id);
   el.appendChild(img);
 }
 
-const lightbox = document.getElementById("lightbox");
-const lightboxImg = document.getElementById("lightboxImg");
-const lightboxLabel = document.getElementById("lightboxLabel");
-
-function openLightbox(src, label) {
-  if (!src) return;
-  lightboxImg.src = src;
-  lightboxLabel.textContent = label || "";
-  lightbox.classList.add("open");
-  lightbox.setAttribute("aria-hidden", "false");
-}
-
-function closeLightbox() {
-  lightbox.classList.remove("open");
-  lightbox.setAttribute("aria-hidden", "true");
-  lightboxImg.removeAttribute("src");
-}
-
-shotOriginal.addEventListener("click", () => {
-  if (shotOriginal.classList.contains("has-img")) {
-    openLightbox(shotOriginal.dataset.full, shotOriginal.dataset.label);
-  }
-});
-shotPreview.addEventListener("click", () => {
-  if (shotPreview.classList.contains("has-img")) {
-    openLightbox(shotPreview.dataset.full, shotPreview.dataset.label);
-  }
-});
-lightbox.addEventListener("click", (e) => {
-  if (e.target === lightbox || e.target === lightboxImg) closeLightbox();
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") closeLightbox();
-});
-
-const origCache = { key: "" };
-const prevCache = { key: "" };
-
-function paintStages(run) {
-  ensureStageCells();
-  const done = new Set((run && run.done) || []);
-  const active = run && run.active;
-  const stalled = run && run.stalled;
-  [...stageRow.children].forEach((el, i) => {
-    const name = stages[i];
-    el.className = "scell";
-    if (!run) return;
-    if (run.complete || done.has(name)) el.classList.add("done");
-    else if (name === active) el.classList.add(stalled ? "stalled" : "active");
-    else if (run.failed && name === active) el.classList.add("failed");
-  });
-}
-
-function paintHeat() {
-  const runs = runsList();
-  if (heat.children.length !== runs.length) {
-    heat.innerHTML = "";
-    runs.forEach((run) => {
-      const el = document.createElement("div");
-      el.className = "dot";
-      el.role = "button";
-      el.tabIndex = 0;
-      el.dataset.id = run.id;
-      el.title = run.id;
-      el.addEventListener("click", () => selectAd(el.dataset.id, true));
-      el.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          selectAd(el.dataset.id, true);
-        }
-      });
-      heat.appendChild(el);
-    });
-  }
-  [...heat.children].forEach((el, i) => {
-    const run = runs[i];
-    if (!run) return;
-    el.dataset.id = run.id;
-    el.title = run.id + " · " + run.status + " · " + run.percent.toFixed(1) + "%";
-    el.className = "dot";
-    if (run.status === "running") el.classList.add("active");
-    else if (run.status === "stalled") el.classList.add("stalled");
-    else if (run.status === "failed") el.classList.add("failed");
-    else if (run.level > 0) el.classList.add("l" + run.level);
-    if (run.id === selectedId) el.classList.add("selected");
-  });
-}
-
-function renderDetail() {
+function renderInspect() {
   const id = selectedId || (state && state.live && state.live.image_id);
-  const run = id ? runById(id) : null;
+  const run = id && id !== "runtime-smoke" ? runById(id) : null;
   const done = doneRuns();
-  const doneIdx = run ? done.findIndex(r => r.id === run.id) : -1;
+  const doneIdx = run ? done.findIndex((r) => r.id === run.id) : -1;
 
-  doneNav.textContent = done.length ? (doneIdx >= 0 ? (doneIdx + 1) + " / " + done.length + " done" : done.length + " done") : "0 done";
-  btnPrev.disabled = done.length < 2;
-  btnNext.disabled = done.length < 2;
+  els.doneNav.textContent = done.length
+    ? (doneIdx >= 0 ? (doneIdx + 1) + "/" + done.length : String(done.length)) + " done"
+    : "";
+  els.btnPrev.disabled = done.length < 2;
+  els.btnNext.disabled = done.length < 2;
 
   if (!run) {
-    detailId.textContent = "select an ad";
-    detailLine.textContent = "click a finished dot to inspect original vs reconstruct";
-    setShot(shotOriginal, null, null, "—", origCache);
-    setShot(shotPreview, null, null, "—", prevCache);
+    els.cmpId.textContent = "select a run";
+    els.cmpSub.textContent = "";
+    setShot(els.shotO, null, null, "—", "o");
+    setShot(els.shotP, null, null, "—", "p");
     return;
   }
 
-  detailId.textContent = shortId(run.id);
-  detailId.title = run.id;
-  const stage = run.complete ? "done" : (run.active || run.status || "pending");
-  detailLine.innerHTML =
-    "<em>" + stage + "</em> · " +
-    run.percent.toFixed(1) + "% · " +
-    fmtElapsed(elapsedFor(run)) +
-    (run.status === "stalled" ? " · stalled" : "") +
-    (run.failed ? " · failed" : "") +
-    (run.status === "partial" ? " · partial" : "");
+  els.cmpId.textContent = shortId(run.id);
+  els.cmpId.title = run.id;
+  const qa = run.qa && typeof run.qa.ssim === "number"
+    ? " · ssim " + run.qa.ssim.toFixed(3) +
+      " · recall " + ((run.qa.text_recall || 0) * 100).toFixed(0) + "%" +
+      (run.qa.repairs != null ? " · repairs " + run.qa.repairs : "")
+    : "";
+  els.cmpSub.textContent = run.status + " · " + Number(run.percent || 0).toFixed(0) + "% · " +
+    fmtDur(elapsedFor(run)) + qa;
 
-  const origFile = run.has_original ? "original.png" : null;
-  const prevFile = run.has_preview ? "preview.png" : null;
-
-  setShot(
-    shotOriginal, run, origFile,
-    run.status === "pending" ? "queued" : "waiting on normalize…",
-    origCache
-  );
-
-  if (run.complete || prevFile) {
-    setShot(
-      shotPreview, run, prevFile,
-      run.complete ? "no preview yet" : "reconstructing…",
-      prevCache
-    );
+  setShot(els.shotO, run, run.has_original ? "original.png" : null,
+    run.status === "pending" ? "queued" : "waiting on normalize", "o");
+  if (run.complete || run.has_preview) {
+    setShot(els.shotP, run, run.has_preview ? "preview.png" : null, "no preview", "p");
   } else if (run.status === "running" || run.status === "stalled") {
-    setShot(
-      shotPreview, null, null,
-      "live · " + (run.active || "…") + " — preview after reconstruct",
-      prevCache
-    );
-  } else if (run.status === "partial") {
-    setShot(shotPreview, run, prevFile, "stopped before preview", prevCache);
+    setShot(els.shotP, null, null, "after reconstruct", "p");
   } else {
-    setShot(shotPreview, null, null, "queued", prevCache);
+    setShot(els.shotP, null, null, run.status === "partial" ? "stopped early" : "queued", "p");
   }
 }
 
-function paintFeed() {
-  const items = ((state && state.feed) || []).slice();
-  const live = state && state.live;
-  // Heartbeat so long stages (ocr/sam/inpaint) don't look frozen on an old line.
-  if (live && !live.complete && live.active && live.image_id !== "runtime-smoke") {
-    const heartbeat = (live.active || "…") + "…";
-    const last = items[items.length - 1];
-    if (!last || last.text !== heartbeat) {
-      items.push({ t: "", kind: "stage", text: heartbeat, ad: live.image_id });
-    }
-  }
-  if (!items.length) {
-    const hint = (state && state.phase === "smoke")
-      ? "runtime smoke…"
-      : (live && live.last_line) || "waiting";
-    feedEl.innerHTML = '<div class="feed-empty">' + hint + "</div>";
-    feedEl.dataset.sig = "empty:" + hint;
-    return;
-  }
-  const sig = items.map(e => (e.t || "") + "|" + (e.text || "")).join("\n");
-  if (feedEl.dataset.sig === sig) return;
-  feedEl.dataset.sig = sig;
-  const latest = items[items.length - 1];
-  feedEl.innerHTML = items.slice(-5).map((e) => {
-    const cls = ["feed-row"];
-    if (e === latest) cls.push("fresh");
-    if (e.kind === "error") cls.push("error");
-    if (e.kind === "done") cls.push("done");
-    return (
-      '<div class="' + cls.join(" ") + '">' +
-        '<span class="msg">' + escapeHtml(e.text || "") + "</span>" +
-      "</div>"
-    );
-  }).join("");
+function openLightbox(src) {
+  if (!src) return;
+  els.lbImg.src = src;
+  els.lb.classList.add("open");
 }
-
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+function closeLightbox() {
+  els.lb.classList.remove("open");
+  els.lbImg.removeAttribute("src");
 }
-
-function renderLive() {
-  const live = state && state.live;
-  const bench = state && state.benchmark;
-  const phase = (state && state.phase) || "waiting";
-  if (!live) {
-    liveAd.innerHTML = phase === "smoke"
-      ? "runtime-smoke <span>· starting</span>"
-      : "<span>waiting</span>";
-    liveChip.textContent = phase === "smoke" ? "smoke" : "idle";
-    liveChip.className = "chip" + (phase === "smoke" ? " stage" : "");
-    liveChip.title = "";
-    liveNums.innerHTML = "<b>0.0%</b> · 00:00";
-    pulseDot.className = phase === "smoke" ? "pulse-dot on" : "pulse-dot";
-  } else {
-    const doing = live.complete ? "done" : (live.active || "…");
-    const idLabel = live.image_id === "runtime-smoke" ? "smoke" : shortId(live.image_id);
-    liveAd.innerHTML = idLabel + " <span>· " + doing + "</span>";
-    liveAd.title = live.image_id;
-    liveChip.textContent = doing;
-    liveChip.className = "chip stage";
-    pulseDot.className = "pulse-dot on";
-    if (live.stalled) {
-      liveChip.className = "chip stall";
-      liveChip.textContent = "stalled";
-      liveChip.title = "no new writes for 90s";
-      pulseDot.className = "pulse-dot stall";
-    } else {
-      liveChip.title = "";
-    }
-    if (live.failed) { liveChip.className = "chip fail"; liveChip.textContent = "failed"; liveChip.title = ""; }
-    liveNums.innerHTML = "<b>" + Number(live.percent || 0).toFixed(1) + "%</b> · " + fmtElapsed(elapsedFor(live));
-  }
-  paintFeed();
-  if (bench) {
-    const phaseTag = phase === "smoke" ? " · smoke" : "";
-    benchLabel.textContent = "benchmark · " + (bench.name || "runs") + phaseTag;
-    benchCount.textContent = bench.done_count + " / " + bench.total + " ads";
-    benchPct.textContent = Number(bench.percent || 0).toFixed(1) + "%";
-  }
-}
-
-function followLiveIfNeeded() {
-  const live = state && state.live;
-  if (!live) return;
-  if (live.image_id === "runtime-smoke") return;
-  const gen = state.generation || 0;
-  if (gen !== lastGeneration) {
-    // New live image — unfollow pin so the grid tracks the batch.
-    if (lastGeneration >= 0) pinned = false;
-    lastGeneration = gen;
-  }
-  if (!pinned || !selectedId) {
-    selectedId = live.image_id;
-  }
-}
+els.shotO.addEventListener("click", () => { if (els.shotO.dataset.full) openLightbox(els.shotO.dataset.full); });
+els.shotP.addEventListener("click", () => { if (els.shotP.dataset.full) openLightbox(els.shotP.dataset.full); });
+els.lb.addEventListener("click", closeLightbox);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLightbox(); });
 
 function render(force) {
   if (!state) return;
   const rev = state.rev || 0;
-  if (!force && rev === lastRev) {
-    renderLive();
-    renderDetail();
-    return;
-  }
+  if (!force && rev === lastRev) return;
   lastRev = rev;
   if (state.stages && state.stages.length) stages = state.stages;
   followLiveIfNeeded();
+  renderHeader();
+  renderSummary();
+  renderGrid();
   renderLive();
-  paintHeat();
-  const focus = selectedId ? runById(selectedId) : null;
-  stageLabel.textContent = focus ? ("stages · " + shortId(focus.id)) : "stages";
-  if (focus) stageLabel.title = focus.id;  paintStages(focus);
-  renderDetail();
+  renderInspect();
+  const d = new Date((state.updated_at || Date.now() / 1000) * 1000);
+  els.footUpdated.textContent = "updated " + d.toLocaleTimeString();
 }
 
 function applyStatus(data) {
   if (!data) return;
   state = data;
+  lastRecvAt = Date.now();
   render(false);
 }
+
+setInterval(() => {
+  if (!state) { renderConn(); return; }
+  const live = state.live;
+  if (live && (live.status === "running" || live.status === "stalled")) {
+    const idx = live.active ? stages.indexOf(live.active) + 1 : 0;
+    els.lvMeta.textContent = fmtDur(elapsedFor(live)) + " · " +
+      Number(live.percent || 0).toFixed(0) + "%" +
+      (live.image_id === "runtime-smoke" ? "" : " · " + idx + "/" + stages.length);
+  }
+  document.querySelectorAll("[data-time-for]").forEach((el) => {
+    const run = runById(el.getAttribute("data-time-for"));
+    if (run && (run.status === "running" || run.status === "stalled")) {
+      el.textContent = fmtDur(elapsedFor(run));
+    }
+  });
+  renderConn();
+}, 500);
 
 async function pollOnce() {
   try {
     const res = await fetch("/status.json?_=" + Date.now(), { cache: "no-store" });
     if (!res.ok) throw new Error("bad status");
+    if (sseMode !== "live") sseMode = "poll";
     applyStatus(await res.json());
-  } catch (_) {}
+  } catch (_) { /* keep last state */ }
 }
-
 function connectSSE() {
   let es;
-  try {
-    es = new EventSource("/events");
-  } catch (_) {
-    return false;
-  }
+  try { es = new EventSource("/events"); } catch (_) { sseMode = "poll"; return; }
+  es.onopen = () => { sseMode = "live"; renderConn(); };
+  es.onerror = () => { sseMode = "poll"; renderConn(); };
   es.onmessage = (ev) => {
+    sseMode = "live";
     try { applyStatus(JSON.parse(ev.data)); } catch (_) {}
   };
-  return true;
 }
-
-const sseOk = connectSSE();
-setInterval(pollOnce, sseOk ? 250 : 100);
-setInterval(() => { if (state) { renderLive(); renderDetail(); } }, 100);
+connectSSE();
+setInterval(pollOnce, 2000);
 pollOnce();
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) pollOnce();
-});
+document.addEventListener("visibilitychange", () => { if (!document.hidden) pollOnce(); });
 </script>
 </body>
 </html>

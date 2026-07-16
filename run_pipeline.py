@@ -257,6 +257,9 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 vram.stage_boundary("ocr", "vlm-proofread", cfg, run_dir,
                                     log_fn=lambda msg: _log(run_dir, msg))
             raw_ocr = vlm_proofread.proofread_lines(norm_path, raw_ocr, cfg)
+            # The judge/proofread pop meta.disagreement as they confirm/correct lines;
+            # resync metrics.cross_check so the stored count never drifts from the flags.
+            ocr.refresh_cross_check(raw_ocr)
             dump(raw_ocr, A("ocr_raw.json"))
             oj = raw_ocr.get("vlm_ocr_judge")
             oj_note = ""
@@ -315,6 +318,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 vram.stage_boundary("text", "vlm-font-judge", cfg, run_dir,
                                     log_fn=lambda msg: _log(run_dir, msg))
                 ocr_res = vlm_font_judge.judge_fonts(norm_path, ocr_res, cfg)
+            ocr.refresh_cross_check(ocr_res)
             dump(ocr_res, A("ocr.json"))
             st = ocr_res.get("vlm_scene_text")
             st_note = ""
@@ -447,7 +451,10 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                         text_backend = str(peel_cfg.get("text_inpaint", "telea") or "telea").lower()
                         use_telea = False
                         if hole_px > 0 and meta.get("text_occluder"):
-                            use_telea = text_backend in ("telea", "opencv", "opencv-telea")
+                            # Text directly on a photo plate (H7/H13) needs LaMa —
+                            # Telea smears busy/dark photo content under headlines.
+                            use_telea = (text_backend in ("telea", "opencv", "opencv-telea")
+                                         and not _is_photo_under(meta))
                         elif hole_px > 0 and hole_px < telea_max and not _is_photo_under(meta):
                             use_telea = True
                         if use_telea:
@@ -478,7 +485,8 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                     def _is_photo_under(meta):
                         kind = str((meta or {}).get("under_kind") or "").lower()
                         return kind in {"photo", "photo-fragment", "image", "product",
-                                        "person", "cutout"}
+                                        "person", "cutout", "chart", "graph",
+                                        "screenshot"}
 
                     result = peel_scene.peel_scene(
                         norm_path, scene_elements, inpaint=_peel_inpaint, cfg=cfg)

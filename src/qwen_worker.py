@@ -328,6 +328,34 @@ def _resolve_workflow_path(wf_path: str) -> Optional[str]:
     return alt if os.path.exists(alt) else None
 
 
+def _comfy_abort(base, headers, prompt_id=None):
+    """Interrupt the running job and clear the ComfyUI queue (GB1).
+
+    A Flux Fill job that we stop waiting on (timeout / decode error / no images)
+    keeps running on the GPU holding ~16 GB. The NEXT run's /prompt then queues
+    behind the wedged job and times out too — looking like an unrelated pipeline
+    failure. Every early-return-after-/prompt path must call this so we never
+    leave a job pinning the GPU. Best-effort: swallows all errors (the caller is
+    already degrading to Big-LaMa and must never crash on cleanup).
+    """
+    try:
+        requests = _requests()
+    except Exception:  # pragma: no cover - requests always importable if we got here
+        return
+    for attempt in ("interrupt", "queue"):
+        try:
+            if attempt == "interrupt":
+                requests.post(f"{base}/interrupt", headers=headers, timeout=10)
+            else:
+                # Clear any pending items; also delete the specific job if we have its id.
+                payload = {"clear": True}
+                if prompt_id:
+                    payload["delete"] = [prompt_id]
+                requests.post(f"{base}/queue", headers=headers, json=payload, timeout=10)
+        except Exception as exc:  # pragma: no cover - network best-effort
+            print(f"[flux-inpaint] comfy {attempt} cleanup failed ({exc})")
+
+
 def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
     """Inpaint a background plate with FLUX.1 Fill dev on ComfyUI.
 
@@ -482,6 +510,9 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
             msg = f"timed out waiting for {prompt_id}"
             flux_inpaint.__dict__["last_error"] = msg
             print(f"[flux-inpaint] {msg}; caller will fall back")
+            # GB1: the job is still running on the GPU — interrupt + clear queue so
+            # it does not pin ~16 GB and wedge the next run's /prompt.
+            _comfy_abort(base, headers, prompt_id)
             return None
 
         outputs = history.get("outputs", {})
@@ -512,11 +543,21 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
         msg = "run completed but produced no images"
         flux_inpaint.__dict__["last_error"] = msg
         print(f"[flux-inpaint] {msg}; caller will fall back")
+        # History existed but yielded nothing usable — best-effort clear (job is
+        # done in this case, but clearing keeps the queue clean for the next run).
+        _comfy_abort(base, headers, prompt_id)
         return None
     except Exception as exc:  # pragma: no cover - last-ditch guard, must never crash the run
         msg = f"unexpected error ({exc})"
         flux_inpaint.__dict__["last_error"] = msg
         print(f"[flux-inpaint] {msg}; caller will fall back")
+        # A job may have been submitted before the exception — clear it if we can.
+        _lv = locals()
+        if "base" in _lv and "headers" in _lv:
+            try:
+                _comfy_abort(_lv["base"], _lv["headers"], _lv.get("prompt_id"))
+            except Exception:
+                pass
         return None
 
 

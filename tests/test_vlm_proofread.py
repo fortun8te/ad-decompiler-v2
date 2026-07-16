@@ -151,6 +151,27 @@ def test_max_lines_caps_vlm_calls(tmp_path, monkeypatch):
     assert len(calls) == 4
 
 
+def test_budgeted_ocr_judge_prevents_redundant_legacy_sweep(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        vlm_proofread, "_ask_vlm", lambda *a, **k: calls.append(1) or "fixed",
+    )
+    ocr_result = {
+        "lines": [_line(f"bad{i}", 0.1) for i in range(44)],
+        "vlm_ocr_judge": {"lines_checked": 12, "proofread_checked": 8},
+    }
+    cfg = {"vlm": {
+        "enabled": True,
+        "ocr_judge": {"enabled": True, "proofread": {"enabled": True}},
+    }}
+
+    out = vlm_proofread.proofread_lines(_image(tmp_path), ocr_result, cfg)
+
+    assert calls == []
+    assert out["vlm_proofread"]["skipped"] is True
+    assert out["vlm_proofread"]["skip_reason"] == "covered-by-budgeted-ocr-judge"
+
+
 def test_ensemble_disagreement_proofreads_high_confidence_disputed_line(tmp_path, monkeypatch):
     monkeypatch.setattr(vlm_proofread, "_ask_vlm", lambda *a, **k: "SAVE 30%")
     ocr_result = {

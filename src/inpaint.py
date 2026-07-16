@@ -197,9 +197,17 @@ def text_ink_mask(rgb, box: dict, quad: Optional[list] = None,
     if x1 <= x0 or y1 <= y0:
         return out
     crop = rgb[y0:y1, x0:x1].astype(np.float32)
+    # OCR boxes are often glyph-tight: their first/last rows can be mostly black cap
+    # strokes rather than plate. Estimate the plate from a small exterior collar while
+    # still constraining the removal mask to the authored OCR box. Otherwise the white
+    # plate is selected as "ink" and the ghost-text guard paints a solid black slab.
+    collar = max(2, min(6, int(round(min(x1 - x0, y1 - y0) * 0.10))))
+    sx0, sy0 = max(0, x0 - collar), max(0, y0 - collar)
+    sx1, sy1 = min(width, x1 + collar), min(height, y1 + collar)
+    sample = rgb[sy0:sy1, sx0:sx1].astype(np.float32)
     border = np.concatenate(
-        [crop[:1].reshape(-1, 3), crop[-1:].reshape(-1, 3),
-         crop[:, :1].reshape(-1, 3), crop[:, -1:].reshape(-1, 3)], axis=0
+        [sample[:1].reshape(-1, 3), sample[-1:].reshape(-1, 3),
+         sample[:, :1].reshape(-1, 3), sample[:, -1:].reshape(-1, 3)], axis=0
     )
     plate = np.median(border, axis=0)
     distance = np.sqrt(((crop - plate) ** 2).sum(axis=2))

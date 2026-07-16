@@ -426,8 +426,40 @@ def _shift_image(image, dx: int, dy: int):
                            fillcolor=(255, 255, 255))
 
 
+def _sibling_rebuild_crop(run_dir: str, export_size, canvas) -> Optional[tuple]:
+    """Crop box for the rebuilt frame inside a "ship proof" composite export.
+
+    ``figma_import._stage_screenshot_sibling`` widens the staged canvas to place a flat
+    copy of the source screenshot to the LEFT of the reconstruction (``2*w + gap`` wide),
+    so the plugin's ``root.exportAsync`` returns a 2-up PNG. Comparing that whole strip to
+    the single-width source would be meaningless (figma_verify would squash it), so detect
+    the composite and return the rebuild region — the RIGHTMOST canvas-width slice, which
+    is gap-independent. Returns None when the export is a plain single-width frame.
+    """
+    ew, eh = export_size
+    cw, ch = canvas
+    if cw <= 0 or ch <= 0 or ew <= 0 or eh <= 0:
+        return None
+    # The sibling only widens the canvas; height carries the integer export scale (1x/2x/3x).
+    scale = max(1, int(round(eh / ch)))
+    if abs(eh - ch * scale) > 0.02 * ch * scale + 2:
+        return None  # height is not an integer multiple of the canvas — can't reason safely
+    target_w = cw * scale
+    if target_w <= 0 or ew <= target_w + 2:
+        return None  # not wider than one frame → nothing to crop
+    imp = _load_json(os.path.join(run_dir, "figma_import.json")) or {}
+    sibling_staged = bool((imp.get("screenshot_sibling") or {}).get("ok"))
+    # Accept when staging recorded a sibling, or the export is ~2x wide (defensive for
+    # exports staged before figma_import.json carried the flag).
+    if not (sibling_staged or ew >= target_w * 1.5):
+        return None
+    left = int(round(ew - target_w))
+    return (left, 0, ew, eh)
+
+
 def _normalize_export(export_path: str, canvas, reference_path: Optional[str],
-                      evidence_dir: str, thresholds: dict) -> tuple:
+                      evidence_dir: str, thresholds: dict,
+                      run_dir: Optional[str] = None) -> tuple:
     """Scale-normalize (and coarsely align) the export to canvas pixels.
 
     Returns (aligned_png_path, info_dict).  The aligned copy is written into
@@ -439,6 +471,10 @@ def _normalize_export(export_path: str, canvas, reference_path: Optional[str],
     os.makedirs(evidence_dir, exist_ok=True)
     with Image.open(export_path) as raw:
         raw = raw.convert("RGB")
+        full_size = raw.size
+        sibling_crop = _sibling_rebuild_crop(run_dir or "", full_size, canvas)
+        if sibling_crop:
+            raw = raw.crop(sibling_crop)
         export_size = raw.size
         scale = _detect_scale(export_size, canvas, float(thresholds["scale_tolerance"]))
         work = raw if raw.size == tuple(canvas) else raw.resize(tuple(canvas), Image.Resampling.LANCZOS)
@@ -466,6 +502,9 @@ def _normalize_export(export_path: str, canvas, reference_path: Optional[str],
         work.save(aligned_path)
     info = {"size": list(export_size), "canvas": list(canvas),
             "scale": scale, "alignment": alignment}
+    if sibling_crop:
+        info["full_size"] = list(full_size)
+        info["sibling_crop"] = list(sibling_crop)
     return aligned_path, info
 
 
@@ -707,7 +746,7 @@ def verify(run_dir: str, exported_png_path: Optional[str] = None,
     evidence_dir = os.path.join(run_dir, EVIDENCE_DIR)
     try:
         aligned_path, info = _normalize_export(export_path, canvas, reference,
-                                               evidence_dir, thresholds)
+                                               evidence_dir, thresholds, run_dir=run_dir)
         result.export.update(info)
         result.export["aligned_png"] = aligned_path
     except Exception as exc:  # noqa: BLE001

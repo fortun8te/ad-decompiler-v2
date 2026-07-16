@@ -48,7 +48,8 @@ def test_gate_thresholds_archetype_wins_over_reward_defaults():
                                            "reward_local_ssim_min": 0.6},
                   "reward": {"lpips_similarity_min": 0.1, "local_ssim_min": 0.1}}}
     floors = qa_reward.gate_thresholds(cfg)
-    assert floors == {"lpips_similarity_min": 0.5, "local_ssim_min": 0.6}
+    assert floors == {"lpips_similarity_min": 0.5, "local_ssim_min": 0.6,
+                      "worst_local_ssim_min": qa_reward._DEFAULT_WORST_LOCAL_SSIM_MIN}
     defaults = qa_reward.gate_thresholds({})
     assert defaults["lpips_similarity_min"] == qa_reward._DEFAULT_LPIPS_SIMILARITY_MIN
     assert defaults["local_ssim_min"] == qa_reward._DEFAULT_LOCAL_SSIM_MIN
@@ -164,7 +165,8 @@ def test_recalibrated_default_gate_rejects_002_class_but_accepts_good_runs():
     (009/013/052) = LPIPS >= 0.976 / local >= 0.60. The default floors (0.80 / 0.50) must
     sit in that gap — reject the degraded numbers, accept the good ones."""
     floors = qa_reward.gate_thresholds({})
-    assert floors == {"lpips_similarity_min": 0.80, "local_ssim_min": 0.50}
+    assert floors == {"lpips_similarity_min": 0.80, "local_ssim_min": 0.50,
+                      "worst_local_ssim_min": qa_reward._DEFAULT_WORST_LOCAL_SSIM_MIN}
     bad = {"components": {"lpips": {"similarity": 0.732}, "local_ssim": {"score": 0.465}}}
     good = {"components": {"lpips": {"similarity": 0.981}, "local_ssim": {"score": 0.601}}}
     assert qa_reward.acceptance_gate("", {}, reward=bad)["ok"] is False

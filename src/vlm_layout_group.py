@@ -32,6 +32,41 @@ _DEFAULT_MAX_TOKENS = 1200
 _MAX_NAME_LEN = 48
 _TEXT_SNIPPET_LEN = 40
 
+# F13 negative cache. The grouping call is the single most expensive VLM request
+# in the pipeline (full-image + whole element summary, 900+ tokens) and the
+# harness re-runs layout on every repair round. When the endpoint times out under
+# GPU contention its (advisory) result is discarded and the deterministic tree is
+# kept — but the NEXT repair round, if the element summary is byte-identical,
+# re-issues the exact same request and eats the exact same timeout again (measured
+# ~24s each, up to 2-3x per fixture: the "68% of wall time, retried identically"
+# lead). This process-local cache remembers a failed attempt keyed on the exact
+# (image, prompt) it was made with, so an identical later call short-circuits
+# instead of re-timing-out. A round that actually CHANGED the layout produces a
+# different prompt -> cache miss -> legitimate re-inference, so grouping quality
+# is never sacrificed; only the wasted identical retry is removed. Successful
+# results already short-circuit via vlm_client's positive result cache.
+# Reset between independent fixtures with reset_fail_cache(); disable with
+# AD_VLM_GROUP_FAILCACHE=0.
+import threading as _threading
+
+_FAILCACHE_ENABLED = os.environ.get("AD_VLM_GROUP_FAILCACHE", "1") not in ("0", "false", "no", "")
+_FAILCACHE_LOCK = _threading.Lock()
+_FAILCACHE: dict[str, str] = {}
+
+
+def _failcache_key(image: bytes, prompt: str) -> str:
+    h = hashlib.sha256()
+    h.update(prompt.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(hashlib.sha256(image).digest())
+    return h.hexdigest()
+
+
+def reset_fail_cache() -> None:
+    """Clear the grouping negative cache (call between independent fixtures/tests)."""
+    with _FAILCACHE_LOCK:
+        _FAILCACHE.clear()
+
 _DIRECTIONS = frozenset({"row", "column", "none"})
 
 _PROMPT_HEADER = (
@@ -500,6 +535,14 @@ def regroup(roots: list[dict], canvas: dict, cfg: dict | None, z_key=None) -> tu
         return roots, info
 
     prompt = _PROMPT_HEADER + json.dumps(_element_summary(roots), ensure_ascii=False)
+    fail_key = _failcache_key(image, prompt) if _FAILCACHE_ENABLED else None
+    if fail_key is not None:
+        with _FAILCACHE_LOCK:
+            prior = _FAILCACHE.get(fail_key)
+        if prior is not None:
+            # An identical request already failed this run; don't re-eat the timeout.
+            info["reason"] = f"{prior}-cached"
+            return roots, info
     try:
         raw = vlm_client.ask_vlm(
             image,
@@ -510,8 +553,15 @@ def regroup(roots: list[dict], canvas: dict, cfg: dict | None, z_key=None) -> tu
             max_tokens=opts["max_tokens"],
             response_schema=_SPEC_SCHEMA,
         )
-    except Exception:
-        info["reason"] = "vlm-error"
+    except Exception as exc:
+        note, detail = vlm_client.classify_vlm_exception(exc)
+        # note is vlm_timeout or vlm_error; normalize to this module's reason style.
+        reason = "vlm-timeout" if note == vlm_client.VLM_TIMEOUT_NOTE else "vlm-error"
+        vlm_client._log_vlm_failure("vlm_layout_group", note, detail, opts["timeout_s"])
+        if fail_key is not None:
+            with _FAILCACHE_LOCK:
+                _FAILCACHE[fail_key] = reason
+        info["reason"] = reason
         return roots, info
     spec = _parse_spec(raw)
     if spec is None:

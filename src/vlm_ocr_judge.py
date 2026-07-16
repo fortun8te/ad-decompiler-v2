@@ -395,9 +395,9 @@ def _judge_disagreements(
                 "ocr_text": original,
             })
             continue
-        if note == "vlm_error":
+        if note in vlm_client.VLM_ERROR_NOTES:
             errors += 1
-            notes.append({"line_id": line.get("id"), "note": "vlm_error", "ocr_text": original})
+            notes.append({"line_id": line.get("id"), "note": note, "ocr_text": original})
             continue
         if answer is not None and _looks_plausible(original, answer):
             # Hygiene after VLM: collapse ``do do this!`` and un-smash ``WeNEVER``.
@@ -502,9 +502,9 @@ def _judge_uncertain(
         note = result["note"]
         original = result["original"]
         checked += 1
-        if note == "vlm_error":
+        if note in vlm_client.VLM_ERROR_NOTES:
             errors += 1
-            notes.append({"line_id": line.get("id"), "note": "vlm_error", "ocr_text": original})
+            notes.append({"line_id": line.get("id"), "note": note, "ocr_text": original})
             continue
         if note:
             notes.append({"line_id": line.get("id"), "note": note, "ocr_text": original})
@@ -577,7 +577,7 @@ def _ocr_read_missed(
         note = result["note"]
         answer = result["answer"]
         if note:
-            if note == "vlm_error":
+            if note in vlm_client.VLM_ERROR_NOTES:
                 errors += 1
             continue
         if not answer or not _looks_plausible("", answer, max_len_factor=6.0):
@@ -611,7 +611,10 @@ def judge_ocr_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     try:
         from PIL import Image
 
-        image = Image.open(image_path)
+        # Decode once on the caller thread before parallel crop workers share
+        # the image.  This prevents intermittent broken-PNG/data-stream errors.
+        image = Image.open(image_path).convert("RGB")
+        image.load()
     except Exception:
         return ocr_result
 

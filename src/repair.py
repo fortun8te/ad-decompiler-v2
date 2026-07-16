@@ -41,11 +41,61 @@ DEFAULTS = {
     "vectorize_score_min": 0.90,
     "element_recall_min": 0.75,
     "low_conf_ocr": 0.55,
+    # Per-layer blended local score (region_ssim + ink IoU / colour) below which a layer
+    # is measurably broken and must steer a targeted repair (worst first).
+    "local_layer_min": 0.35,
 }
+
+_TEXT_ROLES = {"text", "headline", "subheadline", "body", "cta", "price", "text-block"}
 
 
 def _sev(x):
     return {"high": 3, "medium": 2, "low": 1}.get(x, 0)
+
+
+def _local_layer_score(pl):
+    """Blend pixel_diff per-layer evidence into one local score (same recipe as
+    qa_reward.local_component): region SSIM, then rendered-ink IoU for text rows or
+    local colour similarity for shape/image rows. None when the row carries no metric."""
+    if not isinstance(pl, dict):
+        return None
+    value = pl.get("region_ssim")
+    if not isinstance(value, (int, float)):
+        value = pl.get("score")
+    if not isinstance(value, (int, float)):
+        return None
+    value = max(0.0, min(1.0, float(value)))
+    ink_iou = pl.get("ink_iou")
+    region_color = pl.get("region_color")
+    if isinstance(ink_iou, (int, float)):
+        value = 0.7 * value + 0.3 * max(0.0, min(1.0, float(ink_iou)))
+    elif isinstance(region_color, (int, float)):
+        value = 0.85 * value + 0.15 * max(0.0, min(1.0, float(region_color)))
+    return value
+
+
+def _repair_badness(item):
+    """Measured badness of the region/layer a repair targets (0 = no local evidence).
+
+    Repairs that carry measured per-layer/window evidence sort ahead of vague ones at
+    equal severity, so the harness attacks the worst measured failure first."""
+    params = item.get("params") or {}
+    worst = None
+    regions = list(params.get("regions") or [])
+    region = params.get("region")
+    if isinstance(region, dict):
+        regions.append(region)
+    for entry in regions:
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("local_score")
+        if not isinstance(value, (int, float)):
+            value = entry.get("region_ssim")
+        if isinstance(value, (int, float)):
+            worst = value if worst is None else min(worst, value)
+    if worst is None:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - float(worst)))
 
 
 def repairs_from_anomalies(anomalies, design=None):
@@ -492,6 +542,24 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             else:
                 out.append({"stage": "pipeline", "action": "review",
                             "reason": f"{rule}: {detail}", "severity": "medium"})
+        elif rule in ("local-ssim-worst-region", "local-ssim-worst-window"):
+            # The worst measured local window is a concrete, boxed failure — it must map
+            # to an actionable, targeted reconstruction pass, not a manual "pipeline
+            # review" (002: worst window ssim 0.009 at x=704,y=512 got filed as a
+            # medium review while the harness chased a vague VLM opinion instead).
+            region = {"box": hf.get("bbox") or hf.get("box"), "reasons": [detail]}
+            worst_window = qa.get("local_ssim_worst_window") or {}
+            if isinstance(worst_window.get("ssim"), (int, float)):
+                region["region_ssim"] = worst_window["ssim"]
+                region["local_score"] = worst_window["ssim"]
+                if not region.get("box"):
+                    region["box"] = worst_window.get("bbox")
+            out.append({
+                "stage": "reconstruct", "action": "inspect-worst-regions",
+                "reason": detail,
+                "params": {"regions": [region], "worst_window": True},
+                "severity": "high",
+            })
         elif rule in ("local-ssim", "edge-fidelity", "color-fidelity"):
             if rule == "local-ssim":
                 out.append({"stage": "qwen", "action": "retry", "reason": detail,
@@ -573,6 +641,10 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             reasons = raster_slice_failures(pl, fallback_thresholds)
             if reasons:
                 slice_rows.append((pl, reasons))
+        # Worst first: the repair target and the region order must follow the measured
+        # per-layer scores, not the incidental per_layer row order.
+        slice_rows.sort(key=lambda row: _local_layer_score(row[0])
+                        if _local_layer_score(row[0]) is not None else 1.0)
         slice_ids = {str(pl.get("id")) for pl, _ in slice_rows}
         if slice_rows:
             regions = [{
@@ -611,6 +683,58 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
                            "region(s): "
                            + ", ".join(str(entry.get("id")) for entry in unresolved[:4])),
                 "params": {"strict_mask_composite": True},
+                "severity": "high",
+            })
+
+    # ── worst measured layers steer targeted repairs (worst first) ─────────────────────
+    # pixel_diff writes region_ssim/ink_iou/region_color per layer; a layer whose blended
+    # local score collapses is a measured, boxed failure and outranks whole-image
+    # opinions. 002: CTA 0.112, €49 0.185, strike 0.191, €63 0.310 were all ignored while
+    # the harness acted on a vague VLM "misaligned" note.
+    measured_rows = []
+    for pl in per_layer:
+        if not isinstance(pl, dict):
+            continue
+        lid = str(pl.get("id") or "")
+        role = str(pl.get("role") or pl.get("type") or "")
+        if not lid or lid in slice_ids or role == "background":
+            continue
+        local = _local_layer_score(pl)
+        if local is None or local >= t["local_layer_min"]:
+            continue
+        measured_rows.append((local, pl))
+    measured_rows.sort(key=lambda row: row[0])
+    for local, pl in measured_rows:
+        lid = str(pl.get("id"))
+        role = str(pl.get("role") or pl.get("type") or "")
+        box = pl.get("abs_box") or pl.get("box")
+        region_evidence = {
+            "layer_id": lid,
+            "region_ssim": pl.get("region_ssim"),
+            "region_color": pl.get("region_color"),
+            "ink_iou": pl.get("ink_iou"),
+            "box": box,
+            "local_score": round(local, 4),
+        }
+        if pl.get("type") == "text" or role in _TEXT_ROLES:
+            out.append({
+                "stage": "text-analysis",
+                "action": "refit-text-box",
+                "target_id": lid,
+                "reason": (f"text layer {lid} local score {local:.3f} < "
+                           f"{t['local_layer_min']:.2f} (worst measured)"),
+                "params": {"widen": True, "shrink_to_fit": True, "layer_ids": [lid],
+                           "box": box, "region": region_evidence},
+                "severity": "high",
+            })
+        else:
+            out.append({
+                "stage": "reconstruct",
+                "action": "inspect-worst-regions",
+                "target_id": lid,
+                "reason": (f"layer {lid} local score {local:.3f} < "
+                           f"{t['local_layer_min']:.2f} (worst measured)"),
+                "params": {"regions": [region_evidence]},
                 "severity": "high",
             })
 
@@ -679,9 +803,26 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
                 }
             )
 
-    # ── low-confidence OCR lines (from the OCR artifact directly) ──────────────────────
+    # ── low-confidence + disagreeing OCR lines (from the OCR artifact directly) ─────────
+    # Text baked into element-owned product/raster regions (packaging labels, nutrition
+    # panels) is not part of the editable-ad contract: swapping the product image swaps
+    # that text.  Its low confidence and cross-backend disagreement are expected noise and
+    # must not trigger an OCR rerun/review.  Exclude those lines up front using the same
+    # ownership signal the pipeline already produces (elements.json), so repair, QA and the
+    # cross-check metric all count one canonical editable-disagreement set.
     lines = ocr.get("lines", []) if isinstance(ocr, dict) else (ocr or [])
-    low = [l for l in lines if float(l.get("conf", 1.0)) < t["low_conf_ocr"]]
+    from src import ocr as _ocr_mod
+    _product_boxes = []
+    if run_dir:
+        _elements = _load_json(os.path.join(run_dir, "elements.json"), [])
+        _product_boxes = _ocr_mod.product_region_boxes(_elements)
+
+    def _editable(seq):
+        if not _product_boxes:
+            return list(seq)
+        return [l for l in seq if not _ocr_mod.line_in_product_region(l, _product_boxes)]
+
+    low = _editable(l for l in lines if float(l.get("conf", 1.0)) < t["low_conf_ocr"])
     if low:
         out.append(
             {
@@ -693,8 +834,8 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
                 "severity": "low",
             }
         )
-    # disagreement flags from challenger reconciliation
-    disagree = [l for l in lines if (l.get("meta") or {}).get("disagreement")]
+    # disagreement flags from challenger reconciliation (editable text only)
+    disagree = _ocr_mod.disagreement_lines(lines, product_boxes=_product_boxes)
     if disagree:
         out.append(
             {
@@ -728,7 +869,9 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             seen.add(key)
             unique.append(item)
     out = unique
-    out.sort(key=lambda r: _sev(r.get("severity")), reverse=True)
+    # Severity first, then measured local badness: at equal severity the repair that
+    # targets the worst measured region/layer is acted on first (worst first).
+    out.sort(key=lambda r: (_sev(r.get("severity")), _repair_badness(r)), reverse=True)
 
     if not qwen_enabled:
         # Keep the repair actionable when Qwen is unavailable.  Reconstruction is the

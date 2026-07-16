@@ -69,6 +69,14 @@ _WEIGHT_KEYS = ("local_ssim", "lpips", "text")
 # and are the values actually used when a preset is applied.
 _DEFAULT_LPIPS_SIMILARITY_MIN = 0.80
 _DEFAULT_LOCAL_SSIM_MIN = 0.50
+# F6 (002 audit): worst-local floor. Aggregate local SSIM 0.6064 passed the 0.55 gate
+# while the worst 64px window sat at 0.0091 — a giant, high-scoring host raster covering
+# ~70% of the canvas bought the aggregate. The gate must also look at the worst window /
+# worst layer; 0.10 mirrors pixel_diff's own local-ssim-worst-region hard-fail threshold.
+_DEFAULT_WORST_LOCAL_SSIM_MIN = 0.10
+# One layer may contribute at most this share of the local-component weight, so a single
+# huge raster cannot dominate the weighted mean (the reward-buying vector on 002).
+_LOCAL_WEIGHT_SHARE_CAP = 0.25
 
 # F12 content penalty (docs/CRITIC-REVIEW-2026-07-15.md F12c). The scalar reward must not
 # read "globally plausible" when content is erased or headlines are rasterized. The metrics
@@ -95,6 +103,10 @@ _DEFAULT_LPIPS_MAX_EDGE = 256
 # runs predating the contract fields (every existing fixture) carry no contract score and are
 # scored exactly as before.
 _CONSTRUCTION_WEIGHT = 0.55
+# GA3: ceiling on the construction component when the contract EXPLICITLY failed and the
+# score came from a fallback (native_text_ratio / bare construction) rather than the real
+# contract_score. Keeps a failed-contract round from out-scoring a passing one.
+_CONTRACT_FAIL_CONSTRUCTION_CEIL = 0.35
 
 _HARD_FAIL_PENALTY = 0.12          # mirrors harness_loop._qa_score
 
@@ -262,6 +274,9 @@ def gate_thresholds(cfg: Optional[dict] = None) -> dict:
             "lpips_similarity_min", "lpips_similarity_min", _DEFAULT_LPIPS_SIMILARITY_MIN),
         "local_ssim_min": _floor(
             "reward_local_ssim_min", "local_ssim_min", _DEFAULT_LOCAL_SSIM_MIN),
+        "worst_local_ssim_min": _floor(
+            "reward_worst_local_ssim_min", "worst_local_ssim_min",
+            _DEFAULT_WORST_LOCAL_SSIM_MIN),
     }
 
 
@@ -342,26 +357,59 @@ def local_component(qa: Optional[dict]) -> Optional[dict]:
         scored.append((str(row.get("id") or "unnamed"), round(value, 4), weight))
 
     if scored:
+        # F6: cap any single layer's weight share. Pixel weighting let one giant host
+        # raster (~70% of the 002 canvas, region_ssim 0.91) buy the aggregate while
+        # every text/price layer under it had collapsed.
+        raw_total = sum(weight for _, _, weight in scored)
+        weight_cap = _LOCAL_WEIGHT_SHARE_CAP * raw_total
+        scored = [(lid, value, min(weight, weight_cap)) for lid, value, weight in scored]
         total = sum(weight for _, _, weight in scored)
         mean = sum(value * weight for _, value, weight in scored) / max(total, 1e-9)
         ordered = sorted(value for _, value, _ in scored)
         p10 = ordered[min(len(ordered) - 1, int(0.1 * (len(ordered) - 1)))]
-        # Same robust blend pixel_diff uses per scale: the lower tail stays diagnostic.
-        score = 0.7 * mean + 0.3 * p10
+        worst_layer = ordered[0]
+        # Robust blend with the lower tail AND the floor: the worst layer stays
+        # diagnostic instead of vanishing into the weighted mean.
+        score = 0.6 * mean + 0.25 * p10 + 0.15 * worst_layer
+        worst_local = worst_layer
+        worst_window = _worst_window_ssim(qa)
+        if worst_window is not None:
+            # The worst measured 64px window (pixel_diff) is the sharpest degenerate
+            # signal available — fold it in so an erased/seamed region depresses the
+            # component even when every per-layer crop still averages out.
+            score = 0.85 * score + 0.15 * worst_window
+            worst_local = min(worst_local, worst_window)
         worst = sorted(scored, key=lambda item: item[1])[:4]
-        return {
+        result = {
             "score": round(max(0.0, min(1.0, score)), 4),
             "mean": round(mean, 4),
             "p10": round(p10, 4),
+            "min": round(worst_layer, 4),
+            "worst_local": round(worst_local, 4),
             "count": len(scored),
             "worst": [{"id": lid, "score": value} for lid, value, _ in worst],
             "source": "per_layer",
         }
+        if worst_window is not None:
+            result["worst_window"] = round(worst_window, 4)
+        return result
 
     ssim = qa.get("ssim")
     if isinstance(ssim, (int, float)):
         return {"score": round(max(0.0, min(1.0, float(ssim))), 4),
                 "count": 0, "source": "multiscale_ssim"}
+    return None
+
+
+def _worst_window_ssim(qa: Optional[dict]) -> Optional[float]:
+    """Worst measured local window SSIM from pixel_diff evidence, when present."""
+    qa = qa or {}
+    window = qa.get("local_ssim_worst_window")
+    if isinstance(window, dict) and isinstance(window.get("ssim"), (int, float)):
+        return max(0.0, min(1.0, float(window["ssim"])))
+    local = qa.get("local_ssim")
+    if isinstance(local, dict) and isinstance(local.get("min"), (int, float)):
+        return max(0.0, min(1.0, float(local["min"])))
     return None
 
 
@@ -462,7 +510,16 @@ def construction_component(qa: Optional[dict]) -> Optional[dict]:
                 break
     if not isinstance(score, (int, float)):
         return None
-    detail = {"score": round(max(0.0, min(1.0, float(score))), 4), "source": source}
+    score = max(0.0, min(1.0, float(score)))
+    # GA3: when the construction contract EXPLICITLY failed (editability/placement/erasure),
+    # the construction component must not be allowed to dominate the reward off a high raw
+    # native_text_ratio (or bare construction) fallback — an erased-imagery round scores a
+    # great "native text ratio" and would be picked as best. Clamp it below the fail ceiling
+    # so a failed contract can never buy a top-of-ladder construction score.
+    contract_failed = contract.get("pass") is False
+    if contract_failed and source != "contract_score":
+        score = min(score, _CONTRACT_FAIL_CONSTRUCTION_CEIL)
+    detail = {"score": round(score, 4), "source": source}
     ntr = contract.get("native_text_ratio")
     if not isinstance(ntr, (int, float)):
         ntr = qa.get("native_text_ratio")
@@ -470,6 +527,8 @@ def construction_component(qa: Optional[dict]) -> Optional[dict]:
         detail["native_text_ratio"] = round(float(ntr), 4)
     if "pass" in contract:
         detail["contract_pass"] = bool(contract.get("pass"))
+        if contract_failed and source != "contract_score":
+            detail["clamped_contract_fail"] = True
     return detail
 
 
@@ -567,6 +626,12 @@ def _compute_reward(run_dir, cfg, qa, source_path, render_path) -> dict:
         source = source_path or (_resolve_source(run_dir) if run_dir else None)
         render = render_path or (_resolve_render(run_dir) if run_dir else None)
         lpips = lpips_score(source, render, cfg)
+        # GA2: LPIPS was attempted this round (paths available). If it is enabled but came
+        # back None (torch/lpips import failed, model download failed, CPU OOM), mark it
+        # ``unavailable`` so the acceptance gate can flag the missing perceptual floor RED
+        # instead of silently skipping it. Absent-because-disabled leaves lpips None.
+        if lpips is None and lpips_enabled(cfg) and (source and render):
+            lpips = {"similarity": None, "unavailable": True}
     text = text_component(qa)
 
     weights = reward_weights(cfg)
@@ -626,6 +691,9 @@ def acceptance_gate(run_dir: str, cfg: Optional[dict] = None, *,
     if reward_mode(cfg) != "phase2":
         return {"ok": True, "skipped": "legacy"}
     try:
+        if qa is None and run_dir:
+            qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+        qa = qa if isinstance(qa, dict) else {}
         if not isinstance(reward, dict):
             reward = compute_reward(run_dir, cfg, qa=qa)
         floors = gate_thresholds(cfg)
@@ -640,18 +708,71 @@ def acceptance_gate(run_dir: str, cfg: Optional[dict] = None, *,
                                     "min": floors["local_ssim_min"], "ok": passed}
             ok = ok and passed
 
+        # F6: worst-local floor. An aggregate that passes while the worst window sits at
+        # ~0 is a bought score (002: local 0.6064 vs worst window 0.0091) — the gate must
+        # go RED on the worst measured local evidence, not just the mean.
+        worst_local = None
+        if isinstance(local, dict):
+            for key in ("worst_local", "min"):
+                value = local.get(key)
+                if isinstance(value, (int, float)):
+                    worst_local = float(value) if worst_local is None else min(
+                        worst_local, float(value))
+        window = _worst_window_ssim(qa)
+        if window is not None:
+            worst_local = window if worst_local is None else min(worst_local, window)
+        if worst_local is not None:
+            passed = worst_local >= floors["worst_local_ssim_min"]
+            checks["worst_local_ssim"] = {"value": round(worst_local, 4),
+                                          "min": floors["worst_local_ssim_min"],
+                                          "ok": passed}
+            ok = ok and passed
+
         lpips = components.get("lpips") or {}
         if isinstance(lpips, dict) and isinstance(lpips.get("similarity"), (int, float)):
             passed = float(lpips["similarity"]) >= floors["lpips_similarity_min"]
             checks["lpips_similarity"] = {"value": lpips["similarity"],
                                           "min": floors["lpips_similarity_min"], "ok": passed}
             ok = ok and passed
+        elif isinstance(lpips, dict) and lpips.get("unavailable") and lpips_enabled(cfg):
+            # GA2: LPIPS is one of the three advertised anti-degenerate floors. When it was
+            # ATTEMPTED but failed to load (torch/lpips import failed, model download failed,
+            # CPU OOM) compute_reward marks the component ``unavailable`` — the check used to
+            # silently vanish, letting a perceptually catastrophic render clear the gate.
+            # Record it RED so the missing floor is visible and non-passing. A reward that
+            # simply never attempted LPIPS (no run_dir/paths, or explicitly disabled) carries
+            # no sentinel and is still legitimately skipped.
+            checks["lpips_similarity"] = {"value": None, "ok": False,
+                                          "min": floors["lpips_similarity_min"],
+                                          "reason": "unavailable"}
+            ok = False
+
+        # Standing hard failures and a failed construction contract can never be green:
+        # the gate record itself must read RED, not just the separate qa.ok flag (002's
+        # gate said ok:true beside 4 hard fails and contract_pass=false).
+        hard_fails = reward.get("hard_fails")
+        if not isinstance(hard_fails, int):
+            hard_fails = _hard_fail_count(qa)
+        if hard_fails:
+            checks["hard_fails"] = {"value": hard_fails, "max": 0, "ok": False}
+            ok = False
+        contract = qa.get("contract") if isinstance(qa.get("contract"), dict) else {}
+        if contract.get("pass") is False:
+            checks["contract"] = {
+                "value": False, "ok": False,
+                "detail": "construction contract failed (editability/placement)",
+            }
+            ok = False
 
         if not checks:
             return {"ok": True, "skipped": "no_metrics"}
         return {"ok": ok, "checks": checks}
     except Exception as exc:
-        return {"ok": True, "skipped": f"gate_error:{type(exc).__name__}"}
+        # Fail CLOSED. The gate is the anti-degenerate safety net; a gate that cannot
+        # evaluate must never convert a would-be RED into GREEN (critic A GA1). A
+        # malformed qa row / non-dict contract / NaN throwing inside the gate path used
+        # to return ok:True, silently scoring a degenerate render as acceptable.
+        return {"ok": False, "skipped": f"gate_error:{type(exc).__name__}", "error": True}
 
 
 def reward_evidence(reward: Optional[dict]) -> Optional[dict]:
@@ -842,6 +963,62 @@ def _attach_layer_ids(items: list[dict], design: Optional[dict]) -> None:
             item["layer_ids"] = matched
 
 
+_CROP_PAD_PX = 64
+_CROP_NOTE = (
+    "\n\nNOTE: both images are the SAME cropped region of a larger advertisement — the "
+    "region QA measured as the worst match. Report only defects visible inside the crop."
+)
+
+
+def _worst_crop_box(qa: Optional[dict]) -> Optional[dict]:
+    """Box of the worst measured evidence: worst local window, else worst per-layer box.
+
+    F9: the whole-image critique missed local defects (seam, broken plate, wrong fonts)
+    and produced vague whole-image opinions. Feeding the VLM a crop of the worst
+    measured window makes its report local and checkable — and cheap (fewer pixels)."""
+    qa = qa or {}
+    window = qa.get("local_ssim_worst_window")
+    if isinstance(window, dict):
+        box = window.get("bbox") or window.get("box")
+        if isinstance(box, dict) and all(
+                isinstance(box.get(k), (int, float)) for k in ("x", "y", "w", "h")):
+            return dict(box)
+    worst_box, worst_value = None, None
+    for row in qa.get("per_layer") or []:
+        if not isinstance(row, dict):
+            continue
+        value = row.get("region_ssim")
+        if not isinstance(value, (int, float)):
+            continue
+        box = row.get("abs_box") or row.get("box")
+        if not (isinstance(box, dict) and all(
+                isinstance(box.get(k), (int, float)) for k in ("x", "y", "w", "h"))):
+            continue
+        if worst_value is None or value < worst_value:
+            worst_value, worst_box = value, dict(box)
+    return worst_box
+
+
+def _crop_image_bytes(image_bytes: bytes, box: dict, pad: int = _CROP_PAD_PX) -> bytes:
+    """Crop PNG bytes to *box* (padded, clamped). Raises on any failure — callers catch."""
+    import io
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image.load()
+        left = max(0, int(box["x"]) - pad)
+        top = max(0, int(box["y"]) - pad)
+        right = min(image.width, int(box["x"] + box["w"]) + pad)
+        bottom = min(image.height, int(box["y"] + box["h"]) + pad)
+        if right - left < 8 or bottom - top < 8:
+            raise ValueError("crop box degenerate")
+        cropped = image.crop((left, top, right, bottom))
+        out = io.BytesIO()
+        cropped.save(out, format="PNG")
+        return out.getvalue()
+
+
 def run_critique(run_dir: str, cfg: Optional[dict] = None, *,
                  source_path: Optional[str] = None,
                  preview_path: Optional[str] = None,
@@ -877,10 +1054,26 @@ def _run_critique(run_dir, cfg, source_path, preview_path, design, write) -> dic
     if not source_bytes or not preview_bytes:
         return {"items": [], "error": "empty_artifacts"}
 
+    # F9: where per-layer/window QA evidence exists, critique CROPS of the worst
+    # measured region instead of the whole image (opt-out via critique.crop_worst).
+    crop_box = None
+    prompt = _CRITIQUE_PROMPT
+    if _critique_cfg(cfg).get("crop_worst", True) and run_dir:
+        qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+        box = _worst_crop_box(qa if isinstance(qa, dict) else {})
+        if box:
+            try:
+                source_bytes = _crop_image_bytes(source_bytes, box)
+                preview_bytes = _crop_image_bytes(preview_bytes, box)
+                crop_box = box
+                prompt = _CRITIQUE_PROMPT + _CROP_NOTE
+            except Exception:
+                crop_box = None  # fall back to the whole image, failure-proof
+
     settings = _critique_vlm_settings(cfg)
     try:
         answer = _ask_vlm_pair(
-            source_bytes, preview_bytes, _CRITIQUE_PROMPT,
+            source_bytes, preview_bytes, prompt,
             base_url=settings["base_url"], model=settings["model"],
             timeout_s=settings["timeout_s"], max_tokens=settings["max_tokens"],
             response_schema=_CRITIQUE_SCHEMA,
@@ -899,6 +1092,8 @@ def _run_critique(run_dir, cfg, source_path, preview_path, design, write) -> dic
         "source": os.path.basename(source),
         "preview": os.path.basename(preview),
     }
+    if crop_box:
+        result["crop"] = crop_box
     if write and run_dir:
         try:
             _write_json(os.path.join(run_dir, "qa_critique.json"), result)

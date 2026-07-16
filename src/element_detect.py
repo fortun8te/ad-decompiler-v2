@@ -439,26 +439,125 @@ def detect(
     merged.sort(key=lambda c: c["area"], reverse=True)
     merged = merged[: opts["maxElements"]]
 
+    # 8. rounded-plate overlays (pills / cards / banners on ANY background, incl.
+    #    full-bleed photos where the residual pass drowns in fragments).  Classic-CV
+    #    proposals from overlay_detect; duplicates of residual CCs are skipped here
+    #    and fusion dedups against SAM observations later.  docs/HARD-CREATIVES-SPEC.md
+    #    gap #2 — the critical detection lever for peel (docs/PEEL-DECOMPOSITION.md §4a).
+    if ((cfg.get("overlay_detect") or {}).get("enabled", True)):
+        try:
+            merged.extend(_overlay_candidates(rgb, ocr, cfg, merged, n))
+        except Exception:
+            pass  # overlay proposals are additive; never break detection
+
     elements = []
     masks = []
     for i, e in enumerate(merged):
         eid = f"E{i}"
-        elements.append(
-            {
-                "id": eid,
-                "box": e["box"],
-                "kind": e["kind"],
-                "area": float(e["area"]),
-                "coverage": e["coverage"],
-                "source": "residual-cc",
-                "mask": os.path.join("elements", f"{eid}.png") if run_dir else None,
-            }
-        )
+        entry = {
+            "id": eid,
+            "box": e["box"],
+            "kind": e["kind"],
+            "area": float(e["area"]),
+            "coverage": e["coverage"],
+            "source": e.get("source", "residual-cc"),
+            "mask": os.path.join("elements", f"{eid}.png") if run_dir else None,
+        }
+        if e.get("role"):
+            entry["role"] = e["role"]
+        if e.get("meta"):
+            entry["meta"] = e["meta"]
+        elements.append(entry)
         masks.append((eid, e["_mask"]))
 
     if run_dir:
         _write_artifacts(schema, elements, run_dir, masks)
     return elements
+
+
+_OVERLAY_ROLE = {"pill": "button", "stadium": "button", "banner": "shape",
+                 "card": "card"}
+
+
+def _render_plate_mask(bw: int, bh: int, radius):
+    """Analytic rounded-rect mask (box-local uint8 255) from a proposal's radius.
+
+    The analytic silhouette beats the raw CC mask: text/AA holes are filled and the
+    footprint is exactly what the native rect will cover — which is precisely the
+    occluder footprint peel needs (docs/PEEL-DECOMPOSITION.md §2).
+    """
+    np = _require_np()
+    cv2 = _require_cv2()
+    mask = np.zeros((bh, bw), np.uint8)
+    if radius is None or (isinstance(radius, (int, float)) and radius <= 0):
+        mask[:, :] = 255
+        return mask
+    if isinstance(radius, dict):
+        r = {k: int(round(max(0.0, float(v)))) for k, v in radius.items()}
+    else:
+        rr = int(round(max(0.0, float(radius))))
+        r = {"topLeft": rr, "topRight": rr, "bottomRight": rr, "bottomLeft": rr}
+    cap = min(bw, bh) // 2
+    r = {k: min(v, cap) for k, v in r.items()}
+    mask[:, :] = 255
+    yy, xx = np.mgrid[0:bh, 0:bw]
+    for name, (cx_edge, cy_edge) in (("topLeft", (0, 0)), ("topRight", (1, 0)),
+                                     ("bottomRight", (1, 1)), ("bottomLeft", (0, 1))):
+        rad = r.get(name, 0)
+        if rad <= 0:
+            continue
+        cx = rad if cx_edge == 0 else bw - rad
+        cy = rad if cy_edge == 0 else bh - rad
+        qx = (xx < cx) if cx_edge == 0 else (xx >= cx)
+        qy = (yy < cy) if cy_edge == 0 else (yy >= cy)
+        outside = qx & qy & (((xx - cx) ** 2 + (yy - cy) ** 2) > rad * rad)
+        mask[outside] = 0
+    return mask
+
+
+def _overlay_candidates(rgb, ocr, cfg, existing, n):
+    """Rounded-plate overlay proposals as element candidates (see step 8 in detect)."""
+    np = _require_np()
+    from src import overlay_detect
+    h, w = rgb.shape[:2]
+    lines = (ocr or {}).get("lines", []) if isinstance(ocr, dict) else (ocr or [])
+    plates = overlay_detect.detect_overlays(
+        rgb.astype(np.uint8), text_lines=lines, canvas={"w": w, "h": h}, cfg=cfg)
+    out = []
+    for plate in plates:
+        b = plate["bbox"]
+        dup = False
+        for other in existing:
+            ob = other["box"]
+            ix = max(0, min(b["x"] + b["w"], ob["x"] + ob["w"]) - max(b["x"], ob["x"]))
+            iy = max(0, min(b["y"] + b["h"], ob["y"] + ob["h"]) - max(b["y"], ob["y"]))
+            inter = ix * iy
+            union = b["w"] * b["h"] + ob["w"] * ob["h"] - inter
+            if union > 0 and inter / union >= 0.70:
+                dup = True
+                break
+        if dup:
+            continue
+        mask = _render_plate_mask(b["w"], b["h"], plate.get("corner_radius"))
+        area = int(np.count_nonzero(mask))
+        out.append({
+            "box": dict(b),
+            "_mask": mask,
+            "kind": "shape",
+            "role": _OVERLAY_ROLE.get(plate["kind"], "card"),
+            "area": area,
+            "coverage": round(area / n, 4),
+            "source": "overlay-cv",
+            "meta": {"overlay_kind": plate["kind"],
+                     "corner_radius": plate.get("corner_radius"),
+                     "fill": plate.get("fill"),
+                     "text_ids": list(plate.get("text_ids") or []),
+                     "interior_uniform": plate.get("interior_uniform"),
+                     "source": "overlay-cv"},
+            "_stats": {"solidity": plate.get("fill_ratio"),
+                       "domColors": 1, "edgeDensity": 0.0},
+        })
+    return out
 
 
 def _write_artifacts(schema, elements, run_dir, masks=None):

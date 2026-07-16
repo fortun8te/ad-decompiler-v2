@@ -45,6 +45,7 @@ from src.harness import (
     is_actionable,
     load_repairs,
     load_repair_candidates,
+    rank_repairs,
     recommended_resume,
     _load_json,
     _write_json,
@@ -67,9 +68,16 @@ from src.qa_config import visual_pass_ssim
 # runs/benchmark-final/016_attached_ac1eeeabce759396: qa.json restored to the round-0 ssim
 # 0.874 while runtime_report.json.qa_evidence still showed round-1's ssim 0.7586 / "editable
 # text recall 0.33 < 0.88").
+# GB4: snapshot the metadata AND the pixel assets that reconstruction.json / design.json
+# reference. Restoring only the JSON on a rollback used to leave a regressed round's bad
+# pixels (a botched inpaint / removal mask) on disk under rolled-back metadata, so the
+# reverted "best" design shipped with the worse round's background. Keep raster outputs in
+# lockstep with the metadata that points at them.
 _SNAPSHOT_FILES = (
     "design.json", "qa.json", "preview.png", "layout.json", "figma_export.png",
     "reconstruction.json", "fallback.json", "runtime_report.json",
+    "background_clean.png", "removal_mask.png", "ownership.png",
+    "removal_ownership.png", "normalized.png", "layers_contact.png",
 )
 
 # Metrics folded into the harness-local round score. This is a read-only aggregation of QA
@@ -139,11 +147,15 @@ def _score_round(run_dir: str, cfg: Optional[dict], qa: Optional[dict]) -> tuple
 
 
 def _reward_gate(run_dir: str, cfg: Optional[dict], qa: Optional[dict]) -> dict:
-    """Anti-degenerate acceptance gate (phase2 only). Failure-proof: defaults to ok."""
+    """Anti-degenerate acceptance gate (phase2 only). Fails CLOSED on error.
+
+    A gate that cannot evaluate must not grant acceptance (critic A GA1); a swallowed
+    exception here used to default ok:True and silently flip a degenerate round green.
+    """
     try:
         return qa_reward.acceptance_gate(run_dir, cfg, qa=qa)
     except Exception as exc:
-        return {"ok": True, "skipped": f"gate_error:{type(exc).__name__}"}
+        return {"ok": False, "skipped": f"gate_error:{type(exc).__name__}", "error": True}
 
 
 def _snapshot_artifacts(run_dir: str) -> dict[str, bytes]:
@@ -352,12 +364,15 @@ def _fallback_critic(run_dir: str, cfg: dict) -> dict:
 
 
 def _apply_vlm_critique(run_dir: str, cfg: dict, critic_output: dict) -> dict:
-    """Fold the phase2 VLM critique into the critic output as the PRIMARY repair driver.
+    """Fold the phase2 VLM critique into the critic output as a TIEBREAKER repair source.
 
     Critique repairs (already mapped onto the existing repair-action vocabulary by
-    qa_reward.critique_to_repairs) are prepended to ``filtered_repairs`` so
-    ``recommended_resume`` picks them first; metric/tool repairs remain as fallback
-    (the VLM is never the sole authority). Failure-proof: any error leaves the critic
+    qa_reward.critique_to_repairs) are merged AFTER the metric/tool repairs and the
+    combined list is re-ranked by ``harness.rank_repairs``: deterministic, measured
+    evidence (per-layer SSIM/ink IoU, hard failures) outranks VLM opinions at equal
+    severity, and the worst measured layer sorts first. (Previously critique repairs
+    were prepended as the "primary driver", which let a vague medium VLM opinion outrank
+    HIGH measured failures — the 002 no-op.) Failure-proof: any error leaves the critic
     output untouched.
     """
     try:
@@ -365,11 +380,25 @@ def _apply_vlm_critique(run_dir: str, cfg: dict, critic_output: dict) -> dict:
             return critic_output
         critique = qa_reward.run_critique(run_dir, cfg)
         items = critique.get("items") or []
+        critique_error = critique.get("error")
+        # GB2: a VLM timeout / transport error (vlm_client default 20s, nondeterministic
+        # under GPU contention) must NOT read as "the VLM inspected the render and found
+        # nothing". Empty-with-an-error is INCONCLUSIVE; empty-without-error is a clean
+        # opinion. Surface the distinction so downstream never treats a flickering timeout
+        # as convergence evidence.
+        if items:
+            status = "ok"
+        elif critique_error:
+            status = "error"
+        else:
+            status = "empty"
         critic_output["vlm_critique"] = {
             "items": items,
             "count": len(items),
             "model": critique.get("model"),
-            "error": critique.get("error"),
+            "error": critique_error,
+            "status": status,
+            "inconclusive": status == "error",
         }
         if not items:
             return critic_output
@@ -380,16 +409,113 @@ def _apply_vlm_critique(run_dir: str, cfg: dict, critic_output: dict) -> dict:
             return critic_output
         merged: list = []
         seen: set[tuple] = set()
-        for repair in critique_repairs + list(critic_output.get("filtered_repairs") or []):
+        admission_rejected = []
+        for repair in list(critic_output.get("filtered_repairs") or []) + critique_repairs:
+            params = repair.get("params") or {}
+            # A crop critique that already resolves to concrete layer IDs is a local
+            # reconstruction/text problem, not evidence that the whole SAM proposal
+            # stage missed an object. Broad element-propose here caused dozens of nearly
+            # identical full-card peel masks for 002's one missing arrow.
+            if (repair.get("stage") == "sam3"
+                    and repair.get("action") == "rerun-detection"
+                    and params.get("source") == "vlm_critique"
+                    and params.get("layer_ids")):
+                admission_rejected.append({
+                    "repair": repair,
+                    "reason": "localized-vlm-issue-must-not-trigger-broad-redetection",
+                })
+                continue
+            if (repair.get("stage") == "layout"
+                    and repair.get("action") == "refit-geometry"
+                    and params.get("source") == "vlm_critique"
+                    and not any(key in params for key in (
+                        "measured_dx", "measured_dy", "min_container_frac",
+                        "max_container_frac", "tighten_containers",
+                    ))):
+                admission_rejected.append({
+                    "repair": repair,
+                    "reason": "vlm-layout-opinion-has-no-measured-geometry-or-patch",
+                })
+                continue
             signature = (repair.get("stage"), repair.get("action"), repair.get("target_id"))
             if signature in seen:
                 continue
             seen.add(signature)
             merged.append(repair)
-        critic_output["filtered_repairs"] = merged
+        qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+        critic_output["filtered_repairs"] = rank_repairs(merged, qa)
+        if admission_rejected:
+            critic_output.setdefault("admission_control", {})["rejected"] = admission_rejected
     except Exception:
         pass
     return critic_output
+
+
+def _fixer_proposals(critic_output: dict, fixes: list) -> list[dict]:
+    """Rank applied fixer ids against the critic's prioritized issues (F10 honesty).
+
+    Every proposal is concrete (it names the config key it changed) and starts
+    ``unvalidated`` — fixer.json must never present untested config changes as fixes."""
+    prefix_to_category = (
+        ("inpaint", "inpaint"), ("force-lama", "inpaint"),
+        ("ocr", "ocr"), ("boost-ocr", "ocr"),
+        ("vlm", "sam"), ("boost-vlm", "sam"),
+        ("layout", "layout"), ("tighten-containers", "layout"),
+        ("restage", "staging"), ("figma", "staging"), ("staging", "staging"),
+    )
+    issue_rank: dict[str, tuple] = {}
+    issues = (critic_output or {}).get("prioritized_issues") or (critic_output or {}).get("issues") or []
+    for position, issue in enumerate(issues):
+        category = str((issue or {}).get("category") or "").lower()
+        if category and category not in issue_rank:
+            issue_rank[category] = (position, issue.get("severity"))
+
+    records = []
+    for index, fix in enumerate(fixes or []):
+        fid = str(fix)
+        category = next((cat for prefix, cat in prefix_to_category
+                         if fid.startswith(prefix)), "staging")
+        position, severity = issue_rank.get(category, (len(issues), None))
+        records.append({
+            "fix": fid,
+            "category": category,
+            "severity": severity,
+            "status": "unvalidated",
+            "_sort": (position, index),
+        })
+    records.sort(key=lambda record: record.pop("_sort"))
+    for rank, record in enumerate(records, start=1):
+        record["rank"] = rank
+    return records
+
+
+def _patch_fixer_validation(run_dir: str, fixer_round: Optional[int],
+                            convergence_trail: list[dict], epsilon: float) -> None:
+    """After the loop, mark fixer.json proposals validated only if a LATER round improved."""
+    path = os.path.join(run_dir, "fixer.json")
+    if fixer_round is None or not os.path.exists(path):
+        return
+    report = _load_json(path, None)
+    if not isinstance(report, dict):
+        return
+    validated = any(
+        isinstance(record, dict)
+        and (record.get("round") or 0) > fixer_round
+        and isinstance(record.get("delta"), (int, float))
+        and record["delta"] > epsilon
+        for record in convergence_trail or []
+    )
+    report["validated"] = bool(validated)
+    for proposal in report.get("proposals") or []:
+        if isinstance(proposal, dict):
+            proposal["status"] = "validated" if validated else "unvalidated"
+    if not validated:
+        report["note"] = ("config proposals were applied but no later round improved the "
+                          "reward — they remain unvalidated, not fixes")
+    try:
+        _write_json(path, report)
+    except OSError:
+        pass
 
 
 def _run_fixer_pass(run_dir: str, cfg: dict, critic_output: dict) -> dict:
@@ -513,9 +639,17 @@ def _run_round(
             return round_record, working_cfg, True
 
     fixer_result = _run_fixer_pass(run_dir, working_cfg, critic_output)
+    fixer_fixes = fixer_result.get("fixes") or []
     _write_json(os.path.join(run_dir, "fixer.json"), {
-        "fixes": fixer_result.get("fixes") or [],
-        "fix_count": len(fixer_result.get("fixes") or []),
+        "fixes": fixer_fixes,
+        "fix_count": len(fixer_fixes),
+        # Honesty contract: these are config PROPOSALS applied to the next round's
+        # config; none is a proven fix until a rerun improves the reward. The loop
+        # patches ``validated`` after observing the following round.
+        "proposals": _fixer_proposals(critic_output, fixer_fixes),
+        "validated": False,
+        "note": ("ranked config proposals for the next round; unvalidated until a "
+                 "rerun demonstrates an improved reward"),
     })
     round_record["fixer"] = {
         "fixes": fixer_result.get("fixes") or [],
@@ -578,6 +712,7 @@ def run_until_acceptable(
     best_snapshot = _snapshot_artifacts(run_dir) if before_score is not None else {}
     plateau = 0
     rolled_back_rounds = 0
+    last_fixer_round: Optional[int] = None
     # Which round's artifacts are actually on disk right now (0 = the pre-loop pipeline
     # result). This is the single source of truth the final "emit best design" step and
     # the harness reports below use to say what shipped -- distinct from ``best_round``,
@@ -612,6 +747,17 @@ def run_until_acceptable(
         round_stopped = round_record.get("stopped")
         attempts = (round_record.get("repairs") or {}).get("attempts") or []
         last_repair_refreshed_qa = any(attempt.get("qa_fresh") for attempt in attempts)
+        # A round only counts as convergence EVIDENCE when something was actually
+        # evaluated: an admitted repair executed, or the pipeline wrote fresh QA. Rounds
+        # whose every candidate was rejected/skipped at admission are not proof the run
+        # converged — counting them caused the observed premature plateau (002: one
+        # rejected no-op ended the loop before any high-severity repair was tried).
+        round_evaluated = bool(
+            [a for a in attempts
+             if not a.get("admission_skipped") and not a.get("admission_rejected")]
+        ) or bool((round_record.get("pipeline") or {}).get("qa_fresh"))
+        if (round_record.get("fixer") or {}).get("fixes"):
+            last_fixer_round = round_num
         if round_stopped not in {"pipeline_exception", "pipeline_failed"}:
             # The pipeline and/or repairs actually ran and wrote fresh artifacts this
             # round; it is what's on disk until the scoring below proves otherwise. The
@@ -670,9 +816,18 @@ def run_until_acceptable(
             # zero, so it counts toward the plateau. This is what makes a reward that
             # flips between two states (the observed 0.87/0.5 ↔ 0.37/0.79 oscillation)
             # plateau-stop instead of bouncing until max_rounds.
-            plateau = plateau + 1 if (record["rolled_back"] or abs(delta) < epsilon) else 0
+            #
+            # Rejected/admission-skipped repairs are NOT convergence evidence: a round
+            # that evaluated nothing (every candidate rejected before a rerun) leaves the
+            # plateau counter untouched so the loop moves on to the remaining repairs
+            # instead of "giving up" on the strength of a no-op it refused to run.
+            record["evaluated"] = round_evaluated
+            if record["rolled_back"] or (abs(delta) < epsilon and round_evaluated):
+                plateau += 1
+            elif abs(delta) >= epsilon:
+                plateau = 0
             before_score = after_score
-        elif not _round_made_progress(round_record):
+        elif round_evaluated and not _round_made_progress(round_record):
             # F13c: even with no scalar reward (legacy / metrics unavailable), a round that
             # neither improved QA metrics nor applied a fix is a no-op — count it toward the
             # plateau and block its repairs so the loop stops instead of chasing OCR noise.
@@ -760,6 +915,7 @@ def run_until_acceptable(
         },
     }
     _write_json(os.path.join(run_dir, "harness_loop.json"), summary)
+    _patch_fixer_validation(run_dir, last_fixer_round, convergence, epsilon)
     _patch_harness_report(run_dir, summary["reward"], shipped_round=summary["shipped_round"])
     _patch_runtime_report(run_dir, summary["convergence"], stopped, summary["qa_ok"],
                           reward=summary["reward"])

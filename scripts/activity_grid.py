@@ -48,6 +48,9 @@ _MARKERS: list[tuple[str, tuple[str, ...]]] = [
 
 _LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2})\]\s+(.*)$")
 _DONE_SECS_RE = re.compile(r"\bdone in\s+(\d+(?:\.\d+)?)s\b")
+_QA_METRICS_RE = re.compile(
+    r"\bssim=(\d+(?:\.\d+)?)\s+text_recall=(\d+(?:\.\d+)?)\s+repairs=(\d+)"
+)
 _STALL_S = 90.0
 _POLL_S = 0.08
 _ROOT_RECHECK_S = 1.0
@@ -254,6 +257,52 @@ def estimate_log_span_s(text: str) -> float | None:
     if delta < 0:
         delta += 86400
     return float(delta)
+
+
+def parse_qa_metrics(text: str) -> dict[str, float] | None:
+    """Last ``qa → ssim=… text_recall=… repairs=…`` metrics in the log, if any."""
+    last: re.Match[str] | None = None
+    for m in _QA_METRICS_RE.finditer(text):
+        last = m
+    if not last:
+        return None
+    try:
+        return {
+            "ssim": float(last.group(1)),
+            "text_recall": float(last.group(2)),
+            "repairs": int(last.group(3)),
+        }
+    except ValueError:
+        return None
+
+
+def parse_stage_secs(text: str) -> dict[str, float]:
+    """Per-stage wall seconds from consecutive stage-marker timestamps.
+
+    Each marker prints when its stage finishes, so the delta from the previous
+    marker (or the first log timestamp) approximates that stage's duration.
+    """
+    out: dict[str, float] = {}
+    prev_ts: int | None = None
+    first_ts: int | None = None
+    for raw in text.splitlines():
+        m = _LINE_RE.match(raw.strip())
+        if not m:
+            continue
+        ts = _hms_to_secs(m.group(1))
+        if first_ts is None:
+            first_ts = ts
+        body = m.group(2)
+        for name, markers in _MARKERS:
+            if any(mk in body for mk in markers):
+                anchor = prev_ts if prev_ts is not None else first_ts
+                delta = ts - anchor
+                if delta < 0:
+                    delta += 86400
+                out[name] = round(float(delta), 1)
+                prev_ts = ts
+                break
+    return out
 
 
 def estimate_started_at(text: str, log_mtime: float, now: float) -> float:
@@ -644,6 +693,8 @@ def _pending_stub(image_id: str, run_dir: Path) -> dict[str, Any]:
         "has_preview": False,
         "last_line": "",
         "feed": [],
+        "qa": None,
+        "stage_secs": {},
     }
 
 
@@ -810,6 +861,8 @@ class Tracker:
                 "has_preview": False,
                 "last_line": "",
                 "feed": [],
+                "qa": None,
+                "stage_secs": {},
             }
 
         prev = self._cache.get(image_id)
@@ -830,9 +883,13 @@ class Tracker:
         if unchanged:
             done, active, complete, failed = prev["parsed"]
             text = prev.get("text", "")
+            qa = prev.get("qa")
+            stage_secs = prev.get("stage_secs") or {}
         else:
             text = self._read_text_cached(image_id, log_path, size, mtime)
             done, active, complete, failed = parse_log(text)
+            qa = parse_qa_metrics(text)
+            stage_secs = parse_stage_secs(text)
 
         # Harness / resume reopened a previously finished log — unfreeze the clock.
         prev_complete = bool(prev and prev.get("parsed") and prev["parsed"][2])
@@ -914,6 +971,8 @@ class Tracker:
             "text": text,
             "parsed": (done, active, complete, failed),
             "activity_mtime": activity_mtime,
+            "qa": qa,
+            "stage_secs": stage_secs,
         }
 
         return {
@@ -935,6 +994,8 @@ class Tracker:
             "has_preview": has_preview,
             "last_line": _last_log_line(text),
             "feed": extract_feed(text, image_id=image_id),
+            "qa": qa,
+            "stage_secs": stage_secs,
         }
 
     def refresh(self) -> None:

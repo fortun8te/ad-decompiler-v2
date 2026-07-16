@@ -415,6 +415,62 @@ Notes for the applier:
   `matting=`; add `vram.stage_boundary("elements", "peel", …)` before it when
   `peel.matting.device == "cuda"` (CPU needs no boundary).
 
+## 5c. H7/H13 make-or-break: text directly on a busy/dark photo (2026-07-16)
+
+The user-flagged make-or-break case is **text sitting directly on a busy or DARK photo
+with no backing plate** (H7 sleep-mask, H13 dark-towel callouts). The risk is subtle: a
+locally-flat ring on a dark photo passes the solid-median flat-fill test and leaves a
+flat painted patch under the peeled headline — a visible smear. The fix
+(`background_plate_kind`, §5 diff) classifies the background plate as `photo` vs
+`background` by median windowed stddev over the visible plate; a `photo` plate denies
+the solid path (`_flat_fill_allowed` returns False for photo kinds) and routes every
+hole — text and element — to the injected inpainter (LaMa/Flux, never a solid patch).
+
+**Proven this session (ground-truth, exact):** `tests/test_peel_scene.py` adds three
+H7 tests:
+
+* `test_background_plate_kind_flags_photo_and_rejects_flat_chrome` — flat gray and
+  near-black FLAT chrome → `background`; textured photo AND **dark textured** photo →
+  `photo` (the sleep-mask risk).
+* `test_flat_fill_is_denied_on_photo_under_kind` — the routing guard: no solid patch may
+  land on a `photo` plate regardless of policy/caps, while the same hole on a `background`
+  plate stays solid-eligible (proves the gate is kind-driven).
+* `test_h7_text_on_photo_plate_routes_to_inpaint_not_solid` — full `peel_scene` on a
+  photographic background + an activating card/badge element pair + a headline sitting
+  directly on the photo. Asserts: not skipped, `plate_kind == "photo"`, the text-class
+  background hole routes to `inpaint` (**zero solid backends**), the inpaint call carries
+  `under_kind="photo", background=True, text_occluder=True`, background pixels outside the
+  union-of-footprints are **byte-identical** to the input, and recomposite is **exact**
+  (`max_abs_diff=0`) with the text footprint excluded (native text renders on top — no
+  ghost text baked into the plate).
+
+**Measured limitation (honest):** the stddev classifier reads a *heavily* Gaussian-blurred
+smooth dark region (σ≈3 blur of noise) as `background`, because it has no local texture.
+Real photos (JPEG grain, edges, gradients) clear the σ=7 threshold comfortably; a fully
+out-of-focus dark backdrop is the residual edge case. Not re-tuned — lowering the
+threshold would misclassify subtle-vignette flat chrome as photo. `flat_fill_tol` bounds
+the downside if it ever misfires.
+
+**Runtime safety (the original enabled blocker) is resolved.** `run_pipeline.py`
+`_peel_inpaint` is now a ladder: text holes → Telea (LaMa when the under-layer is a
+photo), small non-photo holes → Telea, photo-band holes → Flux **only after
+`vram.ensure_flux_vram` evicts SAM**. Plus the GB1 fix in `src/qwen_worker.py`
+(`_comfy_abort`): every early-return-after-`/prompt` path in `flux_inpaint` (timeout,
+no-images, exception) now POSTs `/interrupt` and clears `/queue`, so a stalled Flux job
+can no longer pin ~16 GB and wedge the next run's `/prompt`
+(`tests/test_qwen_worker.py::test_flux_inpaint_timeout_interrupts_and_clears_queue`).
+
+**peel.enabled decision: KEEP `true`.** Rationale: the overlap gate + granularity guard
+are conservative — only genuine element-over-element pairs with solid (non-fragmented)
+members activate, so flat/UI/most photo-background ads skip untouched (re-confirmed on
+052: `needed=False`, all 5 pairs blocked against the 402-component E000 residual). The H7
+photo-plate routing is now proven exact on ground truth, and the two runtime hazards
+(Flux-while-SAM-resident, wedged-Flux-job) are both closed. **Still unproven this
+session:** a full real-pipeline GPU run exercising the Flux photo-band at peel time (the
+GB1 guard is tested in isolation, not against a live wedged ComfyUI); and 052-class
+before/after panels still can't peel until detection surfaces the two portraits as
+distinct solid elements (§9 — the standing detection-granularity blocker, not a peel bug).
+
 ## 6. Validation
 
 1. **Synthetic before/after proof** (`tests/test_peel_scene.py`, 17 tests): the seam

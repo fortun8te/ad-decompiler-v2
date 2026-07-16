@@ -4292,6 +4292,26 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
             )
             if not text_only_shell:
                 continue
+        # A giant painted panel that swallows most of the scene AND owns many
+        # heterogeneous children is a BACKDROP, not a card: nesting products, prices,
+        # decorations AND the CTA under it produces the "everything-under-host" monster
+        # group the construction contract forbids (benchmark 002: c_E003 at 70% of
+        # canvas owned 8 heterogeneous children). Size alone isn't a reliable signal —
+        # an ordinary photo card with 1-2 overlays (a badge, a caption) is legitimately
+        # large relative to its canvas and should still group normally; require BOTH the
+        # size and the child-count symptom together so a simple photo+badge composition
+        # isn't mistaken for a monster host.
+        # Semantic shells (button/badge/card/...) keep their children regardless.
+        semantic_shell = (
+            role in ("button", "badge", "card", "chip", "banner", "seal", "starburst",
+                     "callout", "pill", "ama_body", "ama_header", "ama_sticker")
+            or meta.get("text_bearing_shell") or meta.get("plate_shell")
+            or meta.get("ama_body") or meta.get("ama_header")
+        )
+        backdrop_host_children = int(lcfg.get("backdrop_host_min_children", 3))
+        if (frac > float(lcfg.get("backdrop_host_frac", 0.55)) and not semantic_shell
+                and len(inside) >= backdrop_host_children):
+            continue
         if len(inside) >= 2 or (len(inside) == 1 and (
                 inside[0].get("target") == "text"
                 or role in ("button", "badge", "card", "chip", "banner", "seal", "starburst",

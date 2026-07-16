@@ -112,7 +112,7 @@ def test_unannotated_scene_uses_background_gradient_image_icon_text_stack(tmp_pa
     ], {"w": 100, "h": 100}, str(tmp_path), base_src=str(background))
 
     assert [layer.id for layer in doc.layers] == ["background", "gradient", "photo", "icon", "copy"]
-    assert [layer.z_index for layer in doc.layers] == [-1_000_000, 20.0, 30.0, 35.0, 40.0]
+    assert [layer.z_index for layer in doc.layers] == [-1_000_000, 20.0, 30.0, 35.0, 60.0]
 
 
 def test_shape_style_paints_are_preserved_for_native_figma_mapping(tmp_path):
@@ -287,3 +287,80 @@ def test_f11_fidelity_image_with_substitution_is_explained_not_unexplained(tmp_p
     assert accounting["unexplained_raster_ids"] == ["bare"]
     # Both are still non-native (the substitution image did not launder into native).
     assert accounting["native_leaf_count"] == 0
+
+
+def test_text_stack_group_lifts_z_above_chrome_host(tmp_path):
+    """002 regression: group scope must not bury editable headline children."""
+    background = tmp_path / "background_clean.png"
+    Image.new("RGB", (200, 400), "white").save(background)
+    tree = [{
+        "id": "host", "target": "shape", "box": {"x": 0, "y": 200, "w": 200, "h": 200},
+        "meta": {"role": "badge", "z_band": "chrome"}, "z": 0,
+    }, {
+        "id": "text-stack", "target": "group", "z": 8,
+        "box": {"x": 10, "y": 40, "w": 180, "h": 80},
+        "meta": {"role": "text-stack"},
+        "children": [{
+            "id": "c_B2", "target": "text", "text": "KRACHTSPORT BUNDEL", "z": 8,
+            "box": {"x": 0, "y": 40, "w": 180, "h": 30},
+            "style": {"fontSize": 18, "color": "#000000"},
+            "meta": {"role": "subheadline"},
+        }],
+    }]
+    doc = build_design_json.build(
+        tree, {"w": 200, "h": 400}, str(tmp_path), base_src=str(background),
+    )
+    by_id = {layer.id: layer for layer in doc.layers}
+    assert by_id["text-stack"].z_index > by_id["host"].z_index
+    assert by_id["text-stack"].z_index >= 60
+    child = by_id["text-stack"].children[0]
+    assert child.box["x"] >= 0 and child.box["y"] >= 0
+    assert child.box["x"] + child.box["w"] <= by_id["text-stack"].box["w"]
+    assert child.box["y"] + child.box["h"] <= by_id["text-stack"].box["h"]
+
+
+def test_decoration_reanchors_to_owner_across_group_and_translation():
+    """002 regression: a root-level strike must follow its owner word even when the
+    owner is nested in a group AND was translated (box != visible_box) by layout.
+
+    The owner sits inside a group at (100, 200) and was moved +20,+40 from its
+    pre-layout frame (visible_box). The tight ink (prefit_ink_box) is recorded in
+    the pre-move frame, so the reanchor must (a) find the owner across the whole tree
+    and (b) shift the ink by (box - visible_box) into absolute space. Endpoint
+    fractions 0..1 span the glyph ink exactly.
+    """
+    from src.schema import Layer
+
+    owner = Layer(
+        id="c_B5__w0", type="text", name="price", text="€63",
+        box={"x": 50, "y": 60, "w": 120, "h": 140},          # final (translated)
+        visible_box={"x": 30, "y": 20, "w": 120, "h": 140},  # pre-move frame
+        meta={"prefit_ink_box": {"x": 32, "y": 70, "w": 110, "h": 50}},
+    )
+    group = Layer(
+        id="text-stack", type="group", name="stack",
+        box={"x": 100, "y": 200, "w": 300, "h": 300}, children=[owner],
+    )
+    deco = Layer(
+        id="c_B5__decoration_0", type="shape", name="strike",
+        box={"x": 0, "y": 0, "w": 1, "h": 1},
+        stroke={"color": "#e1491b", "width": 3},
+        meta={
+            "native_decoration": True, "role": "strikethrough",
+            "line": {"x0": 999, "y0": 999, "x1": 1099, "y1": 999, "thickness": 3.0},
+            "anchor": {"owner_id": "c_B5", "word_text": "€63",
+                       "fx0": 0.0, "fy0": 0.5, "fx1": 1.0, "fy1": 0.5},
+        },
+    )
+    layers = [deco, group]
+    moved = build_design_json._reanchor_decorations(layers)
+    assert moved == 1
+    assert deco.meta["reanchored_to"] == "c_B5__w0"
+    # Owner final ink in absolute space: group(100,200)+prefit(32,70)+delta(20,40)
+    #   x: 100+32+20 = 152 .. 152+110 = 262 ; y-center: 200+70+40 + 25 = 335
+    line = deco.meta["line"]
+    assert abs(line["x0"] - 152.0) <= 0.6
+    assert abs(line["x1"] - 262.0) <= 0.6
+    assert abs(line["y0"] - 335.0) <= 0.6 and abs(line["y1"] - 335.0) <= 0.6
+    # The stale source line is preserved for provenance.
+    assert deco.meta["source_line"]["x0"] == 999
