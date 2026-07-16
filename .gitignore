@@ -28,3 +28,6 @@ config.yaml
 # os
 .DS_Store
 Thumbs.db
+
+# scratch/working directory (GPU lock, local tool clones, dev artifacts)
+/work/
