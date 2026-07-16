@@ -66,10 +66,21 @@ def test_circular_flat_badge_emits_native_ellipse_not_raster_square(tmp_path):
     assert shell.z_index < min(c.z_index for c in group.children if c.id != shell.id)
 
 
-# ── 013: a wide flat chip → native stadium/pill rrect, not a hard-cornered box ──────
-def test_wide_flat_chip_emits_native_pill_rrect(tmp_path):
-    _plate(tmp_path)
-    _source(tmp_path)
+def _rounded_rect_source(tmp_path, box, radius, color, size=(800, 900)):
+    """Paint a real rounded-rect plate into normalized.png so geometry can be MEASURED."""
+    img = Image.new("RGB", size, (240, 240, 240))
+    from PIL import ImageDraw
+    d = ImageDraw.Draw(img)
+    x, y, w, h = box
+    d.rounded_rectangle([x, y, x + w - 1, y + h - 1], radius=radius, fill=color)
+    img.save(tmp_path / "normalized.png")
+
+
+# ── 013: a real stadium chip → native pill rrect with a MEASURED radius ─────────────
+def test_wide_flat_chip_emits_native_pill_rrect_from_measured_corners(tmp_path):
+    _plate(tmp_path, (800, 900))
+    box = (413, 719, 114, 50)
+    _rounded_rect_source(tmp_path, box, 25, (26, 26, 26))   # a true stadium pill
     tree = [{
         "id": "c_E006", "target": "group", "box": {"x": 413, "y": 719, "w": 114, "h": 50},
         "shape_kind": "rect", "fill": {"kind": "flat", "color": "#1a1a1a"},
@@ -82,11 +93,35 @@ def test_wide_flat_chip_emits_native_pill_rrect(tmp_path):
     doc = build_design_json.build(tree, {"w": 800, "h": 900}, str(tmp_path),
                                   base_src=str(_plate(tmp_path, (800, 900))))
     group = next(layer for layer in doc.layers if layer.id == "c_E006")
-    shell = next(c for c in group.children if c.meta.get("rebuilt_from") == "flat-rect-shell")
+    shell = next(c for c in group.children if "shell" in str(c.id))
     assert shell.type == "shape" and shell.shape_kind == "rect"
-    # aspect 2.28 with no explicit radius reads as a stadium pill → radius == h/2.
-    assert shell.radius == pytest.approx(25.0)
+    # A stadium end snaps to min(h,w)/2 == 25 — MEASURED from the pixels, not guessed.
+    assert shell.radius == pytest.approx(25.0, abs=1.5)
+    assert shell.meta["measured_corner_radius"] == pytest.approx(25.0, abs=1.5)
     assert shell.fill == {"kind": "flat", "color": "#1a1a1a"}
+
+
+def test_wide_square_cornered_plate_is_not_wrongly_rounded(tmp_path):
+    """A wide, short but HARD-CORNERED plate must stay square: 104's "Cadence" plate is
+    145x35, so an aspect-based "wide == pill" guess would falsely round it."""
+    _plate(tmp_path, (800, 900))
+    box = (467, 267, 145, 35)
+    _rounded_rect_source(tmp_path, box, 0, (6, 6, 6))       # square corners
+    tree = [{
+        "id": "c_E000", "target": "group", "box": {"x": 467, "y": 267, "w": 145, "h": 35},
+        "shape_kind": "rect", "fill": {"kind": "flat", "color": "#060606"},
+        "meta": {"role": "badge", "plate_shell": True, "text_bearing_shell": True},
+        "children": [
+            {"id": "c_B1", "target": "text", "z": 40, "text": "Cadence",
+             "box": {"x": 20, "y": 8, "w": 100, "h": 20}, "style": {"fontSize": 14}},
+        ],
+    }]
+    doc = build_design_json.build(tree, {"w": 800, "h": 900}, str(tmp_path),
+                                  base_src=str(_plate(tmp_path, (800, 900))))
+    group = next(layer for layer in doc.layers if layer.id == "c_E000")
+    shell = next(c for c in group.children if "shell" in str(c.id))
+    assert not shell.radius, "a hard-cornered wide plate must not be rounded into a pill"
+    assert doc.meta["asset_materialization"]["measured_radii"] == []
 
 
 # ── 016: a scalloped seal → analytic star polygon (vectorize's verified fitter) ─────
@@ -223,39 +258,43 @@ def test_nested_drop_child_is_not_re_emitted_as_unexplained_raster(tmp_path):
 
 # ── 104 / 107 / 021: ban empty asset groups + blank ghost rasters ───────────────────
 def test_empty_asset_group_materializes_real_source_pixels(tmp_path):
-    _plate(tmp_path)
-    # A source whose box region carries a real subject (high variance), not flat bg.
-    src = tmp_path / "normalized.png"
+    # The subject must live in the PLATE: materialization crops background_clean, not
+    # the original (original ink is owned by emitted layers — 013's materialized band
+    # re-painted the headline under the native text). 104's burned-in phones are in
+    # the plate precisely because they were never removed.
+    plate = tmp_path / "background_clean.png"
     arr = np.full((400, 400, 3), 240, dtype=np.uint8)
     arr[100:300, 50:250] = np.random.default_rng(0).integers(0, 255, (200, 200, 3), dtype=np.uint8)
-    Image.fromarray(arr).save(src)
+    Image.fromarray(arr).save(plate)
     tree = [{
         "id": "asset-group-c_E002", "target": "group",
         "box": {"x": 50, "y": 100, "w": 200, "h": 200},
         "meta": {"role": "product"}, "children": [],
     }]
     doc = build_design_json.build(tree, {"w": 400, "h": 400}, str(tmp_path),
-                                  base_src=str(_plate(tmp_path)))
+                                  base_src=str(plate))
     group = next(layer for layer in doc.layers if layer.id == "asset-group-c_E002")
     assert group.children, "an empty product asset-group must never ship empty"
-    child = group.children[0]
-    assert child.type == "image" and child.src
-    assert child.meta["materialized_reason"] == "empty-asset-group"
+    # ONE owner per band: either the per-group plate slice claims the group (making it
+    # non-empty so materialization skips) or the materialized crop does — never both
+    # (013 shipped two stacked bands, the second re-painting original headline ink).
+    images = [c for c in group.children if c.type == "image" and c.src]
+    assert len(images) == 1, f"exactly one pixel child expected, got {[c.id for c in group.children]}"
+    child = images[0]
     staged = tmp_path / child.src
     assert staged.exists()
     with Image.open(staged) as im:
         assert im.size == (200, 200)          # pixel-exact, cropped from its own box
         assert np.asarray(im.convert("RGBA"))[..., 3].min() == 255   # opaque, no ghost
-    report = doc.meta["asset_materialization"]
-    assert [m["id"] for m in report["materialized"]] == ["asset-group-c_E002"]
 
 
 def test_blank_ghost_raster_is_materialized_from_source(tmp_path):
-    _plate(tmp_path)
-    src = tmp_path / "normalized.png"
+    # Subject lives in the PLATE (see test above): a ghost raster's real pixels are
+    # recovered from background_clean, never from the original.
+    plate = tmp_path / "background_clean.png"
     arr = np.full((400, 400, 3), 240, dtype=np.uint8)
     arr[100:300, 50:250] = np.random.default_rng(1).integers(0, 255, (200, 200, 3), dtype=np.uint8)
-    Image.fromarray(arr).save(src)
+    Image.fromarray(arr).save(plate)
     # The 8KB blank PNG class: correct size, alpha ~= 0 → renders nothing.
     ghost = tmp_path / "pack.png"
     Image.new("RGBA", (200, 200), (0, 0, 0, 0)).save(ghost)
@@ -265,7 +304,7 @@ def test_blank_ghost_raster_is_materialized_from_source(tmp_path):
         "src": str(ghost), "meta": {"role": "product"},
     }]
     doc = build_design_json.build(tree, {"w": 400, "h": 400}, str(tmp_path),
-                                  base_src=str(_plate(tmp_path)))
+                                  base_src=str(plate))
     layer = next(l for l in doc.layers if l.id == "c_E004")
     assert layer.meta["materialized_reason"] == "blank-ghost-raster"
     with Image.open(tmp_path / layer.src) as im:
@@ -291,9 +330,11 @@ def test_blank_group_over_featureless_source_is_dropped_with_a_reason(tmp_path):
 
 
 def test_unverifiable_blank_layer_is_kept_not_erased(tmp_path):
-    """No readable source → KEEP + warn. Erasing what we merely failed to VERIFY is
-    content erasure (F1), a worse bug than the ghost it would fix."""
-    _plate(tmp_path)   # deliberately NO normalized.png / original.png in the run dir
+    """A blank IMAGE whose pixels are NOT in the plate (uniform crop) is KEPT + warned:
+    erasing what we merely failed to rebuild is content erasure (F1). An EMPTY GROUP
+    over the same featureless plate has nothing anywhere and is dropped with a
+    recorded reason (that is the empty-asset-group ban working)."""
+    plate = _plate(tmp_path)  # uniform white plate: no subject anywhere
     tree = [
         {"id": "avatar0", "target": "image", "z": 20,
          "box": {"x": 10, "y": 10, "w": 60, "h": 60},
@@ -302,14 +343,14 @@ def test_unverifiable_blank_layer_is_kept_not_erased(tmp_path):
          "meta": {"role": "photo"}, "children": []},
     ]
     doc = build_design_json.build(tree, {"w": 400, "h": 400}, str(tmp_path),
-                                  base_src=str(_plate(tmp_path)))
+                                  base_src=str(plate))
     ids = {layer.id for layer in doc.layers}
     assert "avatar0" in ids, "an unverifiable layer must never be silently erased"
-    assert "asset-group-x" in ids
-    assert doc.meta["asset_materialization"]["dropped"] == []
+    assert "asset-group-x" not in ids
+    dropped = doc.meta["asset_materialization"]["dropped"]
+    assert [d["id"] for d in dropped] == ["asset-group-x"]
     codes = {w.get("code") for w in doc.meta["warnings"]}
     assert "blank-raster-unverified" in codes
-    assert "empty-asset-group-unverified" in codes
 
 
 def test_materialization_never_regates_a_confidence_slice(tmp_path):

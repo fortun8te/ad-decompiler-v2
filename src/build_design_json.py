@@ -516,6 +516,48 @@ def _flat_fill_color(fill):
     return None
 
 
+def _shell_silhouette(run_dir, abs_box, color):
+    """Boolean mask of the flat-``color`` shell inside ``abs_box`` of the ORIGINAL source.
+
+    ``abs_box`` MUST be canvas-absolute. Interior holes (the badge's own text) are filled
+    so only the OUTER silhouette drives geometry fitting. Returns None when unavailable.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception:
+        return None
+    source = None
+    for name in ("normalized.png", "original.png"):
+        cand = os.path.join(run_dir, name)
+        if os.path.exists(cand):
+            source = cand
+            break
+    if not source or not color or len(color) != 7 or not color.startswith("#"):
+        return None
+    try:
+        rgb = np.asarray(Image.open(source).convert("RGB"), dtype=np.int16)
+        x = int(round(float(abs_box.get("x", 0) or 0)))
+        y = int(round(float(abs_box.get("y", 0) or 0)))
+        w = int(round(float(abs_box.get("w", 1) or 1)))
+        h = int(round(float(abs_box.get("h", 1) or 1)))
+        if w < 16 or h < 16 or x < 0 or y < 0:
+            return None
+        crop = rgb[y:y + h, x:x + w]
+        if crop.shape[0] < 16 or crop.shape[1] < 16:
+            return None
+        target = np.array([int(color[i:i + 2], 16) for i in (1, 3, 5)], dtype=np.int16)
+        mask = np.abs(crop - target).sum(axis=2) < 110
+        try:
+            from scipy import ndimage
+            mask = ndimage.binary_fill_holes(mask)
+        except Exception:
+            pass
+        return mask
+    except Exception:
+        return None
+
+
 def _starburst_path_for_shell(run_dir, abs_box, color):
     """Fit a regular-star polygon to the flat-colour silhouette inside ``abs_box``.
 
@@ -623,16 +665,14 @@ def _native_shell_shape(candidate, box, z_index):
             constraints={"horizontal": "STRETCH", "vertical": "STRETCH"},
             meta={**common_meta, "rebuilt_from": "flat-ellipse-shell"},
         )
-    # 3) Flat rect / pill → native (rounded) rect. A wide short rect with no explicit
-    #    radius reads as a stadium pill; snap it so it is not a hard-cornered box
-    #    (013 "snacks" chip).
-    radius = candidate.get("radius")
-    if radius in (None, 0, 0.0) and aspect >= 2.0:
-        radius = round(min(w, h) / 2.0, 2)
+    # Flat rect / pill → native rect. Its corner radius is MEASURED from the source by
+    # ``_refine_native_shells`` (absolute coords needed): guessing "wide == pill" from the
+    # aspect would round a legitimately square-cornered banner (104's "Cadence" wordmark
+    # plate is 145x35 but hard-cornered).
     return Layer(
         id=shell_id, type="shape", shape_kind="rect",
         name=label, box=local_box, z_index=z_index, fill=fill_spec,
-        stroke=stroke_spec, radius=radius,
+        stroke=stroke_spec, radius=candidate.get("radius"),
         constraints={"horizontal": "STRETCH", "vertical": "STRETCH"},
         meta={**common_meta, "rebuilt_from": "flat-rect-shell"},
     )
@@ -1374,6 +1414,18 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
                 if "letterSpacing" in run_style:
                     run_style["letterSpacing"] = 0.0
                 _promote_weight_candidate(run_style)
+                # Runs express WEIGHT/STYLE changes, never size (contract). fit_text_box
+                # rescales the NODE's fontSize but runs kept their pre-fit sizes — 013's
+                # headline node fitted to 153 while run[0] still said 227.98, and the
+                # renderer painting conflicting metrics collided line 2 into an
+                # overlapping glyph pile ("do this!" double-struck). Runs inherit the
+                # node's fitted size.
+                if "fontSize" in run_style:
+                    fitted = style.get("fontSize")
+                    if fitted is not None:
+                        run_style["fontSize"] = fitted
+                    else:
+                        run_style.pop("fontSize", None)
                 run["style"] = run_style
             text_runs.append(run)
         # Codia-style GENEROUS text boxes (anti-clipping): the tight ink box becomes a
@@ -1913,28 +1965,34 @@ def _asset_alpha_coverage(run_dir, src):
         return None, 0
 
 
-def _materialize_source_crop(run_dir, abs_box, layer_id, warnings, min_std=6.0):
-    """Crop opaque, pixel-exact pixels from the ORIGINAL source at ``abs_box``.
+def _materialize_source_crop(run_dir, abs_box, layer_id, warnings, min_std=6.0,
+                             plate_path=None):
+    """Crop opaque pixels for a blank layer at ``abs_box`` from the CLEAN PLATE.
+
+    The plate — not the original — is the correct source: it is "what no other layer
+    owns". Cropping the ORIGINAL re-paints ink that an emitted layer already owns
+    natively, which double-strikes (013: the materialized y491-989 band carried the
+    original "do this!" headline ink under the native headline → a doubled glyph pile).
+    A subject that was never extracted (104's phones, burned into the background) is
+    still present in the plate, so it materializes correctly from it either way.
 
     Returns ``(status, rel_src)`` where status is one of:
-      "ok"          — real source pixels were written to ``rel_src``
-      "no-subject"  — the source region is a near-uniform patch (nothing to rebuild),
-                      so the caller may DROP the layer with a recorded reason
-      "no-source"   — the source could not be read at all. The caller must KEEP the
-                      layer untouched: deleting content we simply failed to VERIFY is
-                      content erasure (F1), a worse bug than the ghost it would fix.
+      "ok"          — real pixels were written to ``rel_src``
+      "no-subject"  — the region is a near-uniform patch (nothing to rebuild), so the
+                      caller may DROP the layer with a recorded reason
+      "no-source"   — no readable plate. The caller must KEEP the layer untouched:
+                      deleting content we merely failed to VERIFY is content erasure
+                      (F1), a worse bug than the ghost it would fix.
     """
     try:
         import numpy as np
         from PIL import Image
     except Exception:
         return "no-source", None
-    source = None
-    for name in ("normalized.png", "original.png"):
-        cand = os.path.join(run_dir, name)
-        if os.path.exists(cand):
-            source = cand
-            break
+    source = plate_path if (plate_path and os.path.exists(plate_path)) else None
+    if not source:
+        cand = os.path.join(run_dir, "background_clean.png")
+        source = cand if os.path.exists(cand) else None
     if not source:
         return "no-source", None
     try:
@@ -1962,16 +2020,22 @@ def _materialize_source_crop(run_dir, abs_box, layer_id, warnings, min_std=6.0):
         return "no-source", None
 
 
-def _upgrade_starburst_shells(layers, run_dir, warnings):
-    """Promote near-circular native shells that are really SCALLOPED SEALS to star paths.
+def _refine_native_shells(layers, run_dir, warnings):
+    """Refine native badge/chip shells against the ORIGINAL source pixels.
 
-    Runs post-compile because it samples the ORIGINAL source and only here are absolute
-    coordinates known (a compiled group box is parent-relative). 016's "Get up to 45% Off"
-    seal is a 26-scallop starburst that shipped as a plain teal square; an ellipse is
-    closer but still wrong. vectorize's analytic-star fitter reconstructs it natively
-    (IoU ~0.97). A genuine disc/pill never fits, so it keeps its ellipse.
+    Runs post-compile because it samples the source and only here are absolute
+    coordinates known (a compiled group box is parent-relative).
+
+      * ellipse shell that is really a SCALLOPED SEAL → analytic star path. 016's
+        "Get up to 45% Off" seal is a 26-scallop starburst that shipped as a plain teal
+        square; vectorize's star fitter reconstructs it natively (IoU ~0.97). A genuine
+        disc never fits, so it keeps its ellipse.
+      * rect shell → MEASURED corner radius (overlay_detect.estimate_corner_radius),
+        which snaps a stadium/pill end to min(h,w)/2 (013 "snacks" chip) and returns None
+        for a noisy/square plate so a hard-cornered banner is never wrongly rounded
+        (104's "Cadence" plate is 145x35 — wide, but square).
     """
-    upgraded = []
+    report = {"starburst_seals": [], "measured_radii": []}
 
     def visit(nodes, offset):
         for node in nodes or []:
@@ -1986,34 +2050,61 @@ def _upgrade_starburst_shells(layers, run_dir, warnings):
             }
             if node.children:
                 visit(node.children, (abs_box["x"], abs_box["y"]))
-            if (node.meta or {}).get("rebuilt_from") != "flat-ellipse-shell":
-                continue
-            aspect = abs_box["w"] / max(1.0, abs_box["h"])
-            if not (0.75 <= aspect <= 1.34):
+            rebuilt = (node.meta or {}).get("rebuilt_from")
+            if rebuilt not in ("flat-ellipse-shell", "flat-rect-shell"):
                 continue
             color = _flat_fill_color(node.fill)
             if not color:
                 continue
-            star = _starburst_path_for_shell(run_dir, abs_box, color)
-            if star is None:
+            if rebuilt == "flat-ellipse-shell":
+                aspect = abs_box["w"] / max(1.0, abs_box["h"])
+                if not (0.75 <= aspect <= 1.34):
+                    continue
+                star = _starburst_path_for_shell(run_dir, abs_box, color)
+                if star is None:
+                    continue
+                star_d, prim = star
+                node.shape_kind = "path"
+                node.path = star_d
+                node.meta = {**(node.meta or {}), "rebuilt_from": "starburst-seal",
+                             "star_primitive": prim}
+                report["starburst_seals"].append(
+                    {"id": node.id, "points": prim["points"], "iou": prim["iou"]})
                 continue
-            star_d, prim = star
-            node.shape_kind = "path"
-            node.path = star_d
-            node.meta = {**(node.meta or {}), "rebuilt_from": "starburst-seal",
-                         "star_primitive": prim}
-            upgraded.append({"id": node.id, "points": prim["points"], "iou": prim["iou"]})
+            # flat-rect-shell: measure the real corner radius rather than guess it.
+            if node.radius not in (None, 0, 0.0):
+                continue  # upstream already supplied evidence-backed geometry
+            mask = _shell_silhouette(run_dir, abs_box, color)
+            if mask is None:
+                continue
+            try:
+                from . import overlay_detect
+                radius = overlay_detect.estimate_corner_radius(mask)
+            except Exception as exc:
+                warnings.append({"code": "corner-radius-error", "layer_id": node.id,
+                                 "detail": str(exc)})
+                continue
+            if radius is None or isinstance(radius, dict) or float(radius) <= 0:
+                continue  # square / unsupported → leave it a hard-cornered rect
+            node.radius = radius
+            node.meta = {**(node.meta or {}), "measured_corner_radius": radius}
+            report["measured_radii"].append({"id": node.id, "radius": radius})
 
     visit(layers, (0.0, 0.0))
-    return upgraded
+    return report
 
 
-def _enforce_asset_materialization(layers, run_dir, canvas, warnings):
+def _enforce_asset_materialization(layers, run_dir, canvas, warnings, plate_path=None):
     """Ban empty asset groups and blank/ghost photo-product rasters (recorded, not muted).
 
     Walks the compiled tree with absolute offsets. Any empty group or blank image in a
-    pixel-required role is rebuilt from source pixels cropped to its box, or dropped with
-    a recorded reason. Returns an audit report for design_preflight.json.
+    pixel-required role is rebuilt from CLEAN-PLATE pixels cropped to its box, or dropped
+    with a recorded reason. Returns an audit report for design_preflight.json.
+
+    MUST run AFTER ``_add_group_backgrounds``: that pass skips empty groups, so running
+    materialization first hands it a now-non-empty group and it stacks a SECOND
+    ``__groupbg`` plate over the same band (013 shipped both a groupbg plate and a
+    materialized asset for asset-group-c_E003). Running last keeps ONE owner per band.
     """
     report = {"materialized": [], "dropped": [], "checked": 0}
 
@@ -2039,7 +2130,7 @@ def _enforce_asset_materialization(layers, run_dir, canvas, warnings):
             if node.type == "group" and not node.children:
                 if role in _PIXEL_REQUIRED_ROLES or str(node.id or "").startswith("asset-group"):
                     status, rel = _materialize_source_crop(
-                        run_dir, abs_box, str(node.id), warnings)
+                        run_dir, abs_box, str(node.id), warnings, plate_path=plate_path)
                     if status == "ok":
                         node.children = [Layer(
                             id=f"{node.id}__materialized", type="image", name=node.name,
@@ -2085,14 +2176,15 @@ def _enforce_asset_materialization(layers, run_dir, canvas, warnings):
                             report["materialized"].append(
                                 {"id": node.id, "reason": "blank-ghost-raster",
                                  "alpha_cov": cov, "box": abs_box})
-                        elif status == "no-subject":
-                            report["dropped"].append(
-                                {"id": node.id, "reason": "blank-ghost-raster-no-subject",
-                                 "alpha_cov": cov})
-                            continue  # drop the ghost
                         else:
+                            # "no-subject" (uniform plate crop) or "no-source": the layer's
+                            # pixels are simply NOT in the plate — an avatar/product whose
+                            # asset went missing. Dropping would erase a layer we merely
+                            # failed to rebuild (F1: content erasure beats a blank ghost).
+                            # Keep + warn; QA's blank-asset accounting still surfaces it.
                             warnings.append({"code": "blank-raster-unverified",
-                                             "layer_id": node.id})
+                                             "layer_id": node.id,
+                                             "materialize_status": status})
             kept.append(node)
         return kept
 
@@ -2473,24 +2565,19 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
         _reanchor_decorations(layers)
     except Exception as exc:
         warnings.append({"code": "decoration-reanchor-error", "detail": str(exc)})
-    # A near-circular native shell that is really a scalloped SEAL becomes a star path
-    # (016). Needs absolute coordinates, hence post-compile. Never breaks the compile:
-    # worst case the shell keeps its ellipse.
-    starbursts = []
+    # Refine native shells against the source: scalloped seal → star path (016), rect →
+    # measured corner radius (013 pill). Needs absolute coordinates, hence post-compile.
+    # Never breaks the compile: worst case the shell keeps its ellipse / square corners.
+    shell_refinement = {"starburst_seals": [], "measured_radii": []}
     try:
-        starbursts = _upgrade_starburst_shells(layers, run_dir, warnings)
+        shell_refinement = _refine_native_shells(layers, run_dir, warnings)
     except Exception as exc:
-        warnings.append({"code": "starburst-upgrade-error", "detail": str(exc)})
-    # Ban empty asset groups and blank/ghost photo-product rasters — materialize real
-    # source pixels or drop with a recorded reason (never ship a silent 8KB blank PNG).
-    materialization = {"materialized": [], "dropped": [], "checked": 0}
-    try:
-        layers, materialization = _enforce_asset_materialization(
-            layers, run_dir, canvas, warnings)
-    except Exception as exc:
-        warnings.append({"code": "asset-materialization-error", "detail": str(exc)})
-    materialization["starburst_seals"] = starbursts
+        warnings.append({"code": "shell-refine-error", "detail": str(exc)})
     # Background-per-group (Codia region construction; config background.per_group).
+    # MUST run BEFORE materialization: a group that receives a plate slice here is no
+    # longer empty, so the materialization pass below skips it — otherwise BOTH a
+    # __groupbg plate and a __materialized crop stack over the same band (013 shipped
+    # two full-width bands at y491, the second re-painting original headline ink).
     if base_src and bool(((cfg or {}).get("background") or {}).get("per_group", True)):
         try:
             _add_group_backgrounds(
@@ -2498,6 +2585,15 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
             )
         except Exception as exc:
             warnings.append({"code": "group-background-error", "detail": str(exc)})
+    # Ban empty asset groups and blank/ghost photo-product rasters — materialize real
+    # plate pixels or drop with a recorded reason (never ship a silent 8KB blank PNG).
+    materialization = {"materialized": [], "dropped": [], "checked": 0}
+    try:
+        layers, materialization = _enforce_asset_materialization(
+            layers, run_dir, canvas, warnings)
+    except Exception as exc:
+        warnings.append({"code": "asset-materialization-error", "detail": str(exc)})
+    materialization.update(shell_refinement)
     # Single-ownership enforcement (one owner per pixel): erase every native text layer's
     # baked duplicate from the raster carrier beneath it so nothing double-renders.
     single_ownership = {"enabled": False}

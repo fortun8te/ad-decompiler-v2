@@ -218,6 +218,40 @@ def _shape_tile(layer, size, run_dir=None):
             width=stroke_width,
         )
         return tile
+    star = meta.get("star_primitive")
+    if star and layer.get("shape_kind") == "path":
+        # A starburst seal (badge shells rebuilt by build_design_json) keeps its authored
+        # star PATH for Figma, which draws vectors natively. Preview must not depend on
+        # cairosvg for it: libcairo is routinely absent on the Windows benchmark workers,
+        # and _svg_or_path_mask would then return None and silently omit the whole seal
+        # (016's "45% Off" seal vanished, leaving bare plate). The primitive is exact
+        # geometry, so draw the polygon directly — same precedent as native_decoration.
+        try:
+            box = layer.get("box") or {}
+            scale_x = width / max(1.0, _number(box.get("w"), 1) or 1)
+            scale_y = height / max(1.0, _number(box.get("h"), 1) or 1)
+            points = max(3, int(star.get("points") or 5))
+            rotation = _number(star.get("rotation"))
+            cx, cy = _number(star.get("cx")), _number(star.get("cy"))
+            r_outer, r_inner = _number(star.get("r_outer")), _number(star.get("r_inner"))
+            verts = []
+            for index in range(points):
+                a_out = rotation + 2.0 * math.pi * index / points
+                a_in = rotation + 2.0 * math.pi * (index + 0.5) / points
+                verts.append(((cx + r_outer * math.cos(a_out)) * scale_x,
+                              (cy + r_outer * math.sin(a_out)) * scale_y))
+                verts.append(((cx + r_inner * math.cos(a_in)) * scale_x,
+                              (cy + r_inner * math.sin(a_in)) * scale_y))
+            # Build a polygon MASK and paint the layer's real fill through it (the fill
+            # may be flat or a gradient) — same composition the vector branch uses.
+            mask = Image.new("L", size, 0)
+            ImageDraw.Draw(mask).polygon(verts, fill=255)
+            if mask.getbbox() is not None:
+                tile = _fill_tile(size, _layer_fill(layer))
+                tile.putalpha(_multiply_alpha(tile, mask).getchannel("A"))
+                return tile
+        except Exception:
+            pass  # fall through to the generic vector/raster handling below
     svg = layer.get("svg")
     is_vector_path = bool(svg or (layer.get("shape_kind") == "path" and layer.get("path")))
     if is_vector_path:
