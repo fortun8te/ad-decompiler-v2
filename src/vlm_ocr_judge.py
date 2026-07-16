@@ -316,6 +316,19 @@ def _judge_disagreements(
         ln for ln in lines
         if ln.get("box") and _has_disagreement(ln) and not ln.get("vlm_ocr_judged")
     ]
+    # Display headlines: both engines can misread the SAME stylized glyphs the same
+    # way (067: "SAYINC"/"COODBYE" for SAYING/GOODBYE — G→C twice, no disagreement
+    # flag, judge never looked, misreads shipped into the render). A wrong headline
+    # is the single most visible OCR failure and costs 1-2 crops to check, so the
+    # tallest lines are always judged even without an engine disagreement.
+    seen = {id(c) for c in candidates}
+    display = sorted(
+        (ln for ln in lines
+         if ln.get("box") and not ln.get("vlm_ocr_judged") and id(ln) not in seen
+         and float((ln.get("box") or {}).get("h", 0) or 0) >= 40),
+        key=lambda ln: -float((ln.get("box") or {}).get("h", 0) or 0),
+    )
+    candidates.extend(display[:2])
     # Spend the bounded budget on brand / price / CTA / large lines first —
     # same lesson as proofread.max_regions priority sorting.
     candidates.sort(key=_disagreement_priority)

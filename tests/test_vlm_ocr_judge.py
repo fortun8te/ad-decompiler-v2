@@ -301,9 +301,12 @@ def test_ocr_read_skips_regions_overlapping_existing_lines(tmp_path, monkeypatch
 
     monkeypatch.setattr(vlm_client, "multi_pass_answer", _count)
     img = _image(tmp_path, size=(200, 200))
-    ocr_result = {
-        "lines": [_line("BIG", box={"x": 0, "y": 0, "w": 200, "h": 200})],
-    }
+    # vlm_ocr_judged isolates this test to the grid-read skip logic: a tall unjudged
+    # display line is now legitimately force-judged (067: both engines misread the
+    # same stylized headline with no disagreement flag), which is separate behavior.
+    big = _line("BIG", box={"x": 0, "y": 0, "w": 200, "h": 200})
+    big["vlm_ocr_judged"] = True
+    ocr_result = {"lines": [big]}
     vlm_ocr_judge.judge_ocr_lines(img, ocr_result, _cfg(ocr_read=True))
     assert calls["n"] == 0
 
