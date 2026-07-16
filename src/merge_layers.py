@@ -33,6 +33,7 @@ from collections import Counter
 from typing import Optional
 from .wordmark import is_platform_lockup, semantic_text_role
 from .raster_clusters import is_intentional_raster_cluster
+from .raster_clusters import normalized_role as cluster_normalized_role
 from .diagram_editability import (
     is_chart_label_role,
     is_chart_primitive_role,
@@ -116,6 +117,37 @@ _SAVE_BADGE_RE = re.compile(
 
 # Product/person cutouts that must NEVER be promoted to editable-shell chrome.
 _BAKE_CUTOUT_ROLES = _PRODUCT_CUTOUT_ROLES - {"logo"}
+
+# Photographic PANEL owners (comparison sides, lifestyle crops). A person/photo panel
+# rarely carries printed copy of its own: checklist/card/label text sitting on it is
+# normally composited by the designer, not photographed ink. Product/pack faces are
+# deliberately NOT here — printed-on-product stays baked (091/094/002 invariant).
+_PHOTOGRAPHIC_PANEL_ROLES = frozenset({
+    "photo", "photo-fragment", "photo_fragment", "person", "people", "portrait",
+})
+
+
+def _positive_scene_ink_evidence(meta: dict, ownership: dict | None) -> bool:
+    """True only with a REAL photographic-scene verdict for this OCR line.
+
+    Fail-open contract (009 tweet body / 025 checklist cards): the failed-closed VLM
+    sentinels (vlm_error / vlm_parse_error / vlm_disagreement, confidence 0.0) are NOT
+    scene evidence. Text the archetype preset promises editable must never bake on
+    *missing* data — only a positive "this ink is photographed/printed in the scene"
+    verdict may keep it in the raster.
+    """
+    ownership = ownership or {}
+    reason = str(ownership.get("reason") or "")
+    real_printed_verdict = (
+        ownership.get("action") == "raster_keep"
+        and str(ownership.get("placement") or "") == "printed"
+        and float(ownership.get("confidence") or 0) > 0.01
+        and reason not in {"vlm_disagreement", "vlm_error", "vlm_parse_error"}
+    )
+    return bool(
+        real_printed_verdict
+        or str(meta.get("scene_text_role") or "") == "printed_on_product"
+    )
 
 
 def _is_full_bleed(box: dict, canvas: dict, frac: float = 0.92) -> bool:
@@ -2525,7 +2557,10 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                 "role": role,
             })
 
-    scene_facts = ((cfg.get("scene") or {}).get("facts") or {})
+    scene_cfg = cfg.get("scene") or {}
+    scene_facts = (scene_cfg.get("facts") or {})
+    scene_archetype = str(scene_cfg.get("archetype") or "")
+    scene_text_preset = ((scene_cfg.get("preset") or {}).get("text") or {})
     photo_scene_only = _photographic_scene_text_mode(
         text_cands, elem_cands, canvas, cfg, product_regions,
     )
@@ -2591,7 +2626,29 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                 or (meta.get("chart_group_id") and is_chart_label_role(meta.get("role")))
             )
             meta["raster_cluster_owner"] = owner_id
-            if positive_overlay:
+            # SCREENSHOT-FAMILY FAIL-OPEN (009): on a social_screenshot the archetype
+            # preset promises platform UI copy editable (text.editable_ui_copy) — post
+            # body, header, handle, timestamps, engagement counts. Missing VLM ownership
+            # on such a line must fail OPEN → native TEXT parked over the screenshot
+            # crop, never bake. Only positive photographic-scene evidence (a real VLM
+            # "printed" verdict or printed_on_product) keeps the ink in the raster.
+            # Non-UI cluster owners (chart/receipt/nutrition/product-cluster…) keep the
+            # conservative fail-closed contract.
+            ui_copy_fail_open = (
+                not positive_overlay
+                and scene_archetype == "social_screenshot"
+                and bool(scene_text_preset.get("editable_ui_copy"))
+                and cluster_normalized_role(
+                    (owner.get("meta") or {}).get("role")) in ("screenshot", "ui-panel")
+                # A one-glyph OCR blip must not authorize destructive inpaint on the
+                # screenshot crop; real UI copy (counts, handles, body) is >= 2 glyphs.
+                and len(re.sub(r"[^0-9A-Z€£$%]", "",
+                               _normalize_text_key(c.get("text")))) >= 2
+                and not _positive_scene_ink_evidence(meta, ownership)
+            )
+            if ui_copy_fail_open:
+                meta["ui_copy_fail_open"] = "social-screenshot-ui-copy"
+            if positive_overlay or ui_copy_fail_open:
                 meta["overlay_text"] = True
                 meta["removal_required"] = True
                 meta["parent_id"] = owner_id
@@ -2730,6 +2787,41 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                             "action": "text-bearing-shell-extract",
                             "host_role": owner_role,
                         })
+                    continue
+                # BEFORE/AFTER PANEL FAIL-OPEN (025): a literal before/after pair
+                # authorizes rebuilding all contained column copy — the archetype
+                # preset already sets suppress_descendants=False for exactly this
+                # scene. White-card checklist lines and the BEFORE/AFTER labels
+                # composited over the two photographic panels are designer overlay,
+                # not scene ink, so missing VLM ownership fails OPEN → editable
+                # TEXT + removal. A real photographic "printed" verdict still bakes
+                # (a caption photographed inside the panel). Product/pack cutout
+                # owners are untouched: printed-on-product keeps its bake.
+                # Guard 1: standalone BEFORE/AFTER column labels are governed by
+                # reconstruct._suppress_comparison_column_labels — when contained in a
+                # column photo it re-bakes them regardless of promotion flags. Promoting
+                # them here with removal_required would erase their ink from the panel
+                # AND drop the native node (mangled label, no replacement). Leave them
+                # to the established bake path. Guard 2: a one/two-glyph OCR blip must
+                # never authorize destructive inpaint on a photographic panel.
+                _line_tokens = _normalize_text_key(c.get("text"))
+                _is_column_label = bool(re.match(r"^\s*(BEFORE|AFTER)\s*$", _line_tokens))
+                if (owner_role in _PHOTOGRAPHIC_PANEL_ROLES
+                        and not _is_column_label
+                        and len(re.sub(r"[^0-9A-Z€£$%]", "", _line_tokens)) >= 3
+                        and (scene_facts.get("before_after_pair")
+                             or scene_facts.get("before_after_labels"))
+                        and not _positive_scene_ink_evidence(c["meta"], ownership)):
+                    c["meta"]["overlay_text"] = True
+                    c["meta"]["removal_required"] = True
+                    c["meta"]["ownership_enforced"] = True
+                    c["meta"]["ui_copy_fail_open"] = "before-after-panel-copy"
+                    diagnostics["scene_text_contract"].append({
+                        "id": c.get("id"),
+                        "host": cutout_owner["id"],
+                        "action": "before-after-panel-copy-promote",
+                        "host_role": owner_role,
+                    })
                     continue
                 if not _should_bake_in_cutout(
                     c, cutout_owner, canvas, scene_text_inside, scene_facts,
