@@ -3926,7 +3926,9 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
                 best = max(best, _num(painted.get("w")) * _num(painted.get("h")))
             return best
 
-        ranked_clusters = sorted(clusters.values(), key=_cluster_prominence, reverse=True)
+        ranked_clusters = list(clusters.values())
+        if font_options.get("prominence_budget", True):
+            ranked_clusters = sorted(ranked_clusters, key=_cluster_prominence, reverse=True)
         for idxs in ranked_clusters:
             if match_count >= max_match_lines:
                 break

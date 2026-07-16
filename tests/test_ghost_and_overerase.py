@@ -546,6 +546,15 @@ def test_sparse_ledger_alpha_never_replaces_an_existing_chip(tmp_path, monkeypat
     """
     import numpy as np
     source = _build_text_run(tmp_path)
+    recon_path = os.path.join(str(tmp_path), "reconstruction.json")
+    recon = load(recon_path)
+    recon["stats"]["text_residual"] = {
+        "enabled": True, "checked": 1, "reinpainted": True, "passes": 3,
+        "flagged": [{"id": "c_B0", "residual_px": 900, "residual_ratio": 0.9,
+                     "resolved": False, "hard_fail": True}],
+        "force_raster_ids": ["c_B0"],
+    }
+    dump(recon, recon_path)
     permissive = {"region_ssim_min": 0.0, "region_color_min": 0.0,
                   "text_ink_iou_min": 0.0, "text_ink_excess_max": 1e9,
                   "text_slice_gate_enabled": True}

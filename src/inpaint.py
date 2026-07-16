@@ -646,6 +646,63 @@ def _regional_crop(mask, cfg: Optional[dict] = None):
     return (x0, y0, x1, y1), (0, 0, pad_right, pad_bottom), context
 
 
+def _analytic_fill_allowed(complexity, regional_cfg, *, has_model, flat_residual,
+                           flat_gradient, flux_gradient, flat_ui_archetype,
+                           ui_chrome_hole):
+    """May this hole take a FLAT/affine analytic fill? -> (analytic, ui_chrome_analytic).
+
+    Analytic fills are cheap and never hallucinate, but they paint ONE colour (or a plane)
+    across the hole. That is right for a flat plate and wrong for a gradient: filling a ramp
+    with its dominant colour lays down an off-palette RECTANGLE (013: the "61% OFF" hole on
+    the green seal came back a dark-green block that also clipped the baked "+ FREE GIFTS";
+    016: the flat teal patch between the bears).
+
+    Both "earn it back" clauses below used to ignore ``gradient_p90`` entirely and so could
+    overturn the base rule's correct refusal:
+
+      * dominant-flat-rgb: a high dominant_fraction only says "one colour covers most of the
+        ring" -- on a ramp that colour is just the middle of it.
+      * flat-UI archetype: the ARCHETYPE being flat does not make every hole in it flat; a
+        gradient seal sits on a flat plate all the time.
+
+    Past ``flux_gradient`` the router already classifies the same region as
+    ``complex_background``, so calling it dominant-flat is self-contradictory. Both clauses
+    therefore share that ceiling and hand a real gradient to the active backend.
+    """
+    if not has_model:
+        return False, False
+    # NB: `or 1e9` is wrong here — a perfectly flat plate measures residual/gradient 0.0,
+    # which is falsy and would read as "infinitely complex", refusing analytic on exactly
+    # the holes it suits best.
+    def _metric(key):
+        value = complexity.get(key)
+        return float(value) if isinstance(value, (int, float)) else 1e9
+
+    residual = _metric("residual_p90")
+    gradient = _metric("gradient_p90")
+    analytic = bool(
+        residual <= flat_residual
+        # A panel boundary can raise ring gradient even when a constant/affine model
+        # explains the actual colours almost perfectly (ad9's black/charcoal bars).
+        and (gradient <= flat_gradient or residual <= flat_residual * .4)
+    )
+    dominant_flat_gradient = float(regional_cfg.get(
+        "dominant_flat_gradient_p90", flux_gradient))
+    if (complexity.get("model") == "dominant-flat-rgb"
+            and residual <= flat_residual
+            and gradient <= dominant_flat_gradient):
+        analytic = True
+    if (not analytic and flat_ui_archetype and ui_chrome_hole
+            and float(complexity.get("dominant_fraction") or 0) >= float(
+                regional_cfg.get("ui_analytic_dominant_fraction", 0.40))
+            and residual <= float(
+                regional_cfg.get("ui_analytic_residual_p90", flat_residual * 2.5))
+            and gradient <= float(
+                regional_cfg.get("ui_analytic_gradient_p90", flux_gradient))):
+        return True, True
+    return analytic, False
+
+
 def _background_model(rgb, mask, global_union, cfg: Optional[dict] = None):
     """Fit a robust local affine RGB plate and report exterior complexity."""
     cv2, np, _ = _deps()
@@ -1480,26 +1537,14 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             crop_union = cv2.copyMakeBorder(crop_union, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=0)
 
         coeff, complexity = _background_model(crop_rgb, crop_mask, crop_union, cfg)
-        analytic = bool(
-            coeff is not None
-            and complexity["residual_p90"] <= flat_residual
-            # A panel boundary can raise ring gradient even when a constant/affine model
-            # explains the actual colours almost perfectly (ad9's black/charcoal bars).
-            and (complexity["gradient_p90"] <= flat_gradient
-                 or complexity["residual_p90"] <= flat_residual * .4)
+        analytic, ui_chrome_analytic = _analytic_fill_allowed(
+            complexity, regional_cfg,
+            has_model=coeff is not None,
+            flat_residual=flat_residual, flat_gradient=flat_gradient,
+            flux_gradient=flux_gradient,
+            flat_ui_archetype=flat_ui_archetype, ui_chrome_hole=ui_chrome_hole,
         )
-        if (coeff is not None and complexity.get("model") == "dominant-flat-rgb"
-                and complexity["residual_p90"] <= flat_residual):
-            analytic = True
-        # Flat/UI chrome (text, badge, chip, icon on social/product-on-flat plates): prefer
-        # analytic even when the ring is slightly noisier. Generative backends invent
-        # glyph residue / smear into these holes and cost seconds for worse quality.
-        if (not analytic and coeff is not None and flat_ui_archetype and ui_chrome_hole
-                and float(complexity.get("dominant_fraction") or 0) >= float(
-                    regional_cfg.get("ui_analytic_dominant_fraction", 0.40))
-                and float(complexity.get("residual_p90") or 1e9) <= float(
-                    regional_cfg.get("ui_analytic_residual_p90", flat_residual * 2.5))):
-            analytic = True
+        if ui_chrome_analytic:
             complexity = dict(complexity)
             complexity["ui_chrome_analytic"] = True
         # Analytic plates are safe (non-hallucinating) but can wipe subtle photographic

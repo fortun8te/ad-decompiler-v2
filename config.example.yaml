@@ -170,6 +170,46 @@ text_analysis:
     google_fonts_cache: ~/.cache/google-fonts
     fallback_families: [Inter, Arial, Helvetica, Roboto]
     font_dirs: []                     # add brand/font-library folders here
+    # Spend the bounded match budget (max_lines) on the largest painted ink first rather
+    # than in OCR read order. Document order spends it on whatever was read first — on
+    # 091 that was product-label microcopy (~1k px²), which used all 16 slots and left the
+    # ad's biggest headline (76k px², a serif) with no render match at all.
+    prominence_budget: true
+    consensus:
+      # A serif/script family on a sans-majority document is normally a cross-class leak
+      # and is folded into the consensus sans. That must not fire when the SOURCE ink is
+      # itself serif (091's serif headline "Foggy and Steady"): protect a line whose
+      # class gate positively says serif/script at or above this confidence.
+      source_class_protect_min_confidence: 0.20
+  # Hand-drawn / marker / script text -> pixel-exact chip of the ORIGINAL ink, because no
+  # library font can reproduce it and the nearest plain sans is the most visible failure
+  # there is (091's marker "Sharp" rendered as Barlow Condensed).
+  #
+  # Cheap stats CANNOT make this call: 091's marker "Sharp" scores a LOWER stroke-width CV
+  # (0.17) than the typeset lines it must be separated from (013 "We NEVER" 0.22), and its
+  # render-back (0.20) is STRONGER than typeset "+ FREE GIFTS" (0.09) because render-back
+  # falls off with string length. Only the VLM can decide, so Stage A merely narrows the
+  # field and a weak render-back is necessary but never sufficient.
+  handwriting:
+    enabled: true
+    renderback_weak: 0.35      # fitted-font IoU below which the font cannot reproduce the ink
+    shape_score_min: 0.60      # a candidate needs a *plausible* font for "renders wrong" to mean marker
+    stroke_cv_strong: 0.42     # Stage-A recall signal only (never decides on its own)
+    min_alnum: 3               # a 1-2 char fragment cannot be classified reliably
+    ocr_conf_min: 0.50         # garbled ink is not hand-lettering; it slices on its own merits
+    vlm_confidence_min: 0.55
+    allow_stats_only: false    # NEVER rasterize without the VLM; fail safe = stay editable
+    vlm:
+      # OFF until the Stage-B classifier is validated against the labelled set in
+      # tests/test_handwriting.py::test_vlm_style_classifier_eval (AD_DECOMP_VLM_EVAL=1).
+      # The first formulation ("was this drawn by hand?") measured INVERTED on the only
+      # two lines that matter, so the prompt now asks for the letterform STYLE instead —
+      # a reformulation that has not yet been measured end-to-end. Rasterizing editable
+      # typeset copy is the worse contract violation, so it stays off until it is.
+      enabled: false
+      max_lines: 8             # bounded budget, spent on the largest-ink candidates first
+      timeout_s: 30
+      max_tokens: 96
 
 sam3:
   enabled: true

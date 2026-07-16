@@ -659,6 +659,44 @@ def test_style_cluster_propagates_font_match_beyond_max_lines_budget(tmp_path):
     assert result["text_analysis"]["font_matches_attempted"] <= 3
 
 
+def test_font_match_budget_is_spent_on_the_most_prominent_text_first(tmp_path):
+    # 091: OCR reads product-label microcopy before the headline, so a document-order
+    # budget spent all 16 match slots on ~1k px² labels and left the ad's BIGGEST text
+    # (a 76k px² serif headline) with no render match at all — it fell back to a generic
+    # sans that renders visibly wrong. The budget must follow prominence, not read order.
+    font_path = _font_path()
+    if not font_path:
+        pytest.skip("Pillow did not expose a test TrueType font path")
+
+    image = Image.new("RGB", (900, 400), "white")
+    draw = ImageDraw.Draw(image)
+    lines = []
+    # Six small labels FIRST (distinct sizes => distinct style clusters), headline LAST.
+    for i, word in enumerate(["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"]):
+        box = _draw_text(draw, (20, 10 + i * 30), word, _font(12 + i), (20, 20, 20))
+        lines.append(_line(f"L{i}", word, box))
+    headline_box = _draw_text(draw, (20, 250), "Headline", _font(90), (20, 20, 20))
+    lines.append(_line("L6", "Headline", headline_box))
+    path = tmp_path / "prominence.png"
+    image.save(path)
+    ocr = {"source": {"path": str(path), "w": image.width, "h": image.height}, "lines": lines}
+
+    def families(prominence):
+        cfg = {"text_analysis": {"font_matching": {
+            "enabled": True, "font_files": [font_path], "font_dirs": [],
+            "max_fonts": 1, "top_k": 1,
+            "max_lines": 2,                      # only two clusters can be matched
+            "prominence_budget": prominence,
+        }}}
+        out = text_analysis.analyze_text(str(path), ocr, cfg)
+        return {l["id"]: l["style"]["fontCandidates"][0]["source"] for l in out["lines"]}
+
+    # Prominence order: the headline is the largest ink, so it MUST get a real match.
+    assert families(True)["L6"] == "local-render"
+    # Document order burns the budget on the small labels read first and starves it.
+    assert families(False)["L6"] != "local-render"
+
+
 def test_meta_alignment_prefers_matching_weight():
     profile = text_analysis._typography_profile({"weight": 700, "shear_angle": None, "font_size": 24})
     bold_meta = {"family": "Inter", "style": "Bold", "weight": 700}

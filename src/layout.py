@@ -15,6 +15,7 @@ import re
 from statistics import median
 from typing import Optional
 
+from . import structure
 from . import vlm_layout_group
 from .diagram_editability import members_support_native_chart
 
@@ -1114,6 +1115,23 @@ def _short(value, length=24):
     return value if len(value) <= length else value[: length - 1] + "…"
 
 
+def _publish_semantic_names(nodes):
+    """Mirror ``meta.semantic_name`` onto ``node["name"]`` where a name is missing.
+
+    Layout keeps its designer-facing name on the meta so downstream consumers can tell an
+    inferred name from an authored one. Tree passes that only read ``name`` would treat
+    such a node as unnamed and rename it, so publish the name before handing the tree to
+    one. Never overwrites an existing name.
+    """
+    for node in nodes or []:
+        children = node.get("children") or []
+        if children:
+            _publish_semantic_names(children)
+        semantic = (node.get("meta") or {}).get("semantic_name")
+        if semantic and not str(node.get("name") or "").strip():
+            node["name"] = semantic
+
+
 def _apply_semantic_names(nodes):
     """Give structural frames designer-facing names; explicit clean names always win."""
     for node in nodes:
@@ -1222,6 +1240,8 @@ class _TreeWithNotice(list):
     grouping status instead of it being silently dropped."""
 
     vlm_grouping: Optional[dict] = None
+    #: ``structure.restructure`` report (pruned/collapsed/banded counts) for the caller.
+    structure: Optional[dict] = None
 
 
 _STRUCTURE_GROUP_KEYS = (
@@ -4551,10 +4571,41 @@ def infer(candidates: list, canvas: dict, cfg: Optional[dict] = None) -> list:
         _finalize_vlm_group_layouts(roots)
 
     _apply_semantic_names(roots)
+
+    # Deterministic tree policy: prune empty groups, collapse redundant wrappers, and
+    # split a flat pile of roots into semantic bands, so the exported Figma tree is one a
+    # designer can actually work in (009: 18 flat text nodes -> Header/Body/Footer with
+    # every text preserved and editable).
+    #
+    # Ordered AFTER _apply_semantic_names deliberately: restructure's dedupe_sibling_names
+    # gives every still-unnamed node a name, and _apply_semantic_names skips any node that
+    # already has one — so running it first silently suppressed every role-derived name
+    # ("Button / Buy now", "Stats", "Comparison"). Naming first lets the specific,
+    # role-aware names win and leaves restructure to name only what it creates (its own
+    # Header/Body/Footer bands).
+    #
+    # structure.order_children is held off by default: its rank puts every raster (0)
+    # behind every shape (1), which reorders ART AMONGST ITSELF rather than only lifting
+    # text above rasters as its contract states — a full-bleed plate (shape) sorts ABOVE
+    # an overlapping cutout (image) and hides it. Layout already owns z (``_node_z``), so
+    # the safe composition is: take structure's tree shaping, keep layout's paint order.
+    # An explicit ``structure.text_above_rasters`` in config still wins.
+    structure_cfg = dict(cfg) if isinstance(cfg, dict) else {}
+    structure_opts = dict(structure_cfg.get("structure") or {})
+    structure_opts.setdefault("text_above_rasters", False)
+    structure_cfg["structure"] = structure_opts
+    # structure.dedupe_sibling_names reads only ``node["name"]``; layout carries its
+    # designer-facing names on ``meta.semantic_name``. Publish them onto ``name`` first or
+    # every named band ("Header"/"Body"/"Footer") is seen as unnamed and overwritten with
+    # a generic "Layer" / "Layer / 2".
+    _publish_semantic_names(roots)
+    roots, structure_notice = structure.restructure(roots, canvas, structure_cfg, z_key=_node_z)
+
     _finalize_layout(roots)
 
     for root in roots:
         _relativize(root)
     out = _TreeWithNotice(roots)
     out.vlm_grouping = vlm_notice
+    out.structure = structure_notice
     return out

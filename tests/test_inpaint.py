@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from src import inpaint
+from src.inpaint import _analytic_fill_allowed
 
 
 def test_check_backends_reports_opencv_fallback(monkeypatch):
@@ -808,3 +809,63 @@ def test_regional_global_context_uses_full_original_canvas():
 
     assert bounds == (0, 0, 80, 60)
     assert context == 80
+
+
+
+# ── a gradient surface must never take a flat analytic fill ───────────────────────────
+
+_REGIONAL = {}
+_GATE_KW = dict(has_model=True, flat_residual=10.0, flat_gradient=10.0, flux_gradient=18.0)
+
+
+def _seal_complexity(**over):
+    """013 c_B2: the real numbers measured on the "61% OFF" hole of the green seal."""
+    base = {"model": "dominant-flat-rgb", "dominant_fraction": 0.573,
+            "residual_median": 3.0, "residual_p90": 8.0, "gradient_p90": 49.4975}
+    base.update(over)
+    return base
+
+
+def test_gradient_seal_hole_is_refused_by_the_dominant_flat_override():
+    """013: residual is low (8.0) so "dominant flat" claimed the hole and filled it with one
+    dark green -> a rectangle across the seal's ramp that clipped the baked "+ FREE GIFTS".
+    gradient_p90 49.5 is far past flux_gradient, where the router already says
+    `complex_background`. It must NOT be analytic."""
+    analytic, ui = _analytic_fill_allowed(
+        _seal_complexity(), _REGIONAL, flat_ui_archetype=False, ui_chrome_hole=False,
+        **_GATE_KW)
+    assert analytic is False and ui is False
+
+
+def test_gradient_seal_hole_is_refused_by_the_flat_ui_clause_too():
+    """013 is product_on_flat and the hole is text, so the flat-UI clause re-enabled analytic
+    right after the dominant-flat cap refused it. A gradient seal ON a flat plate is still a
+    gradient."""
+    analytic, ui = _analytic_fill_allowed(
+        _seal_complexity(), _REGIONAL, flat_ui_archetype=True, ui_chrome_hole=True,
+        **_GATE_KW)
+    assert analytic is False and ui is False
+
+
+def test_genuinely_flat_ui_chrome_still_takes_the_cheap_analytic_fill():
+    """The gate is a gradient ceiling, not a ban: a real flat plate keeps analytic (no
+    generative smear, no wasted seconds)."""
+    analytic, ui = _analytic_fill_allowed(
+        _seal_complexity(gradient_p90=6.0), _REGIONAL,
+        flat_ui_archetype=True, ui_chrome_hole=True, **_GATE_KW)
+    assert analytic is True
+
+    # And a noisier-but-still-flat UI hole is still claimed by the UI clause.
+    analytic, ui = _analytic_fill_allowed(
+        _seal_complexity(residual_p90=20.0, gradient_p90=12.0), _REGIONAL,
+        flat_ui_archetype=True, ui_chrome_hole=True, **_GATE_KW)
+    assert analytic is True and ui is True
+
+
+def test_panel_boundary_still_earns_analytic_via_low_residual():
+    """ad9's black/charcoal bars: ring gradient is high but an affine model explains the
+    colours almost perfectly -- that carve-out must survive."""
+    analytic, _ = _analytic_fill_allowed(
+        {"model": "affine-rgb", "residual_p90": 3.0, "gradient_p90": 40.0},
+        _REGIONAL, flat_ui_archetype=False, ui_chrome_hole=False, **_GATE_KW)
+    assert analytic is True
