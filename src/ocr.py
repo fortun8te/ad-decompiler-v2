@@ -1346,6 +1346,123 @@ def _restore_dropped_punctuation(text: str, alternatives: Iterable[str]) -> str:
     return "".join(out)
 
 
+# Glyphs OCR engines confuse with a trailing exclamation mark on display fonts.
+# Ad 013: doctr read ``do this!`` as ``do1 this`` (the '!' became a '1' and was
+# relocated into the first token) while easyocr read ``do thisı`` (trailing
+# dotless-i).  Both engines saw one stray thin glyph; neither kept the '!'.
+_EXCLAIM_CONFUSABLE_TOKEN = re.compile(r"^([^\W\d_]{2,})([1lIı|!])$")
+_PLAIN_ALPHA_TOKEN = re.compile(r"^[^\W\d_]+[!.,]?$")
+
+
+def _exclaim_candidate(text: str) -> Optional[tuple[str, int, bool, bool]]:
+    """Parse a reading as *alpha words + exactly one '!'-confusable glyph*.
+
+    Returns ``(cleaned_text, glyph_token_index, at_line_end, saw_bang)`` when the
+    line consists of alphabetic tokens plus exactly one token that ends in a
+    '!'-confusable glyph (``do1``, ``thisı``, ``this!``); ``None`` otherwise.
+    """
+    tokens = str(text or "").split()
+    if len(tokens) < 2:
+        return None
+    hits = [(index, _EXCLAIM_CONFUSABLE_TOKEN.match(token))
+            for index, token in enumerate(tokens)]
+    hits = [(index, match) for index, match in hits if match]
+    if len(hits) != 1:
+        return None
+    index, match = hits[0]
+    for other_index, token in enumerate(tokens):
+        if other_index != index and not _PLAIN_ALPHA_TOKEN.match(token):
+            return None
+    cleaned = list(tokens)
+    cleaned[index] = match.group(1)
+    return (" ".join(cleaned), index, index == len(tokens) - 1, match.group(2) == "!")
+
+
+def _fix_exclamation_confusion(winner_text: str, peer_texts: Iterable[str]) -> Optional[str]:
+    """Deterministic trailing-'!' recovery when engines relocate/confuse the glyph.
+
+    Fires only when the winner and a peer read the *same letters* but each carry a
+    single stray '!'-confusable glyph in *different* token positions (relocation is
+    the classic '!'-misread signature — ad 013 ``do1 this`` vs ``do thisı``), or the
+    peer literally saw a trailing ``!``.  One of the readings must place the glyph
+    at line end.  Returns the cleaned letters plus ``!``, or ``None``.
+    """
+    winner = _exclaim_candidate(winner_text)
+    if winner is None:
+        return None
+    w_clean, w_index, w_end, w_bang = winner
+    if w_bang:
+        return None  # winner already carries the '!'
+    for peer_text in peer_texts:
+        peer_text = str(peer_text or "")
+        if not peer_text.strip() or peer_text.strip() == str(winner_text or "").strip():
+            continue
+        peer = _exclaim_candidate(peer_text)
+        if peer is None:
+            continue
+        p_clean, p_index, p_end, p_bang = peer
+        if _text_key(p_clean) != _text_key(w_clean):
+            continue
+        if p_bang and p_end:
+            return w_clean + "!"
+        if not p_bang and p_index != w_index and (w_end or p_end):
+            return w_clean + "!"
+    return None
+
+
+# Isolated dash-like tokens (`` - ``) that one engine hallucinates mid-line.
+# Ad 066: doctr emitted ``SO YOU - DON'T`` (dash word conf 0.50) while easyocr
+# read the same headline without any dash.
+_STRAY_PUNCT_TOKEN = re.compile(r"^[-–—−|]{1,2}$")
+
+
+def _strip_stray_punct_tokens(winner: dict, member_texts: list[str]) -> Optional[dict]:
+    """Drop a low-evidence isolated dash token that near-identical peers lack.
+
+    Only fires for an *interior* punctuation-only token, and only when either the
+    winner's own word-level confidence for that token is weak (< 0.6) or at least
+    two peer readings agree the line without it.  Legitimate dashes (one engine
+    merely dropping a separator) are protected — that direction is handled by
+    ``_restore_dropped_punctuation``.
+    """
+    text = str(winner.get("text") or "")
+    tokens = text.split()
+    if len(tokens) < 3:
+        return None
+    stray_indices = [index for index, token in enumerate(tokens)
+                     if 0 < index < len(tokens) - 1 and _STRAY_PUNCT_TOKEN.match(token)]
+    if not stray_indices:
+        return None
+    words = winner.get("words") or []
+    peers = [str(value or "") for value in member_texts
+             if str(value or "").strip() and _text_key(value) != _text_key(text)]
+    for index in stray_indices:
+        token = tokens[index]
+        removed = tokens[:index] + tokens[index + 1:]
+        removed_text = " ".join(removed)
+        lacking = sum(1 for peer in peers if _text_key(peer) == _text_key(removed_text))
+        if not lacking:
+            continue
+        word_conf = None
+        for word in words:
+            if str(word.get("text") or "").strip() == token:
+                word_conf = _float(word.get("conf"), 1.0)
+                break
+        weak_word = word_conf is not None and word_conf < 0.6
+        if not weak_word and lacking < 2:
+            continue
+        new_words = [word for word in words
+                     if str(word.get("text") or "").strip() != token]
+        return {
+            "text": removed_text,
+            "words": new_words,
+            "dropped": token,
+            "word_conf": word_conf,
+            "peers_without": lacking,
+        }
+    return None
+
+
 def _targeted_retry(img_path: str, lines: list, engine: str, cfg: dict,
                     runner: Optional[Callable] = None) -> list:
     options = _retry_options(cfg)
@@ -1624,6 +1741,41 @@ def _reconcile(primary_lines, challenger_sets, iou_thresh=0.42, cfg=None):
             if reconciled != str(winner.get("text") or ""):
                 winner["text"] = reconciled
 
+        # Deterministic backstops for engine-confusion patterns the VLM judge only
+        # catches when it happens to sample the line (and never when it errors).
+        all_peer_texts = [
+            str(member.get("text") or "") for index, member in enumerate(members)
+            if index != winner_index
+        ]
+        exclaim_fixed = _fix_exclamation_confusion(str(winner.get("text") or ""), all_peer_texts)
+        if exclaim_fixed:
+            fix_meta = winner.setdefault("meta", {})
+            fix_meta["exclamation_fix"] = {
+                "from": str(winner.get("text") or ""),
+                "to": exclaim_fixed,
+                "readings": [str(member.get("text") or "") for member in members],
+            }
+            winner["text"] = exclaim_fixed
+            # Keep word tokens consistent: strip the confusable from its word and
+            # move the '!' to the final word so line/word text cannot diverge.
+            words = winner.get("words") or []
+            new_tokens = exclaim_fixed.split()
+            if len(words) == len(new_tokens):
+                for word, token in zip(words, new_tokens):
+                    word["text"] = token
+        stray = _strip_stray_punct_tokens(winner, [m.get("text", "") for m in members])
+        if stray is not None:
+            fix_meta = winner.setdefault("meta", {})
+            fix_meta["stray_punct_dropped"] = {
+                "from": str(winner.get("text") or ""),
+                "to": stray["text"],
+                "token": stray["dropped"],
+                "word_conf": stray["word_conf"],
+                "peers_without": stray["peers_without"],
+            }
+            winner["text"] = stray["text"]
+            winner["words"] = stray["words"]
+
         # A singleton/orphan winner can have no peer above the agreement
         # threshold.  Treat the winner itself as the only supporting reading
         # instead of crashing the whole benchmark on max(empty).
@@ -1675,9 +1827,15 @@ def _reconcile(primary_lines, challenger_sets, iou_thresh=0.42, cfg=None):
             "confidence": round(min(1.0, winner["conf"] * (.55 + .45 * agreement) *
                                     (support_count / max(1, engine_count)) ** .35), 4),
         }
-        unique_texts = sorted({member.get("text", "") for member in members})
+        unique_texts = {member.get("text", "") for member in members}
         if len({_text_key(value) for value in unique_texts}) > 1:
-            meta["disagreement"] = unique_texts
+            # Include the (possibly deterministically fixed) winner text so a later
+            # VLM arbitration sees the corrected reading as a candidate instead of
+            # only the raw engine misreads.
+            winner_current = str(winner.get("text") or "")
+            if winner_current:
+                unique_texts.add(winner_current)
+            meta["disagreement"] = sorted(unique_texts)
         winner["meta"] = meta
         output.append(winner)
     return output
@@ -2228,6 +2386,246 @@ def _verify_numeric_tokens(img_path: str, lines: list[dict], cfg: Optional[dict]
 # Public pipeline
 
 
+# ---------------------------------------------------------------------------
+# Deterministic strikethrough recovery (ad 091: struck-through headline word
+# OCR'd as ``A900A`` because the strike ink pollutes recognition)
+
+
+# A token with letters on both sides of digits (``A900A``) is essentially never a
+# real word in ad copy — it is the classic strike-ink recognition signature.
+_DIGIT_SANDWICH_RE = re.compile(r"(?<!\w)[^\W\d_]+\d+[^\W\d_]+(?!\w)|(?<!\w)\d+[^\W\d_]+\d+(?!\w)")
+
+
+def _strikethrough_options(cfg: Optional[dict]) -> dict:
+    raw = ((cfg or {}).get("ocr") or {}).get("strikethrough", True)
+    if isinstance(raw, bool):
+        options = {"enabled": raw}
+    elif isinstance(raw, dict):
+        options = dict(raw)
+        options.setdefault("enabled", True)
+    else:
+        options = {"enabled": False}
+    options.setdefault("max_lines", 4)
+    options.setdefault("scale", 2.0)
+    return options
+
+
+def _is_strike_candidate(line: dict) -> bool:
+    """Cheap gate: only lines where engines disagreed AND the selected reading
+    carries a digit-sandwich token are worth the pixel-level strike check."""
+    provenance = (line.get("meta") or {}).get("provenance") or []
+    texts = {_text_key(entry.get("text")) for entry in provenance
+             if str(entry.get("text") or "").strip()}
+    if len(texts) < 2:
+        return False
+    return bool(_DIGIT_SANDWICH_RE.search(str(line.get("text") or "")))
+
+
+def _detect_strike(crop):
+    """Detect strike ink over text in an RGB crop.
+
+    Two deterministic detectors:
+    1. Foreign-color ink (a red scribble over dark text): ink pixels whose color is
+       far from the dominant text ink, spanning a wide horizontal extent and
+       crossing the line's vertical middle band.
+    2. Same-color thin strike: a near-solid ink row band at mid-height spanning
+       most of the line width (row fill far above normal glyph rows).
+
+    Returns ``(mask, bbox)`` — a boolean pixel mask to erase and the strike's
+    bounding box in crop coordinates — or ``None``.
+    """
+    import numpy as np
+
+    arr = np.asarray(crop, dtype=np.int32)
+    if arr.ndim != 3 or arr.shape[0] < 8 or arr.shape[1] < 16:
+        return None
+    height, width = arr.shape[:2]
+    border = np.concatenate([arr[0], arr[-1], arr[:, 0], arr[:, -1]], axis=0)
+    background = np.median(border, axis=0)
+    dist_bg = np.abs(arr - background).sum(axis=2)
+    ink = dist_bg > 120
+    ink_fraction = float(ink.mean())
+    if ink_fraction < 0.01 or ink_fraction > 0.9:
+        return None
+
+    # Detector 1: foreign-color strike ink.  Anti-aliased glyph edges blend
+    # between the background and the text ink, so they sit ON the bg→text color
+    # axis; measure each pixel's distance FROM that axis instead of a plain
+    # color distance, so only genuinely foreign hues (a red scribble over dark
+    # text) are flagged and glyph edges survive the mask.
+    text_color = np.median(arr[ink], axis=0)
+    axis = background - text_color
+    axis_norm = float(np.sqrt((axis * axis).sum()))
+    if axis_norm < 1.0:
+        return None
+    unit = axis / axis_norm
+    rel = arr.astype(np.float64) - text_color
+    along = (rel * unit).sum(axis=2)
+    off_axis_sq = (rel * rel).sum(axis=2) - along * along
+    off_axis = np.sqrt(np.clip(off_axis_sq, 0.0, None))
+    foreign = ink & (off_axis > 60.0)
+    foreign_fraction = float(foreign.mean())
+    if 0.003 <= foreign_fraction <= 0.25:
+        ys, xs = np.nonzero(foreign)
+        span = (int(xs.max()) - int(xs.min()) + 1) / float(width)
+        mid_band = ((ys >= 0.25 * height) & (ys <= 0.75 * height)).mean()
+        if span >= 0.25 and mid_band >= 0.2:
+            grown = foreign.copy()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy or dx:
+                        grown |= np.roll(np.roll(foreign, dy, axis=0), dx, axis=1)
+            bbox = {"x": int(xs.min()), "y": int(ys.min()),
+                    "w": int(xs.max()) - int(xs.min()) + 1,
+                    "h": int(ys.max()) - int(ys.min()) + 1}
+            return grown, bbox
+
+    # Detector 2: same-color thin horizontal strike at mid-height.
+    row_fill = ink.mean(axis=1)
+    rows = np.arange(height)
+    band = (rows >= 0.3 * height) & (rows <= 0.7 * height)
+    solid_rows = np.nonzero((row_fill >= 0.7) & band)[0]
+    if solid_rows.size and solid_rows.size <= max(2.0, 0.3 * height):
+        strike_ink = ink[solid_rows]
+        xs = np.nonzero(strike_ink.any(axis=0))[0]
+        if xs.size:
+            span = (int(xs.max()) - int(xs.min()) + 1) / float(width)
+            if span >= 0.7:
+                mask = np.zeros_like(ink)
+                mask[solid_rows] = ink[solid_rows]
+                bbox = {"x": int(xs.min()), "y": int(solid_rows.min()),
+                        "w": int(xs.max()) - int(xs.min()) + 1,
+                        "h": int(solid_rows.max()) - int(solid_rows.min()) + 1}
+                return mask, bbox
+    return None
+
+
+def _reocr_masked_crop(crop, mask, engine: str, cfg: dict, scale: float,
+                       runner: Optional[Callable] = None) -> Optional[str]:
+    """Erase the strike mask to the background color, upscale, and re-OCR."""
+    import numpy as np
+    from PIL import Image
+
+    runner = runner or _run_backend
+    arr = np.asarray(crop).copy()
+    border = np.concatenate([arr[0], arr[-1], arr[:, 0], arr[:, -1]], axis=0)
+    background = np.median(border, axis=0).astype(arr.dtype)
+    arr[mask] = background
+    masked = Image.fromarray(arr)
+    if scale > 1.0:
+        masked = masked.resize(
+            (max(1, int(round(masked.width * scale))),
+             max(1, int(round(masked.height * scale)))),
+            Image.LANCZOS,
+        )
+    with tempfile.TemporaryDirectory(prefix="ocr_strike_") as directory:
+        path = os.path.join(directory, "strike_crop.png")
+        masked.save(path)
+        payload = runner(engine, path, cfg, use_cache=False)
+    lines = payload.get("lines") or []
+    if not lines:
+        return None
+    ordered = sorted(lines, key=lambda ln: (_float((ln.get("box") or {}).get("y")),
+                                            _float((ln.get("box") or {}).get("x"))))
+    text = " ".join(str(ln.get("text") or "").strip() for ln in ordered).strip()
+    return text or None
+
+
+def _fix_strikethrough_lines(img_path: str, lines: list[dict], cfg: Optional[dict],
+                             runner: Optional[Callable] = None) -> list[dict]:
+    """Recover struck-through text deterministically.
+
+    When strike ink is detected over a disputed line, the strike is masked out and
+    the crop re-OCR'd; the engine reading closest to the clean re-read wins.  If
+    re-OCR is unavailable, a peer reading without the digit-sandwich pollution is
+    preferred over the polluted winner.  Every strike sets ``meta.strikethrough``
+    so text analysis can emit the strike decoration.  Never raises.
+    """
+    options = _strikethrough_options(cfg)
+    if not options.get("enabled") or not lines:
+        return lines
+    candidates = [line for line in lines if line.get("box") and _is_strike_candidate(line)]
+    if not candidates:
+        return lines
+    candidates = candidates[: max(0, int(options.get("max_lines", 4)))]
+    try:
+        import numpy as np  # noqa: F401  (detector dependency)
+        from PIL import Image
+
+        image = Image.open(img_path).convert("RGB")
+        image.load()
+    except Exception:
+        return lines
+    primary = str(((cfg or {}).get("ocr") or {}).get("primary", "doctr"))
+
+    for line in candidates:
+        box = _clean_box(line.get("box") or {})
+        pad = max(2, int(round(box["h"] * 0.2)))
+        x0 = max(0, int(box["x"] - pad))
+        y0 = max(0, int(box["y"] - pad))
+        x1 = min(image.width, int(math.ceil(box["x"] + box["w"] + pad)))
+        y1 = min(image.height, int(math.ceil(box["y"] + box["h"] + pad)))
+        if x1 - x0 < 16 or y1 - y0 < 8:
+            continue
+        crop = image.crop((x0, y0, x1, y1))
+        detection = _detect_strike(crop)
+        if detection is None:
+            continue
+        mask, strike_bbox = detection
+        meta = line.setdefault("meta", {})
+        meta["strikethrough"] = True
+        meta["strikethrough_box"] = {
+            "x": x0 + strike_bbox["x"], "y": y0 + strike_bbox["y"],
+            "w": strike_bbox["w"], "h": strike_bbox["h"],
+        }
+        current = str(line.get("text") or "")
+        readings = [
+            (str(entry.get("engine") or ""), str(entry.get("text") or ""),
+             _float(entry.get("calibrated_confidence"), _float(entry.get("confidence"))))
+            for entry in meta.get("provenance") or []
+            if str(entry.get("text") or "").strip()
+        ]
+        reocr_text = None
+        try:
+            reocr_text = _reocr_masked_crop(
+                crop, mask, primary, cfg or {}, _float(options.get("scale"), 2.0),
+                runner=runner,
+            )
+        except Exception as error:
+            print(f"[ocr] strikethrough re-OCR failed: {error}")
+        chosen = None
+        method = None
+        if reocr_text and readings:
+            best = max(readings, key=lambda entry: _text_similarity(reocr_text, entry[1]))
+            if (_text_similarity(reocr_text, best[1]) >= 0.6
+                    and _text_key(best[1]) != _text_key(current)):
+                chosen, method = best, "reocr-matches-peer"
+        if chosen is None and _DIGIT_SANDWICH_RE.search(current):
+            clean_peers = [entry for entry in readings
+                           if _text_key(entry[1]) != _text_key(current)
+                           and not _DIGIT_SANDWICH_RE.search(entry[1])]
+            if clean_peers:
+                chosen = max(clean_peers, key=lambda entry: entry[2])
+                method = "clean-peer-preferred"
+        if chosen is None:
+            continue
+        meta["strikethrough_fix"] = {
+            "from": current,
+            "to": chosen[1],
+            "engine": chosen[0],
+            "method": method,
+            "reocr_text": reocr_text,
+        }
+        line["ocr_text"] = current
+        line["text"] = chosen[1]
+        if chosen[2] > 0:
+            line["conf"] = round(min(1.0, chosen[2]), 4)
+        # The old winner's word tokens no longer match the adopted reading.
+        if line.get("words"):
+            line["words"] = []
+    return lines
+
+
 def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = None):
     schema = _load_schema()
     cfg = cfg or {}
@@ -2371,6 +2769,10 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
     merged = _suppress_contained_duplicates(merged, cfg=cfg)
     repaired = _recombine_fragments(merged, cfg=cfg)
     repaired = _apply_line_text_cleanup(repaired)
+    try:
+        repaired = _fix_strikethrough_lines(img_path, repaired, cfg)
+    except Exception as error:  # deterministic backstop must never sink OCR
+        print(f"[ocr] strikethrough pass skipped: {error}")
     ordered = _order_lines(repaired)
     lines_out = []
     for line in ordered:

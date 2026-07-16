@@ -160,6 +160,35 @@ SCENE_DEFAULTS = {
     # eligible). plate/photo force the classification.
     "background_kind": "auto",
     "background_photo_sigma": 7.0,   # median local stddev above this = photo plate
+    # ── §10 top-down peel discipline (LayerD / Inpaint-Anything survey) ──
+    # Peel unoccluded top-of-stack occluders first; deeper strata become peelable
+    # on later iterations. Elements deeper than max_iterations stay flattened in
+    # the plate (never punched, never emitted). 0 = unlimited (legacy).
+    "max_iterations": 3,
+    # Per-iteration punched-footprint budget as a canvas fraction. The sum of the
+    # emitted footprints at one occlusion depth may not exceed this — overflow
+    # elements stay plate-committed (013 punched >55% of the canvas without it).
+    # 0 = off (module default; config.yaml enables it for pipeline runs).
+    "iter_mask_budget_frac": 0.0,
+    # Per-element footprint cap (canvas fraction). A single element bigger than
+    # this cannot peel — its removal would rebuild most of the plate. 0 = off.
+    "max_punch_canvas_frac": 0.0,
+    # Plate bands: an element spanning ≥ plate_band_span_frac of the canvas width
+    # or height AND ≥ plate_band_min_area_frac of its area is a background stratum
+    # (013's E003/E008/E013 full-width bands) — it stays in the plate; peeling the
+    # plate out of itself is the LayerD anti-pattern. span 0 = off.
+    "plate_band_span_frac": 0.0,
+    "plate_band_min_area_frac": 0.05,
+    # Text parallel track (§10 rule 3): OCR ink NEVER enters a peel punch mask —
+    # text is extracted natively downstream, never inpainted away at peel. Text
+    # boxes still blind the inpaint context (no ink bleeding into fills).
+    "text_parallel_track": True,
+    # Per-run Flux budget (§10 rule 5): max flux-comfy peel calls per peel_scene
+    # invocation; overflow reroutes to LaMa. 0 = unlimited. Enforced through the
+    # shared meta["flux_state"] the pipeline adapter passes back to
+    # peel_inpaint_mode. flux_max_hole_frac is the per-hole canvas-fraction cap.
+    "flux_budget": 4,
+    "flux_max_hole_frac": 0.25,
     # ── under-layer ownership (H10: chart slice must not bake the product in) ──
     # Baking original pixels into a peeled UNDER-LAYER ghosts the occluder into
     # that layer's RGBA (move it in Figma → the occluder appears twice). Large
@@ -276,6 +305,33 @@ def resolve_peel_fill_policy(cfg: Optional[dict] = None, *, under_kind: str = ""
             "archetype": archetype, "flat_scene": flat_scene}
 
 
+def _flux_budget_admits(opts: dict, meta: dict, hole_px: int) -> bool:
+    """§10 rule 5: per-run Flux budget + per-hole area cap.
+
+    ``peel_scene`` seeds every fill's meta with a shared mutable
+    ``meta["flux_state"] = {"used", "budget", "canvas_px"}``; the pipeline adapter
+    passes meta back into :func:`peel_inpaint_mode`, so admitting a call here IS
+    the accounting. Overflow (budget spent / hole above ``flux_max_hole_frac`` of
+    the canvas) returns False and the caller falls through to LaMa/Telea/flat.
+    Callers without a flux_state (unit probes) only see the per-hole cap.
+    """
+    state = meta.get("flux_state") if isinstance(meta.get("flux_state"), dict) else None
+    canvas_px = int(meta.get("canvas_px") or (state or {}).get("canvas_px") or 0)
+    frac_cap = float(opts.get("flux_max_hole_frac") or 0.0)
+    if frac_cap > 0 and canvas_px > 0 and hole_px > frac_cap * canvas_px:
+        if state is not None:
+            state["overflow"] = int(state.get("overflow") or 0) + 1
+        return False
+    if state is None:
+        return True
+    budget = int(state.get("budget") or 0)
+    if budget > 0 and int(state.get("used") or 0) >= budget:
+        state["overflow"] = int(state.get("overflow") or 0) + 1
+        return False
+    state["used"] = int(state.get("used") or 0) + 1
+    return True
+
+
 def peel_inpaint_mode(cfg: Optional[dict] = None, meta: Optional[dict] = None) -> str:
     """Backend mode for the pipeline peel adapter.
 
@@ -292,7 +348,7 @@ def peel_inpaint_mode(cfg: Optional[dict] = None, meta: Optional[dict] = None) -
     if bool(opts.get("allow_flux")) and _is_photo_kind(under) and hole_px > 0:
         lo = int(opts.get("flux_min_hole_px") or 0)
         hi = int(opts.get("flux_max_hole_px") or 0) or 10**9
-        if lo <= hole_px <= hi:
+        if lo <= hole_px <= hi and _flux_budget_admits(opts, meta, hole_px):
             return "flux_comfy"
     # Big-LaMa's strength is TEXTURE synthesis; on smooth chrome/wash plates it
     # hallucinates blotchy bands (013's smudge under the headline came from LaMa on a
@@ -645,6 +701,107 @@ def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
                            "max_hole_frac": float(opts["max_hole_frac"]),
                            "max_components": int(opts.get("max_components") or 0),
                            "require_eligible": require_eligible}}
+
+
+# ── §10 top-down iteration plan ──────────────────────────────────────────────────────
+
+def occlusion_levels(elements: list) -> dict:
+    """Occlusion depth per non-text element: 0 = unoccluded top-of-stack.
+
+    Level(e) = 1 + max(level of overlapping higher non-text elements), i.e. the
+    iteration at which a strict top-down peel (LayerD-style) would reach ``e``.
+    Text never counts — it is a parallel track (§10 rule 3), not a peel layer.
+    """
+    _, np, _ = _deps()
+    non_text = [e for e in elements if not e.is_text]
+    levels: dict = {}
+    for e in sorted(non_text, key=lambda e: -e.z):
+        above = [levels[o.id] for o in non_text if o.z > e.z
+                 and bool(np.logical_and(np.asarray(o.mask, bool),
+                                         np.asarray(e.mask, bool)).any())]
+        levels[e.id] = (max(above) + 1) if above else 0
+    return levels
+
+
+def plan_peel_iterations(elements: list, canvas: dict, cfg: Optional[dict] = None):
+    """Top-down peel discipline (§10): decide which elements may peel at all.
+
+    Returns ``(kept_elements, plan)``. ``kept_elements`` preserves input order and
+    always includes text elements (they participate as context blinds / metadata,
+    never as punches when the parallel track is on). A refused element is
+    *plate-committed*: it is not punched into anything, not completed, and not
+    emitted — it dissolves into the background plate, and holes from kept
+    occluders above it attribute to the plate instead (exactly what an iterative
+    peel that never reaches it would produce).
+
+    Refusal reasons, in precedence order:
+      * ``max-iterations`` — occlusion depth ≥ ``peel.max_iterations``;
+      * ``punch-cap`` — footprint > ``peel.max_punch_canvas_frac`` of the canvas;
+      * ``plate-band`` — full-span background stratum (``plate_band_span_frac``);
+      * ``iteration-budget`` — the per-iteration punched-area budget
+        (``peel.iter_mask_budget_frac`` × canvas) is exhausted at its depth
+        (smaller footprints are admitted first — deterministic).
+    """
+    _, np, _ = _deps()
+    opts = _options(cfg)
+    w, h = int(canvas.get("w", 0)), int(canvas.get("h", 0))
+    canvas_px = max(1, w * h)
+    non_text = [e for e in elements if not e.is_text]
+    levels = occlusion_levels(elements)
+    areas = {e.id: int(np.count_nonzero(e.mask)) for e in non_text}
+    max_iter = int(opts.get("max_iterations") or 0)
+    punch_cap = float(opts.get("max_punch_canvas_frac") or 0.0)
+    band_span = float(opts.get("plate_band_span_frac") or 0.0)
+    band_area = float(opts.get("plate_band_min_area_frac") or 0.0)
+    budget_frac = float(opts.get("iter_mask_budget_frac") or 0.0)
+    refused: dict = {}
+    for e in non_text:
+        frac = areas[e.id] / canvas_px
+        if max_iter > 0 and levels[e.id] >= max_iter:
+            refused[e.id] = (f"max-iterations (occlusion depth {levels[e.id]} >= "
+                             f"{max_iter})")
+        elif punch_cap > 0 and frac > punch_cap:
+            refused[e.id] = (f"punch-cap (footprint {frac:.0%} of canvas > "
+                             f"{punch_cap:.0%})")
+        elif band_span > 0 and frac >= band_area:
+            box = _tight_bbox(e.mask)
+            if box["w"] >= band_span * w or box["h"] >= band_span * h:
+                refused[e.id] = ("plate-band (full-span background stratum stays "
+                                 "in the plate)")
+    per_iteration: dict = {}
+    if budget_frac > 0:
+        budget = budget_frac * canvas_px
+        for lvl in sorted(set(levels.values())):
+            spent = 0
+            for e in sorted(non_text, key=lambda e: (areas[e.id], e.id)):
+                if levels[e.id] != lvl or e.id in refused:
+                    continue
+                if spent + areas[e.id] > budget:
+                    refused[e.id] = (
+                        f"iteration-budget (iteration {lvl} punched "
+                        f"{spent / canvas_px:.0%} + {areas[e.id] / canvas_px:.0%} > "
+                        f"{budget_frac:.0%} of canvas)")
+                else:
+                    spent += areas[e.id]
+            per_iteration[lvl] = spent
+    else:
+        for e in non_text:
+            if e.id not in refused:
+                per_iteration[levels[e.id]] = (per_iteration.get(levels[e.id], 0)
+                                               + areas[e.id])
+    kept = [e for e in elements if e.is_text or e.id not in refused]
+    punched = sum(areas[e.id] for e in non_text if e.id not in refused)
+    plan = {
+        "levels": levels,
+        "max_iterations": max_iter,
+        "refused": refused,
+        "kept": [e.id for e in kept if not e.is_text],
+        "per_iteration_punched_px": {str(k): int(v) for k, v in sorted(per_iteration.items())},
+        "punched_px": int(punched),
+        "punched_canvas_frac": round(punched / canvas_px, 4),
+        "canvas_px": canvas_px,
+    }
+    return kept, plan
 
 
 # ── the layer-owner hole split ─────────────────────────────────────────────────────
@@ -1168,8 +1325,18 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
     accepts_meta = _accepts_meta(inpaint)
     dilate = int(opts["hole_dilate_px"])
     text_dilate = max(dilate, int(opts.get("text_hole_dilate_px") or dilate))
+    text_track = bool(opts.get("text_parallel_track", True))
 
-    ordered = sorted([e for e in elements], key=lambda e: e.z)   # back-to-front
+    # §10 top-down discipline: refused elements dissolve into the plate — they are
+    # never punched, completed, or emitted, and holes from kept occluders above
+    # them attribute to the background instead.
+    active, plan = plan_peel_iterations(elements, canvas, cfg)
+    # Shared, mutable Flux accounting for this run; peel_inpaint_mode spends it.
+    flux_state = {"used": 0, "overflow": 0,
+                  "budget": int(opts.get("flux_budget") or 0),
+                  "canvas_px": h * w}
+
+    ordered = sorted([e for e in active], key=lambda e: e.z)   # back-to-front
     non_text = [e for e in ordered if not e.is_text]
     if matting is not None and opts.get("refine_alpha"):
         for element in non_text:
@@ -1178,7 +1345,7 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
     layers: list = []
     for z_index, element in enumerate(non_text):
         mask = np.asarray(element.mask, bool)
-        higher = [o for o in elements if o.z > element.z
+        higher = [o for o in active if o.z > element.z
                   and bool(np.logical_and(o.mask, mask).any())]
         lower = [u for u in non_text if u.z < element.z
                  and bool(np.logical_and(u.mask, mask).any())]
@@ -1200,7 +1367,14 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
             # per_occluder_area get their own fill — batching a 500k photo hole
             # with icon holes produced LaMa haze + rectangular smears (016).
             per_area = int(opts.get("per_occluder_area") or 0)
+            done = np.zeros((h, w), bool)   # §10 rule 4: inpaint once per region
             for is_text_class in (False, True):
+                if is_text_class and text_track:
+                    # §10 rule 3: text is a parallel track — OCR ink never enters
+                    # a peel punch mask (native TEXT is extracted downstream).
+                    # Text boxes stayed in the occluder map above, so they still
+                    # blind the inpaint context; they just never punch.
+                    continue
                 jobs = []  # list of (write_mask, [occluder_ids])
                 small_mask = np.zeros((h, w), bool)
                 small_ids = []
@@ -1228,13 +1402,18 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
                     jobs.append((small_mask, small_ids))
                 for write, occ_ids in jobs:
                     for write_cc in _iter_write_regions(write, opts):
+                        write_cc = write_cc & ~done   # dilate once, inpaint once
                         if not write_cc.any():
+                            meta["reinpaint_blocked"] = int(
+                                meta.get("reinpaint_blocked") or 0) + 1
                             continue
+                        done |= write_cc
                         fill_info = _fill_region(
                             flat, rgb, mask, visible, write_cc, inpaint, accepts_meta,
                             {"under_id": element.id, "under_kind": element.kind,
                              "occluder_ids": occ_ids, "text_occluder": is_text_class,
-                             "hole_px": int(np.count_nonzero(write_cc))},
+                             "hole_px": int(np.count_nonzero(write_cc)),
+                             "canvas_px": h * w, "flux_state": flux_state},
                             opts, cfg=cfg)
                         if fill_info["backend"] == "abandoned":
                             alpha[write_cc] = 0
@@ -1271,19 +1450,22 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
         bg_meta["background"] = "provided"
     else:
         union = np.zeros((h, w), bool)
-        for element in elements:
+        for element in active:
             union |= np.asarray(element.mask, bool)
         plate = flat.copy()
         if union.any():
             pseudo = SceneElement(id="background", mask=np.ones((h, w), bool), z=-1.0)
-            occluder_map, occ_order = _direct_occluder_map(pseudo, list(elements))
+            occluder_map, occ_order = _direct_occluder_map(pseudo, list(active))
             bg_visible = ~_dilate_px(union, dilate)
             bg_kind = str(opts.get("background_kind") or "auto").strip().lower()
             if bg_kind not in ("photo", "plate", "background"):
                 bg_kind = background_plate_kind(flat, bg_visible, opts)
             under_kind = "photo" if bg_kind == "photo" else "background"
             bg_meta["plate_kind"] = under_kind
+            bg_done = np.zeros((h, w), bool)   # §10 rule 4: inpaint once per region
             for is_text_class in (False, True):
+                if is_text_class and text_track:
+                    continue   # §10 rule 3: OCR ink never punches the plate at peel
                 class_mask = np.zeros((h, w), bool)
                 class_occluders = []
                 hole_px = text_dilate if is_text_class else dilate
@@ -1300,6 +1482,12 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
                     continue
                 write = _dilate_px(class_mask, hole_px)
                 for write_cc in _iter_write_regions(write, opts):
+                    write_cc = write_cc & ~bg_done   # dilate once, inpaint once
+                    if not write_cc.any():
+                        bg_meta["reinpaint_blocked"] = int(
+                            bg_meta.get("reinpaint_blocked") or 0) + 1
+                        continue
+                    bg_done |= write_cc
                     fill_info = _fill_region(
                         flat, plate, np.ones((h, w), bool), bg_visible,
                         write_cc, inpaint, accepts_meta,
@@ -1307,13 +1495,22 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
                          "background": True,
                          "occluder_ids": class_occluders,
                          "text_occluder": is_text_class,
-                         "hole_px": int(np.count_nonzero(write_cc))}, opts, cfg=cfg)
+                         "hole_px": int(np.count_nonzero(write_cc)),
+                         "canvas_px": h * w, "flux_state": flux_state}, opts, cfg=cfg)
                     bg_meta.setdefault("fill_backends", []).append(
                         {"text_occluder": is_text_class,
                          "backend": fill_info["backend"],
                          "area": int(np.count_nonzero(write_cc))})
+            bg_meta["plate_punched_px"] = int(np.count_nonzero(bg_done))
+            bg_meta["plate_punched_canvas_frac"] = round(
+                float(np.count_nonzero(bg_done)) / float(h * w), 4)
         bg_meta["background"] = "inpainted"
 
+    # §10 accounting: iteration plan + Flux budget feed the changed-canvas ledger
+    # (the manifest carries them; the harness reads punched_canvas_frac directly).
+    bg_meta["iteration_plan"] = plan
+    bg_meta["flux"] = dict(flux_state)
+    bg_meta["text_parallel_track"] = text_track
     result = ScenePeelResult(layers=layers, background=plate, canvas=canvas,
                              overlap=report, background_fills=background_fills,
                              meta=bg_meta)

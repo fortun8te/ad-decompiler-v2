@@ -21,6 +21,120 @@ STAGE_ALIASES = {
     "sam3": "sam",
 }
 
+# Canonical pipeline stage order (mirrors run_pipeline.STAGES). Resuming at stage i
+# re-runs every stage >= i via the orchestrator's dirty cascade — including the peel
+# stack's Flux inpaints — so the harness must never resume earlier than the first
+# stage a repair's config patch can actually affect (GB6).
+PIPELINE_STAGE_ORDER = [
+    "normalize", "ocr", "text", "residual", "qwen", "sam", "elements",
+    "peel", "merge", "structure", "reconstruct", "layout", "design", "preview",
+    "figma", "export", "diff", "qa",
+]
+
+# Config levers the pipeline stages actually read, verified against stage code. A repair
+# whose patch only writes keys outside this registry cannot change any stage's behaviour;
+# the resumed rerun is guaranteed byte-identical. postfix-benchmark-4 evidence: ~70
+# refit-text-box repairs wrote ``text_analysis.fit`` and 009's restore-native-nodes wrote
+# ``design.restore_native_nodes`` — no stage reads either key, so every one of those
+# reruns replayed the full downstream stack (091: 12 Flux peel inpaints) for a no-op.
+_PIPELINE_LEVERS: dict[str, set] = {
+    "ocr": {"challengers", "retry_2x"},
+    "text_analysis": {"font_matching"},
+    "vlm": {"enabled", "ocr_judge", "font_judge", "scene_text",
+            "segment_filter", "element_propose"},
+    "qwen": {"enabled", "layers"},
+    "merge": {"dedup_iou", "dedup_text", "duplicate_text", "layer_ids"},
+    "reconstruct": {"focus_regions", "dedup_iou"},
+    "inpaint": {"mode", "allow_fallback"},
+    # measured_dx/measured_dy are the admission contract for measured VLM geometry
+    # evidence (CRITIC-REVIEW 002 replay test) even though layout currently derives its
+    # own offsets; min/max_container_frac are read directly by layout.py.
+    "layout": {"min_container_frac", "max_container_frac", "measured_dx", "measured_dy"},
+    "sam3": {"enabled", "confidence", "box_refine_confidence", "reject_internal_holes"},
+    "vectorize": {"force_raster_fallback"},
+    "figma": {"enabled", "reimport"},
+    "fallback": {"force_slice_ids"},
+}
+
+# Earliest pipeline stage that reads each config section (vlm resolved per-subkey).
+_SECTION_EARLIEST_STAGE = {
+    "ocr": "ocr", "text_analysis": "text", "qwen": "qwen", "sam3": "sam",
+    "merge": "merge", "inpaint": "reconstruct", "reconstruct": "reconstruct",
+    "vectorize": "reconstruct", "fallback": "reconstruct", "layout": "layout",
+    "design": "design", "figma": "figma",
+}
+_VLM_SUBKEY_STAGE = {
+    "ocr_judge": "ocr", "scene_text": "text", "font_judge": "text",
+    "segment_filter": "sam", "element_propose": "sam",
+}
+
+# Primary artifacts each resume stage writes. If none of these change after a repair
+# rerun, the round produced byte-identical outputs (the plateau-with-identical-artifacts
+# class) and the rest of the round can be short-circuited.
+_STAGE_OUTPUTS: dict[str, tuple] = {
+    "ocr": ("ocr_raw.json",),
+    "text": ("ocr.json",),
+    "qwen": ("qwen.json",),
+    "sam": ("elements.json",),
+    "elements": ("fused_elements.json",),
+    "merge": ("merged.json",),
+    "reconstruct": ("reconstruction.json", "fallback.json"),
+    "layout": ("layout.json",),
+    "design": (),
+    "figma": ("figma_import.json",),
+}
+# Tail sentinels watched for every resume stage: any real repair must eventually move
+# the compiled design or its render.
+_TAIL_OUTPUTS = ("design.json", "preview.png")
+
+
+def _stage_order_index(name: Optional[str]) -> int:
+    try:
+        return PIPELINE_STAGE_ORDER.index(str(name))
+    except ValueError:
+        return -1
+
+
+def _reachable_levers(patches: dict) -> list[tuple[str, str]]:
+    """(section, key) pairs of a patch that a pipeline stage actually reads."""
+    out: list[tuple[str, str]] = []
+    for section, body in (patches or {}).items():
+        if section == "harness" or not isinstance(body, dict):
+            continue
+        levers = _PIPELINE_LEVERS.get(section)
+        if not levers:
+            continue
+        for key, value in body.items():
+            if key not in levers:
+                continue
+            if section == "reconstruct" and key == "focus_regions":
+                # apply_raster_slice_fallback only honors entries carrying a layer_id;
+                # box-only "worst window" regions are dead weight (the 002/016 no-ops).
+                if not any(isinstance(entry, dict) and entry.get("layer_id")
+                           for entry in (value or [])):
+                    continue
+            out.append((section, key))
+    return out
+
+
+def patch_reaches_pipeline(patches: dict) -> bool:
+    """True when at least one patched key is a lever some pipeline stage reads."""
+    return bool(_reachable_levers(patches))
+
+
+def earliest_patched_stage(patches: dict) -> Optional[str]:
+    """Earliest pipeline stage that reads any lever this patch writes (GB6)."""
+    best: Optional[int] = None
+    for section, key in _reachable_levers(patches):
+        if section == "vlm":
+            stage = _VLM_SUBKEY_STAGE.get(key, "ocr")
+        else:
+            stage = _SECTION_EARLIEST_STAGE.get(section)
+        index = _stage_order_index(stage)
+        if index >= 0 and (best is None or index < best):
+            best = index
+    return PIPELINE_STAGE_ORDER[best] if best is not None else None
+
 # Actions the harness can drive without human review.
 ACTIONABLE = {
     ("ocr", "rerun"),
@@ -110,7 +224,13 @@ def config_patches_for(repair: dict) -> dict:
     if stage == "ocr" and action == "rerun":
         ocr_patch: dict[str, Any] = {}
         if params.get("upscale"):
-            ocr_patch["retry_2x"] = {"enabled": True}
+            # retry_2x is enabled by default (ocr.py: scale 2.0, low_confidence 0.72,
+            # max_regions 6), so {"enabled": True} was a placebo — the rerun was
+            # config-identical. Escalate for real: higher upscale, retry more lines.
+            ocr_patch["retry_2x"] = {
+                "enabled": True, "scale": 3.0,
+                "low_confidence": 0.85, "max_regions": 12,
+            }
         challengers = params.get("challengers")
         if challengers:
             ocr_patch["challengers"] = list(challengers)
@@ -289,16 +409,32 @@ def resume_stage_for(repair: dict) -> Optional[str]:
 def is_actionable(repair: dict) -> bool:
     stage = repair.get("stage")
     action = repair.get("action")
-    return bool(stage and action and (stage, action) in ACTIONABLE and resume_stage_for(repair))
+    if not (stage and action and (stage, action) in ACTIONABLE and resume_stage_for(repair)):
+        return False
+    if (stage, action) in _SELF_CONCRETE_ACTIONS:
+        return True
+    # Reachability screen: a repair whose entire patch writes config keys no pipeline
+    # stage reads can never change the output — it is not actionable, so it must not
+    # trigger harness rounds or burn a full-pipeline rerun (postfix-benchmark-4:
+    # refit-text-box/restore-native-nodes/rebuild-schema were all in this class).
+    patches = {key: value for key, value in config_patches_for(repair).items()
+               if key != "harness"}
+    if any(value for value in patches.values()):
+        return patch_reaches_pipeline(patches)
+    # Empty-patch untargeted rerun: config-identical, so it can only differ through
+    # stage nondeterminism. That lottery ticket must never replay the expensive peel
+    # stack (Flux inpaints) — admit it only when the resume point is after peel.
+    return _stage_order_index(resume_stage_for(repair)) > _stage_order_index("peel")
 
 
 # Actions whose resume performs real, state-changing I/O even with an identical config
-# (re-staging inbox/assets, re-importing after a compiler report). Everything else needs a
-# concrete config delta to be worth a rerun.
+# (re-staging the inbox, re-importing after a compiler report). Everything else needs a
+# concrete config delta to be worth a rerun. NOTE: ("reconstruct", "restage-assets") was
+# removed — its ``reconstruct.restage_assets`` patch has no consumer anywhere in the
+# pipeline, so the rerun it bought was always byte-identical.
 _SELF_CONCRETE_ACTIONS = {
     ("figma", "restage-inbox"),
     ("figma", "fix-compiler-report"),
-    ("reconstruct", "restage-assets"),
 }
 
 
@@ -311,16 +447,23 @@ def plan_is_concrete(choice: dict) -> bool:
     plan (target_id set, or a VLM-sourced opinion) must patch something real beyond the
     target id; untargeted whole-stage reruns stay admissible (the plan-fingerprint
     memory already blocks their replays on unchanged inputs)."""
+    if (choice.get("stage"), choice.get("action")) in _SELF_CONCRETE_ACTIONS:
+        return True
     patches = {key: value for key, value in (choice.get("patches") or {}).items()
                if key != "harness"}
     if any(value for value in patches.values()):
-        return True
-    if (choice.get("stage"), choice.get("action")) in _SELF_CONCRETE_ACTIONS:
-        return True
+        # A non-empty patch is only concrete when at least one written key is a lever a
+        # pipeline stage actually reads; a patch made entirely of unread keys is a
+        # guaranteed byte-identical rerun (the "repairs never convert" class).
+        return patch_reaches_pipeline(patches)
     params = choice.get("params") or {}
     if params.get("source") == "vlm_critique":
         return False
-    return not choice.get("target_id")
+    if choice.get("target_id"):
+        return False
+    # Empty-patch untargeted rerun: only concrete when its resume cannot replay the
+    # expensive peel stack (same guard as is_actionable).
+    return _stage_order_index(choice.get("resume")) > _stage_order_index("peel")
 
 
 def _layer_local_scores(qa: Optional[dict]) -> dict:
@@ -424,6 +567,16 @@ def recommended_resume(repairs: list) -> Optional[dict]:
         resume = resume_stage_for(repair)
         if not resume:
             continue
+        patches = config_patches_for(repair)
+        # GB6: never resume earlier than the first stage the patch can actually affect.
+        # Resuming earlier replays expensive stages (peel's Flux inpaints, SAM) whose
+        # inputs and config the patch does not touch, producing identical outputs at
+        # full cost (the 091 full peel-stack replay class).
+        if (repair.get("stage"), repair.get("action")) not in _SELF_CONCRETE_ACTIONS:
+            earliest = earliest_patched_stage(patches)
+            if earliest and _stage_order_index(resume) >= 0 \
+                    and _stage_order_index(earliest) > _stage_order_index(resume):
+                resume = earliest
         return {
             "stage": repair.get("stage"),
             "action": repair.get("action"),
@@ -432,7 +585,7 @@ def recommended_resume(repairs: list) -> Optional[dict]:
             "reason": repair.get("reason"),
             "severity": repair.get("severity"),
             "params": dict(repair.get("params") or {}),
-            "patches": config_patches_for(repair),
+            "patches": patches,
         }
     return None
 
@@ -856,6 +1009,13 @@ def execute_repairs(
         qa_path = os.path.join(run_dir, "qa.json")
         qa_before = copy.deepcopy(qa)
         before_qa_fingerprint = _artifact_fingerprint(qa_path)
+        # Watch the resumed stage's primary outputs plus the compiled-design tail. If
+        # none change, the repair provably had no effect (qa.json alone can be rewritten
+        # with identical metrics), and the loop can short-circuit the rest of the round.
+        watched = tuple(dict.fromkeys(_STAGE_OUTPUTS.get(resume, ()) + _TAIL_OUTPUTS))
+        before_watched = {
+            name: _artifact_fingerprint(os.path.join(run_dir, name)) for name in watched
+        }
         try:
             result = _invoke_run_one(run_one, input_path, run_dir, iter_cfg, resume)
             if not isinstance(result, dict):
@@ -871,6 +1031,10 @@ def execute_repairs(
             and after_qa_fingerprint != before_qa_fingerprint
         )
         qa_improved, metric_deltas = _qa_progress(qa_before, qa) if qa_fresh else (False, {})
+        artifacts_changed = any(
+            _artifact_fingerprint(os.path.join(run_dir, name)) != before_watched[name]
+            for name in watched
+        )
         attempt = {
             "iteration": iteration,
             "resume": resume,
@@ -885,9 +1049,12 @@ def execute_repairs(
             "pipeline_error": pipeline_error,
             "qa_fresh": qa_fresh,
             "qa_improved": qa_improved,
+            "artifacts_changed": artifacts_changed,
             "metric_deltas": metric_deltas,
             "qa_ok": qa_fresh and _qa_accepts(qa, allow_summary=True),
         }
+        if result.get("ok") and not artifacts_changed and not qa_improved:
+            attempt["no_effect"] = "identical-artifacts"
         attempts.append(attempt)
         seen_plans[plan_fingerprint] = {
             "plan": plan_payload, "qa_fresh": qa_fresh, "qa_improved": qa_improved,

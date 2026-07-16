@@ -137,12 +137,13 @@ def test_clipped_text_anomaly_becomes_text_refit_repair():
     repairs = repair.repairs_from_anomalies(anomalies)
     item = repairs[0]
     assert (item["stage"], item["action"]) == ("text-analysis", "refit-text-box")
+    # refit-text-box's ``text_analysis.fit`` patch has NO consumer in the text stage:
+    # postfix-benchmark-4 burned ~70 byte-identical full-pipeline reruns on it. It is
+    # a suggestion for human review, not an auto-actionable repair, until a text-stage
+    # consumer exists — so the harness must NOT pick it as the resume choice.
+    assert harness.is_actionable(item) is False
     choice = harness.recommended_resume(repairs)
-    assert choice["resume"] == "text"
-    fit = choice["patches"]["text_analysis"]["fit"]
-    assert fit["widen_clipped"] is True
-    assert fit["shrink_to_fit"] is True
-    assert fit["clipped_text"] == ["30% KORTING"]
+    assert choice is None
 
 
 def test_wrong_glyphs_anomaly_becomes_resolve_fonts_repair():
@@ -172,8 +173,12 @@ def test_assess_reads_anomalies_embedded_in_qa():
     assert ("text-analysis", "refit-text-box") in _actions(repairs)
 
 
-def test_refit_text_box_is_actionable_and_maps_to_text():
+def test_refit_text_box_is_not_auto_actionable():
+    # The action stays in the repair vocabulary (resume mapping intact) but its config
+    # patch (text_analysis.fit) reaches no pipeline stage, so the harness must refuse
+    # to spend a full-pipeline rerun on it (postfix-benchmark-4: ~70 no-op reruns,
+    # including 091's full peel-stack replay with 12 Flux inpaints).
     r = {"stage": "text-analysis", "action": "refit-text-box",
          "params": {"widen": True, "shrink_to_fit": True}}
-    assert harness.is_actionable(r) is True
     assert harness.resume_stage_for(r) == "text"
+    assert harness.is_actionable(r) is False

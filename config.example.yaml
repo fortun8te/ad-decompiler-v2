@@ -222,6 +222,17 @@ element_fusion:
   containment: 0.92
   nested_max_area_ratio: 0.62
 
+# Post-fusion ✓ / ✗ / ? glyph icons + chart-region clusters (src/icon_detect.py).
+# Deterministic CPU pass: list-row glyphs become role-tagged icon elements attached
+# to their text lines (comparison ads), stacked duplicate fragments collapse, and a
+# gridline-verified chart region is re-roled "chart" so it slices as one clean crop.
+icon_detect:
+  enabled: true
+  row_accept_score: 0.55               # template-IoU floor for a lone row glyph
+  row_column_accept_score: 0.42        # relaxed floor once a column has >=2 members
+  standalone_accept_score: 0.60        # large free-floating ✓/✗/? (e.g. mystery "?")
+  chart_min_gridlines: 3               # evenly spaced long horizontals that mark a plot
+
 qwen:
   enabled: false                       # opt in only after the separate local ComfyUI service is online
   required: false                      # set true only for an experiment that depends on its alpha layers
@@ -488,3 +499,12 @@ peel:
   punch_artwork_into_photos: false
   text_inpaint: telea         # telea | lama — text-occluder fills (never Flux)
   telea_max_hole_px: 2500     # non-text holes below this use Telea too
+  # §10 top-down peel discipline (docs/PEEL-DECOMPOSITION.md §10)
+  max_iterations: 3           # top-down peel depth; deeper strata stay in the plate
+  iter_mask_budget_frac: 0.45 # per-iteration punched-footprint budget (canvas frac)
+  max_punch_canvas_frac: 0.30 # single-element footprint cap (canvas frac)
+  plate_band_span_frac: 0.95  # full-span background bands stay in the plate
+  plate_band_min_area_frac: 0.05
+  text_parallel_track: true   # OCR ink never enters a peel punch mask
+  flux_budget: 4              # max flux-comfy peel calls per pass; overflow → LaMa
+  flux_max_hole_frac: 0.25    # per-hole canvas-frac cap for the Flux band

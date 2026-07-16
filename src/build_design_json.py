@@ -558,6 +558,161 @@ def _shell_silhouette(run_dir, abs_box, color):
         return None
 
 
+def _measure_rect_shell(run_dir, abs_box):
+    """Re-measure a flat-rect badge/chip shell against the ORIGINAL source pixels.
+
+    Segments "not the surrounding background" inside ``abs_box`` (background sampled
+    from a ring OUTSIDE the box, so a plate that is flush with its box still reads),
+    keeps the largest hole-filled component and classifies the shell:
+
+      * ``phantom``  — no plate exists: the flat fill was sampled from the TEXT's own
+        ink (104 "Cadence": a black wordmark on white background shipped as a black
+        rect at region_ssim 0.14). The caller DROPS the shell; the sibling text layer
+        already owns that ink.
+      * ``outlined`` — a thin rim in a distinct colour around a differently-painted
+        interior (013 "snacks": white stroke around a near-black pill). The caller
+        re-styles: stroke = rim colour, fill = interior colour (or None when the
+        interior is just the background showing through).
+      * ``solid``    — rim and interior agree: a genuine solid plate. The caller keeps
+        the upstream fill untouched.
+
+    Returns None when the measurement cannot be trusted (no source, degenerate box,
+    scipy missing) — the caller then falls back to the fill-colour radius path.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+        from scipy import ndimage
+    except Exception:
+        return None
+    source = None
+    for name in ("normalized.png", "original.png"):
+        cand = os.path.join(run_dir, name)
+        if os.path.exists(cand):
+            source = cand
+            break
+    if not source:
+        return None
+    try:
+        rgb = np.asarray(Image.open(source).convert("RGB"), dtype=np.int16)
+        H, W = rgb.shape[:2]
+        x = int(round(float(abs_box.get("x", 0) or 0)))
+        y = int(round(float(abs_box.get("y", 0) or 0)))
+        w = int(round(float(abs_box.get("w", 1) or 1)))
+        h = int(round(float(abs_box.get("h", 1) or 1)))
+        if w < 16 or h < 16 or x < 0 or y < 0 or x + w > W or y + h > H:
+            return None
+        # Background reference: a ring OUTSIDE the box (the box itself may be flush
+        # with the plate, so its own corners can be plate pixels).
+        pad = 8
+        rx0, ry0 = max(0, x - pad), max(0, y - pad)
+        rx1, ry1 = min(W, x + w + pad), min(H, y + h + pad)
+        ring = np.ones((ry1 - ry0, rx1 - rx0), dtype=bool)
+        ring[y - ry0:y - ry0 + h, x - rx0:x - rx0 + w] = False
+        ring_px = rgb[ry0:ry1, rx0:rx1][ring]
+        if ring_px.shape[0] < 32:
+            return None
+        bg = np.median(ring_px, axis=0)
+        crop = rgb[y:y + h, x:x + w]
+        notbg = np.abs(crop - bg).sum(axis=2) > 110
+        if float(notbg.mean()) < 0.02:
+            # Nothing in the box differs from the surrounding background at all:
+            # the shell paints chrome that simply is not there.
+            return {"verdict": "phantom", "coverage": 0.0, "bbox_fill": 0.0}
+        sil = ndimage.binary_fill_holes(notbg)
+        lab, n = ndimage.label(sil)
+        if n > 1:
+            sizes = ndimage.sum(sil, lab, range(1, n + 1))
+            sil = lab == (int(np.argmax(sizes)) + 1)
+        cov = float(sil.mean())
+        ys, xs = np.nonzero(sil)
+        bw = int(xs.max()) - int(xs.min()) + 1
+        bh = int(ys.max()) - int(ys.min()) + 1
+        bbox_fill = float(sil.sum()) / max(1.0, float(bw * bh))
+        # A genuine rect/pill plate fills its own bounding box nearly completely and
+        # a large share of the layer box; hole-filled TEXT INK does neither.
+        # Measured on the real evidence: 013 "snacks" pill (genuine, antialiased edges)
+        # reads bbox_fill 0.796; 104 "Cadence" bold wordmark ink (phantom) reads 0.671
+        # with coverage 0.633. Scattered ink (disjoint glyphs) fails the coverage gate
+        # because only the largest component is kept.
+        if cov < 0.45 or bbox_fill < 0.72:
+            return {"verdict": "phantom", "coverage": cov, "bbox_fill": bbox_fill}
+        # Rim vs interior paint.
+        it = max(2, min(4, min(w, h) // 12))
+        er = ndimage.binary_erosion(sil, iterations=it)
+        band = sil & ~er
+        if int(band.sum()) < 16 or int(er.sum()) < 16:
+            return {"verdict": "solid", "coverage": cov, "bbox_fill": bbox_fill,
+                    "sil": sil}
+        rim = np.median(crop[band], axis=0)
+        inner_px = crop[er]
+        rim_like = np.abs(inner_px - rim).sum(axis=1) < 110
+        distinct = inner_px[~rim_like]
+        if distinct.shape[0] < max(16, int(0.10 * inner_px.shape[0])):
+            return {"verdict": "solid", "coverage": cov, "bbox_fill": bbox_fill,
+                    "sil": sil}
+        interior = np.median(distinct, axis=0)
+        if float(np.abs(rim - interior).sum()) <= 150:
+            return {"verdict": "solid", "coverage": cov, "bbox_fill": bbox_fill,
+                    "sil": sil}
+        # Outlined: measure the stroke width as how many 1px erosion shells stay
+        # rim-coloured. The OUTERMOST shell is antialiased against the background
+        # (013's white ring reads (135,179,154) there), so a non-rim shell only ends
+        # the count once a rim-coloured shell has been seen.
+        rim_shells = 0
+        seen_rim = False
+        prev = sil
+        for k in range(1, 9):
+            step = ndimage.binary_erosion(sil, iterations=k)
+            shell_band = prev & ~step
+            prev = step
+            if int(shell_band.sum()) < 8:
+                break
+            med = np.median(crop[shell_band], axis=0)
+            if float(np.abs(med - rim).sum()) < 110:
+                rim_shells += 1
+                seen_rim = True
+            elif seen_rim:
+                break
+        width = max(1, rim_shells)
+        # Interior: transparent only when it truly matches the surrounding background
+        # (013's near-black pill interior sits on dark green — sum-distance 81 — so the
+        # gate must be tight or a real fill silently vanishes).
+        fill_hex = None
+        if float(np.abs(interior - bg).sum()) > 60:
+            fill_hex = "#%02x%02x%02x" % tuple(int(v) for v in np.clip(interior, 0, 255))
+        # Radius: the strict fitter fails on a photographed chip (013's pill is a few
+        # degrees off-axis and its paw icon overlaps the left cap), so fall back to a
+        # corner-occupancy test: a stadium/rounded chip leaves its silhouette-bbox
+        # corner squares mostly EMPTY (~0.79 occupancy for a quarter-round), a square
+        # outlined frame fills them (~1.0).
+        radius = None
+        try:
+            from . import overlay_detect
+            radius = overlay_detect.estimate_corner_radius(sil)
+        except Exception:
+            radius = None
+        if radius is None or isinstance(radius, dict) or float(radius) <= 0:
+            r = max(4, min(bw, bh) // 2)
+            y0, x0 = int(ys.min()), int(xs.min())
+            y1, x1 = int(ys.max()) + 1, int(xs.max()) + 1
+            corners = [
+                sil[y0:y0 + r, x0:x0 + r], sil[y0:y0 + r, x1 - r:x1],
+                sil[y1 - r:y1, x0:x0 + r], sil[y1 - r:y1, x1 - r:x1],
+            ]
+            occ = float(np.mean([float(c.mean()) for c in corners if c.size]))
+            radius = (min(w, h) / 2.0) if occ < 0.88 else None
+        return {
+            "verdict": "outlined", "coverage": cov, "bbox_fill": bbox_fill, "sil": sil,
+            "stroke_color": "#%02x%02x%02x" % tuple(int(v) for v in np.clip(rim, 0, 255)),
+            "stroke_width": float(width),
+            "fill_color": fill_hex,
+            "radius": radius,
+        }
+    except Exception:
+        return None
+
+
 def _starburst_path_for_shell(run_dir, abs_box, color):
     """Fit a regular-star polygon to the flat-colour silhouette inside ``abs_box``.
 
@@ -707,6 +862,38 @@ _WEIGHT_SPLIT_MAX_SEGMENTS = 3
 _WEIGHT_CANDIDATE_MATCH_TOL = 150
 
 
+def _italic_variant_path(path, weight: int):
+    """Best-effort italic sibling of an upright font file (georgia.ttf ->
+    georgiai.ttf, Lato-Regular.ttf -> Lato-Italic.ttf). The preview renderer
+    resolves faces by candidate PATH, so an italic run whose top candidate
+    points at the upright file draws upright (025: 'Hears'). Returns an
+    existing italic file path, or None to keep the original candidate."""
+    if not path:
+        return None
+    name = os.path.basename(str(path)).lower()
+    if "italic" in name or re.search(r"(?:i|z)\.(?:ttf|otf)$", name):
+        return None
+    base, ext = os.path.splitext(str(path))
+    candidates = []
+    for suffix, italic_suffix in (("-Regular", "-Italic"), ("Regular", "Italic"),
+                                  ("-Bold", "-BoldItalic"), ("Bold", "BoldItalic")):
+        if base.endswith(suffix):
+            candidates.append(base[: -len(suffix)] + italic_suffix + ext)
+    # Windows core-font naming: georgia.ttf -> georgiai.ttf (italic) /
+    # georgiaz.ttf (bold italic); prefer the weight-appropriate face.
+    windows_pair = [base + "i" + ext, base + "z" + ext]
+    if weight >= 600:
+        windows_pair.reverse()
+    candidates += windows_pair + [base + "-Italic" + ext, base + "Italic" + ext]
+    for candidate in candidates:
+        try:
+            if os.path.exists(candidate):
+                return candidate
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def _promote_weight_candidate(style: dict) -> None:
     """Keep ``fontCandidates[0]`` consistent with the declared ``fontWeight``.
 
@@ -754,6 +941,10 @@ def _promote_weight_candidate(style: dict) -> None:
             style["fontStyle"] = top_style
         else:
             top["style"] = style_label
+    if italic:
+        italic_path = _italic_variant_path(top.get("path"), weight)
+        if italic_path:
+            top["path"] = italic_path
     rest = [c for c in ranked[1:]]
     style["fontCandidates"] = [top] + rest
     if top.get("family"):
@@ -806,6 +997,62 @@ def _normalize_text_stroke(stroke, style: dict, effects: list) -> tuple:
     return out, list(effects or [])
 
 
+def _resolve_overlapping_runs(text: str, runs: list[dict]) -> list[dict]:
+    """Rebuild runs as NON-overlapping character ranges; specific runs win their span.
+
+    merge emits both a whole-line run and word-level emphasis runs inside it (025:
+    "Switching to Hears" carried Regular 15-33 AND Italic 28-33 — Figma/preview
+    apply ranges in order, so the broad Regular run shadowed the styled word and
+    the emphasis flattened at render). Paint broad runs first and narrower (more
+    specific) runs last onto a per-character map, then re-emit contiguous
+    segments: every character keeps exactly one style, the styled word wins its
+    span, and the surrounding span keeps the line run's style.
+    """
+    text_len = len(text)
+    spans = []
+    for run in runs:
+        if not isinstance(run, dict) or not isinstance(run.get("style"), dict):
+            continue
+        try:
+            start, end = int(run.get("start")), int(run.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= start < end <= text_len):
+            continue
+        spans.append((start, end, run))
+    if len(spans) <= 1:
+        return [run for _s, _e, run in spans]
+    ordered = sorted(spans, key=lambda item: (item[0], item[1]))
+    if all(prev_end <= start for (_s0, prev_end, _r0), (start, _e1, _r1)
+           in zip(ordered, ordered[1:])):
+        return [run for _s, _e, run in ordered]
+    owner = [None] * text_len
+    # Broad spans first, narrow spans last (they overwrite = win). Equal-length
+    # overlaps keep source order: the later, more specific emission wins.
+    for index in sorted(range(len(spans)),
+                        key=lambda i: (-(spans[i][1] - spans[i][0]), i)):
+        start, end, _run = spans[index]
+        for pos in range(start, end):
+            owner[pos] = index
+    resolved = []
+    pos = 0
+    while pos < text_len:
+        index = owner[pos]
+        if index is None:
+            pos += 1
+            continue
+        stop = pos
+        while stop < text_len and owner[stop] == index:
+            stop += 1
+        piece = dict(spans[index][2])
+        piece["start"], piece["end"] = pos, stop
+        if piece.get("text") is not None:
+            piece["text"] = text[pos:stop]
+        resolved.append(piece)
+        pos = stop
+    return resolved
+
+
 def _split_weight_run_siblings(candidate: dict) -> list[dict]:
     """Split a single-line text candidate at weight-run boundaries into siblings.
 
@@ -829,7 +1076,9 @@ def _split_weight_run_siblings_unsafe(candidate: dict) -> list[dict]:
     except (TypeError, ValueError):
         base_weight = 400
     runs = []
-    for run in candidate.get("text_runs") or []:
+    # Resolve merge's nested line+word ranges into disjoint spans first so a
+    # genuine emphasis word inside a whole-line run can still become a sibling.
+    for run in _resolve_overlapping_runs(text, candidate.get("text_runs") or []):
         if not isinstance(run, dict):
             return [candidate]
         style = run.get("style") or {}
@@ -1114,6 +1363,15 @@ def _generous_text_box(box: dict, style: dict, text: str, stroke=None) -> dict:
             _TEXT_BOX_HEIGHT_FACTOR * line_height * lines,
             font_size * 1.25 * lines,
         )
+        # Growth cap (user-locked 2026-07-16): the box must stay NEAR its ink — each
+        # side may drift at most ~15% of the ink height above/below it. Uncapped, an
+        # inflated lineHeight let 013's headline box start 137px above its glyphs
+        # (box y=150 for ink y=294), wrecking Figma selection ergonomics. The cap
+        # never squeezes below the actual content (lines*lineHeight and the 1.25x
+        # fontSize anti-clip floor), so descenders/ascenders still fit.
+        if h > 0:
+            content_floor = max(line_height * lines, font_size * 1.25 * lines)
+            min_h = max(min(min_h, h + 2.0 * 0.15 * h), content_floor)
         stroke_pad = 0.0
         if isinstance(stroke, dict):
             try:
@@ -1340,6 +1598,15 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
                 for child in children:
                     child.box["x"] = float((child.box or {}).get("x", 0) or 0) - min_x
                     child.box["y"] = float((child.box or {}).get("y", 0) or 0) - min_y
+                    # prefit_ink_box lives in the SAME parent frame as child.box; QA
+                    # (pixel_diff) scores placement against it. Leaving it unshifted
+                    # after the union shift made QA crop ~min_y px away from the real
+                    # ink (107 text-stack: 58% headline scored a region 130px above
+                    # its glyphs → placement_ink_iou 0.14 on a correct render).
+                    prefit = (child.meta or {}).get("prefit_ink_box")
+                    if isinstance(prefit, dict):
+                        prefit["x"] = float(prefit.get("x", 0) or 0) - min_x
+                        prefit["y"] = float(prefit.get("y", 0) or 0) - min_y
                 common["meta"]["expanded_to_child_union"] = True
         # When a native shell primitive now carries the shell paint, the FRAME must NOT
         # also paint its flat fill/stroke/radius — a frame paints its fill as a rectangle
@@ -1428,6 +1695,11 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
                         run_style.pop("fontSize", None)
                 run["style"] = run_style
             text_runs.append(run)
+        # Emitted runs must be DISJOINT: merge ships a whole-line run plus word
+        # emphasis runs inside it, and downstream renderers apply ranges in order,
+        # so the broad run silently flattens the styled word (025: italic "Hears").
+        # The narrower, more specific run wins its span.
+        text_runs = _resolve_overlapping_runs(text_value, text_runs)
         # Codia-style GENEROUS text boxes (anti-clipping): the tight ink box becomes a
         # loose box >= 1.6x lineHeight per line, grown symmetrically around the ink
         # center (vertical CENTER alignment keeps the visual baseline put), with ~6%
@@ -2030,16 +2302,45 @@ def _refine_native_shells(layers, run_dir, warnings):
         "Get up to 45% Off" seal is a 26-scallop starburst that shipped as a plain teal
         square; vectorize's star fitter reconstructs it natively (IoU ~0.97). A genuine
         disc never fits, so it keeps its ellipse.
-      * rect shell → MEASURED corner radius (overlay_detect.estimate_corner_radius),
+      * rect shell → re-MEASURED against the source (``_measure_rect_shell``):
+          - phantom (no plate in the pixels — the fill was sampled from the text's own
+            ink; 104 "Cadence" shipped a black rect over a white background at
+            region_ssim 0.14) → the shell is DROPPED with a recorded reason.
+          - outlined (013 "snacks": white stroke rim around a near-black interior,
+            which upstream averaged into a wrong grey fill) → stroke + measured fill.
+          - solid → upstream fill kept.
+        Either way the corner radius is MEASURED (overlay_detect.estimate_corner_radius),
         which snaps a stadium/pill end to min(h,w)/2 (013 "snacks" chip) and returns None
         for a noisy/square plate so a hard-cornered banner is never wrongly rounded
         (104's "Cadence" plate is 145x35 — wide, but square).
     """
-    report = {"starburst_seals": [], "measured_radii": []}
+    report = {"starburst_seals": [], "measured_radii": [],
+              "phantom_shells": [], "restyled_shells": []}
+
+    def _measured_radius(node, mask):
+        """Set a MEASURED corner radius on ``node`` from silhouette ``mask``."""
+        if node.radius not in (None, 0, 0.0):
+            return  # upstream already supplied evidence-backed geometry
+        if mask is None:
+            return
+        try:
+            from . import overlay_detect
+            radius = overlay_detect.estimate_corner_radius(mask)
+        except Exception as exc:
+            warnings.append({"code": "corner-radius-error", "layer_id": node.id,
+                             "detail": str(exc)})
+            return
+        if radius is None or isinstance(radius, dict) or float(radius) <= 0:
+            return  # square / unsupported → leave it a hard-cornered rect
+        node.radius = radius
+        node.meta = {**(node.meta or {}), "measured_corner_radius": radius}
+        report["measured_radii"].append({"id": node.id, "radius": radius})
 
     def visit(nodes, offset):
+        kept = []
         for node in nodes or []:
             if not isinstance(node, Layer):
+                kept.append(node)
                 continue
             box = node.box or {}
             abs_box = {
@@ -2049,14 +2350,14 @@ def _refine_native_shells(layers, run_dir, warnings):
                 "h": float(box.get("h", 1) or 1),
             }
             if node.children:
-                visit(node.children, (abs_box["x"], abs_box["y"]))
+                node.children = visit(node.children, (abs_box["x"], abs_box["y"]))
             rebuilt = (node.meta or {}).get("rebuilt_from")
-            if rebuilt not in ("flat-ellipse-shell", "flat-rect-shell"):
-                continue
             color = _flat_fill_color(node.fill)
-            if not color:
+            if rebuilt not in ("flat-ellipse-shell", "flat-rect-shell") or not color:
+                kept.append(node)
                 continue
             if rebuilt == "flat-ellipse-shell":
+                kept.append(node)
                 aspect = abs_box["w"] / max(1.0, abs_box["h"])
                 if not (0.75 <= aspect <= 1.34):
                     continue
@@ -2071,26 +2372,51 @@ def _refine_native_shells(layers, run_dir, warnings):
                 report["starburst_seals"].append(
                     {"id": node.id, "points": prim["points"], "iou": prim["iou"]})
                 continue
-            # flat-rect-shell: measure the real corner radius rather than guess it.
-            if node.radius not in (None, 0, 0.0):
-                continue  # upstream already supplied evidence-backed geometry
-            mask = _shell_silhouette(run_dir, abs_box, color)
-            if mask is None:
+            # flat-rect-shell: re-measure paint + geometry from the source pixels.
+            measured = _measure_rect_shell(run_dir, abs_box)
+            if measured is None:
+                # Unverifiable (no source / scipy) → keep, radius from the fill-colour
+                # silhouette as before. Conservative: never drop what we cannot read.
+                kept.append(node)
+                _measured_radius(node, _shell_silhouette(run_dir, abs_box, color))
                 continue
-            try:
-                from . import overlay_detect
-                radius = overlay_detect.estimate_corner_radius(mask)
-            except Exception as exc:
-                warnings.append({"code": "corner-radius-error", "layer_id": node.id,
-                                 "detail": str(exc)})
+            if measured["verdict"] == "phantom":
+                warnings.append({
+                    "code": "phantom-shell-dropped", "layer_id": node.id,
+                    "detail": "no plate in source pixels (coverage %.2f, bbox_fill %.2f);"
+                              " fill was sampled from text ink" % (
+                                  measured["coverage"], measured["bbox_fill"]),
+                })
+                report["phantom_shells"].append(
+                    {"id": node.id, "coverage": round(measured["coverage"], 3),
+                     "bbox_fill": round(measured["bbox_fill"], 3)})
+                continue  # DROP: the sibling text layer owns this ink
+            kept.append(node)
+            if measured["verdict"] == "outlined":
+                node.stroke = {"color": measured["stroke_color"],
+                               "width": measured["stroke_width"]}
+                node.fill = ({"kind": "flat", "color": measured["fill_color"]}
+                             if measured["fill_color"] else None)
+                node.meta = {**(node.meta or {}), "rebuilt_from": "outlined-rect-shell",
+                             "measured_stroke": dict(node.stroke)}
+                report["restyled_shells"].append(
+                    {"id": node.id, "stroke": measured["stroke_color"],
+                     "stroke_width": measured["stroke_width"],
+                     "fill": measured["fill_color"]})
+                # Outlined chips carry their own measured/occupancy-derived radius
+                # (the strict fitter fails on an off-axis photographed pill).
+                out_radius = measured.get("radius")
+                if node.radius in (None, 0, 0.0) and out_radius:
+                    node.radius = out_radius
+                    node.meta = {**(node.meta or {}),
+                                 "measured_corner_radius": out_radius}
+                    report["measured_radii"].append(
+                        {"id": node.id, "radius": out_radius})
                 continue
-            if radius is None or isinstance(radius, dict) or float(radius) <= 0:
-                continue  # square / unsupported → leave it a hard-cornered rect
-            node.radius = radius
-            node.meta = {**(node.meta or {}), "measured_corner_radius": radius}
-            report["measured_radii"].append({"id": node.id, "radius": radius})
+            _measured_radius(node, measured.get("sil"))
+        return kept
 
-    visit(layers, (0.0, 0.0))
+    layers[:] = visit(layers, (0.0, 0.0))
     return report
 
 

@@ -648,3 +648,102 @@ def test_wavy_tube_across_photo_panel_stays_top_level_cutout(tmp_path):
     assert "product" in by_role and "photo" in by_role
     assert by_role["product"].get("parent_id") is None
     assert by_role["photo"].get("parent_id") is None
+
+
+# ── canonical product geometry (013 / 135 / 067) ───────────────────────────────────
+
+
+def _sam_el(sid, x, y, w, h, role, score, mode, prompt=None, residual_id=None):
+    prov = {"mode": mode}
+    if prompt:
+        prov["prompt"] = prompt
+    if residual_id is not None:
+        prov["residual_id"] = residual_id
+    return {
+        "id": sid, "box": _box(x, y, w, h), "role": role,
+        "kind": "photo-fragment", "score": score, "_mask": _mask(x, y, w, h),
+        "provenance": prov,
+    }
+
+
+def test_near_identical_masks_merge_across_product_photo_labels():
+    """135: box-refine 'photo' + text-prompt 'product' with IoU≈1 are one object."""
+    photo = _sam_el("S0", 20, 20, 40, 40, "photo", 0.94, "box-refine", residual_id="R9")
+    product = _sam_el("S1", 20, 20, 40, 40, "product", 0.88, "text-prompt", prompt="product")
+
+    fused = element_fusion.fuse({"elements": [photo, product]}, [], [], CANVAS)
+
+    assert len(fused) == 1
+    # heuristic box-refine label loses the identity election to the semantic prompt
+    assert fused[0]["role"] == "product"
+
+
+def test_disjoint_products_never_merge():
+    """067: distinct jars (zero overlap) stay separate canonical products."""
+    jars = [
+        _sam_el(f"S{i}", 5 + i * 32, 40, 26, 30, "product", 0.8, "text-prompt", prompt="product")
+        for i in range(3)
+    ]
+
+    fused = element_fusion.fuse({"elements": jars}, [], [], CANVAS)
+
+    assert len(fused) == 3
+    assert all(e["role"] == "product" for e in fused)
+
+
+def test_union_blob_photo_absorbed_into_products():
+    """067: a no-evidence 'photo' equal to the union of jar masks is a duplicate."""
+    jars = [
+        _sam_el(f"S{i}", 5 + i * 32, 40, 26, 30, "product", 0.8, "text-prompt", prompt="product")
+        for i in range(3)
+    ]
+    blob_mask = np.zeros((100, 100), dtype=bool)
+    for i in range(3):
+        blob_mask |= _mask(5 + i * 32, 40, 26, 30)
+    blob = {
+        "id": "S9", "box": _box(5, 40, 90, 30), "role": "photo",
+        "kind": "photo-fragment", "score": 0.9, "_mask": blob_mask,
+        "provenance": {"mode": "box-refine", "residual_id": "R1"},
+    }
+
+    fused = element_fusion.fuse({"elements": jars + [blob]}, [], [], CANVAS)
+
+    assert len(fused) == 3
+    assert all(e["role"] == "product" for e in fused)
+    reasons = [m.get("reason") for e in fused for m in e["provenance"]["nms"]["merges"]]
+    assert "absorbed-product-shadow" in reasons
+
+
+def test_full_bleed_low_score_photo_band_is_suppressed(tmp_path):
+    """013: residual-backed full-width gradient band must not ship as an element."""
+    import json
+
+    band = {
+        "id": "S0", "box": _box(0, 30, 100, 30), "role": "photo",
+        "kind": "photo-fragment", "score": 0.35, "_mask": _mask(0, 30, 100, 30),
+        "provenance": {"mode": "box-refine", "residual_id": "R0"},
+    }
+    residual = [{"id": "R0", "box": _box(0, 30, 100, 30), "kind": "photo-fragment",
+                 "_mask": _mask(0, 30, 100, 30)}]
+    product = _sam_el("S1", 40, 40, 20, 50, "product", 0.9, "text-prompt", prompt="product")
+
+    fused = element_fusion.fuse({"elements": [band, product]}, residual, [], CANVAS,
+                                run_dir=str(tmp_path))
+
+    assert [e["role"] for e in fused] == ["product"]
+    report = json.load(open(tmp_path / "fusion_report.json"))
+    assert report["counts"]["suppressed_junk_bands"] == 1
+
+
+def test_high_score_full_bleed_photo_band_is_kept():
+    """A real full-bleed photo (strong model score) keeps its element."""
+    band = {
+        "id": "S0", "box": _box(0, 30, 100, 40), "role": "photo",
+        "kind": "photo-fragment", "score": 0.96, "_mask": _mask(0, 30, 100, 40),
+        "provenance": {"mode": "box-refine", "residual_id": "R0"},
+    }
+
+    fused = element_fusion.fuse({"elements": [band]}, [], [], CANVAS)
+
+    assert len(fused) == 1
+    assert fused[0]["role"] == "photo"

@@ -401,6 +401,20 @@ def flux_inpaint(rgb, mask, cfg: Optional[dict] = None):
             print(f"[flux-inpaint] {msg}; caller will fall back")
             return None
 
+        # Pre-flight queue hygiene (§10 discipline / GB1 companion): a killed
+        # previous run can leave stale queued prompts that this call would queue
+        # behind and time out on. Clear pending items before submitting ours.
+        # Best-effort — never blocks the real work.
+        try:
+            queue_state = requests.get(f"{base}/queue", headers=headers, timeout=10)
+            pending = (queue_state.json() or {}).get("queue_pending") or []
+            if pending:
+                requests.post(f"{base}/queue", headers=headers,
+                              json={"clear": True}, timeout=10)
+                print(f"[flux-inpaint] cleared {len(pending)} stale queued job(s)")
+        except Exception:
+            pass
+
         wf_path = _resolve_workflow_path(str(params["workflow"]))
         if not wf_path:
             msg = f"workflow not found: {params['workflow']}"

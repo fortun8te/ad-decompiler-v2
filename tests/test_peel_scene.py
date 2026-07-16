@@ -105,6 +105,10 @@ def _cfg(**peel):
     peel.setdefault("inpaint_feather_px", 0)  # unit tests assert exact fill pixels
     peel.setdefault("fail_closed_to_flat", False)
     peel.setdefault("flat_fill_allow_background", False)  # keep recomposite exact
+    # Most of this file exercises the legacy text-punch attribution contract; the
+    # §10 default (text_parallel_track=True — OCR ink never punches) has its own
+    # tests below.
+    peel.setdefault("text_parallel_track", False)
     return {"peel": peel}
 
 
@@ -1009,3 +1013,152 @@ def test_write_pipeline_layers_shape(tmp_path):
         assert Image.open(path).size == (W, H)                       # full canvas RGBA
         assert Image.open(path).mode == "RGBA"
     assert layers[2]["kind_hint"] == "product"
+
+
+# ── §10 top-down peel discipline (docs/PEEL-DECOMPOSITION.md §10) ────────────────────
+
+def test_text_parallel_track_never_punches_text_by_default():
+    """Rule 3: with the module default (text_parallel_track=True) OCR ink never
+    enters a peel punch mask — layers keep original ink under text, no text fills
+    are recorded, and recomposite stays exact."""
+    flat, elements, masks = _scene()
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(flat, elements, inpaint=spy,
+                                   cfg=_cfg(text_parallel_track=True))
+    assert not result.skipped
+    left = result.layer("left")
+    text_left = masks["text"] & masks["left"]
+    # Original ink stays (no punch), the element hole still fills.
+    assert np.all(left.rgba[:, :, :3][text_left] == INK)
+    assert np.all(left.rgba[:, :, :3][masks["circle"] & masks["left"]]
+                  == SENTINELS["left"])
+    assert all(not f.text_occluder for f in left.fills)
+    assert all(not f.text_occluder for f in result.background_fills)
+    assert all(not call["meta"].get("text_occluder") for call in spy.calls)
+    assert result.meta["text_parallel_track"] is True
+    # Composite still reproduces the input byte-exactly (ink is in the layers).
+    assert result.meta["recomposite"]["exact"]
+
+
+def test_text_boxes_still_blind_context_on_the_parallel_track():
+    """Rule 3 nuance: text never punches, but its box still masks the inpaint
+    CONTEXT so ink cannot bleed into neighbouring fills."""
+    flat, elements, masks = _scene()
+    spy = SpyInpaint()
+    peel_scene.peel_scene(flat, elements, inpaint=spy,
+                          cfg=_cfg(text_parallel_track=True))
+    left_calls = [c for c in spy.calls if c["meta"]["under_id"] == "left"]
+    assert left_calls
+    for call in left_calls:
+        assert INK not in call["context_colors"]
+        assert call["context_colors"] <= {BLUE}
+
+
+def test_occlusion_levels_top_down_depth():
+    a = SceneElement(id="a", mask=_rect_mask((10, 10, 200, 200)), z=0.0, kind="photo")
+    b = SceneElement(id="b", mask=_rect_mask((20, 20, 150, 150)), z=1.0, kind="card")
+    c = SceneElement(id="c", mask=_rect_mask((30, 30, 100, 100)), z=2.0, kind="product")
+    t = SceneElement(id="t", mask=_rect_mask((15, 15, 60, 40)), z=3.0,
+                     kind="text", is_text=True)
+    lonely = SceneElement(id="lonely", mask=_rect_mask((300, 250, 400, 320)), z=0.5)
+    levels = peel_scene.occlusion_levels([a, b, c, t, lonely])
+    assert levels == {"c": 0, "b": 1, "a": 2, "lonely": 0}   # text never counts
+
+
+def test_plan_max_iterations_refuses_deep_strata():
+    a = SceneElement(id="a", mask=_rect_mask((10, 10, 200, 200)), z=0.0, kind="photo")
+    b = SceneElement(id="b", mask=_rect_mask((20, 20, 150, 150)), z=1.0, kind="card")
+    c = SceneElement(id="c", mask=_rect_mask((30, 30, 100, 100)), z=2.0, kind="product")
+    kept, plan = peel_scene.plan_peel_iterations(
+        [a, b, c], {"w": W, "h": H}, _cfg(max_iterations=2))
+    assert [e.id for e in kept] == ["b", "c"]
+    assert "max-iterations" in plan["refused"]["a"]
+    kept3, plan3 = peel_scene.plan_peel_iterations(
+        [a, b, c], {"w": W, "h": H}, _cfg(max_iterations=3))
+    assert plan3["refused"] == {} and len(kept3) == 3
+
+
+def test_plan_plate_band_and_punch_cap_stay_in_plate():
+    band = SceneElement(id="band", mask=_rect_mask((0, 100, W, 160)), z=0.0,
+                        kind="photo-fragment")           # full-width stratum, 18% area
+    giant = SceneElement(id="giant", mask=_rect_mask((30, 10, 400, 330)), z=0.5,
+                         kind="photo")                    # 79% of the canvas
+    prod = SceneElement(id="prod", mask=_rect_mask((60, 120, 160, 200)), z=1.0,
+                        kind="product")
+    kept, plan = peel_scene.plan_peel_iterations(
+        [band, giant, prod], {"w": W, "h": H},
+        _cfg(plate_band_span_frac=0.95, plate_band_min_area_frac=0.05,
+             max_punch_canvas_frac=0.30))
+    assert [e.id for e in kept] == ["prod"]
+    assert "plate-band" in plan["refused"]["band"]
+    assert "punch-cap" in plan["refused"]["giant"]
+    assert plan["punched_canvas_frac"] < 0.10
+
+
+def test_plan_iteration_budget_admits_smaller_first():
+    big = SceneElement(id="big", mask=_rect_mask((0, 0, 300, 200)), z=0.0)
+    small = SceneElement(id="small", mask=_rect_mask((320, 0, 420, 60)), z=0.5)
+    kept, plan = peel_scene.plan_peel_iterations(
+        [big, small], {"w": W, "h": H}, _cfg(iter_mask_budget_frac=0.10))
+    assert [e.id for e in kept] == ["small"]
+    assert "iteration-budget" in plan["refused"]["big"]
+    assert plan["per_iteration_punched_px"]["0"] == int(np.count_nonzero(small.mask))
+
+
+def test_refused_band_dissolves_into_the_plate_and_holes_reattribute():
+    """A refused stratum is not emitted and not punched; a kept occluder's hole
+    over it attributes to the BACKGROUND plate instead."""
+    flat, elements, masks = _scene()
+    # Make the left portrait a full-width band so the plan refuses it.
+    band = _rect_mask((0, 20, W, 320))
+    flat[band] = BLUE
+    flat[masks["right"]] = GREEN
+    flat[masks["circle"]] = RED
+    elements[0] = SceneElement(id="left", mask=band, z=0.0, kind="photo")
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(plate_band_span_frac=0.95, plate_band_min_area_frac=0.05,
+                 text_parallel_track=True))
+    assert not result.skipped
+    assert result.layer("left") is None                     # not emitted
+    assert "plate-band" in result.meta["iteration_plan"]["refused"]["left"]
+    # The circle's left-side hole now belongs to the background plate.
+    bg_ids = {f.occluder_id for f in result.background_fills}
+    assert "circle" in bg_ids
+    assert result.meta["recomposite"]["exact"]
+
+
+def test_fill_backends_write_each_plate_pixel_at_most_once():
+    """Rule 4 (dilate once, inpaint once): with a dilation ring that makes
+    neighbouring punches overlap, the recorded write areas still sum to the area
+    of their union — no pixel is ever re-inpainted."""
+    flat, elements, masks = _scene()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=SpyInpaint(),
+        cfg=_cfg(hole_dilate_px=6, text_hole_dilate_px=8,
+                 text_parallel_track=False, fill_cc_split=False))
+    assert not result.skipped
+    punched = int(result.meta.get("plate_punched_px") or 0)
+    recorded = sum(entry["area"] for entry in result.meta.get("fill_backends") or [])
+    assert punched > 0 and recorded == punched
+
+
+def test_flux_budget_caps_calls_and_reroutes_overflow_to_lama():
+    cfg = _cfg(allow_flux=True, flux_min_hole_px=100, flux_max_hole_px=10 ** 6,
+               flux_budget=2, flux_max_hole_frac=0.0)
+    state = {"used": 0, "overflow": 0, "budget": 2, "canvas_px": 10 ** 6}
+    meta = {"under_kind": "photo", "hole_px": 5000, "flux_state": state}
+    assert peel_scene.peel_inpaint_mode(cfg, meta) == "flux_comfy"
+    assert peel_scene.peel_inpaint_mode(cfg, meta) == "flux_comfy"
+    assert peel_scene.peel_inpaint_mode(cfg, meta) == "lama"     # budget spent
+    assert state == {"used": 2, "overflow": 1, "budget": 2, "canvas_px": 10 ** 6}
+
+
+def test_flux_per_hole_canvas_frac_cap():
+    cfg = _cfg(allow_flux=True, flux_min_hole_px=100, flux_max_hole_px=10 ** 9,
+               flux_budget=0, flux_max_hole_frac=0.25)
+    meta = {"under_kind": "photo", "hole_px": 400_000, "canvas_px": 1_000_000}
+    assert peel_scene.peel_inpaint_mode(cfg, meta) == "lama"     # 40% > 25% cap
+    meta["hole_px"] = 100_000
+    assert peel_scene.peel_inpaint_mode(cfg, meta) == "flux_comfy"

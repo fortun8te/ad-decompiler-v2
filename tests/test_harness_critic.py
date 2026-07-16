@@ -179,8 +179,10 @@ def test_critic_review_drops_contradictory_inpaint_vs_layout(tmp_path):
 
 def test_critic_review_keeps_highest_confidence_duplicate_stage_action(tmp_path):
     repairs = [
-        {"stage": "ocr", "action": "rerun", "reason": "low recall", "severity": "medium"},
-        {"stage": "ocr", "action": "rerun", "reason": "low recall duplicate", "severity": "high"},
+        {"stage": "ocr", "action": "rerun", "reason": "low recall", "severity": "medium",
+         "params": {"upscale": True}},
+        {"stage": "ocr", "action": "rerun", "reason": "low recall duplicate", "severity": "high",
+         "params": {"upscale": True}},
     ]
     critic_output = {
         "scores": {

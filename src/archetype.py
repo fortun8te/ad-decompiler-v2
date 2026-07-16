@@ -135,6 +135,96 @@ def image_facts(image_path: str) -> dict:
     }
 
 
+def _line_box(line: dict) -> tuple[float, float, float, float] | None:
+    box = line.get("bbox") or line.get("box") or {}
+    try:
+        return float(box["x"]), float(box["y"]), float(box["w"]), float(box["h"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _largest_xstart_cluster(members: list, tol: float) -> list:
+    """Chain-cluster column candidates by x-start; return the largest cluster."""
+    if not members:
+        return []
+    rows = sorted(members, key=lambda r: r[0])
+    clusters, current = [], [rows[0]]
+    for row in rows[1:]:
+        if row[0] - current[-1][0] <= tol:
+            current.append(row)
+        else:
+            clusters.append(current)
+            current = [row]
+    clusters.append(current)
+    return max(clusters, key=len)
+
+
+def _mirrored_column_facts(canvas: dict, lines: list) -> dict:
+    """Detect two mirrored checklist columns (rows of icon+text) from OCR geometry.
+
+    Comparison creatives (BEFORE/AFTER cards, us-vs-competitor checklists, split-panel
+    product tables) share a structure that survives OCR even when no BEFORE/AFTER token
+    is printed: a left-aligned column of row texts in each canvas half, the two column
+    x-starts separated by roughly half the canvas, with rows y-aligned pairwise. The
+    detector is deliberately strict — packshot label microtext (nutrition tables,
+    repeated can wordmarks) also produces y-coincident text, so membership requires
+    OCR confidence >= 0.55, per-column x-start coherence, real text (median length >= 4,
+    widest member >= 15% canvas width), wide column separation (>= 35% canvas width),
+    and most rows of the smaller column mirrored (pair ratio >= 0.6). Calibrated on
+    runs/postfix-benchmark-4: fires on 025/066/101 only; 002/091/135 packaging tables
+    and 094 chart-axis labels all fail at least two of the quality gates.
+    """
+    w = max(1, int(canvas.get("w", 1)))
+    boxed = []
+    for line in lines:
+        box = _line_box(line)
+        text = str(line.get("text") or "").strip()
+        conf = line.get("conf", line.get("confidence"))
+        if conf is not None:
+            try:
+                if float(conf) < 0.55:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        if box and text:
+            boxed.append((*box, text))
+    mid = w / 2.0
+    # A column member sits inside one canvas half; canvas-spanning headlines excluded.
+    left = [r for r in boxed if r[2] <= 0.55 * w and r[0] + r[2] <= 1.05 * mid and r[0] < mid]
+    right = [r for r in boxed if r[2] <= 0.55 * w and r[0] >= 0.95 * mid]
+    tol = 0.025 * w
+    lcol = _largest_xstart_cluster(left, tol)
+    rcol = _largest_xstart_cluster(right, tol)
+
+    def column_ok(col: list) -> bool:
+        if len(col) < 3:
+            return False
+        lens = sorted(len(r[4]) for r in col)
+        return lens[len(lens) // 2] >= 4 and max(r[2] for r in col) >= 0.15 * w
+
+    pairs = 0
+    separation = (rcol[0][0] - lcol[0][0]) / w if (lcol and rcol) else 0.0
+    if column_ok(lcol) and column_ok(rcol) and separation >= 0.35:
+        used: set[int] = set()
+        for lx, ly, lw, lh, _lt in sorted(lcol, key=lambda r: r[1]):
+            lyc = ly + lh / 2
+            best = None
+            for j, (rx, ry, rw, rh, _rt) in enumerate(rcol):
+                if j in used:
+                    continue
+                dist = abs(lyc - (ry + rh / 2))
+                if dist <= 0.75 * max(lh, rh) and (best is None or dist < best[0]):
+                    best = (dist, j)
+            if best:
+                used.add(best[1])
+                pairs += 1
+    ratio = pairs / max(1, min(len(lcol), len(rcol)))
+    return {
+        "mirrored_column_rows": pairs,
+        "mirrored_columns": bool(pairs >= 4 and ratio >= 0.6),
+    }
+
+
 def scene_facts(canvas: dict, ocr: dict | None = None, observations: dict | None = None) -> dict:
     """Normalize cheap scene observations into stable, testable classifier facts."""
     observations = copy.deepcopy(observations or {})
@@ -219,6 +309,14 @@ def scene_facts(canvas: dict, ocr: dict | None = None, observations: dict | None
         "photo_of_handwriting": photo_of_handwriting,
         "text_on_photographic_surfaces_only": text_on_photo_only,
     }
+    facts.update(_mirrored_column_facts(canvas, lines))
+    # Column-header comparison cues (OUR COMPETITOR / TYPICAL X / VS) only count when a
+    # genuinely mirrored row structure backs them — "typical" in body copy of a
+    # lifestyle ad must not manufacture comparison evidence on its own.
+    facts["column_vs_cues"] = bool(
+        facts["mirrored_column_rows"] >= 3
+        and re.search(r"\b(vs\.?|versus|competitors?|typical)\b", joined)
+    )
     facts.update(observations)
     if photo_of_handwriting:
         facts["photo_of_handwriting"] = True
@@ -264,6 +362,12 @@ def classify(facts: dict, configured: str = "auto") -> dict:
     # creative and previously won 5:4, which flattened one comparison column into the
     # photo plate and defeated the independently-swappable column contract.
     if f.get("before_after_labels"): add("comparison_grid", 7, "comparison labels")
+    # Mirrored checklist columns fire on label-free comparisons (066 two-card mascara
+    # checklists, 101 split-panel TPU table) that carry no BEFORE/AFTER token at all.
+    # The detector is geometry-based and strict (see _mirrored_column_facts), so it is
+    # worth almost as much as an explicit label pair.
+    if f.get("mirrored_columns"): add("comparison_grid", 6, "mirrored column checklist rows")
+    if f.get("column_vs_cues"): add("comparison_grid", 3, "VS/competitor column headers")
     if f.get("stage_progression"): add("comparison_grid", 5, "stage progression strip")
     if f.get("center_divider"): add("comparison_grid", 2, "center divider")
     if photo >= .65: add("lifestyle_overlay", 3, "dominant lifestyle photo")

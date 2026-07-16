@@ -638,6 +638,24 @@ def _run_round(
             round_record["stopped"] = "qa_ok_after_repairs"
             return round_record, working_cfg, True
 
+    # Identical-artifact short-circuit: every executed repair this round left the
+    # watched stage outputs AND the compiled design/preview byte-identical. Nothing
+    # downstream (fixer config proposals scored against this same evidence, another
+    # pipeline rerun) can learn anything new from an unchanged design — end the round
+    # now. The loop's no-progress steering still tries other repairs next round.
+    executed = [attempt for attempt in (repair_summary.get("attempts") or [])
+                if not attempt.get("admission_skipped")
+                and not attempt.get("admission_rejected")]
+    if executed and not repair_improved and all(
+        attempt.get("artifacts_changed") is False for attempt in executed
+    ):
+        round_record["short_circuit"] = "identical-artifacts"
+        round_record["fixer"] = {"fixes": [], "fix_count": 0,
+                                 "skipped": "identical-artifacts"}
+        round_record["next_resume"] = _resume_after_fixer(run_dir, working_cfg, critic_output)
+        round_record["stopped"] = "no_progress"
+        return round_record, working_cfg, True
+
     fixer_result = _run_fixer_pass(run_dir, working_cfg, critic_output)
     fixer_fixes = fixer_result.get("fixes") or []
     _write_json(os.path.join(run_dir, "fixer.json"), {

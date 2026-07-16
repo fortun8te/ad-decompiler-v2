@@ -619,3 +619,39 @@ skeleton we have — the differences are discipline, not architecture:
    and per-iteration mask area.
 6. Later option: LayerD's matting weights (BiRefNet-class) as a peel-matte upgrade —
    not a Qwen-layers revival (rejected for speed; qwen stage stays disabled).
+
+### §10a Implementation (2026-07-16, src/peel_scene.py)
+
+All five rules are live; the closed-form attribution is kept, the discipline is a
+pre-pass (`plan_peel_iterations`) + per-call accounting:
+
+1. **Top-down iteration** — `occlusion_levels()` computes each non-text element's
+   stack depth (0 = unoccluded top-of-stack); `plan_peel_iterations()` refuses
+   elements at depth ≥ `peel.max_iterations` (3). A refused element is
+   *plate-committed*: never punched, never completed, never emitted — it dissolves
+   into the plate and kept occluders' holes over it re-attribute to the background
+   (exactly what an iterative peel that never reaches it produces).
+2. **Per-run Flux budget** — `peel_scene` seeds a shared mutable
+   `meta["flux_state"]`; `peel_inpaint_mode` → `_flux_budget_admits` spends it
+   (`peel.flux_budget`, 4/run) and applies the per-hole canvas-fraction cap
+   (`peel.flux_max_hole_frac`, 0.25); overflow falls through to LaMa/Telea/flat.
+3. **Text parallel track** — `peel.text_parallel_track` (default ON): OCR ink
+   never enters a peel punch mask, for under-layers AND the plate (structural
+   `continue` on the text class). Text boxes stay in the occluder map, so they
+   still blind the inpaint context; native TEXT is extracted downstream.
+4. **Dilate once, inpaint once** — per-surface `done` masks: every write mask is
+   `write & ~done` before filling; overlapping dilation rings can never re-inpaint
+   a region (`meta.reinpaint_blocked` counts collapsed jobs).
+5. **Mask-area budgets** — `peel.iter_mask_budget_frac` (0.45 of canvas per
+   iteration, smaller footprints admitted first), `peel.max_punch_canvas_frac`
+   (0.30 single-element cap), and the plate-band rule
+   (`plate_band_span_frac` 0.95 / `plate_band_min_area_frac` 0.05): a full-span
+   background stratum (013's E003/E008/E013/E000 bands) stays in the plate —
+   peeling the plate out of itself was 013's 56.3% plate-destruction hard fail.
+   `result.meta["iteration_plan"]` + `plate_punched_canvas_frac` feed the
+   changed-canvas accounting.
+
+Module defaults keep the synthetic contract tests exact (budgets/bands off,
+`max_iterations` 3, text track ON); config.yaml enables the full discipline for
+pipeline runs. Tests: `tests/test_peel_scene.py` "§10 top-down peel discipline"
+section.

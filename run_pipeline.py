@@ -17,7 +17,8 @@ from src.console_io import configure_stdio, safe_print
 from src import (normalize, ocr, text_analysis, element_detect, sam3_detect,
                  element_fusion, qwen_worker, peel_scene, merge_layers, reconstruct, layout,
                  scene_intent,
-                 build_design_json, figma_import, pixel_diff, repair, render_preview,
+                 build_design_json, design_preflight, figma_import, pixel_diff, repair,
+                 render_preview,
                  vlm_proofread, vlm_ocr_judge, vlm_font_judge, vlm_scene_text,
                  vlm_segment_filter, vlm_element_propose, vram)
 from src import archetype
@@ -628,10 +629,15 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                     report.stage("layout", "fallback", detail=detail, artifacts=["layout.json"])
                     report.degraded("layout", detail, required=True)
                     runtime_violations = report.violations
+            # An asset-group whose owner image was hoisted to root (raster-slice
+            # fallback / harness rounds) buries its overlay badges+text at the shell's
+            # low z under the hoisted slice — dissolve such shells (013 "snacks").
+            tree = layout.dissolve_orphaned_asset_shells(tree)
             dump(tree, A("layout.json"))
             _log(run_dir, f"layout.json → {len(tree)} root layers")
         if tree is None:
             tree = load(A("layout.json"))
+            tree = layout.dissolve_orphaned_asset_shells(tree)
 
         # 8 schema-v2 Figma scene graph (source of truth)
         if stage("design") or dirty or not exists("design.json"):
@@ -645,6 +651,17 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 doc_id=os.path.basename(run_dir), name=os.path.basename(run_dir), kept_in_photo=kept,
             )
             _log(run_dir, f"design.json → {len(doc.layers)} layers, kept_in_photo={len(doc.kept_in_photo)}")
+            # Predictive preflight: enrich design_preflight.json with the QA hard-fails
+            # this design will produce (empty groups, fair plate destruction, unowned
+            # text, unexplained rasters, placement drift) BEFORE render/QA spends time.
+            try:
+                pf = design_preflight.run(run_dir, cfg)
+                predicted = [item.get("rule") for item in
+                             (pf.get("qa_predictions") or {}).get("predicted_hard_fails") or []]
+                _log(run_dir, f"design_preflight → ok={pf.get('ok')}"
+                     + (f", predicted QA fails: {', '.join(predicted)}" if predicted else ""))
+            except Exception as exc:
+                _log(run_dir, f"design_preflight prediction failed (non-fatal): {exc}")
 
         # 8.5 LOCAL PREVIEW — see the layers without Figma (default on)
         need_local_preview = bool(cfg.get("preview", True)) or (

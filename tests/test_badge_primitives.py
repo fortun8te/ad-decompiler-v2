@@ -124,6 +124,82 @@ def test_wide_square_cornered_plate_is_not_wrongly_rounded(tmp_path):
     assert doc.meta["asset_materialization"]["measured_radii"] == []
 
 
+def test_phantom_shell_over_bare_text_ink_is_dropped(tmp_path):
+    """104 "Cadence": the wordmark sits DIRECTLY on the white background — there is no
+    plate at all. Upstream sampled the text ink into a flat near-black fill and the
+    shell shipped a black rect at region_ssim 0.14. The measured shell must be dropped
+    (with a recorded reason); the sibling text layer owns that ink."""
+    _plate(tmp_path, (800, 900))
+    box = (467, 267, 145, 35)
+    img = Image.new("RGB", (800, 900), (250, 250, 250))
+    from PIL import ImageDraw
+    d = ImageDraw.Draw(img)
+    # Fat fake "wordmark" ink: a few disjoint letter blobs, NOT a plate.
+    for i in range(7):
+        x0 = 467 + 4 + i * 20
+        d.ellipse([x0, 267 + 6, x0 + 14, 267 + 29], fill=(6, 6, 6))
+    img.save(tmp_path / "normalized.png")
+    tree = [{
+        "id": "c_E000", "target": "group", "box": {"x": 467, "y": 267, "w": 145, "h": 35},
+        "shape_kind": "rect", "fill": {"kind": "flat", "color": "#060606"},
+        "meta": {"role": "badge", "plate_shell": True, "text_bearing_shell": True},
+        "children": [
+            {"id": "c_B1", "target": "text", "z": 40, "text": "Cadence",
+             "box": {"x": 20, "y": 8, "w": 100, "h": 20}, "style": {"fontSize": 14}},
+        ],
+    }]
+    doc = build_design_json.build(tree, {"w": 800, "h": 900}, str(tmp_path),
+                                  base_src=str(_plate(tmp_path, (800, 900))))
+    group = next(layer for layer in doc.layers if layer.id == "c_E000")
+    assert not any("shell" in str(c.id) for c in group.children), \
+        "a shell with no plate in the source pixels must be dropped"
+    assert any(c.type == "text" for c in group.children)
+    phantoms = doc.meta["asset_materialization"]["phantom_shells"]
+    assert [p["id"] for p in phantoms] == ["c_E000__shell"]
+    assert any(w.get("code") == "phantom-shell-dropped"
+               for w in doc.meta.get("warnings", []))
+
+
+def test_outlined_chip_gets_stroke_and_measured_fill(tmp_path):
+    """013 "snacks": a white-STROKED pill with a near-black interior on a green photo.
+    Upstream averaged the paint into a wrong flat grey; the measured shell must carry
+    stroke=white + fill=near-black instead."""
+    _plate(tmp_path, (800, 900))
+    box = (413, 719, 114, 50)
+    img = Image.new("RGB", (800, 900), (30, 120, 70))
+    from PIL import ImageDraw
+    d = ImageDraw.Draw(img)
+    x, y, w, h = box
+    d.rounded_rectangle([x, y, x + w - 1, y + h - 1], radius=25,
+                        fill=(20, 20, 20), outline=(255, 255, 255), width=4)
+    img.save(tmp_path / "normalized.png")
+    tree = [{
+        "id": "c_E006", "target": "group", "box": {"x": 413, "y": 719, "w": 114, "h": 50},
+        "shape_kind": "rect", "fill": {"kind": "flat", "color": "#4e5553"},
+        "meta": {"role": "badge", "plate_shell": True, "text_bearing_shell": True},
+        "children": [
+            {"id": "c_B9", "target": "text", "z": 40, "text": "snacks",
+             "box": {"x": 20, "y": 12, "w": 70, "h": 24}, "style": {"fontSize": 18}},
+        ],
+    }]
+    doc = build_design_json.build(tree, {"w": 800, "h": 900}, str(tmp_path),
+                                  base_src=str(_plate(tmp_path, (800, 900))))
+    group = next(layer for layer in doc.layers if layer.id == "c_E006")
+    shell = next(c for c in group.children if "shell" in str(c.id))
+    assert shell.meta.get("rebuilt_from") == "outlined-rect-shell"
+    stroke = shell.stroke or {}
+    sr, sg, sb = (int(stroke["color"][i:i + 2], 16) for i in (1, 3, 5))
+    assert min(sr, sg, sb) > 200, "stroke must be the measured near-white rim"
+    assert 2 <= float(stroke["width"]) <= 8
+    fill = shell.fill or {}
+    fr, fg, fb = (int(fill["color"][i:i + 2], 16) for i in (1, 3, 5))
+    assert max(fr, fg, fb) < 80, "fill must be the measured near-black interior, not grey"
+    # Stadium end still snaps to the measured pill radius.
+    assert shell.radius == pytest.approx(25.0, abs=2.0)
+    restyled = doc.meta["asset_materialization"]["restyled_shells"]
+    assert [r["id"] for r in restyled] == ["c_E006__shell"]
+
+
 # ── 016: a scalloped seal → analytic star polygon (vectorize's verified fitter) ─────
 def test_scalloped_seal_emits_native_starburst_path(tmp_path):
     _plate(tmp_path, (400, 400))

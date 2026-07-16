@@ -212,6 +212,68 @@ def test_chat_ui_ocr_selects_social_screenshot():
     assert "chat/DM chrome" in result["reasons"]
 
 
+def _line(text, x, y, w, h, conf=0.9):
+    return {"text": text, "box": {"x": x, "y": y, "w": w, "h": h}, "conf": conf}
+
+
+def test_mirrored_checklist_columns_select_comparison_grid_without_labels():
+    """066/101-style: us-vs-competitor checklists carry no BEFORE/AFTER token at all."""
+    lines = [
+        _line("OUR PRODUCT DEVELOPER TESTED EVERYTHING", 150, 100, 1100, 42),
+        _line("prometics", 315, 773, 152, 28),
+        _line("OUR COMPETITOR", 836, 746, 484, 38),
+    ]
+    for i, (lt, rt) in enumerate([
+        ("Tubing technology", "Tubing technology"),
+        ("Enhances lash growth", "Non growth-boosting"),
+        ("Smudge proof", "Smudges on upper lid"),
+        ("Clump-free & buildable", "Clump free & buildable"),
+        ("Feathery lashes", "Spidery but long"),
+    ]):
+        y = 888 + i * 58
+        lines.append(_line(lt, 183, y, 330, 40))
+        lines.append(_line(rt, 875, y, 330, 40))
+    facts = scene_facts({"w": 1440, "h": 1440}, {"lines": lines})
+    assert facts["mirrored_column_rows"] >= 4
+    assert facts["mirrored_columns"] is True
+    assert facts["column_vs_cues"] is True
+    result = classify(facts)
+    assert result["archetype"] == "comparison_grid"
+    assert "mirrored column checklist rows" in result["reasons"]
+    assert "VS/competitor column headers" in result["reasons"]
+
+
+def test_packshot_label_microtext_does_not_fake_mirrored_columns():
+    """002-style: low-confidence nutrition-table text on a product photo must not fire."""
+    lines = [
+        _line("ALLE ESSENTIALS", 120, 260, 840, 80),
+        # nutrition label: left names + right values, but values are short and the
+        # low-conf packaging junk is filtered out before column membership.
+        _line("voedingswaarden", 148, 1380, 180, 20),
+        _line("vetten", 148, 1430, 80, 20, conf=0.4),
+        _line("koolhydraten", 148, 1460, 140, 20),
+        _line("eiwitten", 148, 1490, 90, 20, conf=0.35),
+        _line("zout", 148, 1520, 50, 20),
+        _line("6.8g", 560, 1430, 40, 20),
+        _line("5.6g", 560, 1460, 40, 20),
+        _line("74g", 560, 1490, 36, 20),
+        _line("0.37g", 560, 1520, 44, 20),
+    ]
+    facts = scene_facts({"w": 1080, "h": 1920}, {"lines": lines})
+    assert facts["mirrored_columns"] is False
+    assert facts["column_vs_cues"] is False
+    assert classify(facts)["archetype"] != "comparison_grid"
+
+
+def test_vs_cue_word_alone_does_not_manufacture_comparison_evidence():
+    facts = scene_facts(
+        {"w": 1080, "h": 1080},
+        {"lines": [_line("Not your typical morning routine", 140, 200, 800, 60)]},
+    )
+    assert facts["column_vs_cues"] is False
+    assert classify(facts)["archetype"] != "comparison_grid"
+
+
 def test_dark_multi_product_packshot_prefers_product_on_flat():
     """Hears-style: dark field + 2 products even when flat fraction is middling."""
     result = classify({

@@ -587,6 +587,19 @@ def _shadow_from_mask(crop, mask) -> Optional[dict]:
         return None
     if float(np.linalg.norm(dark_rgb - bright_rgb)) < 40.0:
         return None
+    # Anti-aliased edges of ordinary flat text form a "bright" pseudo-cluster that
+    # is just a blend between the true ink and the plate behind it (101's checklist:
+    # dark slate ink on a white card read as grey fill + dark "shadow", shipping
+    # near-invisible grey text). A real fill+shadow pair has a fill colour OFF the
+    # ink<->plate blend line; reject bright clusters that sit on it.
+    bg_rgb = np.median(bg_samples, axis=0)
+    axis = dark_rgb - bg_rgb
+    norm = float(np.dot(axis, axis))
+    if norm > 1.0:
+        t = float(np.dot(bright_rgb - bg_rgb, axis) / norm)
+        predicted = bg_rgb + max(0.0, min(1.0, t)) * axis
+        if 0.03 < t < 0.97 and float(np.linalg.norm(bright_rgb - predicted)) < 24.0:
+            return None
     opacity = max(0.22, min(0.72, (255.0 - float(np.mean(dark_rgb))) / 255.0 * 0.85))
     radius = max(2.0, min(14.0, 0.55 * (abs(dx) + abs(dy)) + 1.5))
     return {
@@ -600,13 +613,65 @@ def _shadow_from_mask(crop, mask) -> Optional[dict]:
     }
 
 
+def _relative_luminance(rgb) -> float:
+    """WCAG relative luminance for an (r, g, b) triple in 0..255."""
+    channels = []
+    for value in rgb:
+        c = max(0.0, min(1.0, float(value) / 255.0))
+        channels.append(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+    r, g, b = channels
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast_ratio(hex_colour: str, plate_rgb) -> float:
+    """WCAG contrast ratio between a hex fill and the plate's median RGB."""
+    l1 = _relative_luminance(_hex_rgb(hex_colour))
+    l2 = _relative_luminance(plate_rgb)
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _is_ink_plate_blend(hex_colour: str, fallback_hex: str, plate_rgb) -> bool:
+    """True when a colour sits ON the blend segment between the robust ink sample
+    and the plate — the signature of anti-aliased edge pixels, not authored paint."""
+    import numpy as np
+
+    ink = np.asarray(_hex_rgb(fallback_hex), dtype=np.float32)
+    plate = np.asarray(plate_rgb, dtype=np.float32)
+    probe = np.asarray(_hex_rgb(hex_colour), dtype=np.float32)
+    axis = ink - plate
+    norm = float(np.dot(axis, axis))
+    if norm <= 1.0:
+        return False
+    t = float(np.dot(probe - plate, axis) / norm)
+    predicted = plate + max(0.0, min(1.0, t)) * axis
+    return 0.02 < t < 0.98 and float(np.linalg.norm(probe - predicted)) < 20.0
+
+
 def _paint_from_mask(crop, mask, fallback_hex: str) -> dict:
     """Best-effort fill/stroke/effect description for the painted ink, in addition to the
     single flattened colour used elsewhere for backward compatibility."""
     fill = {"kind": "flat", "color": fallback_hex}
     stroke = None
     effects: list[dict] = []
+    plate_rgb = None
+    try:
+        import numpy as np
+
+        outside = ~np.asarray(mask).astype(bool)
+        if outside.any():
+            plate_rgb = np.median(crop[outside].astype(np.float32), axis=0)
+    except Exception:
+        plate_rgb = None
     gradient = _dominant_axis_gradient(crop, mask)
+    if gradient is not None and plate_rgb is not None:
+        # Thin small text defeats the eroded-core sampling and the "gradient" is just
+        # anti-aliasing: every stop lies on the ink<->plate blend line (101's
+        # "durability" shipped a grey AA pseudo-gradient over #010101 ink). An
+        # authored gradient has at least one stop off that line.
+        stops = [s.get("color") for s in gradient.get("stops") or [] if s.get("color")]
+        if stops and all(_is_ink_plate_blend(c, fallback_hex, plate_rgb) for c in stops):
+            gradient = None
     if gradient is not None:
         fill = gradient
     stroke_result = _stroke_from_mask(crop, mask)
@@ -634,6 +699,23 @@ def _paint_from_mask(crop, mask, fallback_hex: str) -> dict:
                     }
             except Exception:
                 pass
+    # Contrast sanity (no-outline paths only — knockout/outline text legitimately
+    # matches its plate): an effect/gradient override must not ship a fill that
+    # blends into its own plate when the robust ink-core sample contrasts fine.
+    # 101's checklist emitted #9b9b9b on a white card (ghost text) while the
+    # ink-core sample was #010101; re-sample in that case and drop the effects
+    # derived from the same misread ink split.
+    if stroke is None and plate_rgb is not None:
+        if fill.get("kind") == "linear":
+            fill_colours = [s.get("color") for s in fill.get("stops") or [] if s.get("color")]
+        else:
+            fill_colours = [fill.get("color")] if fill.get("color") else []
+        if fill_colours:
+            worst = min(_contrast_ratio(c, plate_rgb) for c in fill_colours)
+            fallback_contrast = _contrast_ratio(fallback_hex, plate_rgb)
+            if worst < 3.0 and fallback_contrast >= worst * 1.6:
+                fill = {"kind": "flat", "color": fallback_hex}
+                effects = []
     return {"fill": fill, "stroke": stroke, "effects": effects}
 
 
@@ -1104,11 +1186,13 @@ def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
     if target_scale < 0.999:
         new_size = max(1.0, font_size * target_scale)
         patch["fontSize"] = round(new_size, 2)
-        # Multiline OCR boxes carry a measured line height for the original font.
-        # Keeping that absolute value after shrinking a substitute font is a common
-        # source of clipped final lines in both the preview and Figma.
-        if line_count > 1:
-            patch["lineHeight"] = round(max(new_size * 1.12, line_height * target_scale), 2)
+        # OCR boxes carry a measured line height for the original font. Keeping that
+        # absolute value after shrinking a substitute font is a common source of
+        # clipped final lines in both the preview and Figma. Single-line nodes need
+        # the rescale just as much: an OCR fontSize over-measure (013 "snacks" fs
+        # 59.7 → fitted 28) otherwise leaves lineHeight at 2.5x the fitted size and
+        # the generous emitted box balloons to ~2.7x the ink height.
+        patch["lineHeight"] = round(max(new_size * 1.12, line_height * target_scale), 2)
 
     # At very small sizes Pillow rounds to whole-pixel font sizes, so the linear estimate
     # can still overshoot by a pixel.  A short bounded refinement keeps the contract exact
@@ -2613,6 +2697,7 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
         1 for w in (line.get("words") or []) if isinstance(w, dict) and _styleable(w)
     )
 
+    measured_words = []
     for raw_word in line.get("words") or []:
         if not isinstance(raw_word, dict) or not _styleable(raw_word):
             continue
@@ -2633,6 +2718,24 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
         painted, _baseline, colour, ink_conf, mask, paint = _painted_geometry(image, probe)
         if ink_conf < min_conf:
             continue
+        density = None
+        try:
+            if mask is not None and mask.size:
+                density = float(mask.mean())
+        except Exception:
+            density = None
+        measured_words.append(
+            {"word": word, "painted": painted, "colour": colour, "ink_conf": ink_conf,
+             "mask": mask, "paint": paint, "density": density}
+        )
+
+    densities = sorted(m["density"] for m in measured_words if m["density"] is not None)
+    line_density = densities[len(densities) // 2] if densities else None
+
+    for measured in measured_words:
+        word = measured["word"]
+        painted, colour = measured["painted"], measured["colour"]
+        ink_conf, mask, paint = measured["ink_conf"], measured["mask"], measured["paint"]
         geo = _pre_font_signals(word, painted, mask, config)
         measured_size = max(1.0, _num(geo.get("font_size"), base_size))
         measured_weight = int(round(_num(geo.get("weight"), base_weight)))
@@ -2640,6 +2743,19 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
         colour_changed = _colour_distance(colour, base_colour) >= colour_delta
         weight_changed = (abs(measured_weight - base_weight) >= weight_delta
                           and ink_conf >= weight_min_conf)
+        # Relative-density bold: absolute density buckets cap thin display faces
+        # well below Bold, so an authored bold word never clears the absolute
+        # ±weight_delta gate (025: bold-italic "Hears" measured 600 vs base 400).
+        # Ink density measured against the line's OWN words is face-independent —
+        # a word ≥35% denser than its line's median word, whose absolute bucket
+        # already reads ≥200 heavier, is authored emphasis, not jitter.
+        if (not weight_changed and line_density and measured["density"]
+                and len(densities) >= 3
+                and measured_weight - base_weight >= 200
+                and measured["density"] >= line_density * 1.35
+                and ink_conf >= weight_min_conf):
+            measured_weight = max(measured_weight, base_weight + 300)
+            weight_changed = True
         # A per-word size override needs an independent reason to believe the word is a
         # genuinely different run (a contrasting colour or a real weight change), not just
         # a different measured height. A single, emphasised token can stand alone; a word
@@ -2832,6 +2948,35 @@ def _infer_alignment(lines: list[dict], canvas_w: float) -> str:
     return min(spread, key=spread.get)
 
 
+def _interleaved(previous: dict, current: dict, others: list[dict]) -> bool:
+    """True when a THIRD line sits vertically between ``previous`` and ``current``.
+
+    _can_join tolerates a gap of ~1.25x line height, which lets a block chain skip
+    straight over a foreign row (an OCR fontSize mis-measure ejects the middle line,
+    e.g. 104 "Slower pace" fs 56 between fs 34 neighbours; 107 "Research says…" fs 43
+    between fs 31 body lines). The block then emits a uniform lineHeight across the
+    hole and every subsequent line renders one pitch off, colliding with the ejected
+    line's own block. A paragraph never has ANOTHER text line living between two of
+    its members, so any horizontally-overlapping interloper vetoes the join.
+    """
+    a, b = previous["box"], current["box"]
+    gap_top = a["y"] + a["h"]
+    gap_bottom = b["y"]
+    if gap_bottom - gap_top < 4.0:
+        return False  # adjacent rows: nothing can hide in the gap
+    for other in others:
+        if other is previous or other is current:
+            continue
+        obox = other["box"]
+        ocy = obox["y"] + obox["h"] / 2.0
+        if not (gap_top - 0.15 * obox["h"] < ocy < gap_bottom + 0.15 * obox["h"]):
+            continue
+        if (_horizontal_overlap(obox, a) >= 0.25
+                or _horizontal_overlap(obox, b) >= 0.25):
+            return True
+    return False
+
+
 def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
     ordered = sorted(lines, key=lambda line: (line["box"]["y"], line["box"]["x"]))
     groups: list[list[dict]] = []
@@ -2842,6 +2987,8 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
         for index, group in enumerate(groups):
             previous = group[-1]
             if not _can_join(previous, line, config):
+                continue
+            if _interleaved(previous, line, ordered):
                 continue
             a, b = previous["box"], line["box"]
             gap = max(0.0, b["y"] - (a["y"] + a["h"]))

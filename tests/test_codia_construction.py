@@ -59,7 +59,13 @@ def test_generous_box_height_floor_and_symmetry():
     style = {"fontSize": 30.0, "lineHeight": 36.0, "align": "LEFT"}
     box = {"x": 100.0, "y": 200.0, "w": 300.0, "h": 34.0}
     out = _generous_text_box(box, style, "Hello world")
-    assert out["h"] >= 1.6 * 36.0 - 0.01
+    # Growth cap (user-locked 2026-07-16): each side may drift at most ~15% of the
+    # ink height, but never below the content floor (lineHeight per line and the
+    # 1.25x fontSize anti-clip floor).
+    content_floor = max(36.0, 30.0 * 1.25)
+    assert out["h"] >= content_floor - 0.01
+    assert out["h"] <= max(box["h"] * 1.3, content_floor) + 0.01
+    assert out["h"] > box["h"]
     # symmetric growth: ink center unchanged
     assert abs((out["y"] + out["h"] / 2) - (box["y"] + box["h"] / 2)) < 0.51
     # width slack away from the LEFT anchor

@@ -444,3 +444,74 @@ def test_resolve_options_defaults_max_lines():
         {"vlm": {"ocr_judge": {"enabled": True, "max_lines": 0}}},
     )
     assert opts_zero["max_lines"] == 0
+
+
+def test_forced_display_headline_correction_accepted_against_original(tmp_path, monkeypatch):
+    """067: both engines agreed on SAYINC/COODBYE (no disagreement flag). The judge
+    force-includes tall display lines, but with zero engine readings the similarity
+    gate scored every answer 0.0 and discarded the correct transcription."""
+    _mock_multi(monkeypatch, ["WE'RE SAYING GOODBYE"])
+    line = _line("WERE SAYINC COODBYE", conf=0.94,
+                 box={"x": 80, "y": 85, "w": 1400, "h": 76})
+    out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), {"lines": [line]}, _cfg())
+    fixed = out["lines"][0]
+    assert fixed["text"] == "WE'RE SAYING GOODBYE"
+    assert fixed["ocr_text"] == "WERE SAYINC COODBYE"
+    assert fixed["vlm_ocr_judged"] is True
+
+
+def test_forced_display_line_still_rejects_wholesale_rewrite(tmp_path, monkeypatch):
+    _mock_multi(monkeypatch, ["BUY SHOES TODAY"])
+    line = _line("WERE SAYINC COODBYE", conf=0.94,
+                 box={"x": 80, "y": 85, "w": 1400, "h": 76})
+    out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), {"lines": [line]}, _cfg())
+    assert out["lines"][0]["text"] == "WERE SAYINC COODBYE"
+    assert out["vlm_ocr_judge"]["notes"][0]["note"] == "vlm_novel_reading"
+
+
+def test_tallest_allcaps_headline_forced_beyond_top_two(tmp_path, monkeypatch):
+    """067's misread headline was only the 3rd-tallest line; the top-2 rule alone
+    never sampled it. The tallest all-caps display line is now always judged."""
+    prompts = []
+
+    def _capture(crop, prompt, **kwargs):
+        prompts.append(prompt)
+        return "OK OK", None
+
+    monkeypatch.setattr(vlm_client, "multi_pass_answer", _capture)
+    body1 = _line("potent power of organic botanicals", conf=0.85,
+                  box={"x": 10, "y": 200, "w": 900, "h": 102})
+    body1["id"] = "BODY1"
+    body2 = _line("the arctic difference before gone", conf=0.80,
+                  box={"x": 10, "y": 320, "w": 900, "h": 97})
+    body2["id"] = "BODY2"
+    headline = _line("WERE SAYINC COODBYE", conf=0.94,
+                     box={"x": 10, "y": 20, "w": 1400, "h": 76})
+    headline["id"] = "HEAD"
+    out = vlm_ocr_judge.judge_ocr_lines(
+        _image(tmp_path, size=(1500, 600)), {"lines": [body1, body2, headline]}, _cfg(),
+    )
+    assert out["vlm_ocr_judge"]["lines_checked"] == 3
+
+
+def test_forced_display_line_uses_neutral_prompt(tmp_path, monkeypatch):
+    prompts = []
+
+    def _capture(crop, prompt, **kwargs):
+        prompts.append(prompt)
+        return "WERE SAYING GOODBYE", None
+
+    monkeypatch.setattr(vlm_client, "multi_pass_answer", _capture)
+    line = _line("WERE SAYINC COODBYE", conf=0.94,
+                 box={"x": 80, "y": 85, "w": 1400, "h": 76})
+    vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), {"lines": [line]}, _cfg())
+    # No engine readings -> the "engines read it differently" prompt is wrong.
+    assert "read it" not in prompts[0]
+    assert "Transcribe" in prompts[0]
+
+
+def test_uppercase_headline_heuristic():
+    assert vlm_ocr_judge._looks_uppercase_headline("WERE SAYINC COODBYE")
+    assert vlm_ocr_judge._looks_uppercase_headline("SAVE 30% TODAY")
+    assert not vlm_ocr_judge._looks_uppercase_headline("potent power of botanicals")
+    assert not vlm_ocr_judge._looks_uppercase_headline("We NEVER do")

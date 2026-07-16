@@ -69,10 +69,34 @@ DEFAULTS = {
     # conflict against a model label must not block geometric dedup (an element must
     # never ship as both photo-fragment and shape).
     "residual_family_advisory": True,
+    # ── canonical product geometry (013/135/067) ────────────────────────────────────
+    # Near-identical masks are the same physical object regardless of how the two
+    # observations were labelled. Without this escape hatch the product-over-photo-panel
+    # carve-out in _semantic_compatible blocked a box-refine "photo" and a text-prompt
+    # "product" with mask IoU 0.99 from merging (135: E004/E005 shipped as dual
+    # near-duplicate full-frame groups).
+    "identity_iou": 0.90,
+    # A raster cluster with no semantic (text-prompt) evidence whose pixels are mostly
+    # covered by the union of semantically-detected product masks is a duplicate
+    # observation of already-owned pixels, not new content (067: box-refine "photo" strip
+    # that was exactly the union of three distinct jars; 135: residual fragment swarm
+    # straddling the two bars). Distinct products themselves are never eligible.
+    "product_shadow": True,
+    "product_shadow_containment": 0.75,
+    # Full-bleed low-score photo bands backed only by residual/box-refine evidence are
+    # background chunks the residual detector re-emitted as elements (013: the y491-989
+    # gradient band that shipped as an opaque "Photo" group plate ABOVE the product and
+    # decapitated the bag; 021: empty junk groups). The plate already owns those pixels.
+    "suppress_junk_bands": True,
+    "junk_band_min_width_frac": 0.92,
+    "junk_band_min_coverage": 0.10,
+    "junk_band_max_score": 0.50,
     "canonical_prefix": "E",
 }
 
-_GRAPHIC_ROLES = {"logo", "icon", "arrow", "badge", "symbol", "pictogram", "sticker"}
+_GRAPHIC_ROLES = {"logo", "icon", "arrow", "badge", "symbol", "pictogram", "sticker",
+                  # list-row glyphs (src/icon_detect.py): ✓ / ✗ / ? marks
+                  "verified", "checkmark", "cross", "question-mark"}
 _RASTER_ROLES = {
     "photo",
     "product",
@@ -236,6 +260,13 @@ def _semantic_compatible(a: dict, b: dict, mask_iou: float, opts: Optional[dict]
     fa, fb = _family(a["role"]), _family(b["role"])
     ra = str(a.get("role") or "").lower().replace("_", "-")
     rb = str(b.get("role") or "").lower().replace("_", "-")
+    # Near-identical masks are one physical object no matter what the two sources called
+    # it — a box-refined residual labelled "photo" and a text-prompt "product" with IoU
+    # 0.99 must collapse (135). This must outrank every role carve-out below; the
+    # carve-outs exist to keep DISTINCT overlapping objects apart, and near-identity is
+    # incompatible with distinctness.
+    if mask_iou >= float((opts or {}).get("identity_iou", DEFAULTS["identity_iou"])):
+        return True
     # Sibling product cutouts (box + earplugs) must stay separate unless masks agree
     # almost completely — same-family alone is not enough to collapse them.
     if (
@@ -631,6 +662,161 @@ def _absorb_fragment_clusters(clusters: list, opts: dict) -> list:
     return [cluster for keep, cluster in zip(alive, clusters) if keep]
 
 
+def _has_text_prompt(cluster: dict) -> bool:
+    return any(m.get("mode") == "text-prompt" for m in cluster["members"])
+
+
+def _cluster_max_score(cluster: dict) -> float:
+    return max(float(m.get("score", 0) or 0) for m in cluster["members"])
+
+
+def _promote_product_identity(clusters: list) -> None:
+    """Give a cluster its semantic product identity when the winner label is heuristic.
+
+    Box-refine/residual observation roles come from residual-CC heuristics
+    (_role_from_residual), not semantics. When such an observation wins a cluster that
+    also holds a text-prompt product observation of the same object (near-identical
+    masks, merged via identity_iou), the canonical element must ship as a product, not
+    as a "photo" (135: the choco bar would otherwise lose its product identity to the
+    box-refine observation that seeded the cluster).
+    """
+    for cluster in clusters:
+        winner = cluster["winner"]
+        if normalized_role(winner["role"]) in _PRODUCT_INSTANCE_ROLES:
+            continue
+        if winner.get("mode") == "text-prompt":
+            continue  # semantic label already; do not override
+        best = None
+        for member in cluster["members"]:
+            if member.get("mode") != "text-prompt":
+                continue
+            if normalized_role(member["role"]) not in _PRODUCT_INSTANCE_ROLES:
+                continue
+            if best is None or member["score"] > best["score"]:
+                best = member
+        if best is not None:
+            winner["role"] = best["role"]
+            winner["kind"] = best["kind"]
+            cluster["merges"].append(
+                {"key": best["key"], "reason": "product-identity-promoted"}
+            )
+
+
+def _suppress_product_shadows(clusters: list, opts: dict) -> list:
+    """Absorb no-evidence raster clusters whose pixels product masks already own.
+
+    A cluster with no text-prompt observation of its own, whose mask is mostly covered
+    by the union of semantically-detected product masks, is a duplicate observation of
+    already-owned pixels (067: one box-refine "photo" strip == the union of three jars;
+    135: the residual fragment swarm straddling both bars). Members are absorbed into
+    the product cluster with the largest pixel overlap so provenance is preserved.
+
+    Distinct products (product-instance roles), graphic roles (logo/badge/icon on a
+    package), and anything with its own text-prompt evidence are never eligible, so
+    multi-SKU layouts (067's three jars) keep every real product.
+    """
+    if not opts.get("product_shadow", True) or len(clusters) < 2:
+        return clusters
+    np = _np()
+    product_idx = [
+        i
+        for i, c in enumerate(clusters)
+        if normalized_role(c["winner"]["role"]) in _PRODUCT_INSTANCE_ROLES
+        and _has_text_prompt(c)
+    ]
+    if not product_idx:
+        return clusters
+    threshold = float(opts.get("product_shadow_containment", 0.75))
+    product_set = set(product_idx)
+    alive = [True] * len(clusters)
+    for i, cluster in enumerate(clusters):
+        if i in product_set:
+            continue
+        winner = cluster["winner"]
+        role = normalized_role(winner["role"])
+        if role in _PRODUCT_INSTANCE_ROLES or role in _GRAPHIC_ROLES:
+            continue
+        if winner["kind"] != "photo-fragment":
+            continue
+        if _has_text_prompt(cluster):
+            continue
+        mask = winner["mask"]
+        area = int(mask.sum())
+        if not area:
+            continue
+        covered = np.zeros_like(mask)
+        best = None
+        for pi in product_idx:
+            pmask = clusters[pi]["winner"]["mask"]
+            inter = int((mask & pmask).sum())
+            if inter:
+                covered |= mask & pmask
+            if best is None or inter > best[0]:
+                best = (inter, pi)
+        frac = int(covered.sum()) / area
+        if frac >= threshold and best is not None and best[0] > 0:
+            parent = clusters[best[1]]
+            parent["members"].extend(cluster["members"])
+            parent["merges"].extend(cluster["merges"])
+            parent["merges"].append(
+                {
+                    "key": winner["key"],
+                    "containment": round(frac, 4),
+                    "reason": "absorbed-product-shadow",
+                }
+            )
+            alive[i] = False
+    return [c for keep, c in zip(alive, clusters) if keep]
+
+
+_JUNK_BAND_ROLES = frozenset({"photo", "image", "object", "photo-fragment"})
+
+
+def _suppress_junk_bands(clusters: list, opts: dict, canvas: dict) -> tuple[list, list]:
+    """Drop full-bleed, low-score photo bands that have no semantic evidence.
+
+    The residual detector re-emits leftover background as full-width "photo" bands;
+    box-refine then rubber-stamps them at scores below the text-prompt bar. Such a band
+    ships as an opaque group plate that can z-order ABOVE a real product and decapitate
+    it (013: the y491-989 gradient band over the gruns bag), or as an empty junk group
+    (021). The background plate already owns these pixels — dropping the cluster leaves
+    them exactly where they belong. Real full-bleed photos keep their element: any
+    text-prompt observation or a score at/above junk_band_max_score exempts the cluster.
+    """
+    if not opts.get("suppress_junk_bands", True):
+        return clusters, []
+    width, height = int(canvas["w"]), int(canvas["h"])
+    min_width = float(opts.get("junk_band_min_width_frac", 0.92)) * width
+    min_area = float(opts.get("junk_band_min_coverage", 0.10)) * width * height
+    max_score = float(opts.get("junk_band_max_score", 0.50))
+    kept, dropped = [], []
+    for cluster in clusters:
+        winner = cluster["winner"]
+        role = normalized_role(winner["role"])
+        score = _cluster_max_score(cluster)
+        if (
+            winner["kind"] == "photo-fragment"
+            and role in _JUNK_BAND_ROLES
+            and not _has_text_prompt(cluster)
+            and float(winner["box"]["w"]) >= min_width
+            and int(winner["mask"].sum()) >= min_area
+            and score < max_score
+        ):
+            dropped.append(
+                {
+                    "key": winner["key"],
+                    "role": winner["role"],
+                    "box": dict(winner["box"]),
+                    "score": round(score, 4),
+                    "members": [m["key"] for m in cluster["members"]],
+                    "reason": "junk-band-no-semantic-evidence",
+                }
+            )
+        else:
+            kept.append(cluster)
+    return kept, dropped
+
+
 def _infer_canvas(sam3, residual, qwen) -> dict:
     if isinstance(sam3, dict) and isinstance(sam3.get("source"), dict):
         src = sam3["source"]
@@ -764,6 +950,13 @@ def fuse(
     # into the containing cluster before canonical IDs are assigned.
     clusters = _absorb_fragment_clusters(clusters, opts)
 
+    # Canonical product geometry: a heuristic-labelled winner takes the product identity
+    # of a merged text-prompt observation; full-bleed no-evidence background bands drop;
+    # duplicate raster coverage of product pixels is absorbed into the products.
+    _promote_product_identity(clusters)
+    clusters, suppressed_bands = _suppress_junk_bands(clusters, opts, canvas)
+    clusters = _suppress_product_shadows(clusters, opts)
+
     # Stable IDs are based on final geometry, not model/source order.
     clusters.sort(
         key=lambda c: (
@@ -888,10 +1081,32 @@ def fuse(
                 }
             )
 
+    # Post-fusion glyph/chart refinement (src/icon_detect.py): ✓ / ✗ / ? list glyphs
+    # become role-tagged icon elements attached to their text rows, stacked duplicate
+    # fragments collapse into one icon, and a gridline-verified chart region is
+    # re-roled to "chart" (intentional raster cluster).  Additive and advisory —
+    # a refinement failure must never break fusion.
+    if run_dir and (cfg.get("icon_detect") or {}).get("enabled", True):
+        try:
+            from . import icon_detect
+            results = icon_detect.refine(results, canvas=canvas, cfg=cfg, run_dir=run_dir)
+        except Exception:
+            pass
+
     if run_dir:
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "fused_elements.json"), "w", encoding="utf-8") as fh:
             json.dump(results, fh, ensure_ascii=False, indent=2)
+        report = {
+            "kind": "fusion-diagnostics",
+            "suppressed_junk_bands": suppressed_bands,
+            "counts": {
+                "canonical": len(results),
+                "suppressed_junk_bands": len(suppressed_bands),
+            },
+        }
+        with open(os.path.join(run_dir, "fusion_report.json"), "w", encoding="utf-8") as fh:
+            json.dump(report, fh, ensure_ascii=False, indent=2)
     return results
 
 

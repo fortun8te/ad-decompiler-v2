@@ -119,6 +119,19 @@ def _looks_like_brand_token(text: str) -> bool:
     return uppercase / len(letters) >= 0.8
 
 
+def _looks_uppercase_headline(text: str) -> bool:
+    """Uppercase-dominant display copy (no word-count cap, unlike brand tokens).
+
+    067's ``WERE SAYINC COODBYE`` is 3 words, so ``_looks_like_brand_token`` skips
+    it — but an all-caps display headline is exactly where both engines misread
+    the same stylized glyphs the same way.
+    """
+    letters = [char for char in str(text or "") if char.isalpha()]
+    if len(letters) < 4:
+        return False
+    return sum(1 for char in letters if char.isupper()) / len(letters) >= 0.8
+
+
 def _looks_like_price_or_offer(text: str) -> bool:
     """Currency, percent-off, or SAVE/OFF/FREE phrasing — high-impact marketing copy."""
     return bool(_PRICE_OR_OFFER_RE.search(str(text or "")))
@@ -328,7 +341,14 @@ def _judge_disagreements(
          and float((ln.get("box") or {}).get("h", 0) or 0) >= 40),
         key=lambda ln: -float((ln.get("box") or {}).get("h", 0) or 0),
     )
-    candidates.extend(display[:2])
+    forced = display[:2]
+    # Also force the tallest all-caps display line: 067's misread headline was only
+    # the 3rd-tallest line, so the top-2 rule alone never looked at it.
+    for ln in display[2:]:
+        if _looks_uppercase_headline(str(ln.get("text") or "")):
+            forced.append(ln)
+            break
+    candidates.extend(forced)
     # Spend the bounded budget on brand / price / CTA / large lines first —
     # same lesson as proofread.max_regions priority sorting.
     candidates.sort(key=_disagreement_priority)
@@ -346,9 +366,13 @@ def _judge_disagreements(
             return None
         wider_crop = vlm_client.crop_box_bytes(image, line["box"], options["padding"] + 2)
         crop_variants = [crop] + ([wider_crop] if wider_crop and wider_crop != crop else [])
+        # Force-included display lines have no engine disagreement to arbitrate;
+        # asking "engines read it differently" with zero readings is a broken
+        # prompt.  Use the neutral verbatim-transcription prompt instead.
+        prompt = _disagreement_prompt(readings) if readings else _PROOFREAD_PROMPT
         answer, note = vlm_client.multi_pass_answer(
             crop,
-            _disagreement_prompt(readings),
+            prompt,
             base_url=options["base_url"],
             model=options["model"],
             timeout_s=options["timeout_s"],
@@ -416,8 +440,17 @@ def _judge_disagreements(
             # Hygiene after VLM: collapse ``do do this!`` and un-smash ``WeNEVER``.
             answer = _cleanup_text(answer)
             normalized_answer = answer.casefold().strip()
+            # Measure against the engine readings AND the current line text. A
+            # force-included display line has no readings at all — comparing only
+            # against them scored every answer 0.0 and rejected it as a novel
+            # reading (067: the judge transcribed the headline correctly and the
+            # correction was discarded). Character-level fixes like SAYINC→SAYING
+            # stay well above the similarity floor; hallucinated rewrites do not.
+            reading_basis = list(readings)
+            if original.strip():
+                reading_basis.append(original)
             similarity = max((SequenceMatcher(None, normalized_answer, reading.casefold().strip()).ratio()
-                              for reading in readings), default=0.0)
+                              for reading in reading_basis), default=0.0)
             if not options["allow_novel_reading"] and similarity < options["min_reading_similarity"]:
                 disagreements += 1
                 notes.append({"line_id": line.get("id"), "note": "vlm_novel_reading",

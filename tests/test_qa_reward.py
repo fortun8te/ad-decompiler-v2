@@ -378,19 +378,24 @@ def test_critique_to_repairs_maps_onto_existing_actionable_vocabulary():
         ("sam3", "rerun-detection"),
         ("inpaint", "rebuild-clean-plate"),
     ]
-    # Every mapped repair is actionable and resumes a real pipeline stage.
+    # Every mapped repair resumes a real pipeline stage; every repair whose config
+    # patch reaches a pipeline lever is actionable. Two documented exceptions the
+    # harness refuses to execute (postfix-benchmark-4 "repairs never convert"):
+    #   refit-text-box      — its text_analysis.fit patch has no pipeline consumer
+    #   refit-colors-effects — empty patch resuming pre-peel (full Flux-stack replay
+    #                          for a config-identical rerun)
     for repair in repairs:
-        assert harness.is_actionable(repair), repair
         assert harness.resume_stage_for(repair)
+        expected = repair["action"] not in {"refit-text-box", "refit-colors-effects"}
+        assert harness.is_actionable(repair) is expected, repair
     dedup = repairs[0]
     assert dedup["target_id"] == "c_B3"
     assert dedup["params"]["duplicate_text"] == ["UPFRONT"]
     assert dedup["params"]["source"] == "vlm_critique"
     refit = repairs[1]
     assert refit["params"]["clipped_text"] == ["30% KORTING"]
-    choice = harness.recommended_resume([refit])
-    assert choice["resume"] == "text"
-    assert choice["patches"]["text_analysis"]["fit"]["widen_clipped"] is True
+    # ...and recommended_resume skips it instead of spending a no-op rerun.
+    assert harness.recommended_resume([refit]) is None
 
 
 def test_critique_to_repairs_skips_unmapped_and_dedupes_signatures():

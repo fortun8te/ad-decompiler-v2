@@ -1982,6 +1982,80 @@ def _semantic_asset_groups(roots):
     return out
 
 
+def _subtree_ids(node) -> set:
+    out = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.get("id"):
+            out.add(current.get("id"))
+        stack.extend(current.get("children") or [])
+    return out
+
+
+def dissolve_orphaned_asset_shells(roots: list) -> list:
+    """Dissolve asset-group shells whose semantic owner escaped to the root level.
+
+    The raster-slice fallback (and harness repair rounds) hoist a failed owner image
+    out of its asset-group as a root-level absolute slice. The leftover shell then
+    keeps only the OVERLAYS (badges, chips) at the group's low z while the hoisted
+    owner and any later band crop paint over them: 013's product shell held the
+    "snacks" badge at group z=5 under the root product slice (z=5, later id) and the
+    photo band crop (z=10), blanking the badge's native text in preview AND Figma
+    (placement ink IoU 0.0). A shell without its asset is not a semantic group — and
+    the per-group background pass would cut a clean-plate slice for it that erases
+    the very product it pretends to host. Promote the overlays back to root with
+    absolute coordinates and their own (higher) z instead.
+
+    Runs on the FINAL tree (both layout.infer and the structure-first hydrate path),
+    so children arrive parent-relative and are re-absolutized here.
+    """
+    if not isinstance(roots, list):
+        return roots
+    all_ids = set()
+    for root in roots:
+        all_ids |= _subtree_ids(root)
+    out = []
+    changed = False
+    for root in roots:
+        meta = root.get("meta") or {}
+        owner_id = meta.get("semantic_owner")
+        if (
+            root.get("target") != "group"
+            or str(meta.get("role") or "") != "asset-group"
+            or not owner_id
+            or root.get("fill")
+            or root.get("src")
+        ):
+            out.append(root)
+            continue
+        subtree = _subtree_ids(root)
+        if owner_id in subtree or owner_id not in all_ids:
+            out.append(root)  # intact group, or owner truly gone (materialize path)
+            continue
+        gbox = root.get("box") or {}
+        gx, gy = float(gbox.get("x", 0) or 0), float(gbox.get("y", 0) or 0)
+        for child in root.get("children") or []:
+            cbox = dict(child.get("box") or {})
+            cbox["x"] = float(cbox.get("x", 0) or 0) + gx
+            cbox["y"] = float(cbox.get("y", 0) or 0) + gy
+            child["box"] = cbox
+            visible = child.get("visible_box")
+            if isinstance(visible, dict):
+                visible = dict(visible)
+                visible["x"] = float(visible.get("x", 0) or 0) + gx
+                visible["y"] = float(visible.get("y", 0) or 0) + gy
+                child["visible_box"] = visible
+            cmeta = child.setdefault("meta", {})
+            cmeta["absolute_box"] = dict(cbox)
+            cmeta["promoted_from_orphan_shell"] = root.get("id")
+            out.append(child)
+        changed = True
+    if changed:
+        out.sort(key=lambda node: (_node_z(node), node.get("id", "")))
+    return out
+
+
 def _unwrap_passthrough_bands(nodes):
     """Drop single-child NONE bands that only inflate node count.
 

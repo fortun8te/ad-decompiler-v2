@@ -213,7 +213,7 @@ def test_harness_loop_runs_repairs_on_failed_qa(tmp_path):
     (run_dir / "runtime_report.json").write_text(json.dumps({"input": str(input_path)}), encoding="utf-8")
     (run_dir / "qa.json").write_text(json.dumps({
         "ok": False,
-        "repairs": [{"stage": "ocr", "action": "rerun", "severity": "high"}],
+        "repairs": [{"stage": "ocr", "action": "rerun", "severity": "high", "params": {"upscale": True}}],
     }), encoding="utf-8")
     calls = []
 
@@ -282,7 +282,7 @@ def test_execute_repairs_tries_alternative_after_pipeline_exception(tmp_path):
         json.dumps({"input": str(input_path)}), encoding="utf-8")
     (run_dir / "qa.json").write_text(json.dumps({"ok": False}), encoding="utf-8")
     (run_dir / "repairs.json").write_text(json.dumps([
-        {"stage": "ocr", "action": "rerun", "severity": "high"},
+        {"stage": "ocr", "action": "rerun", "severity": "high", "params": {"upscale": True}},
         {"stage": "qwen", "action": "retry", "severity": "medium"},
     ]), encoding="utf-8")
     calls = []
@@ -311,7 +311,7 @@ def test_execute_repairs_tries_alternative_when_runner_leaves_stale_qa(tmp_path)
     (run_dir / "runtime_report.json").write_text(json.dumps({"input": str(input_path)}))
     (run_dir / "qa.json").write_text(json.dumps({"ok": False}))
     (run_dir / "repairs.json").write_text(json.dumps([
-        {"stage": "ocr", "action": "rerun", "severity": "high"},
+        {"stage": "ocr", "action": "rerun", "severity": "high", "params": {"upscale": True}},
         {"stage": "qwen", "action": "retry", "severity": "medium"},
     ]))
     calls = []
@@ -338,7 +338,7 @@ def test_execute_repairs_switches_tactic_when_metrics_stagnate(tmp_path):
                "hard_fails": [{"rule": "local-ssim", "detail": "low"}]}
     (run_dir / "qa.json").write_text(json.dumps(base_qa))
     (run_dir / "repairs.json").write_text(json.dumps([
-        {"stage": "ocr", "action": "rerun", "severity": "high"},
+        {"stage": "ocr", "action": "rerun", "severity": "high", "params": {"upscale": True}},
         {"stage": "vlm", "action": "boost-stack", "severity": "medium", "params": {"focus": "text"}},
     ]))
     calls = []
@@ -366,7 +366,7 @@ def test_execute_repairs_supports_three_argument_runner(tmp_path):
         json.dumps({"input": str(input_path)}), encoding="utf-8")
     (run_dir / "qa.json").write_text(json.dumps({"ok": False}), encoding="utf-8")
     (run_dir / "repairs.json").write_text(json.dumps([
-        {"stage": "ocr", "action": "rerun", "severity": "high"},
+        {"stage": "ocr", "action": "rerun", "severity": "high", "params": {"upscale": True}},
     ]), encoding="utf-8")
     calls = []
 
@@ -394,7 +394,7 @@ def test_harness_should_repair_on_actionable_repairs_when_qa_ok():
     ok_result = {"ok": True, "runtime_ok": True}
     qa = {
         "ok": True,
-        "repairs": [{"stage": "ocr", "action": "rerun", "severity": "high"}],
+        "repairs": [{"stage": "ocr", "action": "rerun", "severity": "high", "params": {"upscale": True}}],
     }
     assert harness.harness_should_repair(ok_result, qa=qa, staging={"staged": True}) == (
         True, "actionable_repairs",
@@ -410,7 +410,7 @@ def test_execute_repairs_continues_when_qa_ok_but_repairs_remain(tmp_path):
     (run_dir / "qa.json").write_text(json.dumps({
         "ok": True, "text_recall": 0.5,
         "repairs": [
-            {"stage": "ocr", "action": "rerun", "severity": "high"},
+            {"stage": "ocr", "action": "rerun", "severity": "high", "params": {"upscale": True}},
             {"stage": "text-analysis", "action": "resolve-fonts", "severity": "medium"},
         ],
     }), encoding="utf-8")

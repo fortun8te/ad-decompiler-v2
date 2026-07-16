@@ -482,15 +482,133 @@ def _scene_baked_exemption_block_reason(run_dir, design) -> str:
     return ""
 
 
-def _text_recall(source_ocr, render_ocr, source_gray=None, render_gray=None):
+def _text_recall(source_ocr, render_ocr, source_gray=None, render_gray=None,
+                 design=None, run_dir=None):
+    return _text_recall_detail(source_ocr, render_ocr, source_gray, render_gray,
+                               design=design, run_dir=run_dir)["recall"]
+
+
+def _clip_box(box, width, height):
+    try:
+        x0 = max(0, int(box.get("x", 0)));  y0 = max(0, int(box.get("y", 0)))
+        x1 = min(width, int(box.get("x", 0) + box.get("w", 0)))
+        y1 = min(height, int(box.get("y", 0) + box.get("h", 0)))
+    except (TypeError, ValueError):
+        return None
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return None
+    return x0, y0, x1, y1
+
+
+def _baked_line_leaves(design, source_gray):
+    """Raster leaves eligible to legitimately carry baked (kept-in-photo) text.
+
+    Product/photo cutouts and slices only — never the background plate and never a
+    near-full-canvas raster (a lazy whole-page rasterization must not launder its text
+    through this exemption; the native-leaf/unexplained-raster gates own that failure,
+    and this list refuses to help it)."""
+    if design is None or source_gray is None:
+        return []
+    height, width = source_gray.shape[:2]
+    canvas_area = float(width * height)
+    leaves = []
+    for leaf, box in _iter_leaf_layers_abs((design or {}).get("layers") or []):
+        if leaf.get("type") != "image" or not leaf.get("src"):
+            continue
+        if (leaf.get("meta") or {}).get("role") == "background":
+            continue
+        area = max(0.0, float(box.get("w", 0))) * max(0.0, float(box.get("h", 0)))
+        if canvas_area and area / canvas_area >= 0.90:
+            continue
+        leaves.append((leaf, box))
+    return leaves
+
+
+def _line_baked_in_asset(line_box, source_gray, leaves, run_dir, asset_cache):
+    """True when a source text line's pixels are verbatim present in an emitted asset.
+
+    The pixel-identity idea from the render fallback, applied to the OWNING asset: crop
+    the layer's real asset file at the line's coordinates and require the source pixels
+    to be there (>=50% opaque coverage, small mean delta — resampling tolerance only).
+    Un-gameable: it reads the actual pixels the export will show, so a reconstruction
+    that dropped or repainted the label text cannot pass it."""
+    import numpy as np
+    from PIL import Image
+
+    height, width = source_gray.shape[:2]
+    clipped = _clip_box(line_box, width, height)
+    if clipped is None:
+        return False
+    x0, y0, x1, y1 = clipped
+    line_area = float((x1 - x0) * (y1 - y0))
+    for leaf, box in leaves:
+        bx, by = float(box.get("x", 0)), float(box.get("y", 0))
+        bw, bh = float(box.get("w", 0)), float(box.get("h", 0))
+        if bw < 1 or bh < 1:
+            continue
+        ix0, iy0 = max(x0, bx), max(y0, by)
+        ix1, iy1 = min(x1, bx + bw), min(y1, by + bh)
+        if ix1 - ix0 <= 0 or iy1 - iy0 <= 0:
+            continue
+        if (ix1 - ix0) * (iy1 - iy0) < 0.6 * line_area:
+            continue
+        src = str(leaf.get("src"))
+        cached = asset_cache.get(src)
+        if cached is None:
+            path = _resolve_path(src, run_dir)
+            if not path or not os.path.exists(path):
+                asset_cache[src] = False
+                continue
+            try:
+                image = Image.open(path).convert("RGBA")
+                target = (max(1, int(round(bw))), max(1, int(round(bh))))
+                if image.size != target:
+                    image = image.resize(target, Image.Resampling.LANCZOS)
+                arr = np.asarray(image, dtype=np.float32)
+                gray = arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114
+                cached = (gray, arr[..., 3])
+            except Exception:
+                cached = False
+            asset_cache[src] = cached
+        if cached is False:
+            continue
+        gray, alpha = cached
+        ah, aw = gray.shape[:2]
+        rx0 = max(0, int(round(ix0 - bx))); ry0 = max(0, int(round(iy0 - by)))
+        rx1 = min(aw, int(round(ix1 - bx))); ry1 = min(ah, int(round(iy1 - by)))
+        if rx1 - rx0 < 3 or ry1 - ry0 < 3:
+            continue
+        sx0 = int(round(ix0)); sy0 = int(round(iy0))
+        crop_gray = gray[ry0:ry1, rx0:rx1]
+        crop_alpha = alpha[ry0:ry1, rx0:rx1]
+        src_crop = source_gray[sy0:sy0 + (ry1 - ry0), sx0:sx0 + (rx1 - rx0)]
+        if src_crop.shape != crop_gray.shape:
+            continue
+        opaque = crop_alpha >= 128
+        if float(opaque.mean()) < 0.5:
+            continue
+        delta = np.abs(src_crop.astype(np.float32) - crop_gray)[opaque]
+        if delta.size and float(delta.mean()) <= 8.0:
+            return True
+    return False
+
+
+def _text_recall_detail(source_ocr, render_ocr, source_gray=None, render_gray=None,
+                        design=None, run_dir=None):
     kept = [l for l in source_ocr.get("lines", []) if l.get("conf", 1) >= 0.5
             and len(_norm(l.get("text", ""))) >= 3]
     if not kept:
-        return 1.0
+        return {"recall": 1.0, "found": 0, "lines_total": 0,
+                "baked_excluded": 0, "baked_excluded_lines": []}
     ren_blob = " ".join(_norm(l["text"]) for l in render_ocr.get("lines", []))
+    kept_blob = " ".join(_norm(t) for t in ((design or {}).get("kept_in_photo") or []))
+    baked_leaves = _baked_line_leaves(design, source_gray) if kept_blob else []
+    asset_cache = {}
     found = 0
+    baked_excluded = []
     for line in kept:
-        if _norm(line["text"]) in ren_blob:
+        norm = _norm(line["text"])
+        if norm in ren_blob:
             found += 1
             continue
         # Baked-verbatim fallback: OCR is not deterministic even on IDENTICAL pixels
@@ -498,24 +616,38 @@ def _text_recall(source_ocr, render_ocr, source_gray=None, render_gray=None):
         # region under this line's box survives essentially unchanged in the render,
         # the text is literally present — count it, no re-OCR roulette. Un-gameable:
         # pixel identity cannot be faked by a wrong reconstruction.
-        if source_gray is None or render_gray is None:
-            continue
-        box = line.get("box") or {}
-        try:
-            h, w = source_gray.shape[:2]
-            x0 = max(0, int(box.get("x", 0)));  y0 = max(0, int(box.get("y", 0)))
-            x1 = min(w, int(box.get("x", 0) + box.get("w", 0)))
-            y1 = min(h, int(box.get("y", 0) + box.get("h", 0)))
-            if x1 - x0 < 3 or y1 - y0 < 3:
-                continue
-            import numpy as _np
-            delta = _np.abs(source_gray[y0:y1, x0:x1].astype(_np.float32)
-                            - render_gray[y0:y1, x0:x1].astype(_np.float32))
-            if float(delta.mean()) <= 2.0:
-                found += 1
-        except Exception:
-            continue
-    return found / len(kept)
+        if source_gray is not None and render_gray is not None:
+            clipped = _clip_box(line.get("box") or {}, *source_gray.shape[1::-1])
+            if clipped is not None:
+                try:
+                    import numpy as _np
+                    x0, y0, x1, y1 = clipped
+                    delta = _np.abs(source_gray[y0:y1, x0:x1].astype(_np.float32)
+                                    - render_gray[y0:y1, x0:x1].astype(_np.float32))
+                    if float(delta.mean()) <= 2.0:
+                        found += 1
+                        continue
+                except Exception:
+                    pass
+        # Product-printed-text fairness (135): a line that merge deliberately kept in the
+        # photo (design.kept_in_photo) AND whose pixels are verbatim present in the owning
+        # product/photo ASSET is correctly baked-by-design — the render pipeline never
+        # promised to re-OCR it. Exclude it from the recall DENOMINATOR so the metric
+        # reflects editable-ad text only. Both conditions are evidence-based: the merge
+        # verdict comes from the source image, and the pixels are read from the real asset.
+        if kept_blob and norm and norm in kept_blob:
+            try:
+                if _line_baked_in_asset(line.get("box") or {}, source_gray,
+                                        baked_leaves, run_dir, asset_cache):
+                    baked_excluded.append(str(line.get("text"))[:60])
+                    continue
+            except Exception:
+                pass
+    denominator = len(kept) - len(baked_excluded)
+    recall = 1.0 if denominator <= 0 else found / denominator
+    return {"recall": recall, "found": found, "lines_total": len(kept),
+            "baked_excluded": len(baked_excluded),
+            "baked_excluded_lines": baked_excluded}
 
 
 def _load_design(design, run_dir):
@@ -1116,7 +1248,129 @@ def _load_mask(mask, size):
     return arr > 0
 
 
-def _background_audit(source_rgb, background_path, removal_mask):
+def _asset_paints(src, run_dir, min_alpha_px=24):
+    """True when a layer's raster asset actually paints visible pixels.
+
+    QA-side mirror of reconstruct._asset_has_content (the removal-ledger accounting this
+    module consumes): a blank/near-empty PNG re-renders nothing, so an owner shipping one
+    does NOT count as re-rendering its removal region. Evidence-based — reads the real
+    file on disk, so it cannot be satisfied by metadata alone."""
+    import numpy as np
+    from PIL import Image
+
+    if not src or str(src).startswith("data:"):
+        return False
+    path = _resolve_path(src, run_dir)
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        image = Image.open(path)
+    except Exception:
+        return False
+    if "A" in image.getbands():
+        alpha = np.asarray(image.split()[-1])
+        return int(np.count_nonzero(alpha > 16)) >= int(min_alpha_px)
+    return image.width * image.height >= int(min_alpha_px)
+
+
+def _leaf_claim_keys(leaf):
+    """Identity keys under which an emitted leaf can claim a removal-ledger owner.
+
+    build_design_json splits candidates into derived leaves (``c_B10`` → ``c_B10__w0``,
+    ``c_E003`` → ``c_E003__hostbg``), so the base id before ``__`` is the lineage key.
+    Element ids are additionally normalized (c_E007/E007/e7 → E7)."""
+    keys = set()
+    for value in (leaf.get("id"), (leaf.get("meta") or {}).get("source_id")):
+        if not value:
+            continue
+        base = str(value).split("__")[0]
+        keys.add(base)
+        normalized = _normalized_element_id(base)
+        if normalized:
+            keys.add(normalized)
+    return keys
+
+
+def _leaf_paints(leaf, run_dir):
+    """True when an emitted design leaf visibly re-renders REAL pixels."""
+    ltype = leaf.get("type")
+    if ltype == "text":
+        return bool(_norm(leaf.get("text")))
+    if ltype == "shape":
+        if leaf.get("fill") or leaf.get("stroke") or leaf.get("path") \
+                or leaf.get("paths") or leaf.get("svg"):
+            return True
+        return _asset_paints(leaf.get("src"), run_dir)
+    if ltype in ("image", "icon"):
+        return _asset_paints(leaf.get("src"), run_dir)
+    return False
+
+
+def _removal_claim_mask(run_dir, design, size):
+    """Boolean mask of removal pixels whose ledger owner re-renders with real pixels.
+
+    Consumes reconstruct's removal-ledger accounting (removal_ownership.png +
+    reconstruction.json's removal_owner_index) and independently verifies each owner
+    against the EMITTED design: the owner must ship a leaf whose lineage matches the
+    candidate id AND that leaf must actually paint (native text, a real shape, or a
+    non-empty raster asset on disk). Altered plate pixels under such an owner are
+    re-rendered content (e.g. 066's two eye photos shipped as swappable cutouts), not
+    destruction. Returns (mask_or_None, accounting_dict)."""
+    import numpy as np
+    from PIL import Image
+
+    accounting = {"available": False, "owners_total": 0,
+                  "owners_claimed": [], "owners_unclaimed": []}
+    ownership_path = os.path.join(run_dir or "", "removal_ownership.png")
+    reconstruction = _load_reconstruction(run_dir) if run_dir else {}
+    owner_index = reconstruction.get("removal_owner_index") or {}
+    if not os.path.exists(ownership_path) or not owner_index:
+        return None, accounting
+    # Index emitted leaves by lineage key → does any matching leaf paint real pixels?
+    paints_by_key = {}
+    for leaf, _box in _iter_leaf_layers_abs((design or {}).get("layers") or []):
+        keys = _leaf_claim_keys(leaf)
+        if not keys:
+            continue
+        painted = _leaf_paints(leaf, run_dir)
+        for key in keys:
+            paints_by_key[key] = paints_by_key.get(key, False) or painted
+    claimed_numbers = set()
+    for number, cid in owner_index.items():
+        cid = str(cid)
+        keys = {cid}
+        normalized = _normalized_element_id(cid)
+        if normalized:
+            keys.add(normalized)
+        claimed = any(paints_by_key.get(key) for key in keys)
+        try:
+            number_int = int(number)
+        except (TypeError, ValueError):
+            continue
+        accounting["owners_total"] += 1
+        if claimed:
+            claimed_numbers.add(number_int)
+            accounting["owners_claimed"].append(cid)
+        else:
+            accounting["owners_unclaimed"].append(cid)
+    try:
+        ownership = np.asarray(Image.open(ownership_path))
+    except Exception:
+        return None, accounting
+    if ownership.ndim > 2:
+        ownership = ownership[..., 0]
+    width, height = size
+    if ownership.shape != (height, width):
+        ownership = np.asarray(
+            Image.fromarray(ownership).resize((width, height), Image.Resampling.NEAREST))
+    scale = max(1, 65535 // max(1, len(owner_index)))
+    numbers = np.rint(ownership.astype(np.float64) / scale).astype(np.int64)
+    claimed_mask = np.isin(numbers, sorted(claimed_numbers)) & (ownership > 0)
+    accounting["available"] = True
+    return claimed_mask, accounting
+
+
+def _background_audit(source_rgb, background_path, removal_mask, run_dir=None, design=None):
     import numpy as np
 
     if not background_path or not os.path.exists(background_path):
@@ -1130,7 +1384,8 @@ def _background_audit(source_rgb, background_path, removal_mask):
     if not np.any(mask):
         return {"mask_supplied": mask_supplied, "masked_pixels": 0,
                 "exact_match_ratio": 0.0, "changed_ratio": 1.0,
-                "changed_canvas_ratio": 0.0,
+                "changed_canvas_ratio": 0.0, "destroyed_canvas_ratio": 0.0,
+                "claimed_canvas_ratio": 0.0, "removal_claims": None,
                 "edge_retention": None, "mean_change": 0.0,
                 "outside_changed_ratio": 0.0, "outside_mean_change": 0.0}
     total_px = int(height) * int(width)
@@ -1139,8 +1394,23 @@ def _background_audit(source_rgb, background_path, removal_mask):
     changed = float((delta[mask] > 8.0).mean())
     # Fraction of the WHOLE canvas that was actually altered inside the removal region.
     # changed_ratio is per-mask; this is per-canvas, so it measures how much of the plate
-    # the removal/inpaint pass destroyed regardless of how large the mask was (F3).
-    changed_canvas = float(int((delta[mask] > 8.0).sum()) / max(1, total_px))
+    # the removal/inpaint pass altered regardless of how large the mask was (F3).
+    changed_px = (delta > 8.0) & mask
+    changed_canvas = float(int(changed_px.sum()) / max(1, total_px))
+    # Destruction-accounting fairness: an altered plate pixel whose removal-ledger owner
+    # re-renders REAL pixels on top (e.g. 066's eye photos inpainted out and shipped back
+    # as swappable cutouts) is preserved-and-editable content, not destruction. Destroyed
+    # = altered pixels with NO real re-rendered owner. Falls back to the raw changed ratio
+    # when the ledger artifacts are unavailable (never more lenient without evidence).
+    destroyed_canvas = changed_canvas
+    claimed_canvas = 0.0
+    claim_accounting = None
+    if run_dir:
+        claimed_mask, claim_accounting = _removal_claim_mask(run_dir, design, (width, height))
+        if claimed_mask is not None:
+            claimed_canvas = float(int((changed_px & claimed_mask).sum()) / max(1, total_px))
+            destroyed_canvas = float(
+                int((changed_px & ~claimed_mask).sum()) / max(1, total_px))
     mean_change = float(delta[mask].mean())
     outside = ~mask
     outside_changed = float((delta[outside] > 8.0).mean()) if np.any(outside) else 0.0
@@ -1161,6 +1431,9 @@ def _background_audit(source_rgb, background_path, removal_mask):
         "exact_match_ratio": round(exact, 5),
         "changed_ratio": round(changed, 5),
         "changed_canvas_ratio": round(changed_canvas, 5),
+        "destroyed_canvas_ratio": round(destroyed_canvas, 5),
+        "claimed_canvas_ratio": round(claimed_canvas, 5),
+        "removal_claims": claim_accounting,
         "edge_retention": None if retained is None else round(retained, 5),
         "mean_change": round(mean_change, 4),
         "outside_changed_ratio": round(outside_changed, 5),
@@ -1433,7 +1706,8 @@ def _structural_audit(
         removal_mask = candidate if os.path.exists(candidate) else None
     elif isinstance(removal_mask, str):
         removal_mask = _resolve_path(removal_mask, run_dir)
-    background = _background_audit(source_rgb, background_path, removal_mask)
+    background = _background_audit(source_rgb, background_path, removal_mask,
+                                   run_dir=run_dir, design=design)
     alpha_layers, alpha_failures = _layer_alpha_audit(layers, run_dir, thresholds)
     explicit_leakage = supplied.get("background_leakage")
 
@@ -1601,17 +1875,25 @@ def _structural_audit(
         # F3: cap plate destruction. There are gates for an untouched plate and a no-op
         # removal, but none for the opposite failure — a removal/inpaint that rebuilds most
         # of the canvas (002 erased the whole product cluster, changed_canvas_ratio 0.69).
-        # When more than the configured fraction of the WHOLE canvas is altered inside the
-        # removal region, real content was almost certainly erased.
+        # Fairness: the gate counts DESTROYED pixels — altered plate pixels with NO real
+        # re-rendered owner (removal-ledger accounting, see _removal_claim_mask). 066's
+        # changed_canvas ~0.69 is legitimate: the eye photos were inpainted out and shipped
+        # back as swappable cutouts, so their pixels are preserved content, not destruction.
+        # When the ledger artifacts are missing, destroyed == changed (no unearned leniency).
         canvas_ratio = background.get("changed_canvas_ratio")
+        destroyed_ratio = background.get("destroyed_canvas_ratio", canvas_ratio)
         ceiling = thresholds.get("background_changed_ratio_max")
-        if (background.get("mask_supplied") and canvas_ratio is not None
-                and ceiling is not None and canvas_ratio > float(ceiling)):
+        if (background.get("mask_supplied") and destroyed_ratio is not None
+                and ceiling is not None and destroyed_ratio > float(ceiling)):
+            unclaimed = ((background.get("removal_claims") or {}).get("owners_unclaimed")
+                         or [])[:4]
             _add_fail(
                 fails,
                 "excessive-plate-destruction",
-                f"removal/inpaint altered {canvas_ratio:.1%} of the canvas "
-                f"(> {float(ceiling):.0%}) — likely erased real content, not just a removed object",
+                f"removal/inpaint destroyed {destroyed_ratio:.1%} of the canvas with no "
+                f"re-rendered owner (> {float(ceiling):.0%}; altered total {canvas_ratio:.1%}"
+                + (f"; unclaimed owners: {', '.join(unclaimed)}" if unclaimed else "")
+                + ") — real content was erased, not re-rendered",
             )
     # F15: unresolved glyph residue under a removed text region is a structural failure, not
     # a bare repair suggestion. QA must not report ok while it stands (009 shipped ok with a
@@ -1775,6 +2057,52 @@ def _contract_summary(design_data, structure, source_ocr, per_layer, ssim, thres
     }
 
 
+def _write_worst_window_crop(source_rgb, render_rgb, bbox, run_dir, pad=24):
+    """Write qa_worst_window.png: source|render side-by-side crop of the worst window.
+
+    Forensic artifact for the recurring local-ssim-worst-region fails (002/016/088/094/
+    104/131): the exact region that sank the score, source on the left, render on the
+    right, red frame marking the un-padded window. Small crops are upscaled so glyph-level
+    damage is visible without a zoom tool."""
+    import numpy as np
+    from PIL import Image
+
+    height, width = source_rgb.shape[:2]
+    x0 = max(0, int(bbox.get("x", 0)) - pad)
+    y0 = max(0, int(bbox.get("y", 0)) - pad)
+    x1 = min(width, int(bbox.get("x", 0) + bbox.get("w", 0)) + pad)
+    y1 = min(height, int(bbox.get("y", 0) + bbox.get("h", 0)) + pad)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+
+    def _crop(arr):
+        crop = np.clip(arr[y0:y1, x0:x1], 0, 255).astype(np.uint8)
+        # Red frame on the un-padded window bounds so the scored region is unambiguous.
+        fx0 = max(0, int(bbox.get("x", 0)) - x0); fy0 = max(0, int(bbox.get("y", 0)) - y0)
+        fx1 = min(crop.shape[1] - 1, fx0 + max(1, int(bbox.get("w", 0))))
+        fy1 = min(crop.shape[0] - 1, fy0 + max(1, int(bbox.get("h", 0))))
+        crop = crop.copy()
+        crop[fy0:fy0 + 2, fx0:fx1] = (255, 0, 0)
+        crop[max(0, fy1 - 2):fy1, fx0:fx1] = (255, 0, 0)
+        crop[fy0:fy1, fx0:fx0 + 2] = (255, 0, 0)
+        crop[fy0:fy1, max(0, fx1 - 2):fx1] = (255, 0, 0)
+        return crop
+
+    left, right = _crop(source_rgb), _crop(render_rgb)
+    scale = 1
+    if max(left.shape[0], left.shape[1]) < 200:
+        scale = max(1, int(round(200 / max(1, max(left.shape[0], left.shape[1])))))
+    divider = np.full((left.shape[0], 6, 3), 255, dtype=np.uint8)
+    panel = np.concatenate([left, divider, right], axis=1)
+    image = Image.fromarray(panel)
+    if scale > 1:
+        image = image.resize((image.width * scale, image.height * scale),
+                             Image.Resampling.NEAREST)
+    out_path = os.path.join(run_dir, "qa_worst_window.png")
+    image.save(out_path)
+    return out_path
+
+
 def compare(
     source_path,
     render_path,
@@ -1848,16 +2176,20 @@ def compare(
         reverse=True,
     )
 
+    design_data = _load_design(design, run_dir)
     text_recall = None
+    text_recall_detail = None
     if source_ocr and render_ocr:
-        text_recall = _text_recall(source_ocr, render_ocr, source_gray, render_gray)
+        text_recall_detail = _text_recall_detail(
+            source_ocr, render_ocr, source_gray, render_gray,
+            design=design_data, run_dir=run_dir)
+        text_recall = text_recall_detail["recall"]
 
     opts = dict(DEFAULT_THRESHOLDS)
     # F-per-archetype-floor: apply the archetype preset's own edge/color floors (if any)
     # before the caller's explicit thresholds, so an explicit override always still wins.
     opts.update(_archetype_threshold_overrides(run_dir))
     opts.update(thresholds or {})
-    design_data = _load_design(design, run_dir)
     structure = _structural_audit(
         source_rgb,
         run_dir,
@@ -1889,6 +2221,16 @@ def compare(
     # mean-dominated aggregate, so a catastrophic region (009/016: worst window ~0.03-0.04)
     # cannot hide under a good global/aggregate score. Evidence carries the pixel bbox.
     worst_window = _local_ssim_worst_window(source_gray, render_gray, preserve_mask)
+    # Worst-window forensics: every run gets a side-by-side source|render crop of the
+    # single worst window (qa_worst_window.png) so a local-ssim-worst-region fail is
+    # diagnosable at a glance without re-deriving the bbox by hand.
+    worst_window_png = None
+    if worst_window and worst_window.get("bbox"):
+        try:
+            worst_window_png = _write_worst_window_crop(
+                source_rgb, render_rgb, worst_window["bbox"], run_dir)
+        except Exception:
+            worst_window_png = None
     worst_window_min = opts.get("local_ssim_worst_window_min")
     if (worst_window is not None and worst_window_min is not None
             and worst_window["ssim"] < float(worst_window_min)):
@@ -1947,6 +2289,10 @@ def compare(
         "visual_score": round(visual_score, 4),
         "quality_flags": quality_flags,
         "text_recall": None if text_recall is None else round(text_recall, 4),
+        # Denominator honesty: how many source lines were excluded as correctly-baked
+        # product text (kept_in_photo + pixels verbatim in the owning asset), with the
+        # excluded line texts listed so the exclusion is auditable, never silent.
+        "text_recall_detail": text_recall_detail,
         "editable_text_recall": structure["editable_text_recall"],
         # ── Codia construction contract (the QA objective — see _contract_summary) ────
         # contract_score is the composite of record (native text first, then construction
@@ -1970,6 +2316,7 @@ def compare(
         "rasterized_text_count": structure.get("rasterized_text_count"),
         "rasterized_text_ratio": structure.get("rasterized_text_ratio"),
         "local_ssim_worst_window": worst_window,
+        "worst_window_png": worst_window_png,
         "per_layer": per_layer,
         "per_region_max_delta": float(cells.max()),
         "per_region": {"rows": gy, "cols": gx, "mean_delta": cells.round(3).tolist(), "worst": ranked[:8]},

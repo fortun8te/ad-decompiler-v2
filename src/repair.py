@@ -74,6 +74,40 @@ def _local_layer_score(pl):
     return value
 
 
+def _box_intersection_area(a, b):
+    """Pixel overlap of two {x,y,w,h} boxes (0.0 when either is malformed)."""
+    try:
+        ax, ay, aw, ah = (float(a["x"]), float(a["y"]), float(a["w"]), float(a["h"]))
+        bx, by, bw, bh = (float(b["x"]), float(b["y"]), float(b["w"]), float(b["h"]))
+    except (TypeError, KeyError, ValueError):
+        return 0.0
+    width = min(ax + aw, bx + bw) - max(ax, bx)
+    height = min(ay + ah, by + bh) - max(ay, by)
+    return max(0.0, width) * max(0.0, height)
+
+
+def _layers_overlapping_box(box, per_layer):
+    """Per-layer rows whose absolute box overlaps *box*, worst local score first.
+
+    reconstruct.apply_raster_slice_fallback only honors ``focus_regions`` entries that
+    carry a ``layer_id`` — a box-only worst-window region is a guaranteed no-op patch
+    (the postfix-benchmark-4 002/016 class). Resolving the window to the measured
+    layers under it turns the top-ranked repair into one the pipeline can execute."""
+    if not isinstance(box, dict):
+        return []
+    hits = []
+    for pl in per_layer or []:
+        if not isinstance(pl, dict) or not pl.get("id"):
+            continue
+        layer_box = pl.get("abs_box") or pl.get("box")
+        if _box_intersection_area(box, layer_box) <= 0.0:
+            continue
+        score = _local_layer_score(pl)
+        hits.append((score if score is not None else 1.0, pl))
+    hits.sort(key=lambda item: item[0])
+    return [pl for _, pl in hits]
+
+
 def _repair_badness(item):
     """Measured badness of the region/layer a repair targets (0 = no local evidence).
 
@@ -414,6 +448,19 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
 
     run_dir = cfg.get("run_dir")
 
+    # Terminal fallback dispositions: the slicer already saw these layers this run and
+    # either dropped them (e.g. "plate-already-holds-source-pixels") or refused them at
+    # a gate (readable text, size). Any repair that would re-force them through
+    # focus_regions reaches the exact same decision — postfix-benchmark-4 013 burned its
+    # round re-forcing c_E006/c_E007__hostbg, which fallback.json had already dropped.
+    terminal_ids: set = set()
+    if run_dir:
+        _fallback_report = _load_json(os.path.join(run_dir, "fallback.json"), {})
+        for _key in ("dropped", "skipped"):
+            for _entry in _fallback_report.get(_key) or []:
+                if isinstance(_entry, dict) and _entry.get("id"):
+                    terminal_ids.add(str(_entry["id"]))
+
     # ── element recall (detection → reconstruction survival) ────────────────────────────
     element_recall = _resolve_element_recall(qa, structural, run_dir)
     if element_recall is not None and element_recall < t["element_recall_min"]:
@@ -554,12 +601,40 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
                 region["local_score"] = worst_window["ssim"]
                 if not region.get("box"):
                     region["box"] = worst_window.get("bbox")
-            out.append({
+            # Resolve the window to the measured layers under it: reconstruct's
+            # focus_regions consumer only acts on entries with a layer_id, so a
+            # box-only region cannot force anything (guaranteed no-op rerun).
+            regions = []
+            target_id = None
+            # Exclude layers the slice lever cannot act on: fallback.json terminal
+            # dispositions AND readable text (apply_raster_slice_fallback refuses
+            # "codia-never-slice-readable-text" unless the text gate is enabled).
+            overlapping = [pl for pl in _layers_overlapping_box(
+                region.get("box"), qa.get("per_layer") or [])
+                if str(pl.get("id")) not in terminal_ids
+                and str(pl.get("type") or "") != "text"
+                and str(pl.get("role") or "") not in _TEXT_ROLES]
+            for pl in overlapping[:3]:
+                regions.append({
+                    "layer_id": str(pl.get("id")),
+                    "region_ssim": pl.get("region_ssim"),
+                    "region_color": pl.get("region_color"),
+                    "ink_iou": pl.get("ink_iou"),
+                    "box": pl.get("abs_box") or pl.get("box"),
+                    "reasons": [detail],
+                })
+            if overlapping:
+                target_id = str(overlapping[0].get("id"))
+            regions.append(region)  # raw window last: layer entries are the real levers
+            repair_entry = {
                 "stage": "reconstruct", "action": "inspect-worst-regions",
                 "reason": detail,
-                "params": {"regions": [region], "worst_window": True},
+                "params": {"regions": regions, "worst_window": True},
                 "severity": "high",
-            })
+            }
+            if target_id:
+                repair_entry["target_id"] = target_id
+            out.append(repair_entry)
         elif rule in ("local-ssim", "edge-fidelity", "color-fidelity"):
             if rule == "local-ssim":
                 out.append({"stage": "qwen", "action": "retry", "reason": detail,
@@ -638,6 +713,8 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             # "any truthy fallback" skip hid text→image substitutions from re-gating (F11).
             if not isinstance(pl, dict) or _is_raster_slice({"fallback": pl.get("fallback")}):
                 continue
+            if str(pl.get("id")) in terminal_ids:
+                continue
             reasons = raster_slice_failures(pl, fallback_thresholds)
             if reasons:
                 slice_rows.append((pl, reasons))
@@ -698,6 +775,10 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
         lid = str(pl.get("id") or "")
         role = str(pl.get("role") or pl.get("type") or "")
         if not lid or lid in slice_ids or role == "background":
+            continue
+        if lid in terminal_ids:
+            # fallback.json already dropped/refused this layer; the inspect/focus lever
+            # would reach the identical decision again (the 013 no-op loop).
             continue
         local = _local_layer_score(pl)
         if local is None or local >= t["local_layer_min"]:
