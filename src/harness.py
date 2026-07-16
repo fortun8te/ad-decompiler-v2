@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import json
 import os
+import time
 from typing import Any, Callable, Optional
 
 # Repair modules use logical stage names; the orchestrator uses STAGES in run_pipeline.
@@ -764,6 +765,94 @@ def harness_enabled(cfg: Optional[dict]) -> bool:
     return _flag(runtime.get("auto_repair"))
 
 
+# ── round budget (cost control) ─────────────────────────────────────────────────────────
+# postfix-benchmark-5 002: ONE repair round ran 15 minutes (a sam3 rerun-detection repair
+# cascaded vlm element propose → sam3 → fusion → a ~40-inpaint peel storm → Flux calls at
+# 178-266s each in reconstruct) and produced a WORSE design. A repair round must never be
+# allowed to grind unbounded: it gets a wall-clock ceiling and, for reruns that replay the
+# peel stack, a clamped peel Flux budget (consuming peel_scene's own flux_budget /
+# max_iterations config — the harness only tightens those knobs, never loosens them).
+_DEFAULT_ROUND_WALL_CLOCK_S = 600.0   # a repair round may not cost 10+ minutes
+_DEFAULT_ROUND_FLUX_CALLS = 2         # half of peel_scene DEFAULTS["flux_budget"] (4)
+
+
+def round_budget(cfg: Optional[dict]) -> dict:
+    """Per-harness-round cost ceiling from ``runtime.harness.round_budget``.
+
+    Keys:
+      wall_clock_s     max seconds a single repair round may spend (<=0 disables)
+      flux_calls       peel.flux_budget clamp for reruns that resume at/before peel
+                       (None/negative disables the clamp)
+      peel_iterations  optional peel.max_iterations clamp for the same reruns
+    """
+    harness = ((cfg or {}).get("runtime") or {}).get("harness") or {}
+    raw = harness.get("round_budget") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        wall = float(raw.get("wall_clock_s", _DEFAULT_ROUND_WALL_CLOCK_S))
+    except (TypeError, ValueError):
+        wall = _DEFAULT_ROUND_WALL_CLOCK_S
+    if wall <= 0:
+        wall = float("inf")
+    flux: Optional[int]
+    try:
+        flux_raw = raw.get("flux_calls", _DEFAULT_ROUND_FLUX_CALLS)
+        flux = None if flux_raw is None else int(flux_raw)
+    except (TypeError, ValueError):
+        flux = _DEFAULT_ROUND_FLUX_CALLS
+    if flux is not None and flux < 0:
+        flux = None
+    peel_iters: Optional[int]
+    try:
+        peel_raw = raw.get("peel_iterations")
+        peel_iters = None if peel_raw is None else max(1, int(peel_raw))
+    except (TypeError, ValueError):
+        peel_iters = None
+    return {"wall_clock_s": wall, "flux_calls": flux, "peel_iterations": peel_iters}
+
+
+def apply_round_budget_clamp(cfg: dict, resume: Optional[str],
+                             budget: Optional[dict] = None) -> tuple[dict, Optional[dict]]:
+    """Clamp the peel stack's own budget knobs for a rerun that replays peel.
+
+    Reuses peel_scene's config semantics (``peel.flux_budget``, ``peel.max_iterations``)
+    rather than touching peel code: a harness rerun resuming at or before the peel stage
+    gets AT MOST ``round_budget.flux_calls`` Flux peel inpaints. The clamp only ever
+    lowers the pipeline's existing values. Returns (cfg, clamp_record|None)."""
+    if budget is None:
+        budget = round_budget(cfg)
+    resume_index = _stage_order_index(resume)
+    if resume_index < 0 or resume_index > _stage_order_index("peel"):
+        return cfg, None
+    record: dict[str, Any] = {}
+    existing = cfg.get("peel")
+    if existing is not None and not isinstance(existing, dict):
+        return cfg, None  # cfg["peel"] exists but is not a dict — leave it alone
+    peel_cfg = cfg.setdefault("peel", {})
+    flux_ceiling = budget.get("flux_calls")
+    if flux_ceiling is not None:
+        try:
+            current = int(peel_cfg.get("flux_budget", 4))
+        except (TypeError, ValueError):
+            current = 4
+        clamped = max(0, min(current, int(flux_ceiling)))
+        if clamped != current or "flux_budget" not in peel_cfg:
+            record["flux_budget"] = {"from": current, "to": clamped}
+        peel_cfg["flux_budget"] = clamped
+    iter_ceiling = budget.get("peel_iterations")
+    if iter_ceiling is not None:
+        try:
+            current_iters = int(peel_cfg.get("max_iterations", 3))
+        except (TypeError, ValueError):
+            current_iters = 3
+        clamped_iters = max(1, min(current_iters, int(iter_ceiling)))
+        if clamped_iters != current_iters:
+            record["max_iterations"] = {"from": current_iters, "to": clamped_iters}
+        peel_cfg["max_iterations"] = clamped_iters
+    return cfg, (record or None)
+
+
 def harness_max_rounds(cfg: Optional[dict]) -> int:
     """Max repair rounds from config (default 2)."""
     runtime = (cfg or {}).get("runtime") or {}
@@ -916,6 +1005,8 @@ def execute_repairs(
     exhausted: set[tuple] = set(blocked_repairs or ())
     working_cfg = copy.deepcopy(cfg)
     working_cfg.setdefault("runtime", {})["auto_repair"] = False
+    budget = round_budget(cfg)
+    round_started = time.monotonic()
     admission_path = os.path.join(run_dir, "harness_admission.json")
     admission = _load_json(admission_path, {"seen": {}, "skipped": []})
     seen_plans = admission.get("seen") if isinstance(admission.get("seen"), dict) else {}
@@ -923,6 +1014,20 @@ def execute_repairs(
                     if isinstance(admission.get("classes"), dict) else {})
 
     for iteration in range(1, max(0, int(max_iterations)) + 1):
+        # Cost control: a repair round has a wall-clock ceiling. Once an attempt has
+        # blown it, no further pipeline reruns may start this round — the loop above
+        # decides whether the expensive attempt's output is kept or rolled back.
+        elapsed = time.monotonic() - round_started
+        if elapsed > budget["wall_clock_s"]:
+            return _save_harness_summary(run_dir, {
+                "run_dir": run_dir,
+                "iterations": iteration - 1,
+                "qa_ok": _qa_accepts(_load_json(os.path.join(run_dir, "qa.json"), {})),
+                "stopped": "round_budget_exceeded",
+                "budget": {"wall_clock_s": budget["wall_clock_s"],
+                           "elapsed_s": round(elapsed, 1)},
+                "attempts": attempts,
+            })
         # Admission screen (GB3): rejecting a non-concrete / already-failed / unchanged
         # plan must move to the NEXT candidate WITHIN this iteration, not burn the whole
         # iteration budget. With repair_iterations=1 the old `continue` let a single
@@ -1005,6 +1110,10 @@ def execute_repairs(
         iter_cfg = deep_merge(working_cfg, patches)
         iter_cfg["run_dir"] = run_dir
         iter_cfg.setdefault("runtime", {})["auto_repair"] = False
+        # Peel discipline for reruns: a repair that resumes at/before peel replays the
+        # peel stack — clamp its Flux budget so an element-propose repair can never
+        # trigger an unbounded big-lama/Flux storm (the 002 15-minute round).
+        iter_cfg, budget_clamp = apply_round_budget_clamp(iter_cfg, resume, budget)
 
         qa_path = os.path.join(run_dir, "qa.json")
         qa_before = copy.deepcopy(qa)
@@ -1016,6 +1125,7 @@ def execute_repairs(
         before_watched = {
             name: _artifact_fingerprint(os.path.join(run_dir, name)) for name in watched
         }
+        attempt_started = time.monotonic()
         try:
             result = _invoke_run_one(run_one, input_path, run_dir, iter_cfg, resume)
             if not isinstance(result, dict):
@@ -1052,7 +1162,10 @@ def execute_repairs(
             "artifacts_changed": artifacts_changed,
             "metric_deltas": metric_deltas,
             "qa_ok": qa_fresh and _qa_accepts(qa, allow_summary=True),
+            "elapsed_s": round(time.monotonic() - attempt_started, 1),
         }
+        if budget_clamp:
+            attempt["budget_clamp"] = budget_clamp
         if result.get("ok") and not artifacts_changed and not qa_improved:
             attempt["no_effect"] = "identical-artifacts"
         attempts.append(attempt)

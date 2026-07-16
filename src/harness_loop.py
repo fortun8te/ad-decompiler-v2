@@ -18,6 +18,7 @@ import copy
 import hashlib
 import inspect
 import os
+import time
 from typing import Any, Callable, Optional
 
 
@@ -39,6 +40,7 @@ from src.harness import (
     _qa_progress,
     _qa_accepts,
     _repair_id,
+    apply_round_budget_clamp,
     execute_repairs,
     harness_enabled,
     harness_max_rounds,
@@ -47,6 +49,7 @@ from src.harness import (
     load_repair_candidates,
     rank_repairs,
     recommended_resume,
+    round_budget,
     _load_json,
     _write_json,
 )
@@ -105,6 +108,37 @@ def plateau_round_limit(cfg: Optional[dict] = None, default: int = _DEFAULT_PLAT
         return max(1, int(harness.get("plateau_rounds", default)))
     except (TypeError, ValueError):
         return default
+
+
+# Shipped-artifact invariant (postfix-benchmark-5 002): a round that lowers BOTH global
+# ssim AND text_recall versus the best round must never ship, no matter what the phase2
+# scalar ladder says. In 002 a −0.0462 ssim / −0.0371 text_recall regression compressed
+# into a −0.003 reward delta (local_ssim actually rose 0.4433→0.4501 and LPIPS barely
+# moved), landing inside epsilon — per the ladder a "no-op", in reality a strictly worse
+# design. The tolerances below are per-metric noise floors (same scale as _qa_progress).
+_METRIC_VETO_TOLERANCES = (("ssim", 0.005), ("text_recall", 0.005))
+
+
+def _metrics_regressed(best_qa: Optional[dict], qa: Optional[dict]) -> bool:
+    """True when *qa* lowered every veto metric vs *best_qa* beyond its noise floor.
+
+    Requires all veto metrics present as numbers on BOTH sides — a missing metric is
+    inconclusive, never a veto."""
+    best_qa, qa = best_qa or {}, qa or {}
+    for key, tolerance in _METRIC_VETO_TOLERANCES:
+        old, new = best_qa.get(key), qa.get(key)
+        if not isinstance(old, (int, float)) or not isinstance(new, (int, float)):
+            return False
+        if float(new) >= float(old) - tolerance:
+            return False
+    return True
+
+
+def _veto_metrics(qa: Optional[dict]) -> Optional[dict]:
+    """The veto-metric slice of a QA record (None when no veto metric is present)."""
+    out = {key: (qa or {}).get(key) for key, _ in _METRIC_VETO_TOLERANCES
+           if isinstance((qa or {}).get(key), (int, float))}
+    return out or None
 
 
 def _qa_score(qa: Optional[dict]) -> Optional[float]:
@@ -555,6 +589,16 @@ def _run_round(
 
     if not skip_pipeline:
         loop_cfg = _cfg_for_pipeline(working_cfg)
+        # Peel discipline: a loop-driven REPAIR rerun (round > 1; round 1 without
+        # pipeline_already_ran is the production pass and keeps its full budget) that
+        # resumes at/before peel replays the peel stack — clamp its Flux budget the same
+        # way execute_repairs clamps repair reruns (consumes peel_scene's own
+        # flux_budget/max_iterations config).
+        if round_num > 1:
+            loop_cfg, budget_clamp = apply_round_budget_clamp(
+                loop_cfg, start_from, round_budget(working_cfg))
+            if budget_clamp:
+                round_record["budget_clamp"] = budget_clamp
         qa_path = os.path.join(run_dir, "qa.json")
         qa_before = _artifact_fingerprint(qa_path)
         try:
@@ -724,10 +768,19 @@ def run_until_acceptable(
     # Convergence state — the direct fix for the observed oscillation.
     blocked: set = set()                       # repairs proven non-improving (no-repeat)
     convergence: list[dict] = []               # per-round (repair, before, after, kept/rolled)
-    before_score, _ = _score_round(run_dir, cfg, _load_json(os.path.join(run_dir, "qa.json"), {}))
+    initial_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+    before_score, _ = _score_round(run_dir, cfg, initial_qa)
     best_score = before_score if before_score is not None else float("-inf")
     best_round = 0
-    best_snapshot = _snapshot_artifacts(run_dir) if before_score is not None else {}
+    # Snapshot the pre-loop artifacts unconditionally: even when no scalar score can be
+    # computed (before_score None used to leave best_snapshot = {} — nothing to restore),
+    # the baseline design must remain restorable so a regressing round can never strand
+    # the run with only the damaged artifacts on disk.
+    best_snapshot = _snapshot_artifacts(run_dir)
+    # QA metrics of the round whose artifacts are the current "best" — the evidence the
+    # ssim+text_recall regression veto compares against (see _metrics_regressed).
+    best_qa = _veto_metrics(initial_qa)
+    budget = round_budget(cfg)
     plateau = 0
     rolled_back_rounds = 0
     last_fixer_round: Optional[int] = None
@@ -748,6 +801,7 @@ def run_until_acceptable(
         )
         resume = next_resume
 
+        round_started = time.monotonic()
         round_record, working_cfg, should_stop = _run_round(
             round_num=round_num,
             image_path=image_path,
@@ -762,6 +816,29 @@ def run_until_acceptable(
             blocked_repairs=blocked,
         )
         next_resume = round_record.get("next_resume") or next_resume
+
+        # ── round budget (cost control) ────────────────────────────────────────────
+        # A round that blew its wall-clock ceiling must ABORT the loop (no further
+        # rounds), and the regression/veto bookkeeping below decides whether its
+        # expensive output is kept or rolled back — never both slow AND regressive.
+        round_elapsed = time.monotonic() - round_started
+        round_record["elapsed_s"] = round(round_elapsed, 1)
+        repair_stopped_reason = (round_record.get("repairs") or {}).get("stopped")
+        budget_exceeded = (
+            round_elapsed > budget["wall_clock_s"]
+            or repair_stopped_reason == "round_budget_exceeded"
+        )
+        if budget_exceeded and round_record.get("stopped") not in {
+            "qa_ok", "qa_ok_after_repairs",
+        }:
+            round_record["budget"] = {
+                "wall_clock_s": budget["wall_clock_s"],
+                "elapsed_s": round(round_elapsed, 1),
+                "exceeded": True,
+            }
+            round_record["stopped"] = "round_budget_exceeded"
+            should_stop = True
+
         round_stopped = round_record.get("stopped")
         attempts = (round_record.get("repairs") or {}).get("attempts") or []
         last_repair_refreshed_qa = any(attempt.get("qa_fresh") for attempt in attempts)
@@ -804,29 +881,50 @@ def run_until_acceptable(
         if reward_record:
             record["reward"] = reward_record
 
-        if after_score is not None:
-            delta = after_score - (before_score if before_score is not None else after_score)
-            record["delta"] = round(delta, 6)
-            if after_score > best_score:
+        # Shipped-artifact invariant: a round that lowered ssim AND text_recall versus
+        # the best round must never ship — even when the scalar ladder disagrees (002:
+        # −0.0462 ssim / −0.0371 text_recall compressed into a −0.0033 reward delta,
+        # inside epsilon, so neither the score-regression branch nor the final safety
+        # net's strict comparison was guaranteed to catch it before the loop ended).
+        # Acceptance is authoritative: an accepted round is exempt.
+        qa_accepted = _qa_accepts(after_qa, allow_summary=True)
+        metric_veto = (not qa_accepted) and _metrics_regressed(best_qa, after_qa)
+        if metric_veto:
+            record["metric_veto"] = {
+                "best": dict(best_qa or {}), "after": _veto_metrics(after_qa),
+            }
+
+        if after_score is not None or metric_veto:
+            delta = None
+            if after_score is not None:
+                delta = after_score - (before_score if before_score is not None else after_score)
+                record["delta"] = round(delta, 6)
+            score_regressed = after_score is not None and after_score < best_score - epsilon
+            if not metric_veto and after_score is not None and after_score > best_score:
                 best_score, best_round = after_score, round_num
                 best_snapshot = _snapshot_artifacts(run_dir)
+                best_qa = _veto_metrics(after_qa) or best_qa
                 record["kept"] = True
-            elif after_score < best_score - epsilon and best_snapshot and not should_stop:
-                # Regression: restore the best design and force a different repair next round.
+            elif (metric_veto or score_regressed) and best_snapshot:
+                # Regression (by score, or by the ssim+text_recall veto): restore the
+                # best design and force a different repair next round. NOT gated on
+                # should_stop — a regressing round that also stops the loop
+                # (no_progress/plateau/budget) must still leave the best artifacts on
+                # disk immediately, not damaged ones awaiting the final safety net.
                 _restore_artifacts(run_dir, best_snapshot)
                 disk_round = best_round
                 rolled_back_rounds += 1
                 record["rolled_back"] = True
                 blocked |= set(applied)
                 after_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
-                after_score = best_score
+                after_score = best_score if best_score != float("-inf") else None
                 steer = recommended_resume(
                     [r for r in load_repairs(run_dir, working_cfg)
                      if is_actionable(r) and _repair_id(r) not in blocked]
                 )
                 if steer:
                     next_resume = steer["resume"]
-            elif applied and abs(delta) <= epsilon:
+            elif applied and delta is not None and abs(delta) <= epsilon:
                 # No-op repair — never retry it (F13a admission control: a repair whose
                 # observed reward delta is ~0 must not re-run a full pipeline next round).
                 blocked |= set(applied)
@@ -840,11 +938,14 @@ def run_until_acceptable(
             # plateau counter untouched so the loop moves on to the remaining repairs
             # instead of "giving up" on the strength of a no-op it refused to run.
             record["evaluated"] = round_evaluated
-            if record["rolled_back"] or (abs(delta) < epsilon and round_evaluated):
+            if record["rolled_back"] or (
+                delta is not None and abs(delta) < epsilon and round_evaluated
+            ):
                 plateau += 1
-            elif abs(delta) >= epsilon:
+            elif delta is not None and abs(delta) >= epsilon:
                 plateau = 0
-            before_score = after_score
+            if after_score is not None:
+                before_score = after_score
         elif round_evaluated and not _round_made_progress(round_record):
             # F13c: even with no scalar reward (legacy / metrics unavailable), a round that
             # neither improved QA metrics nor applied a fix is a no-op — count it toward the
@@ -885,11 +986,19 @@ def run_until_acceptable(
             stopped = "plateau"
             break
 
-    # Emit the BEST design seen, not merely the last one.
+    # Emit the BEST design seen, not merely the last one. The ssim+text_recall veto
+    # applies here too: whatever the scalar ladder says, artifacts that regressed both
+    # metrics versus the best round are restored before anything ships.
     final_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
     live_score, _ = _score_round(run_dir, working_cfg, final_qa)
-    if best_snapshot and best_score != float("-inf") and (
-        live_score is None or live_score < best_score
+    final_veto = (
+        not _qa_accepts(final_qa, allow_summary=True)
+        and _metrics_regressed(best_qa, final_qa)
+    )
+    if best_snapshot and (
+        final_veto
+        or (best_score != float("-inf")
+            and (live_score is None or live_score < best_score))
     ):
         _restore_artifacts(run_dir, best_snapshot)
         disk_round = best_round
@@ -917,6 +1026,12 @@ def run_until_acceptable(
         # best_round/rolled_back_rounds alone -- see the _SNAPSHOT_FILES note above.
         "shipped_round": disk_round,
         "thresholds": threshold_snapshot,
+        "round_budget": {
+            "wall_clock_s": (None if budget["wall_clock_s"] == float("inf")
+                             else budget["wall_clock_s"]),
+            "flux_calls": budget["flux_calls"],
+            "peel_iterations": budget["peel_iterations"],
+        },
         "reward": {
             "mode": reward_mode,
             "final": qa_reward.reward_evidence(final_reward),
