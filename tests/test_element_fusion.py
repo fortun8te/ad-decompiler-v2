@@ -1038,3 +1038,92 @@ def test_packaging_flavor_bar_button_absorbs_into_product(tmp_path):
     report = json.load(open(tmp_path / "fusion_report.json"))
     assert report["counts"]["absorbed_packaging_shells"] == 1
     assert report["absorbed_packaging_shells"][0]["reason"] == "printed-on-product-shell"
+
+
+# ── star-rating rows: one pixel-exact chip PER STAR (user's explicit ask) ─────────────
+
+
+def _rating_row_mask(canvas=(200, 60), stars=5, x0=10, y0=20, size=16, gap=20):
+    import numpy as np
+    mask = np.zeros((canvas[1], canvas[0]), dtype=bool)
+    for i in range(stars):
+        x = x0 + i * gap
+        mask[y0:y0 + size, x:x + size] = True
+    return mask
+
+
+def _rating_cluster(mask, role="rating"):
+    return {
+        "winner": {"key": "sam3:S1", "id": "S1", "role": role, "kind": "icon",
+                   "mask": mask, "box": element_fusion._mask_box(mask),
+                   "score": 0.9, "source": "sam3", "meta": {}},
+        "members": [], "merges": [],
+    }
+
+
+def test_rating_row_splits_into_one_alpha_chip_per_star():
+    """"Crop out each star and rasterize it" -- a ★★★★★ row is N glyphs, not one blob.
+
+    sam3 detects the whole row as ONE element (role "rating"), which shipped a single
+    raster strip: the rating could not be restyled and no star was independently
+    swappable. Each star must become its own element with its own box and alpha mask.
+    """
+    mask = _rating_row_mask(stars=5)
+    out = element_fusion._split_rating_clusters([_rating_cluster(mask)], element_fusion.DEFAULTS)
+
+    assert len(out) == 5
+    for index, cluster in enumerate(out):
+        winner = cluster["winner"]
+        assert winner["role"] == "star"
+        assert winner["kind"] == "icon"
+        # Raster-first: an exact alpha cutout, never a traced path.
+        assert winner["meta"]["icon_chip"] is True
+        assert winner["meta"]["rating_star_index"] == index
+        assert winner["meta"]["rating_star_count"] == 5
+        # Each chip is one star's own footprint, not the whole row.
+        assert winner["box"]["w"] == 16 and winner["box"]["h"] == 16
+    # Ordered left to right.
+    xs = [c["winner"]["box"]["x"] for c in out]
+    assert xs == sorted(xs)
+
+
+def test_split_stars_are_never_vectorized_by_routing():
+    """A star must never reach VTracer/the analytic star fitter -- raster-first, always."""
+    from src import routing
+    assert routing.is_chrome_as_raster_role("star") is True
+    assert routing.is_chrome_as_raster_role("rating") is True
+    assert "star" not in routing.EXTENDED_VECTOR_ROLES
+
+
+def test_rating_split_fails_closed_on_a_fused_blob():
+    """One connected strip (touching/fused stars) keeps its single honest chip.
+
+    Shattering real artwork into debris is worse than one accurate raster.
+    """
+    import numpy as np
+    mask = np.zeros((60, 200), dtype=bool)
+    mask[20:36, 10:110] = True  # one solid bar: no separable glyphs
+    out = element_fusion._split_rating_clusters([_rating_cluster(mask)], element_fusion.DEFAULTS)
+
+    assert len(out) == 1
+    assert out[0]["winner"]["role"] == "rating"
+
+
+def test_rating_split_fails_closed_on_mismatched_components():
+    """Wildly different component sizes are not a rating row -- keep the single chip."""
+    import numpy as np
+    mask = np.zeros((60, 200), dtype=bool)
+    mask[20:36, 10:26] = True    # star-sized
+    mask[5:55, 40:140] = True    # a huge unrelated blob
+    out = element_fusion._split_rating_clusters([_rating_cluster(mask)], element_fusion.DEFAULTS)
+
+    assert len(out) == 1
+    assert out[0]["winner"]["role"] == "rating"
+
+
+def test_non_rating_roles_are_untouched():
+    mask = _rating_row_mask(stars=5)
+    out = element_fusion._split_rating_clusters(
+        [_rating_cluster(mask, role="product")], element_fusion.DEFAULTS)
+    assert len(out) == 1
+    assert out[0]["winner"]["role"] == "product"

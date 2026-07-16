@@ -109,6 +109,119 @@ def _cache_key(image_bytes: bytes, prompt: str, model: str, max_tokens: int,
     return h.hexdigest()
 
 
+# ── endpoint circuit breaker ────────────────────────────────────────────────────────
+# postfix-benchmark-6: LM Studio evicts gemma when CUDA engines (SAM/Flux/LaMa) are
+# resident. The endpoint then answers HTTP 400 {"error":"terminated"} or simply stops
+# responding, and EVERY subsequent call paid its full timeout before failing: 9 x 60s +
+# 6 x 24s = 684s of pure dead wait in one bench, and 094 wedged the whole run.
+#
+# Those calls were already failing — the breaker does not skip work that would have
+# succeeded, it stops *waiting* for work that is already known to fail. Callers already
+# treat a VLM failure as "no answer" (VLM_ERROR_NOTES) and fall back, so a fast failure
+# and a slow failure produce the SAME artifacts. Purely wall-clock.
+#
+# Self-healing: the breaker is per (base_url, model), opens only after
+# _BREAKER_THRESHOLD *consecutive* hard failures, and half-opens after a cooldown so one
+# probe can close it again. Any success resets it. Disable with AD_VLM_BREAKER=0.
+_BREAKER_ENABLED = os.environ.get("AD_VLM_BREAKER", "1") not in ("0", "false", "no", "")
+_BREAKER_THRESHOLD = int(os.environ.get("AD_VLM_BREAKER_THRESHOLD", "3"))
+_BREAKER_COOLDOWN_S = float(os.environ.get("AD_VLM_BREAKER_COOLDOWN_S", "90"))
+# Failures must be RECENT to count. benchmark.py runs every fixture in one process: without
+# a staleness window, an endpoint that died during fixture 3 would still be "open" for
+# fixture 12 minutes later and silently suppress its VLM calls — a quality regression, and
+# exactly the kind of leak a global breaker invites. An outage older than this window is
+# treated as ancient history and the endpoint gets a clean probe.
+_BREAKER_WINDOW_S = float(os.environ.get("AD_VLM_BREAKER_WINDOW_S", "120"))
+_BREAKER_LOCK = threading.Lock()
+_BREAKER: dict[str, dict] = {}
+
+
+class VLMCircuitOpen(RuntimeError):
+    """The endpoint failed repeatedly; the call was refused without waiting."""
+
+
+def _breaker_key(base_url: str, model: str) -> str:
+    return f"{base_url}::{model}"
+
+
+def breaker_state() -> dict:
+    """Snapshot of per-endpoint breaker counters (for run reporting/tests)."""
+    with _BREAKER_LOCK:
+        return {key: dict(value) for key, value in _BREAKER.items()}
+
+
+def reset_breaker() -> None:
+    """Close every breaker (used between independent fixtures/tests)."""
+    with _BREAKER_LOCK:
+        _BREAKER.clear()
+
+
+def _breaker_check(base_url: str, model: str) -> None:
+    """Raise VLMCircuitOpen when this endpoint is known-dead and still cooling down."""
+    if not _BREAKER_ENABLED:
+        return
+    key = _breaker_key(base_url, model)
+    with _BREAKER_LOCK:
+        state = _BREAKER.get(key)
+        if not state or state["consecutive"] < _BREAKER_THRESHOLD:
+            return
+        if time.time() - state.get("last_failure_at", 0.0) > _BREAKER_WINDOW_S:
+            state["consecutive"] = 0   # stale outage: probe fresh, never inherit it
+            return
+        waited = time.time() - state["opened_at"]
+        if waited >= _BREAKER_COOLDOWN_S:
+            # Half-open: let exactly one probe through to test for recovery.
+            state["consecutive"] = _BREAKER_THRESHOLD - 1
+            return
+        skipped = state["skipped"] = state.get("skipped", 0) + 1
+    raise VLMCircuitOpen(
+        "VLM endpoint %s is failing (%d consecutive hard failures); refusing the call "
+        "without waiting %.0fs more of cooldown (skipped=%d). The model was most likely "
+        "evicted — see vram.restore_vlm." % (key, _BREAKER_THRESHOLD,
+                                             _BREAKER_COOLDOWN_S - waited, skipped)
+    )
+
+
+def _breaker_record(base_url: str, model: str, *, ok: bool) -> None:
+    if not _BREAKER_ENABLED:
+        return
+    key = _breaker_key(base_url, model)
+    with _BREAKER_LOCK:
+        state = _BREAKER.setdefault(
+            key, {"consecutive": 0, "opened_at": 0.0, "skipped": 0, "failures": 0,
+                  "last_failure_at": 0.0})
+        if ok:
+            state["consecutive"] = 0
+            return
+        now = time.time()
+        if now - state.get("last_failure_at", 0.0) > _BREAKER_WINDOW_S:
+            state["consecutive"] = 0   # previous outage is stale; start this streak fresh
+        state["consecutive"] += 1
+        state["failures"] += 1
+        state["last_failure_at"] = now
+        if state["consecutive"] >= _BREAKER_THRESHOLD:
+            state["opened_at"] = now
+
+
+def _is_hard_endpoint_failure(exc: BaseException) -> bool:
+    """True for failures that mean 'the endpoint is down', not 'this prompt was bad'.
+
+    A schema/parse complaint about one request says nothing about the next one, so it must
+    never trip the breaker. A timeout, a refused connection, or LM Studio's evicted-model
+    400 ({"error":"terminated"} / invalid_request_error on `model`) all do.
+    """
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
+        return True
+    text = str(exc).lower()
+    if "timed out" in text or "connection refused" in text:
+        return True
+    if "terminated" in text or "invalid_request_error" in text or "model_not_found" in text:
+        return True
+    return False
+
+
 def cache_stats() -> dict:
     """Snapshot of cache hit/miss counters (for run reporting)."""
     with _CACHE_LOCK:
@@ -314,6 +427,8 @@ def ask_vlm(
             "timeout_s": timeout_s,
             "schema": bool(response_schema),
         }
+    # Refuse fast when this endpoint is already known-dead (bench-6: 684s of dead wait).
+    _breaker_check(base_url, model)
     started = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
@@ -323,8 +438,11 @@ def ask_vlm(
         if trace is not None:
             trace.update({"s": round(time.perf_counter() - started, 3), "error": f"http-{exc.code}"})
             _trace(trace)
-        raise VLMError(f"VLM HTTP {exc.code}: {detail}") from exc
+        failure = VLMError(f"VLM HTTP {exc.code}: {detail}")
+        _breaker_record(base_url, model, ok=not _is_hard_endpoint_failure(failure))
+        raise failure from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # A malformed body is about THIS response, not endpoint health.
         if trace is not None:
             trace.update({"s": round(time.perf_counter() - started, 3), "error": "bad-json"})
             _trace(trace)
@@ -334,7 +452,9 @@ def ask_vlm(
             trace.update({"s": round(time.perf_counter() - started, 3),
                           "error": type(exc).__name__})
             _trace(trace)
+        _breaker_record(base_url, model, ok=not _is_hard_endpoint_failure(exc))
         raise
+    _breaker_record(base_url, model, ok=True)
     if trace is not None:
         usage = data.get("usage") or {}
         trace.update({
@@ -376,14 +496,21 @@ def ask_vlm(
 #                       JSON, empty content after a full generation). Re-running
 #                       identically will usually fail identically.
 #   vlm_empty        -> every pass succeeded but the accepted answer was blank.
+#   vlm_circuit_open -> the endpoint already failed _BREAKER_THRESHOLD times in a row, so
+#                       this call was refused WITHOUT waiting out its timeout. Same
+#                       downstream meaning as vlm_error ("no answer"), kept distinct so a
+#                       report can tell "we asked and it broke" from "we knew it was
+#                       broken and saved the wait".
 #   vlm_disagreement -> passes succeeded but the reads did not reach consensus
 #                       (this is not a failure; it feeds deterministic fallback).
 VLM_TIMEOUT_NOTE = "vlm_timeout"
 VLM_ERROR_NOTE = "vlm_error"
 VLM_EMPTY_NOTE = "vlm_empty"
+VLM_CIRCUIT_NOTE = "vlm_circuit_open"
 VLM_DISAGREEMENT_NOTE = "vlm_disagreement"
 # The set of notes that mean "no answer was accepted" (an error, not a disagreement).
-VLM_ERROR_NOTES = frozenset({VLM_TIMEOUT_NOTE, VLM_ERROR_NOTE, VLM_EMPTY_NOTE})
+VLM_ERROR_NOTES = frozenset({VLM_TIMEOUT_NOTE, VLM_ERROR_NOTE, VLM_EMPTY_NOTE,
+                             VLM_CIRCUIT_NOTE})
 
 # Best-effort visibility for discarded VLM failures. Previously every exception
 # collapsed to a bare "vlm_error" with the cause thrown away, so a timeout under
@@ -399,6 +526,8 @@ def classify_vlm_exception(exc: BaseException) -> tuple[str, str]:
     non-secret description safe to log. A socket/connection timeout (including
     one wrapped in urllib.error.URLError) is reported as a timeout; everything
     else — HTTP status errors, bad JSON, empty content (VLMError) — is an error."""
+    if isinstance(exc, VLMCircuitOpen):
+        return VLM_CIRCUIT_NOTE, f"{type(exc).__name__}: {exc}"[:400]
     reason: BaseException | object = exc
     if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
         reason = exc.reason

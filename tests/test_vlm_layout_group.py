@@ -276,3 +276,19 @@ def test_background_plate_does_not_trigger_capture_rejection(tmp_path, monkeypat
     out, info = vlm_layout_group.regroup(roots, CANVAS, _cfg(tmp_path))
     assert info["applied"] is True
     assert any(node["id"] == "plate" for node in out)
+
+
+def test_min_elements_counts_flattened_nodes_not_just_roots():
+    """layout._band_groups wraps content into bands before grouping runs, so the
+    gate must count the CONTENT, not the wrapper -- otherwise a rich ad presents
+    as one root and VLM grouping never fires (it never did on any fixture)."""
+    canvas = {"w": 1080, "h": 1350}
+    kids = [{"id": f"t{i}", "type": "TEXT", "box": {"x": 40, "y": 100 + i * 60, "w": 300, "h": 40}}
+            for i in range(6)]
+    roots = [{"id": "band", "type": "GROUP", "box": {"x": 0, "y": 0, "w": 1080, "h": 800},
+              "children": kids}]
+    assert len([n for n in vlm_layout_group._flatten_nodes(roots)
+                if not vlm_layout_group._backgroundish(n, canvas)]) >= 6
+    cfg = {"vlm": {"layout_group": {"enabled": True, "min_elements": 4}}}
+    _, info = vlm_layout_group.regroup(roots, canvas, cfg)
+    assert info.get("reason") != "too-few-elements"

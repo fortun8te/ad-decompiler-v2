@@ -1615,10 +1615,12 @@ def test_strike_span_fraction_none_for_full_width_strike():
         {"x": 10, "y": 26, "w": 278, "h": 12}, {"x": 10, "y": 15, "w": 280, "h": 40}) is None
 
 
-def test_strikethrough_meta_authors_decoration_and_excludes_strike_ink(tmp_path):
-    # 091: OCR flags a hand-drawn red scribble via meta.strikethrough. analyze_text must
-    # (a) author STRIKETHROUGH, (b) keep the fill BLACK despite the red ink over glyphs,
-    # (c) capture the red as decorationColor, (d) emit a partial decorationSpan.
+def test_hand_drawn_strike_emits_measured_vector_swipe_not_a_flat_rule(tmp_path):
+    # 091: OCR flags a hand-drawn red scribble via meta.strikethrough. A drawn annotation
+    # is not a typographic rule, so analyze_text must (a) carry the strike downstream as a
+    # native decoration SHAPE at its MEASURED angle/length/thickness rather than a flat
+    # box-width line, (b) keep the fill BLACK despite the red ink over the glyphs,
+    # (c) capture the red as the shape colour, (d) cover only the struck left portion.
     img = np.full((60, 300, 3), 255, np.uint8)
     img[15:45, 10:140] = (20, 20, 20)     # black glyphs on the left ("Foggy")
     img[46:55, 150:290] = (20, 20, 20)    # black glyphs on the right ("and Steady")
@@ -1633,15 +1635,53 @@ def test_strikethrough_meta_authors_decoration_and_excludes_strike_ink(tmp_path)
         "meta": {"strikethrough": True, "strikethrough_box": {"x": 10, "y": 26, "w": 130, "h": 12}},
     }]}
     out = text_analysis.analyze_text(str(path), ocr_res, {})
-    style = out["lines"][0]["style"]
-    assert style.get("textDecoration") == "STRIKETHROUGH"
-    # Fill stays black (foreign red ink excluded from the colour sample).
+    line = out["lines"][0]
+    style, meta = line["style"], line["meta"]
+
+    assert meta.get("strike_render") == "vector-swipe"
+    shapes = [s for s in (meta.get("native_decoration_shapes") or [])
+              if s.get("source") == "hand-swipe-ink"]
+    assert len(shapes) == 1, f"expected one measured swipe, got {meta.get('native_decoration_shapes')}"
+    swipe = shapes[0]
+    assert swipe["kind"] == "strikethrough"
+    # (c) the rule keeps the red marker ink, not the text colour.
+    col = swipe["color"]
+    assert int(col[1:3], 16) > 150 and int(col[3:5], 16) < 100, f"swipe should be red, got {col}"
+    # (d) it covers the struck left portion only — it must not run under "and Steady".
+    assert swipe["x0"] <= 20 and 130 <= swipe["x1"] <= 155, swipe
+    # It is drawn at the ink's own angle and weight, not as a hairline at mid-box. The
+    # fixture's strike descends to the right (y grows downward at slope +0.05), so the
+    # emitted rule must follow that slope rather than sit flat.
+    assert swipe["y1"] > swipe["y0"], f"swipe should follow the ink's descent: {swipe}"
+    assert swipe["y1"] - swipe["y0"] >= 3.0, f"swipe should be angled, not flat: {swipe}"
+    assert swipe["thickness"] >= 3.0, swipe
+    # A measured vector replaces the flat rule; emitting both would double-draw.
+    assert style.get("textDecoration") is None
+
+    # (b) Fill stays black (foreign red ink excluded from the colour sample).
     fill_hex = style.get("color") or (style.get("fill") or {}).get("color") or ""
     r, g, b = int(fill_hex[1:3], 16), int(fill_hex[3:5], 16), int(fill_hex[5:7], 16)
     assert r < 80 and g < 80 and b < 80, f"fill should stay dark, got {fill_hex}"
-    # decorationColor is the red strike ink.
-    dc = style.get("decorationColor") or ""
-    assert dc and int(dc[1:3], 16) > 150 and int(dc[3:5], 16) < 100, f"strike colour should be red, got {dc}"
-    # Partial span covers the struck left portion, not the whole line.
-    span = style.get("decorationSpan")
+
+
+def test_plain_strike_without_foreign_ink_keeps_flat_text_decoration(tmp_path):
+    # The measured-swipe path is only for DRAWN annotations (saturated foreign ink over
+    # achromatic glyphs). A typographic strike — same colour as the text — has no swipe
+    # geometry to measure, so it must still author a plain STRIKETHROUGH + partial span.
+    img = np.full((60, 300, 3), 255, np.uint8)
+    img[15:45, 10:140] = (20, 20, 20)
+    img[46:55, 150:290] = (20, 20, 20)
+    img[30:33, 10:140] = (20, 20, 20)     # black rule through the left glyphs
+    path = tmp_path / "plain_strike.png"
+    Image.fromarray(img).save(path)
+    ocr_res = {"lines": [{
+        "id": "L0", "text": "Foggy and Steady", "conf": 0.9,
+        "box": {"x": 10, "y": 15, "w": 280, "h": 40},
+        "meta": {"strikethrough": True, "strikethrough_box": {"x": 10, "y": 26, "w": 130, "h": 12}},
+    }]}
+    out = text_analysis.analyze_text(str(path), ocr_res, {})
+    line = out["lines"][0]
+    assert line["style"].get("textDecoration") == "STRIKETHROUGH"
+    assert line["meta"].get("strike_render") == "text-decoration"
+    span = line["style"].get("decorationSpan")
     assert span is not None and span[0] == 0.0 and span[1] < 0.75

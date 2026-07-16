@@ -145,10 +145,17 @@ def test_execute_repairs_stops_without_actionable_repairs(tmp_path):
 
 
 def test_harness_layout_and_inpaint_patches():
+    # postfix-benchmark-6: this used to assert mode == "auto". That patch was the bug —
+    # config.yaml ships mode=flux_comfy and the regional router resolves "auto" to the
+    # same per-region engines, so the rerun replayed a byte-identical plate (002/013/066/
+    # 091 all logged metric_deltas of exactly 0.0). rebuild-clean-plate now escalates the
+    # levers that physically move residue: the removal-mask footprint and the scrub pass.
     inpaint = harness.config_patches_for({
         "stage": "inpaint", "action": "rebuild-clean-plate", "params": {},
-    })
-    assert inpaint["inpaint"]["mode"] == "auto"
+    })["inpaint"]
+    assert inpaint["mask_dilate"]["text"] > 2        # widen past the default halo
+    assert inpaint["multipass_fraction"] < 0.12      # scrub harder than the default
+    assert harness.patch_reaches_pipeline({"inpaint": inpaint})
 
     layout = harness.config_patches_for({
         "stage": "layout", "action": "refit-geometry",

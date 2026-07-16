@@ -228,3 +228,30 @@ def test_bounded_confident_product_still_owns_its_printed_label():
     assert label["meta"].get("baked_owner_id") == "c_E000"
     residual = next(c for c in out if c["id"] == "c_E000")
     assert not residual["meta"].get("oversized_loose_residual")
+
+
+def test_residual_shell_passthrough_declares_its_suppression_reason(tmp_path):
+    """A reasoned plate-passthrough drop must be legible to scene_intent reconciliation.
+
+    The shell drop is DELIBERATE (the clean plate owns those pixels), but it only recorded
+    `removal_skipped`/`plate_passthrough` -- neither of which `scene_intent.
+    _is_explicit_suppression` reads (it keys on keep_in_background / suppression_reason /
+    removal_required). So a PLANNED id that took this path looked like an unexplained drop,
+    raised SceneIntentError ("planned ids became drop: c_E003"), and the whole
+    structure-first tree was discarded for the legacy layout -- a hard `structure-unavailable`
+    on 002 and 101. 101's legacy fallback then shipped 20 raster leaves
+    (native_leaf_ratio 0.375 vs 0.80 structure-first): SSIM propped up by copied pixels.
+    """
+    source, candidates = _shell_scene(tmp_path, shell_box=(0, 0, 120, 100))
+    result = reconstruct.reconstruct(str(source), {"lines": []}, candidates,
+                                     str(tmp_path), {"inpaint": {"mode": "opencv"}})
+    shell = next(c for c in result["candidates"] if c["id"] == "shell")
+
+    assert shell["target"] == "drop"
+    assert shell["meta"]["plate_passthrough"] is True
+    # The reason is stated in the vocabulary the reconciler actually reads.
+    assert shell["meta"]["suppression_reason"] == "oversized-residual-shell"
+    assert shell["meta"]["keep_in_background"] is True
+
+    from src import scene_intent
+    assert scene_intent._is_explicit_suppression(shell) is True

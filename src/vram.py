@@ -234,6 +234,46 @@ def free_comfy_vram(cfg: Optional[dict] = None, *,
         return False
 
 
+# Peel backends that load their weights into OUR torch process (as opposed to routing the
+# work out to the ComfyUI server). These are the ones that lose a race for VRAM against a
+# Flux Fill that ComfyUI is still holding.
+_TORCH_INPAINT_MODES = frozenset({"lama", "big-lama", "simple-lama"})
+
+
+def release_flux_for_torch_inpaint(cfg: Optional[dict] = None, mode: str = "",
+                                   *, flux_used: int = 0,
+                                   log_fn: Optional[Callable[[str], None]] = None) -> bool:
+    """Free ComfyUI's resident Flux before a Big-LaMa peel fill. Returns True if freed.
+
+    postfix-benchmark-6, measured across every big-lama peel call in the bench:
+
+        big-lama with no Flux resident (013, 107)   ->   0s,   2s
+        big-lama with Flux resident   (091)         -> 715s, 163s
+
+    ComfyUI keeps Flux Fill (~9.5 GB) resident after an inpaint. The next peel region that
+    routes to Big-LaMa then loads its own weights into what's left of a 16 GB card and
+    thrashes. 091 paid 878s across two such calls — 18% of the entire bench — for work that
+    costs ~2s on a free card. The VRAM policy already frees Comfy at *stage* boundaries,
+    but peel switches engines *within* the stage, which is where the collision happens.
+
+    Only fires on the real transition (Flux actually ran this peel, and this region routes
+    to a torch engine), so a Flux-only or LaMa-only run pays nothing. Best-effort: the
+    inpaint is correct either way, this only decides whether it is fast. Freeing changes no
+    pixels — it evicts another process's weights, not any input to the fill.
+    """
+    if str(mode).lower() not in _TORCH_INPAINT_MODES:
+        return False
+    if int(flux_used or 0) <= 0:
+        return False   # Flux never ran this peel: nothing of ours is resident to free.
+    # Lower floor + no throttle vs the VLM-boundary defaults: a resident Flux Fill alone
+    # (~9.5 GiB) sits UNDER free_comfy_vram's 11 GiB VLM-era floor, which is exactly why
+    # this collision was never caught by the existing stage-boundary policy.
+    freed = free_comfy_vram(cfg, log_fn=None, min_used_mib=6000.0, throttle_s=5.0)
+    if freed:
+        _emit(log_fn, "vram: freed resident Flux before Big-LaMa peel fill")
+    return freed
+
+
 def _lms_path(cfg: Optional[dict] = None) -> Optional[str]:
     """Locate the LM Studio CLI (`lms`) on PATH or at its default install location."""
     override = str(((cfg or {}).get("runtime") or {}).get("vram", {}).get("lms_path") or "").strip()

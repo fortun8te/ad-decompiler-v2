@@ -93,6 +93,12 @@ CHROME_AS_RASTER_ROLES = frozenset({
     "icon", "symbol", "pictogram",
     "verified", "checkmark", "cross", "question-mark", "question_mark",
     "emoji",
+    # Star ratings: each star is an exact alpha cutout (element_fusion splits the row into
+    # per-star elements). Explicit here so a star can never fall through to the tracer --
+    # vectorize._DEFAULT_SCORE_MIN carries "star"/"star_badge" tiers and an analytic star
+    # fitter, and a *traced* star is precisely the "random lines / overly complex graphics"
+    # the raster-first contract exists to kill. The review copy beside it stays native TEXT.
+    "rating", "star", "stars", "star_rating", "star_icon", "review_stars",
     "starburst", "price_burst", "sale_burst", "burst", "splat", "sticker_burst",
     "chrome",
     *STORY_CHROME_ROLES,

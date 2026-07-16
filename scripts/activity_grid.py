@@ -653,6 +653,56 @@ def smoke_feed(smoke: dict[str, Any] | None) -> list[dict[str, str]]:
     return events[-_FEED_MAX:]
 
 
+def read_bench_summary(root: Path) -> dict[str, Any] | None:
+    """Surface benchmark.py's summary report (benchmark.json) once it exists.
+
+    benchmark.py writes this after EVERY fixture (not only once at the end), so it
+    reflects a partial/aborted run too -- see benchmark.py's ``_flush_reports``. Kept
+    tiny (summary + partial/abort bookkeeping only, not the full per-run detail already
+    duplicated in ``benchmark.runs``) since this is re-read on every poll cycle.
+    """
+    path = root / "benchmark.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        mtime = path.stat().st_mtime
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "partial": bool(data.get("partial")),
+        "aborted_reason": data.get("aborted_reason"),
+        "wall_time_s": data.get("wall_time_s"),
+        "fixtures_planned": data.get("fixtures_planned"),
+        "fixtures_completed": data.get("fixtures_completed"),
+        "summary": data.get("summary") or {},
+        "mtime": mtime,
+    }
+
+
+def read_contract_check(root: Path) -> dict[str, Any] | None:
+    """Surface scripts/text_contract_check.py's aggregate sweep (text_contract_report.json,
+    written by benchmark.py alongside benchmark.json) -- the "no weird text things" gate."""
+    path = root / "text_contract_report.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        mtime = path.stat().st_mtime
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "checked": data.get("checked", 0),
+        "hard_total": data.get("hard_total", 0),
+        "warn_total": data.get("warn_total", 0),
+        "mtime": mtime,
+    }
+
+
 def load_planned(root: Path) -> list[str]:
     """Return planned image stems from planned.json (written by benchmark.py pre-smoke)."""
     path = root / "planned.json"
@@ -735,6 +785,8 @@ class Tracker:
             "live": None,
             "smoke": None,
             "feed": [],
+            "summary": None,
+            "contract_check": None,
         }
 
     def start(self) -> None:
@@ -1086,6 +1138,8 @@ class Tracker:
         running_count = sum(1 for r in runs if r["status"] in ("running", "stalled"))
         bench_pct = round(sum(r["percent"] for r in runs) / len(runs), 1) if runs else 0.0
 
+        bench_summary = read_bench_summary(self.root)
+        contract_check = read_contract_check(self.root)
         smoke = read_smoke(self.root)
         feed: list[dict[str, str]] = []
         if live:
@@ -1180,6 +1234,11 @@ class Tracker:
             "live": live_payload,
             "smoke": smoke,
             "feed": feed,
+            # Surfaced for the dashboard alongside the live per-fixture view: benchmark.py's
+            # summary report (b) -- present even for a partial/aborted run -- and the
+            # text-contract sweep's aggregate. Both None until benchmark.json exists.
+            "summary": bench_summary,
+            "contract_check": contract_check,
         }
 
         fp = (
@@ -1204,6 +1263,8 @@ class Tracker:
                 tuple(smoke.get("done") or ()), smoke.get("stalled"),
             ),
             tuple(_run_fingerprint(r) for r in runs),
+            None if not bench_summary else bench_summary.get("mtime"),
+            None if not contract_check else contract_check.get("mtime"),
         )
 
         with self._lock:

@@ -1073,3 +1073,52 @@ def test_archetype_edge_and_color_floors_are_read_from_archetype_json(tmp_path):
     )
     assert "edge-fidelity" not in _rules(lenient)
     assert "color-fidelity" not in _rules(lenient)
+
+
+# ── word-split text nodes must not read as MISSING (false missing-editable-text) ──────
+
+
+def test_editable_recall_regroups_word_split_nodes_from_one_source_block():
+    """One OCR line emitted as several sibling word nodes is EDITABLE, not missing.
+
+    002 ships "EUR63 -> EUR49" as c_B5__w0 ("EUR63 ->") + c_B5__w1 ("EUR49"); 066 ships
+    "Smudges on upper lid" as c_B5__w0/w1/w2. Both are real, editable TEXT nodes. _norm
+    strips separators, so the source line ("6349") can never be a substring of a
+    space-joined per-node blob ("63 49") -- the line scored as MISSING and fired a false
+    `missing-editable-text` (002: 0.75 vs a 0.84 bar) on work that shipped correctly.
+    Fragments of the SAME block must rejoin before matching.
+    """
+    ocr = {"lines": [{"id": "L31", "text": "€63 → €49", "conf": 0.9},
+                     {"id": "L10", "text": "Smudges on upper lid", "conf": 0.9}]}
+    layers = [
+        {"id": "c_B5__w0", "type": "text", "text": "€63 →"},
+        {"id": "c_B5__w1", "type": "text", "text": "€49"},
+        {"id": "c_B9__w0", "type": "text", "text": "Smudges"},
+        {"id": "c_B9__w1", "type": "text", "text": "on"},
+        {"id": "c_B9__w2", "type": "text", "text": "upper lid"},
+    ]
+    design = {"layers": layers, "kept_in_photo": []}
+
+    result = pixel_diff._text_editability(ocr, design, layers)
+
+    assert result["editable_text_correct"] == 2
+    assert result["editable_text_recall"] == 1.0
+
+
+def test_editable_recall_does_not_fuse_unrelated_blocks_into_phantom_matches():
+    """Regrouping is per-block: separate blocks must never concatenate into a match.
+
+    The split fix must not become a greenwash -- a line that genuinely never shipped
+    stays missing even when its characters exist across unrelated sibling nodes.
+    """
+    ocr = {"lines": [{"id": "L1", "text": "ALPHA BETA", "conf": 0.9}]}
+    layers = [
+        {"id": "c_B0", "type": "text", "text": "ALPHA"},
+        {"id": "c_B1", "type": "text", "text": "BETA"},
+    ]
+    design = {"layers": layers, "kept_in_photo": []}
+
+    result = pixel_diff._text_editability(ocr, design, layers)
+
+    assert result["editable_text_correct"] == 0
+    assert result["editable_text_recall"] == 0.0

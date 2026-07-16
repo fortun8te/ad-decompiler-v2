@@ -43,6 +43,7 @@ from src.harness import (
     _repair_id,
     admission_floors,
     apply_round_budget_clamp,
+    diagnose_blockers,
     element_growth_refused,
     execute_repairs,
     harness_enabled,
@@ -857,7 +858,24 @@ def run_until_acceptable(
 
     next_resume = start_from
     last_repair_refreshed_qa = False
+    refusal: Optional[dict] = None
     for round_num in range(1, max_rounds + 1):
+        # Refusal screen (postfix-benchmark-6): before spending a round, ask whether ANY
+        # blocker still has a config lever. When none does, the round cannot convert by
+        # construction — every candidate would be a no-op or, worse, actively harmful
+        # (021: sam3 rerun on a native-leaf-ratio fail cost -0.40 text_recall). Stopping
+        # with a stated reason is the honest, cheap outcome; a silent plateau is not.
+        # qa.json alone is sufficient: its quality_flags already carry the worst-window
+        # rule, so the verdict is identical with or without the reward (verified across
+        # all 14 bench-6 fixtures). Scoring here would run compute_reward (LPIPS) every
+        # round just to decide whether to skip the round — cost for nothing.
+        current_qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+        if current_qa and not _qa_accepts(current_qa):
+            diagnosis = diagnose_blockers(current_qa, None, run_dir=run_dir)
+            if diagnosis.get("verdict") == "refuse":
+                refusal = diagnosis
+                break
+
         skip_pipeline = (
             (pipeline_already_ran and round_num == 1)
             or (round_num > 1 and last_repair_refreshed_qa)
@@ -1110,6 +1128,16 @@ def run_until_acceptable(
             "trail": convergence,
         },
     }
+    # Every stop gets a stated reason. A refusal is a verdict, not a failure: it records
+    # that the remaining blockers have no config lever and names what code must change.
+    if refusal is not None:
+        summary["stopped"] = "refused_no_lever"
+        summary["refusal"] = refusal
+    else:
+        final_qa_for_diag = _load_json(os.path.join(run_dir, "qa.json"), {})
+        if final_qa_for_diag and not qa_ok:
+            summary["diagnosis"] = diagnose_blockers(
+                final_qa_for_diag, final_reward, run_dir=run_dir)
     _write_json(os.path.join(run_dir, "harness_loop.json"), summary)
     _patch_fixer_validation(run_dir, last_fixer_round, convergence, epsilon)
     _patch_harness_report(run_dir, summary["reward"], shipped_round=summary["shipped_round"])

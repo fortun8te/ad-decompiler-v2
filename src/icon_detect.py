@@ -51,6 +51,18 @@ DEFAULTS = {
     "row_accept_score": 0.55,
     "row_column_accept_score": 0.42,   # relaxed floor once a column has >=2 members
     "column_x_tol_factor": 0.9,        # same-column tolerance, in glyph heights
+    # inline platform-UI glyph scan (009's verified badge)
+    "inline_enabled": True,
+    "inline_min_h_ratio": 0.65,   # vs the adjacent line: a badge matches the cap
+                              # height, a letter counter is a fraction of it
+    "inline_max_h_ratio": 1.60,
+    "inline_max_gap_ratio": 0.90,  # horizontal gap, in line heights
+    "inline_min_center_overlap": 0.45,
+    "inline_min_fill": 0.30,       # a UI glyph is a compact solid, not a stroke wisp
+    "inline_max_aspect": 1.60,
+    "inline_min_area": 80,
+    "inline_row_min_candidates": 4,  # need enough glyphs to know the copy's ink
+    "inline_max_tone_share": 0.25,   # a tone held by more of the row IS the copy
     # standalone scan
     "standalone_enabled": True,
     "standalone_min_h_frac": 0.035,
@@ -430,6 +442,10 @@ def _extreme_masks(rgb):
         "black": (r <= 38) & (g <= 38) & (b <= 38),
         "red": (r - np.maximum(g, b)) >= 60,
         "green": (g - np.maximum(r, b)) >= 45,
+        # Platform UI chrome is overwhelmingly saturated blue: the X/Twitter and
+        # Meta verified badges, inline app logos, link glyphs. Its absence here is
+        # why 009's verified check was never a standalone candidate.
+        "blue": (b - np.maximum(r, g)) >= 45,
     }
 
 
@@ -495,6 +511,132 @@ def detect_standalone_glyphs(rgb, lines: list[dict], canvas: dict, opts: dict,
             continue
         kept.append(d)
     return kept
+
+
+# ── 2b. inline platform-UI glyph scan (the 009 verified badge) ───────────────────────
+
+def detect_inline_glyphs(rgb, lines: list[dict], canvas: dict, opts: dict,
+                         taken: list[dict]) -> list[dict]:
+    """Compact saturated glyphs sitting inline with a text row.
+
+    009's blue verified badge is missed by BOTH existing scans, on three
+    independent counts: it is small (29px on a 1080 canvas, under
+    ``standalone_min_h_frac``), it is ADJACENT to text so the letters/digits
+    guard rejects it (the 'UPFRONT' line box actually ends at x=378, right across
+    the badge at 351..380), and it is a filled disc rather than a stroke glyph, so
+    ``classify_glyph`` scores it near zero.
+
+    This scan deliberately does NOT classify the mark.  Per the raster-first icon
+    policy a platform glyph ships as a pixel-exact IMAGE chip, so its identity is
+    irrelevant — only that it is a compact, colour-pure blob riding a text
+    baseline.  That generalises past the verified badge to inline app logos, link
+    and lock glyphs, and engagement marks.  Each detection carries ``row_text_id``
+    so the chip can be anchored after the display name rather than floated.
+    """
+    np, cv2 = _np(), _cv2()
+    h_img, w_img = rgb.shape[:2]
+    if not lines:
+        return []
+    candidates = []
+    for tone, mask in _extreme_masks(rgb).items():
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask.astype(np.uint8), 8)
+        for index in range(1, count):
+            x, y, w, h, area = [int(v) for v in stats[index]]
+            if area < int(opts["inline_min_area"]) or w <= 0 or h <= 0:
+                continue
+            aspect = w / max(1.0, float(h))
+            if not (1.0 / float(opts["inline_max_aspect"]) <= aspect
+                    <= float(opts["inline_max_aspect"])):
+                continue
+            # A UI glyph is a compact solid; a stray stroke fragment is not.
+            if area / float(w * h) < float(opts["inline_min_fill"]):
+                continue
+            box = {"x": float(x), "y": float(y), "w": float(w), "h": float(h)}
+            row = _inline_row(box, lines, opts)
+            if row is None:
+                continue
+            candidates.append({"tone": tone, "box": box, "row": row,
+                               "label": index, "labels": labels,
+                               "slice": (x, y, w, h)})
+    # Letters guard.  Every glyph of the copy also rides its row and is also a
+    # compact blob, so shape alone cannot separate them — scanning 009 without
+    # this returns 137 detections, one per letter of the body text.  The
+    # discriminator is COLOUR: a row's copy is set in one ink, so the majority
+    # tone on a row IS the copy and only a minority tone can be chrome.  009's
+    # 'UPFRONT' row is ten white letters plus one blue badge; the badge is the
+    # only outlier.  This generalises to any inline logo/lock/link glyph, which
+    # are likewise coloured differently from the text they sit beside.
+    by_row: dict = {}
+    for cand in candidates:
+        by_row.setdefault(str(cand["row"].get("id")), []).append(cand)
+    out = []
+    min_peers = int(opts["inline_row_min_candidates"])
+    max_share = float(opts["inline_max_tone_share"])
+    for row_id, group in by_row.items():
+        if len(group) < min_peers:
+            continue  # too few glyphs on the row to know what the copy's ink is
+        tones: dict = {}
+        for cand in group:
+            tones[cand["tone"]] = tones.get(cand["tone"], 0) + 1
+        for cand in group:
+            if tones[cand["tone"]] / float(len(group)) > max_share:
+                continue  # this tone IS the row's copy
+            box = cand["box"]
+            if any(_box_iou(box, other["box"]) > 0.3 for other in taken + out):
+                continue
+            x, y, w, h = cand["slice"]
+            blob = cand["labels"][y:y + h, x:x + w] == cand["label"]
+            full = np.zeros((h_img, w_img), bool)
+            full[y:y + h, x:x + w] = blob
+            row = cand["row"]
+            out.append({
+                "glyph": None, "score": round(1.0 - tones[cand["tone"]] / float(len(group)), 4),
+                "box": {"x": x, "y": y, "w": w, "h": h},
+                "mask": full, "row_text_id": row.get("id"), "row_box": row.get("box"),
+                "info": {"tone": cand["tone"], "inline": True,
+                         "row_tone_share": round(tones[cand["tone"]] / float(len(group)), 4),
+                         "row_text": str(row.get("text") or "")[:40]},
+                "anchor": "inline", "role": "chrome",
+            })
+    kept = []
+    for det in sorted(out, key=lambda d: -(d["box"]["w"] * d["box"]["h"])):
+        if any(_box_iou(det["box"], other["box"]) > 0.4 for other in kept):
+            continue
+        kept.append(det)
+    return kept
+
+
+def _inline_row(box: dict, lines: list[dict], opts: dict) -> Optional[dict]:
+    """The text row this glyph rides, or None.
+
+    'Rides' means vertically centred on the row and horizontally touching its
+    run — which is true whether the OCR box stops short of the glyph (the ⏳ after
+    009's headline) or swallows it (the badge inside the 'UPFRONT' box).
+    """
+    best = None
+    for line in lines:
+        lbox = line.get("box") or {}
+        lh = float(lbox.get("h") or 0.0)
+        if lh <= 0:
+            continue
+        ratio = box["h"] / lh
+        if not (float(opts["inline_min_h_ratio"]) <= ratio <= float(opts["inline_max_h_ratio"])):
+            continue
+        # Vertically centred on the row.
+        gcy = box["y"] + box["h"] / 2.0
+        lcy = float(lbox.get("y") or 0.0) + lh / 2.0
+        if abs(gcy - lcy) > (1.0 - float(opts["inline_min_center_overlap"])) * lh:
+            continue
+        # Horizontally adjacent to (or inside) the row's run.
+        lx0 = float(lbox.get("x") or 0.0)
+        lx1 = lx0 + float(lbox.get("w") or 0.0)
+        gap = max(lx0 - (box["x"] + box["w"]), box["x"] - lx1, 0.0)
+        if gap > float(opts["inline_max_gap_ratio"]) * lh:
+            continue
+        if best is None or gap < best[0]:
+            best = (gap, line)
+    return best[1] if best else None
 
 
 # ── 3. chart region detection ────────────────────────────────────────────────────────
@@ -644,11 +786,15 @@ def refine(fused: list[dict], canvas: dict, cfg: Optional[dict] = None,
     dets = detect_row_icons(rgb, lines, canvas, opts)
     if opts.get("standalone_enabled", True):
         dets += detect_standalone_glyphs(rgb, lines, canvas, opts, dets)
+    if opts.get("inline_enabled", True):
+        dets += detect_inline_glyphs(rgb, lines, canvas, opts, dets)
 
     dropped_ids: set[str] = set()
     small_limit = 0.02 * canvas["w"] * canvas["h"]
     for det in dets:
-        role = _GLYPH_ROLE[det["glyph"]]
+        # An inline platform glyph ships as a pixel-exact chip and carries its own
+        # role: it is deliberately never template-classified.
+        role = det.get("role") or _GLYPH_ROLE[det["glyph"]]
         group = []
         for el in fused:
             if el["id"] in dropped_ids:

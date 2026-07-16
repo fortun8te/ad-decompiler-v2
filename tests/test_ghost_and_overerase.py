@@ -481,3 +481,92 @@ def test_display_edge_text_coverage_is_dilated(tmp_path):
     )
     assert int(np.count_nonzero(out)) > int(np.count_nonzero(mask))
     assert (cand.get("meta") or {}).get("removal_coverage_dilated", {}).get("edge") is True
+
+
+# ── merge's extractable-chrome contract must survive reconstruct ──────────────────────
+
+
+def _photo_frame_scene(icon_meta):
+    """A swappable photo frame with one small icon sitting inside it."""
+    # The frame must be a SWAPPABLE photo frame, not the background scene: inset from the
+    # canvas edges and under the 0.40 area fraction, else the edge-touching-scene rule
+    # claims it first and the containment branch under test never runs.
+    return [
+        {"id": "frame", "target": "image", "z": 0,
+         "box": {"x": 60, "y": 60, "w": 300, "h": 300},
+         "meta": {"role": "photo", "confidence": 0.9}},
+        {"id": "icon", "target": "image", "z": 5,
+         "box": {"x": 150, "y": 150, "w": 40, "h": 40},
+         "meta": {"role": "icon", "confidence": 0.9, **icon_meta}},
+    ]
+
+
+def test_extractable_chrome_inside_a_photo_frame_is_not_dropped():
+    """009: the verified badge, timer, eyes, back arrow, avatar and all 5 action icons
+    vanished. merge_layers sets chrome_as_raster/extract_from_cluster to declare "keep this
+    as its own IMAGE cutout", but reconstruct read neither flag and dropped every icon as
+    `contained-in-swappable-photo-frame` (role "icon" is not in its avatar/badge/button
+    allowlist). Baking them and dropping the layer punches a hole the editable text paints
+    over -- and it defeats raster-first icons, whose whole point is shipping chrome as a chip.
+    """
+    cfg = {"canvas": {"w": 700, "h": 700}}
+
+    kept, _ = reconstruct._flatten_photo_scene(
+        _photo_frame_scene({"chrome_as_raster": True}), cfg)
+    icon = next(c for c in kept if c["id"] == "icon")
+    assert icon["target"] == "image"
+    assert (icon.get("meta") or {}).get("suppression_reason") != "contained-in-swappable-photo-frame"
+
+    kept, _ = reconstruct._flatten_photo_scene(
+        _photo_frame_scene({"extract_from_cluster": True}), cfg)
+    icon = next(c for c in kept if c["id"] == "icon")
+    assert icon["target"] == "image"
+
+
+def test_unflagged_internal_chrome_still_stays_with_its_photo_frame():
+    """The escape hatch is narrow: without merge's flags the old containment rule holds,
+    so a genuine internal detail of a swappable photo is not promoted to its own layer."""
+    cfg = {"canvas": {"w": 700, "h": 700}}
+    kept, _ = reconstruct._flatten_photo_scene(_photo_frame_scene({}), cfg)
+    icon = next(c for c in kept if c["id"] == "icon")
+    assert icon["target"] == "drop"
+    assert icon["meta"]["suppression_reason"] == "contained-in-swappable-photo-frame"
+
+
+# ── a slice may only REPLACE a render when it actually carries content ────────────────
+
+
+def test_sparse_ledger_alpha_never_replaces_an_existing_chip(tmp_path, monkeypatch):
+    """107: a 10-px alpha over an 88x89 bbox (0.13% coverage) shipped as a "slice" and
+    overwrote a good 755-dark-px down-arrow chip -- the icon visually disappeared.
+
+    The slice box is the alpha's OWN tight bbox, so low coverage inside it means the ledger
+    handed us scattered specks, not a cutout. Such a slice must be refused (the existing
+    render is kept): an imperfect chip beats a blank one.
+    """
+    import numpy as np
+    source = _build_text_run(tmp_path)
+    permissive = {"region_ssim_min": 0.0, "region_color_min": 0.0,
+                  "text_ink_iou_min": 0.0, "text_ink_excess_max": 1e9,
+                  "text_slice_gate_enabled": True}
+
+    # A ledger alpha of a few scattered specks spread across a wide bbox.
+    sparse = np.zeros((140, 200), dtype=bool)
+    for x in range(10, 98, 12):
+        sparse[20, x] = True
+        sparse[100, x] = True
+    def _sparse_ledger(run_dir, reconstruction, shape):
+        return np.where(sparse, 1, 0).astype(np.uint32), {"c_B0": [1]}
+
+    monkeypatch.setattr(reconstruct, "_removal_ledger_numbers", _sparse_ledger)
+
+    report = reconstruct.apply_raster_slice_fallback(
+        str(tmp_path), str(source),
+        {"inpaint": {"mode": "opencv"}, "fallback": dict(permissive)},
+    )
+
+    assert report["slices"] == []
+    sparse_skips = [s for s in (report.get("skipped") or [])
+                    if s.get("reason") == "slice-alpha-too-sparse"]
+    assert sparse_skips, report.get("skipped")
+    assert sparse_skips[0]["alpha_coverage"] < 0.02

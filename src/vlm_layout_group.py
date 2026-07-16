@@ -180,6 +180,23 @@ def _node_box(node: dict) -> dict:
     }
 
 
+def _flatten_nodes(roots: list[dict]) -> list[dict]:
+    """Every node in the tree, roots first (depth-first, cycle-safe)."""
+    out: list[dict] = []
+    seen: set[int] = set()
+    stack = list(roots or [])
+    while stack:
+        node = stack.pop(0)
+        if not isinstance(node, dict) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        out.append(node)
+        children = node.get("children")
+        if isinstance(children, list):
+            stack.extend(children)
+    return out
+
+
 def _backgroundish(node: dict, canvas: dict) -> bool:
     meta = node.get("meta") or {}
     role = str(meta.get("role") or "").lower()
@@ -517,7 +534,13 @@ def regroup(roots: list[dict], canvas: dict, cfg: dict | None, z_key=None) -> tu
         info["reason"] = "disabled"
         return roots, info
     opts = _options(cfg)
-    movable = [node for node in roots if not _backgroundish(node, canvas)]
+    # Count movable nodes over the FLATTENED tree, not just top-level roots.
+    # layout._band_groups already wraps everything into band groups before this
+    # runs, so a rich ad presents as 1-2 roots and trips ``too-few-elements`` --
+    # VLM grouping never applied on any benchmark fixture (flat dumps, no VLM
+    # names). The gate means "is there enough content to be worth grouping", so
+    # it must see the content, not the wrapper.
+    movable = [node for node in _flatten_nodes(roots) if not _backgroundish(node, canvas)]
     if len(movable) < opts["min_elements"]:
         info["reason"] = "too-few-elements"
         return roots, info

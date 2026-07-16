@@ -46,7 +46,16 @@ _PIPELINE_LEVERS: dict[str, set] = {
     "qwen": {"enabled", "layers"},
     "merge": {"dedup_iou", "dedup_text", "duplicate_text", "layer_ids"},
     "reconstruct": {"focus_regions", "dedup_iou"},
-    "inpaint": {"mode", "allow_fallback"},
+    # postfix-benchmark-6: {"mode", "allow_fallback"} alone under-declared this section.
+    # inpaint.py genuinely reads all of the following, verified against stage code:
+    #   mask_dilate        -> resolve_mask_dilate / default_mask_dilate (inpaint.py:375,429)
+    #   multipass_fraction -> inpaint.py:1099
+    #   mask_feather       -> inpaint.py:448
+    #   strict_acceptance  -> inpaint.py:340,955
+    # Omitting them made the ONLY levers that can actually scrub glyph residue look
+    # "unreachable" to the screen, so the planner was left with the inert mode flip.
+    "inpaint": {"mode", "allow_fallback", "mask_dilate", "multipass_fraction",
+                "mask_feather", "strict_acceptance"},
     # measured_dx/measured_dy are the admission contract for measured VLM geometry
     # evidence (CRITIC-REVIEW 002 replay test) even though layout currently derives its
     # own offsets; min/max_container_frac are read directly by layout.py.
@@ -135,6 +144,254 @@ def earliest_patched_stage(patches: dict) -> Optional[str]:
         if index >= 0 and (best is None or index < best):
             best = index
     return PIPELINE_STAGE_ORDER[best] if best is not None else None
+
+# Escalation ladder for inpaint:rebuild-clean-plate (glyph residue under removed text).
+# Each rung is a strictly stronger, *reachable* experiment than the one before it, so a
+# second round tests something new instead of replaying round 1 (the bench-6 "no_progress"
+# class). Rung values are deliberately above config.yaml's effective defaults
+# (mask_dilate unset -> text halo of 2-5px via resolve_mask_dilate's role table,
+# multipass_fraction 0.12) so every rung is a real config delta.
+_CLEAN_PLATE_LADDER: tuple[dict, ...] = (
+    # Rung 0 — widen the removal footprint and scrub harder on the current engine.
+    {"mask_dilate": {"default": 3, "text": 6, "overlay_text": 7, "shape": 6, "button": 8},
+     "multipass_fraction": 0.06,
+     "allow_fallback": False},
+    # Rung 1 — rung 0, wider, on a deterministic CPU engine. Big-LaMa removes the
+    # Flux budget/nondeterminism from the equation and is the fixer's known-good
+    # escalation (harness_fixer.fix_inpaint).
+    {"mode": "big-lama",
+     "mask_dilate": {"default": 4, "text": 8, "overlay_text": 9, "shape": 7, "button": 10},
+     "multipass_fraction": 0.04,
+     "allow_fallback": False},
+)
+
+
+# Repairs whose patch depends on how many times they already ran.
+_LADDERED_ACTIONS = {("inpaint", "rebuild-clean-plate")}
+
+# ── blocker → lever map (postfix-benchmark-6 honesty pass) ──────────────────────────
+# For every QA failure that blocks acceptance, either name the config lever that can
+# move it, or state plainly that none exists. A blocker with no lever must be REFUSED
+# with a reason, not retried: rounds spent on it are pure cost. Verified against stage
+# code — each "structural" entry below has no config key any stage reads that would
+# change the measured quantity.
+_STRUCTURAL_NEEDS_CODE = "structural defect: needs code fix, not config"
+
+_BLOCKER_LEVERS: dict[str, dict] = {
+    "glyph_residue": {
+        "fixable": True,
+        "lever": "inpaint:rebuild-clean-plate",
+        "detail": "removal-mask footprint / scrub pass (inpaint.mask_dilate, multipass_fraction)",
+    },
+    "low_text_recall": {
+        "fixable": True,
+        "lever": "ocr:rerun",
+        "detail": "ocr.retry_2x upscale + challengers",
+    },
+    "element_recall": {
+        "fixable": True,
+        "lever": "sam3:rerun-detection",
+        "detail": "sam3.confidence / vlm.element_propose",
+    },
+    # ── no lever exists ────────────────────────────────────────────────────────────
+    "placement_ink_iou": {
+        "fixable": False,
+        "reason": _STRUCTURAL_NEEDS_CODE,
+        "detail": ("layer geometry is computed by layout/reconstruct from structure "
+                   "evidence; no config key any stage reads sets a layer's box, so no "
+                   "patch can move placement_ink_iou"),
+    },
+    "worst_local_ssim": {
+        "fixable": False,
+        "reason": _STRUCTURAL_NEEDS_CODE,
+        "detail": ("a single worst 64x64 window is a localized reconstruction defect "
+                   "(missing icon / dropped element / badge double); no config lever "
+                   "targets one window"),
+    },
+    "native_text_ratio": {
+        "fixable": False,
+        "reason": _STRUCTURAL_NEEDS_CODE,
+        "detail": ("native-vs-baked text is decided by text/design promotion logic from "
+                   "OCR + kept_in_photo evidence; no config key overrides it per layer"),
+    },
+    "native_leaf_ratio": {
+        "fixable": False,
+        "reason": _STRUCTURAL_NEEDS_CODE,
+        "detail": ("everything was rasterized: promotion to native leaves is a "
+                   "reconstruct/vectorize decision. The only vectorize lever "
+                   "(force_raster_fallback) pushes the WRONG way — it forces more "
+                   "raster, not less. 021 proved acting here is harmful: the planner "
+                   "misread this as element_recall and the sam3 rerun cost -0.40 "
+                   "text_recall"),
+    },
+}
+
+# qa.json hard_fail rule -> blocker name in _BLOCKER_LEVERS.
+_HARD_FAIL_RULES = {
+    "glyph-residue": "glyph_residue",
+    "low-text-recall": "low_text_recall",
+    "low-native-leaf-ratio": "native_leaf_ratio",
+    "low-native-text-ratio": "native_text_ratio",
+    "element-recall": "element_recall",
+    "low-element-recall": "element_recall",
+}
+
+
+def _boxes_overlap(a: Any, b: Any) -> bool:
+    """True when two {x,y,w,h} boxes share any area."""
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return False
+    try:
+        ax, ay, aw, ah = float(a["x"]), float(a["y"]), float(a["w"]), float(a["h"])
+        bx, by, bw, bh = float(b["x"]), float(b["y"]), float(b["w"]), float(b["h"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah)
+
+
+def _residue_boxes(run_dir: Optional[str]) -> list:
+    """Bounding boxes of unresolved glyph-residue regions (reconstruction audit)."""
+    if not run_dir:
+        return []
+    stats = (_load_json(os.path.join(run_dir, "reconstruction.json"), {}) or {}).get("stats") or {}
+    residual = stats.get("text_residual") or {}
+    out = []
+    for entry in residual.get("flagged") or []:
+        if isinstance(entry, dict) and not entry.get("resolved"):
+            box = entry.get("box") or entry.get("bbox")
+            if isinstance(box, dict):
+                out.append(box)
+    return out
+
+
+def worst_window_is_residue(qa: Any, run_dir: Optional[str]) -> bool:
+    """True when the worst local-SSIM window sits on top of unresolved glyph residue.
+
+    postfix-benchmark-6: in 002/013/066/091 the worst 64x64 window overlaps a flagged
+    residue box — the window IS the residue, not a separate structural defect. That makes
+    it reachable by the clean-plate lever, so refusing it as "structural" would be wrong.
+    When it does NOT overlap residue it is a genuine localized defect (missing icon /
+    dropped element / badge double) with no config lever.
+    """
+    if not isinstance(qa, dict):
+        return False
+    boxes = _residue_boxes(run_dir)
+    if not boxes:
+        return False
+    for flag in qa.get("quality_flags") or []:
+        if str((flag or {}).get("rule") or "") != "local-ssim-worst-region":
+            continue
+        window = (flag or {}).get("bbox")
+        if any(_boxes_overlap(window, box) for box in boxes):
+            return True
+    return False
+
+
+def _blocker_names(qa: Any, reward: Any = None) -> list[str]:
+    """Names of the QA/gate failures currently blocking acceptance."""
+    names: list[str] = []
+    if not isinstance(qa, dict):
+        return names
+    if _glyph_residue_unresolved(qa):
+        names.append("glyph_residue")
+    # Read declared hard_fails generically (qa.json and the structural sub-report both
+    # carry them). 021's real blocker was "low-native-leaf-ratio", which the planner never
+    # saw — it acted on an artifact-derived element_recall instead and regressed the run.
+    structural = qa.get("structural") if isinstance(qa.get("structural"), dict) else {}
+    for fail in list(qa.get("hard_fails") or []) + list(structural.get("hard_fails") or []):
+        if not isinstance(fail, dict):
+            continue
+        mapped = _HARD_FAIL_RULES.get(str(fail.get("rule") or ""))
+        if mapped:
+            names.append(mapped)
+    contract = qa.get("contract") if isinstance(qa.get("contract"), dict) else {}
+    if contract.get("placement_ok") is False:
+        names.append("placement_ink_iou")
+    if contract.get("native_text_ok") is False:
+        names.append("native_text_ratio")
+    for flag in qa.get("quality_flags") or []:
+        rule = str((flag or {}).get("rule") or "")
+        if rule == "low-text-recall":
+            names.append("low_text_recall")
+        elif rule == "local-ssim-worst-region":
+            names.append("worst_local_ssim")
+    gate = ((reward or {}).get("gate") or {}) if isinstance(reward, dict) else {}
+    for key, check in (gate.get("checks") or {}).items():
+        if isinstance(check, dict) and check.get("ok") is False and key == "worst_local_ssim":
+            names.append("worst_local_ssim")
+    out: list[str] = []
+    for name in names:
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def diagnose_blockers(qa: Any, reward: Any = None, run_dir: Optional[str] = None) -> dict:
+    """Explain every acceptance blocker as fixable-by-lever or refused-with-reason.
+
+    Returns ``{"blockers": [...], "fixable": [...], "refused": [...], "verdict": str}``.
+    ``verdict`` is ``"refuse"`` when NOTHING blocking has a lever — the honest outcome
+    the bench-6 plateau rounds were hiding (002/013/066/088/091 all burned a round on a
+    residue patch while placement/native-ratio blockers had no lever at all).
+    """
+    names = _blocker_names(qa, reward)
+    residue_window = worst_window_is_residue(qa, run_dir)
+    fixable: list[dict] = []
+    refused: list[dict] = []
+    for name in names:
+        spec = _BLOCKER_LEVERS.get(name)
+        if not spec:
+            refused.append({"blocker": name, "reason": "unclassified blocker: no mapped lever"})
+            continue
+        if name == "worst_local_ssim" and residue_window:
+            # The worst window sits on unresolved residue: the clean-plate lever reaches it.
+            fixable.append({
+                "blocker": name, "lever": "inpaint:rebuild-clean-plate",
+                "detail": "worst local-SSIM window overlaps a flagged glyph-residue box",
+            })
+            continue
+        if spec.get("fixable"):
+            fixable.append({"blocker": name, "lever": spec.get("lever"),
+                            "detail": spec.get("detail")})
+        else:
+            refused.append({"blocker": name, "reason": spec.get("reason"),
+                            "detail": spec.get("detail")})
+    if not names:
+        verdict = "clean"
+    elif fixable:
+        verdict = "repair"
+    else:
+        verdict = "refuse"
+    return {"blockers": names, "fixable": fixable, "refused": refused, "verdict": verdict}
+
+
+def _escalation_level(params: Optional[dict], ladder_len: int = len(_CLEAN_PLATE_LADDER)) -> int:
+    """Clamp a repair's requested escalation rung into the ladder's range."""
+    try:
+        level = int((params or {}).get("escalation_level") or 0)
+    except (TypeError, ValueError):
+        level = 0
+    return max(0, min(ladder_len - 1, level))
+
+
+def escalation_level_from_history(run_dir: Optional[str], stage: str, action: str) -> int:
+    """How many times this (stage, action) already ran — its next ladder rung.
+
+    Reads the admission ledger, which persists every admitted plan across rounds. Without
+    this, round 2 re-planned the identical patch, hit the ``seen`` fingerprint and was
+    skipped as "unchanged-repair-plan-and-inputs" -> guaranteed plateau.
+    """
+    if not run_dir:
+        return 0
+    admission = _load_json(os.path.join(run_dir, "harness_admission.json"), {})
+    seen = admission.get("seen") if isinstance(admission.get("seen"), dict) else {}
+    count = 0
+    for entry in seen.values():
+        plan = (entry or {}).get("plan") if isinstance(entry, dict) else None
+        if isinstance(plan, dict) and plan.get("stage") == stage and plan.get("action") == action:
+            count += 1
+    return count
+
 
 # Actions the harness can drive without human review.
 ACTIONABLE = {
@@ -589,10 +846,20 @@ def config_patches_for(repair: dict) -> dict:
         patches["text_analysis"] = {"fit": fit_patch}
 
     elif stage == "inpaint" and action == "rebuild-clean-plate":
-        patches["inpaint"] = {
-            "mode": params.get("mode", "auto"),
-            "allow_fallback": False,
-        }
+        # postfix-benchmark-6: the old patch was {"mode": "auto", "allow_fallback": False}.
+        # config.yaml ships inpaint.mode=flux_comfy, and for the regional router "auto" and
+        # "flux_comfy" resolve to the SAME per-region engine choice, so the rerun replayed
+        # a byte-identical plate: 002/013/066/091 logged metric_deltas of exactly 0.0 and
+        # 088 moved edge_f1 by -0.0001. Five rounds, zero pixels changed.
+        #
+        # Glyph residue is a *physical* defect: the removal mask did not cover the glyph's
+        # anti-aliased halo, so ink survives under re-drawn editable text. The levers that
+        # actually move it are the mask footprint and the scrub pass — not the engine name.
+        # Escalate along a ladder so a second round is a genuinely different experiment.
+        level = _escalation_level(params)
+        patches["inpaint"] = copy.deepcopy(_CLEAN_PLATE_LADDER[level])
+        if params.get("mode"):
+            patches["inpaint"]["mode"] = params["mode"]
 
     elif stage == "layout" and action == "refit-geometry":
         layout_patch: dict[str, Any] = {}
@@ -857,8 +1124,32 @@ def load_repair_candidates(run_dir: str, cfg: Optional[dict] = None) -> list:
     critic = _load_json(os.path.join(run_dir, "critic.json"), {})
     filtered = critic.get("filtered_repairs")
     if isinstance(filtered, list) and filtered:
-        return rank_repairs(filtered, qa)
-    return rank_repairs(load_repairs(run_dir, cfg), qa)
+        ranked = rank_repairs(filtered, qa)
+    else:
+        ranked = rank_repairs(load_repairs(run_dir, cfg), qa)
+    return _stamp_escalation(ranked, run_dir)
+
+
+def _stamp_escalation(repairs: list, run_dir: str) -> list:
+    """Advance laddered repairs to the rung their history has earned.
+
+    Pure planners (repair.assess) are stateless, so without this every round emits rung 0
+    forever. Stamping here — the one place that has both the candidate list and run_dir —
+    keeps config_patches_for a pure function of the repair record.
+    """
+    for repair in repairs or []:
+        if not isinstance(repair, dict):
+            continue
+        key = (repair.get("stage"), repair.get("action"))
+        if key not in _LADDERED_ACTIONS:
+            continue
+        params = repair.setdefault("params", {})
+        if not isinstance(params, dict):
+            continue
+        if "escalation_level" not in params:
+            params["escalation_level"] = escalation_level_from_history(
+                run_dir, repair.get("stage"), repair.get("action"))
+    return repairs
 
 
 def recommended_resume(repairs: list) -> Optional[dict]:

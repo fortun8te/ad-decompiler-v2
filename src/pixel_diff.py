@@ -424,6 +424,27 @@ def _norm(s):
     return "".join(ch.lower() for ch in str(s) if ch.isalnum())
 
 
+def _text_block_key(layer):
+    """Source-block identity of a text node, so word-splits of one line regroup.
+
+    Emitters split a single OCR block into per-word/per-run nodes with a ``__`` suffix
+    (``c_B5`` -> ``c_B5__w0``/``c_B5__w1``). The stem before ``__`` is the block the
+    fragments came from. Falls back to the node's own id (its own block) so an unsplit
+    node is simply a group of one, and to an object-identity key when a node carries no
+    id at all — never to a shared constant, which would fuse unrelated nodes into one
+    phantom string.
+    """
+    meta = layer.get("meta") or {}
+    for key in ("source_block_id", "block_id", "split_of"):
+        value = meta.get(key)
+        if value:
+            return str(value)
+    lid = str(layer.get("id") or "")
+    if not lid:
+        return f"__anon_{id(layer)}"
+    return lid.split("__", 1)[0] or lid
+
+
 # Archetypes whose "text" is genuinely interface copy (posts, tweets, DMs, chat), never
 # printed-into-a-photograph scene text.  A screenshot that baked all its copy is a FAILURE,
 # not the contract-correct single-photo answer, so it can never earn the scene-baked
@@ -1152,7 +1173,7 @@ def _text_editability(source_ocr, design, layers):
     """
     if not source_ocr or not design:
         return None
-    editable_texts = []
+    editable_blocks: "dict[str, list]" = {}
     raster_line_ids = set()
     raster_texts = []
     for layer in _flatten_layers(layers):
@@ -1162,7 +1183,17 @@ def _text_editability(source_ocr, design, layers):
             # A TEXT node is editable in Figma regardless of wordmark/lockup styling.
             norm = _norm(layer.get("text"))
             if norm:
-                editable_texts.append(norm)
+                # Group by SOURCE BLOCK, not per node: one OCR line is frequently emitted
+                # as several sibling word nodes (002 "€63 → €49" -> c_B5__w0 "€63 →" +
+                # c_B5__w1 "€49"; 066 "Smudges on upper lid" -> c_B5__w0/w1/w2). Both nodes
+                # ARE editable, but _norm strips the separators, so the source line
+                # ("6349") could never be a substring of a space-joined blob ("63 49") and
+                # the line was scored as MISSING — a false `missing-editable-text` /
+                # `low-text-recall` on work we actually shipped correctly. Re-joining the
+                # fragments of the same block (and only that block) restores the honest
+                # numerator without letting unrelated nodes concatenate into phantom
+                # matches.
+                editable_blocks.setdefault(_text_block_key(layer), []).append(norm)
             continue
         # Image layers that carry text pixels are non-editable text: raster slices of failed
         # overlay copy, fidelity-image substitutions (legacy fallback=True headline images),
@@ -1180,7 +1211,9 @@ def _text_editability(source_ocr, design, layers):
         if norm:
             raster_texts.append(norm)
 
-    editable_blob = " ".join(editable_texts)
+    # Per-block fragments concatenate (a split line reads as one string); separate blocks
+    # stay space-separated so they can never fuse into a match that was never rendered.
+    editable_blob = " ".join("".join(parts) for parts in editable_blocks.values())
     raster_blob = " ".join(raster_texts)
     kept_blob = " ".join(_norm(text) for text in (design.get("kept_in_photo") or []))
 

@@ -15,6 +15,8 @@ from scripts.activity_grid import (
     parse_done_seconds,
     parse_log,
     read_activity_pointer,
+    read_bench_summary,
+    read_contract_check,
     resolve_watch_root,
     write_activity_pointer,
 )
@@ -188,3 +190,70 @@ def test_merge_progress_ignores_stale_artifacts_far_ahead():
     assert complete is False
     assert done == ["normalize", "ocr"]
     assert active == "text"
+
+
+def test_read_bench_summary_absent_before_benchmark_json_exists(tmp_path: Path):
+    assert read_bench_summary(tmp_path) is None
+
+
+def test_read_bench_summary_surfaces_a_partial_aborted_run(tmp_path: Path):
+    # Shape benchmark.py's _build_report writes on a mid-loop abort (see
+    # tests/test_benchmark_reporting.py for the producer side).
+    (tmp_path / "benchmark.json").write_text(json.dumps({
+        "partial": True, "aborted_reason": "RuntimeError: simulated wedge",
+        "wall_time_s": 12.5, "fixtures_planned": 16, "fixtures_completed": 9,
+        "summary": {"images": 9, "qa_passing": 5, "mean_ssim": 0.83},
+    }), encoding="utf-8")
+
+    summary = read_bench_summary(tmp_path)
+
+    assert summary["partial"] is True
+    assert summary["aborted_reason"] == "RuntimeError: simulated wedge"
+    assert summary["fixtures_planned"] == 16
+    assert summary["fixtures_completed"] == 9
+    assert summary["summary"]["mean_ssim"] == 0.83
+
+
+def test_read_contract_check_absent_and_present(tmp_path: Path):
+    assert read_contract_check(tmp_path) is None
+    (tmp_path / "text_contract_report.json").write_text(json.dumps({
+        "checked": 9, "hard_total": 2, "warn_total": 5, "runs": [],
+    }), encoding="utf-8")
+
+    check = read_contract_check(tmp_path)
+
+    assert check["checked"] == 9
+    assert check["hard_total"] == 2
+    assert check["warn_total"] == 5
+
+
+def test_tracker_snapshot_surfaces_summary_and_contract_check(tmp_path: Path):
+    bench = tmp_path / "bench"
+    bench.mkdir()
+    _write_log(bench / "001_a" / "pipeline.log", PARTIAL_LOG)
+    (bench / "benchmark.json").write_text(json.dumps({
+        "partial": True, "aborted_reason": None, "wall_time_s": 1.0,
+        "fixtures_planned": 1, "fixtures_completed": 1,
+        "summary": {"images": 1},
+    }), encoding="utf-8")
+    (bench / "text_contract_report.json").write_text(json.dumps({
+        "checked": 1, "hard_total": 0, "warn_total": 1, "runs": [],
+    }), encoding="utf-8")
+
+    t = Tracker(bench, auto_root=False)
+    t.refresh()
+    snap = t.snapshot()
+
+    assert snap["summary"]["fixtures_completed"] == 1
+    assert snap["contract_check"]["warn_total"] == 1
+
+
+def test_tracker_snapshot_summary_is_none_before_benchmark_json_exists(tmp_path: Path):
+    bench = tmp_path / "bench"
+    bench.mkdir()
+    _write_log(bench / "001_a" / "pipeline.log", PARTIAL_LOG)
+    t = Tracker(bench, auto_root=False)
+    t.refresh()
+    snap = t.snapshot()
+    assert snap["summary"] is None
+    assert snap["contract_check"] is None

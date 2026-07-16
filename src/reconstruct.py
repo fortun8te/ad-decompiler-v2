@@ -585,8 +585,18 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
             root_is_background_scene = (min(canvas_w, canvas_h) >= 400
                                         and root_role in {"photo", "image", "person"}
                                         and root_fraction >= .40 and root_edges >= 2)
+        # Chrome that merge explicitly marked extractable is NOT "internal detail of a
+        # swappable photo": merge_layers (see its comment at the raster-cluster owner loop,
+        # "009 verified check, engagement glyphs") sets chrome_as_raster/extract_from_cluster
+        # precisely to say "keep this as its own IMAGE cutout". reconstruct read neither flag
+        # and dropped every such icon here because role "icon" is not in the avatar/badge/
+        # button allowlist — baking them and dropping the layer punches a hole the editable
+        # text then paints over (009 lost its verified badge, timer, eyes, back arrow, avatar
+        # and all five action icons). Honour the upstream contract; raster-first icons depend
+        # on it.
         if (containing_frame and not root_is_background_scene
-                and target not in {"text", "drop"} and role not in {"avatar", "badge", "button"}):
+                and target not in {"text", "drop"} and role not in {"avatar", "badge", "button"}
+                and not (meta.get("chrome_as_raster") or meta.get("extract_from_cluster"))):
             c["target"] = "drop"
             meta["kept_in_owner"] = containing_frame.get("id")
             meta["suppression_reason"] = "contained-in-swappable-photo-frame"
@@ -3208,6 +3218,18 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                 c.pop("mask", None)
                 c["meta"]["plate_passthrough"] = True
                 c["meta"]["raster_fallback"] = "oversized-residual-shell-plate-passthrough"
+                # Declare the reason in the vocabulary scene_intent reconciliation reads
+                # (`_is_explicit_suppression`: keep_in_background / suppression_reason /
+                # removal_required). This drop is DELIBERATE and reasoned — the plate owns
+                # these pixels — but it only recorded `removal_skipped`/`plate_passthrough`,
+                # which the reconciler cannot see. An undeclared drop of a PLANNED id read
+                # as "reconstruction made a structural decision the frozen intent cannot
+                # explain", raising SceneIntentError -> the whole structure-first tree was
+                # discarded for the legacy layout and the run took a hard
+                # `structure-unavailable` (002 c_E003, 101 E000/E001/E002). The pixels are
+                # kept in the background either way; saying so keeps the structure.
+                c["meta"]["keep_in_background"] = True
+                c["meta"]["suppression_reason"] = "oversized-residual-shell"
             continue
         if _keeps_underlay(c):
             # Insets, avatars, callout chrome and other true overlays sit above a valid
@@ -3958,6 +3980,28 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
         ys, xs = np.nonzero(alpha)
         y0, y1 = int(ys.min()), int(ys.max()) + 1
         x0, x1 = int(xs.min()), int(xs.max()) + 1
+        # Minimum-alpha gate: the box above is alpha's OWN tight bbox, so a low coverage
+        # inside it means the ledger handed us scattered specks, not a cutout. Shipping
+        # that "slice" REPLACES a good chip with a near-empty one and the element visually
+        # disappears (107: a 10-px alpha over an 88x89 bbox = 0.13% coverage overwrote a
+        # 755-dark-px down-arrow icon). A slice may only replace an existing render when it
+        # actually carries content; otherwise keep what we have — an imperfect chip beats a
+        # blank one, and this fails toward NOT destroying material we cannot improve.
+        alpha_px = int(alpha.sum())
+        box_area = max(1, (x1 - x0) * (y1 - y0))
+        coverage = alpha_px / float(box_area)
+        min_alpha_px = int(thresholds.get("min_slice_alpha_px", 24))
+        min_alpha_frac = float(thresholds.get("min_slice_alpha_frac", 0.02))
+        if alpha_px < min_alpha_px or coverage < min_alpha_frac:
+            report["skipped"].append({
+                "id": rid,
+                "reason": "slice-alpha-too-sparse",
+                "alpha_px": alpha_px,
+                "alpha_coverage": round(coverage, 5),
+                "box": {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0},
+                "failing_reasons": list(reasons),
+            })
+            continue
         tile = np.dstack([
             rgb[y0:y1, x0:x1],
             (alpha[y0:y1, x0:x1].astype(np.uint8) * 255),

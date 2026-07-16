@@ -426,6 +426,12 @@ def _tag_lines(lines: Iterable[dict], engine: str) -> list:
         line.setdefault("words", [])
         line.setdefault("quad", _rect_quad(line.get("box") or {}))
         line.setdefault("box", _quad_to_box(line["quad"]))
+        # An emoji an engine read as a junk token ('GC' for 👀) is dropped from the
+        # text but still stretches the box over the emoji's pixels, hiding it from
+        # element detection.  Idempotent: a line without an orphan is untouched.
+        orphan = _excise_orphan_edge_word(line)
+        if orphan is not None:
+            line.setdefault("meta", {})["orphan_edge_word_excised"] = orphan
         line.setdefault("meta", {})
         line["meta"].setdefault("engine", engine)
         tagged.append(line)
@@ -2314,6 +2320,161 @@ _NUMERIC_PROMPT = (
 )
 
 
+def _edge_char_drop(original: str, answer: str) -> tuple[int, int]:
+    """(leading, trailing) glyph counts an arbitration dropped from ``original``.
+
+    Only pure edge truncations count.  A substitution ('5B%' -> '58%') leaves the
+    glyph extent unchanged and must never move the box, so it reports (0, 0).
+    """
+    original, answer = str(original or ""), str(answer or "")
+    if not answer or not original or answer == original or len(answer) >= len(original):
+        return 0, 0
+    if original.endswith(answer):
+        return len(original) - len(answer), 0
+    if original.startswith(answer):
+        return 0, len(original) - len(answer)
+    return 0, 0
+
+
+def _peer_edge(meta: dict, box: dict, *, leading: bool) -> Optional[float]:
+    """A dissenting engine's box edge for the same row, when it reads inside ours.
+
+    The rejected reading is real geometric evidence: on 107 doctr swallowed the
+    ↓-in-circle icon as a leading '0' (box x=288) while easyocr read the same row
+    from x=378 — past the icon.  Only same-row peers strictly inside our own edge
+    qualify, so an equally-wide or wider peer can never widen the winner.
+    """
+    y0, y1 = _float(box.get("y")), _float(box.get("y")) + _float(box.get("h"))
+    best = None
+    for reading in (meta.get("provenance") or []):
+        if not isinstance(reading, dict) or reading.get("selected"):
+            continue
+        peer = _clean_box(reading.get("box") or {})
+        if peer["w"] <= 0 or peer["h"] <= 0:
+            continue
+        py0, py1 = peer["y"], peer["y"] + peer["h"]
+        overlap = min(y1, py1) - max(y0, py0)
+        if overlap <= 0.4 * min(_float(box.get("h")), peer["h"]):
+            continue
+        edge = peer["x"] if leading else peer["x"] + peer["w"]
+        inside = edge > _float(box.get("x")) if leading else edge < _float(box.get("x")) + _float(box.get("w"))
+        if inside:
+            best = edge if best is None else (max(best, edge) if leading else min(best, edge))
+    return best
+
+
+def _retighten_after_edge_char_drop(line: dict, original: str, answer: str) -> Optional[dict]:
+    """Shrink a line box when arbitration drops glyphs off an edge.
+
+    ``_verify_numeric_tokens`` rewrites only the TEXT: on 107 the VLM correctly
+    turned '058%' into '58%' — the leading '0' was the ↓-in-circle icon — but the
+    box kept spanning x=288..737, so the icon's pixels stayed owned by a text
+    line.  Element detection then treats the region as text and the icon's raster
+    chip is sliced against an empty alpha ledger (fallback.json alpha_px=10 for a
+    88x89 box).  Re-tighten to the surviving glyphs so the freed region can be
+    detected and sliced as artwork.  Estimation prefers a dissenting peer's edge
+    (real ink evidence) and falls back to a proportional per-glyph estimate;
+    whichever clips LESS wins, so a wrong guess can never eat live text.
+    """
+    lead, trail = _edge_char_drop(original, answer)
+    if not (lead or trail):
+        return None
+    box = _clean_box(line.get("box") or {})
+    if box["w"] <= 0 or box["h"] <= 0:
+        return None
+    per_char = box["w"] / max(1, len(str(original)))
+    x0, x1 = box["x"], box["x"] + box["w"]
+    meta = line.get("meta") or {}
+    new_x0, new_x1 = x0, x1
+    if lead:
+        proportional = x0 + per_char * lead
+        peer = _peer_edge(meta, box, leading=True)
+        new_x0 = min(proportional, peer) if peer is not None else proportional
+    if trail:
+        proportional = x1 - per_char * trail
+        peer = _peer_edge(meta, box, leading=False)
+        new_x1 = max(proportional, peer) if peer is not None else proportional
+    if new_x1 - new_x0 < 0.25 * box["w"]:
+        return None
+    tightened = {"x": float(new_x0), "y": box["y"],
+                 "w": float(new_x1 - new_x0), "h": box["h"]}
+    line["box"] = tightened
+    line["quad"] = _rect_quad(tightened)
+    for word in line.get("words") or []:
+        wb = _clean_box(word.get("box") or {})
+        if wb["w"] <= 0:
+            continue
+        if _text_key(word.get("text")) == _text_key(original):
+            word["text"] = answer
+            word["box"] = dict(tightened)
+            word["quad"] = _rect_quad(tightened)
+    return {"from": {k: round(v, 2) for k, v in box.items()},
+            "to": {k: round(v, 2) for k, v in tightened.items()},
+            "dropped_leading": lead, "dropped_trailing": trail}
+
+
+_ORPHAN_GLYPH_MAX_CONF = 0.72
+
+
+def _excise_orphan_edge_word(line: dict) -> Optional[dict]:
+    """Free an edge word whose glyphs never reached the line text.
+
+    An engine reads an emoji as a junk token — 009's trailing 👀 becomes 'GC'
+    (conf 0.52) and its ⏳ becomes 'X' — which reconciliation drops from the TEXT
+    while leaving it in ``words`` and inside the box union.  The line box then
+    claims the emoji's pixels (the 👀 sits at x=620..657 and the line box ends at
+    exactly 657), so element detection never gets to emit it as an image chip.
+    The ⏳ only survives today by luck: its gap is wide enough that the box
+    stopped short of it.  Excise the orphan and retighten to the real glyphs.
+
+    Deliberately conservative: only a DETACHED, outermost word whose text is
+    absent from the line text and which is weakly read.  Interior tokens (the
+    '·' separators of a timestamp row) and any word the text actually uses are
+    never touched.
+    """
+    words = [w for w in (line.get("words") or []) if _clean_box(w.get("box") or {})["w"] > 0]
+    if len(words) < 2:
+        return None
+    text_tokens = {_text_key(token) for token in str(line.get("text") or "").split()}
+    text_tokens.discard("")
+    if not text_tokens:
+        return None
+    ordered = sorted(words, key=lambda w: _clean_box(w["box"])["x"])
+    box = _clean_box(line.get("box") or {})
+    removed = []
+    for candidate, neighbour, leading in ((ordered[-1], ordered[-2], False),
+                                          (ordered[0], ordered[1], True)):
+        if _text_key(candidate.get("text")) in text_tokens:
+            continue
+        if _float(candidate.get("conf"), 1.0) > _ORPHAN_GLYPH_MAX_CONF:
+            continue
+        cb, nb = _clean_box(candidate["box"]), _clean_box(neighbour["box"])
+        gap = (nb["x"] - (cb["x"] + cb["w"])) if leading else (cb["x"] - (nb["x"] + nb["w"]))
+        if gap < 0.08 * max(1.0, box["h"]):
+            continue
+        removed.append(candidate)
+    if not removed:
+        return None
+    keep = [w for w in words if w not in removed]
+    if not keep or not any(_text_key(w.get("text")) in text_tokens for w in keep):
+        return None
+    xs0 = min(_clean_box(w["box"])["x"] for w in keep)
+    xs1 = max(_clean_box(w["box"])["x"] + _clean_box(w["box"])["w"] for w in keep)
+    tightened = {"x": float(min(xs0, box["x"] + box["w"])), "y": box["y"],
+                 "w": float(max(0.0, xs1 - xs0)), "h": box["h"]}
+    if tightened["w"] <= 0 or tightened["w"] >= box["w"]:
+        return None
+    line["box"] = tightened
+    line["quad"] = _rect_quad(tightened)
+    line["words"] = keep
+    return {"from": {k: round(v, 2) for k, v in box.items()},
+            "to": {k: round(v, 2) for k, v in tightened.items()},
+            "excised": [{"text": str(w.get("text") or ""),
+                         "conf": _float(w.get("conf"), 0.0),
+                         "box": {k: round(v, 2) for k, v in _clean_box(w["box"]).items()}}
+                        for w in removed]}
+
+
 def _numeric_verify_options(cfg: Optional[dict]) -> dict:
     cfg = cfg or {}
     raw = (cfg.get("ocr") or {}).get("numeric_verify", True)
@@ -2452,6 +2613,13 @@ def _verify_numeric_tokens(img_path: str, lines: list[dict], cfg: Optional[dict]
         if answer != original:
             line["ocr_text"] = original
             line["text"] = answer
+            # The correction moved glyphs, so the geometry must follow it: a
+            # dropped edge glyph was usually never text at all (107's ↓ icon read
+            # as a leading '0'), and a stale box keeps a text line owning the
+            # artwork's pixels.
+            retightened = _retighten_after_edge_char_drop(line, original, answer)
+            if retightened is not None:
+                evidence["box_retightened"] = retightened
             corrected += 1
         # This *is* a VLM arbitration of the numeric reading; mark the line so
         # the later generic OCR judge does not spend budget re-arbitrating it.

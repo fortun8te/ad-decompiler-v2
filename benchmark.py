@@ -5,6 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing as mp
+import queue
+import sys
+import time
 from pathlib import Path
 
 from doctor import inspect as inspect_machine
@@ -27,6 +31,128 @@ VISUAL_FAILURE_RULES = frozenset({
     "background-leakage", "unclean-background", "inpaint-outside-mask",
     "layer-alpha-holes", "empty-layer-alpha", "low-element-recall",
 })
+
+# ── per-fixture watchdog ────────────────────────────────────────────────────────
+# postfix-benchmark-6 lost all 16 fixtures when 094 wedged on a VLM call: benchmark.py
+# invoked run_one() directly in-process (see run_pipeline.run_one), so once that call
+# stalled -- LM Studio had dropped its loaded model, and every VLM call it touched
+# retried into TimeoutErrors indefinitely (bench_stderr.log: repeated
+# "vlm_timeout ... TimeoutError: timed out" with no end) -- there was no way to
+# interrupt it and no later fixture (101, 104, 107, 131, 135) ever ran.
+#
+# signal.alarm does not exist on win32, so a same-process timeout cannot forcibly
+# reclaim a blocked call. The fix mirrors the isolation runtime_smoke.py already uses
+# for its GPU probes: run each fixture in its own child process (multiprocessing,
+# spawn context -- the only context win32 supports) so the parent can actually
+# TerminateProcess() it on timeout, record the failure, and move on to the next
+# fixture. 091 legitimately took 2018s (heavy Flux inpaint + 2 harness rounds) in the
+# same run, so the default timeout must clear genuine slow-but-working fixtures by a
+# wide margin.
+DEFAULT_FIXTURE_TIMEOUT_S = 3600.0
+
+# REQUIRED_ARTIFACTS is already the ordered list of files each stage of run_pipeline
+# produces; reuse it (rather than re-deriving from run_pipeline.STAGES, which does not
+# map 1:1 onto artifact names) to guess which stage a killed fixture was stuck in: the
+# first artifact still missing on disk when we kill it.
+_ARTIFACT_STAGE = {
+    "input_manifest.json": "normalize", "normalized.png": "normalize",
+    "ocr_raw.json": "ocr", "ocr.json": "text",
+    "residual.json": "residual", "qwen.json": "qwen", "sam3.json": "sam",
+    "fused_elements.json": "elements", "elements.json": "elements",
+    "merged.json": "merge", "reconstruction.json": "reconstruct",
+    "background_clean.png": "reconstruct", "removal_mask.png": "reconstruct",
+    "ownership.png": "reconstruct", "layout.json": "layout",
+    "design.json": "design", "design_preflight.json": "design",
+    "layers_contact.png": "preview", "preview.png": "preview",
+    "diff.png": "qa", "runtime_report.json": "qa", "qa.json": "qa",
+}
+
+
+def _infer_wedged_stage(run_dir: Path) -> str:
+    """Best-effort "which stage was this fixture stuck in" from artifact presence."""
+    run_dir = Path(run_dir)
+    for name in REQUIRED_ARTIFACTS:
+        if not (run_dir / name).is_file():
+            return _ARTIFACT_STAGE.get(name, name)
+    return "qa"  # every artifact present; the harness loop after run_one() is the culprit
+
+
+def _fixture_worker(image_path: str, run_dir: str, cfg: dict, resume: str, output_queue) -> None:
+    """Child-process entry point (see ``run_bounded``): run one fixture end to end.
+
+    Runs in its own OS process so the parent can forcibly kill it if it wedges;
+    ``run_one`` already catches broadly, but a second net costs nothing here.
+    """
+    try:
+        result = run_one(image_path, run_dir, cfg, resume)
+    except Exception as exc:  # pragma: no cover - run_one already catches broadly
+        result = {"ok": False, "run_dir": run_dir, "runtime_ok": False,
+                  "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        output_queue.put(result)
+    except Exception:
+        pass
+
+
+def run_bounded(target, args: tuple, run_dir: Path, timeout_s: float, *, cfg: dict | None = None) -> dict:
+    """Run ``target(*args, output_queue)`` in an isolated child process with a hard
+    wall-clock timeout, killing it (and best-effort cancelling any orphaned remote
+    ComfyUI job) if it outlives ``timeout_s``.
+
+    ``target`` must be a module-level (picklable) callable; ``multiprocessing``'s
+    ``spawn`` context is used unconditionally because it is the only context win32
+    supports (``fork`` does not exist there), matching ``runtime_smoke._run_bounded``.
+    """
+    run_dir = Path(run_dir)
+    context = mp.get_context("spawn")
+    output_queue = context.Queue(maxsize=1)
+    process = context.Process(target=target, args=(*args, output_queue))
+    started = time.monotonic()
+    process.start()
+    process.join(timeout_s)
+    if process.is_alive():
+        stage = _infer_wedged_stage(run_dir)
+        process.terminate()
+        process.join(5)
+        if process.is_alive():  # stubborn child; TerminateProcess again via kill()
+            process.kill()
+            process.join(5)
+        if cfg is not None:
+            # A killed worker does not cancel a remote job it started (Flux via
+            # ComfyUI keeps sampling after we vanish) -- same caveat runtime_smoke.py
+            # documents for its own probes; reuse its cleanup rather than reinventing it.
+            try:
+                from runtime_smoke import _cancel_remote_comfy_job
+                _cancel_remote_comfy_job(cfg)
+            except Exception:
+                pass
+        elapsed = round(time.monotonic() - started, 3)
+        reason = f"watchdog: fixture exceeded {timeout_s:.0f}s timeout while in stage '{stage}'"
+        record = {"ok": False, "run_dir": str(run_dir), "duration_s": elapsed,
+                  "runtime_ok": False, "runtime_status": "timeout",
+                  "error": reason, "failed_stage": stage, "timed_out": True,
+                  "timeout_s": timeout_s}
+        try:
+            (run_dir / "watchdog_timeout.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+        return record
+    try:
+        result = output_queue.get(timeout=5)
+    except queue.Empty:
+        elapsed = round(time.monotonic() - started, 3)
+        return {"ok": False, "run_dir": str(run_dir), "duration_s": elapsed,
+                "runtime_ok": False, "runtime_status": "failed",
+                "error": f"fixture process exited {process.exitcode} without a result",
+                "failed_stage": _infer_wedged_stage(run_dir)}
+    result.setdefault("run_dir", str(run_dir))
+    return result
+
+
+def _run_fixture(image: Path, run_dir: Path, cfg: dict, resume: str, timeout_s: float) -> dict:
+    """Run one benchmark fixture with the per-fixture watchdog applied."""
+    return run_bounded(_fixture_worker, (str(image), str(run_dir), cfg, resume),
+                       run_dir, timeout_s, cfg=cfg)
 
 # Codia construction CONTRACT pass bar (docs/CODIA-PARITY-SPEC.md): a per-run PASS requires
 # native text everywhere (no handwriting archetype exists, so 0.90 is universal), a clean
@@ -261,6 +387,18 @@ def _entry(run_dir: Path, result: dict) -> dict:
         if key and key not in seen_failures:
             merged_hard_fails.append(item)
             seen_failures.add(key)
+    # Per-fixture watchdog (run_bounded): a killed/crashed fixture has no qa.json to carry
+    # its failure, so surface it here as a hard fail -- the stage name + timeout/error
+    # reason then rides the existing hard_fails column instead of vanishing silently.
+    if result.get("error") and not result.get("ok"):
+        rule = "fixture-timeout" if result.get("timed_out") else "fixture-error"
+        key = (rule, result.get("error"))
+        if key not in seen_failures:
+            merged_hard_fails.append({
+                "rule": rule, "detail": result.get("error"), "hard": True,
+                "stage": result.get("failed_stage"),
+            })
+            seen_failures.add(key)
     qa_evidence_complete = bool(
         isinstance(qa, dict)
         and hard_fails is not None
@@ -399,6 +537,9 @@ def _entry(run_dir: Path, result: dict) -> dict:
             leaf_accounting.get("unexplained_raster_count", 0) or 0
         ),
         "run_dir": str(run_dir),
+        "failure_reason": result.get("error"),
+        "failed_stage": result.get("failed_stage"),
+        "timed_out": bool(result.get("timed_out")),
         **_harness_telemetry(run_dir),
     }
 
@@ -465,7 +606,6 @@ def _markdown(report: dict) -> str:
 
 def _emit_html_report(output: Path) -> None:
     """Best-effort visual report.html hook; never fails the benchmark run."""
-    import sys
     scripts_dir = Path(__file__).resolve().parent / "scripts"
     if str(scripts_dir) not in sys.path:
         sys.path.insert(0, str(scripts_dir))
@@ -475,6 +615,128 @@ def _emit_html_report(output: Path) -> None:
         print(f"HTML report: {path}")
     except Exception as exc:  # pragma: no cover - reporting must not break a benchmark
         print(f"report.html generation skipped: {exc}")
+
+
+def _point_activity_grid_at(output: Path) -> Path:
+    """Point scripts/activity_grid.py's dashboard at this run (it follows ``.activity_current``).
+
+    Written unconditionally, before the per-fixture loop starts (not after it finishes),
+    so a RESUMED run (re-invoked against the same/an existing --output) re-asserts the
+    same pointer, and a PARTIAL/ABORTED run (killed or crashed mid-loop) still leaves the
+    pointer correctly naming this run dir -- it was written before anything could go wrong.
+    """
+    pointer = output.resolve().parent / ".activity_current"
+    try:
+        pointer.write_text(str(output.resolve()), encoding="utf-8")
+        print(f"Activity grid pointer -> {pointer} ({output.name})", flush=True)
+    except OSError as exc:
+        print(f"Activity grid pointer skipped: {exc}", flush=True)
+    return pointer
+
+
+def _build_report(source_dir: Path, output: Path, images: list[Path], requested_ids: list[str],
+                  runs: list[dict], *, wall_s: float, partial: bool,
+                  aborted_reason: str | None = None) -> dict:
+    """Assemble the benchmark.json/.md payload from whatever ``runs`` has so far.
+
+    Called after every fixture (not just once at the end) so a run that dies mid-loop --
+    killed fixture, Ctrl-C, an unexpected exception -- still leaves a summary behind
+    instead of nothing at all (postfix-benchmark-6 produced no benchmark.json/.md because
+    the only write was after the full loop completed).
+    """
+    return {
+        "version": 1,
+        "input_dir": str(source_dir.resolve()),
+        "output": str(output.resolve()),
+        "fixture_manifest": _source_manifest(images, requested_ids),
+        "runs": runs,
+        # Partial/abort bookkeeping: additive fields, so a fully-completed run's report
+        # is unchanged in shape from before other than these new keys.
+        "partial": partial,
+        "aborted_reason": aborted_reason,
+        "wall_time_s": wall_s,
+        "fixtures_planned": len(images),
+        "fixtures_completed": len(runs),
+        "summary": {
+            "images": len(runs),
+            "complete_runs": sum(1 for row in runs if row["complete"]),
+            "pipeline_passing": sum(1 for row in runs if row["pipeline_ok"]),
+            "qa_passing": sum(1 for row in runs if row["qa_ok"]),
+            # Codia contract: the objective, ahead of qa/runtime in the headline.
+            "contract_passing": sum(1 for row in runs if contract_verdict(row)["pass"]),
+            "mean_native_text_ratio": _mean(runs, "native_text_ratio"),
+            "mean_contract_score": _mean(runs, "contract_score"),
+            "runtime_accepted": sum(1 for row in runs if row["runtime_ok"]),
+            "degraded_runs": sum(1 for row in runs if row["runtime_degraded"]),
+            "runtime_violation_runs": sum(1 for row in runs if row["runtime_violations"]),
+            "mean_visual_score": _mean(runs, "visual_score"),
+            "mean_ssim": _mean(runs, "ssim"),
+            "mean_text_recall": _mean(runs, "text_recall"),
+            "mean_editable_text_recall": _mean(runs, "editable_text_recall"),
+            "mean_true_text_coverage": _mean(runs, "true_text_coverage"),
+            "rasterized_text_total": sum(
+                int(row.get("rasterized_text_count") or 0) for row in runs
+            ),
+            "mean_native_leaf_ratio": _mean(runs, "native_leaf_ratio"),
+            "intentional_raster_clusters_total": sum(
+                row.get("intentional_raster_clusters", 0) for row in runs
+            ),
+            "unexplained_raster_fallbacks_total": sum(
+                row.get("unexplained_raster_fallbacks", 0) for row in runs
+            ),
+            "mean_edge_f1": _mean(runs, "edge_f1"),
+            "background_leakage_runs": sum(1 for row in runs if row["background_leakage"]),
+            "inpaint_outside_mask_runs": sum(1 for row in runs if row["inpaint_outside_mask"]),
+            "layer_alpha_hole_runs": sum(1 for row in runs if row["layer_alpha_holes"]),
+            "empty_layer_alpha_runs": sum(1 for row in runs if row["empty_layer_alpha"]),
+            "low_element_recall_runs": sum(1 for row in runs if row["low_element_recall"]),
+            "qa_evidence_complete_runs": sum(1 for row in runs if row["qa_evidence_complete"]),
+            "figma_exports_present": sum(1 for row in runs if row.get("figma_export_present")),
+            "figma_exports_awaiting_manual_import": sum(
+                1 for row in runs if not row.get("figma_export_present")
+            ),
+            "mean_element_recall": _mean(runs, "element_recall"),
+            "runs_with_hard_fails": sum(1 for row in runs if row["hard_fails"]),
+            "auto_fixed_runs": sum(1 for row in runs if row.get("auto_fixed")),
+            "harness_rounds_total": sum(row.get("harness_rounds", 0) for row in runs),
+            "final_qa_passing": sum(1 for row in runs if row.get("final_qa_ok")),
+            "timed_out_runs": sum(1 for row in runs if row.get("timed_out")),
+        },
+    }
+
+
+def _run_text_contract_check(run_dir: Path) -> dict | None:
+    """One fixture's text-contract sweep (scripts/text_contract_check.check_run).
+
+    Returns None for a fixture that never reached design.json (for example, one the
+    watchdog killed before the design stage) -- there is nothing to check yet, the same
+    way scripts/text_contract_check.py's own CLI skips run dirs without design.json.
+    """
+    if not (Path(run_dir) / "design.json").is_file():
+        return None
+    from scripts.text_contract_check import check_run
+    try:
+        return check_run(str(run_dir))
+    except Exception as exc:  # never let the contract sweep take down the benchmark
+        return {"fixture": Path(run_dir).name, "nodes": 0, "source_lines": 0,
+                "violations": [{"severity": "ERROR", "rule": "contract-check-crashed",
+                                "detail": str(exc), "text": ""}]}
+
+
+def _build_contract_report(contract_reports: list[dict]) -> dict:
+    """Aggregate scripts/text_contract_check.py's per-fixture reports (see main()'s
+    per-image loop, which appends one entry per fixture as soon as it reaches design.json)."""
+    hard = sum(1 for r in contract_reports for v in r.get("violations", [])
+              if v.get("severity") in ("HARD", "ERROR"))
+    warn = sum(1 for r in contract_reports for v in r.get("violations", [])
+              if v.get("severity") == "WARN")
+    return {
+        "version": 1,
+        "checked": len(contract_reports),
+        "hard_total": hard,
+        "warn_total": warn,
+        "runs": contract_reports,
+    }
 
 
 def main():
@@ -506,6 +768,11 @@ def main():
     parser.add_argument("--contract", action="store_true",
                         help="print the per-image Codia construction-contract verdict "
                         "(native text >= 90%%, zero glyph residue, placement in tolerance)")
+    parser.add_argument("--fixture-timeout", type=float, default=DEFAULT_FIXTURE_TIMEOUT_S,
+                        help="max seconds a single fixture may run before its stuck stage is "
+                        "killed and it is recorded as a timeout failure, so one wedged "
+                        "fixture (a stuck VLM/HTTP call) cannot take down the whole "
+                        f"benchmark (default: {DEFAULT_FIXTURE_TIMEOUT_S:.0f}s)")
     args = parser.parse_args()
     source_dir = Path(args.input_dir)
     output = Path(args.output)
@@ -552,12 +819,7 @@ def main():
     for path in images:
         (output / path.stem).mkdir(parents=True, exist_ok=True)
     # Point activity grid at this bench (scripts/activity_grid.py follows .activity_current).
-    pointer = output.resolve().parent / ".activity_current"
-    try:
-        pointer.write_text(str(output.resolve()), encoding="utf-8")
-        print(f"Activity grid pointer -> {pointer} ({output.name})", flush=True)
-    except OSError as exc:
-        print(f"Activity grid pointer skipped: {exc}", flush=True)
+    _point_activity_grid_at(output)
     print(f"Planned {len(images)} ads -> {output / 'planned.json'}", flush=True)
 
     from src.runtime_bootstrap import ensure_services
@@ -590,67 +852,44 @@ def main():
             print(json.dumps({"benchmark": "blocked", "runtime_smoke": smoke.get("checks")}, indent=2))
             raise SystemExit(2)
 
-    runs = []
-    for image in images:
-        run_dir = output / image.stem
-        print(f"\n=== {image.name} ===", flush=True)
-        result = run_one(str(image), str(run_dir), cfg, args.resume)
-        runs.append(_entry(run_dir, result))
+    runs: list[dict] = []
+    contract_reports: list[dict] = []
+    aborted_reason: str | None = None
+    bench_t0 = time.time()
 
-    report = {
-        "version": 1,
-        "input_dir": str(source_dir.resolve()),
-        "output": str(output.resolve()),
-        "fixture_manifest": _source_manifest(images, requested_ids),
-        "runs": runs,
-        "summary": {
-            "images": len(runs),
-            "complete_runs": sum(1 for row in runs if row["complete"]),
-            "pipeline_passing": sum(1 for row in runs if row["pipeline_ok"]),
-            "qa_passing": sum(1 for row in runs if row["qa_ok"]),
-            # Codia contract: the objective, ahead of qa/runtime in the headline.
-            "contract_passing": sum(1 for row in runs if contract_verdict(row)["pass"]),
-            "mean_native_text_ratio": _mean(runs, "native_text_ratio"),
-            "mean_contract_score": _mean(runs, "contract_score"),
-            "runtime_accepted": sum(1 for row in runs if row["runtime_ok"]),
-            "degraded_runs": sum(1 for row in runs if row["runtime_degraded"]),
-            "runtime_violation_runs": sum(1 for row in runs if row["runtime_violations"]),
-            "mean_visual_score": _mean(runs, "visual_score"),
-            "mean_ssim": _mean(runs, "ssim"),
-            "mean_text_recall": _mean(runs, "text_recall"),
-            "mean_editable_text_recall": _mean(runs, "editable_text_recall"),
-            "mean_true_text_coverage": _mean(runs, "true_text_coverage"),
-            "rasterized_text_total": sum(
-                int(row.get("rasterized_text_count") or 0) for row in runs
-            ),
-            "mean_native_leaf_ratio": _mean(runs, "native_leaf_ratio"),
-            "intentional_raster_clusters_total": sum(
-                row.get("intentional_raster_clusters", 0) for row in runs
-            ),
-            "unexplained_raster_fallbacks_total": sum(
-                row.get("unexplained_raster_fallbacks", 0) for row in runs
-            ),
-            "mean_edge_f1": _mean(runs, "edge_f1"),
-            "background_leakage_runs": sum(1 for row in runs if row["background_leakage"]),
-            "inpaint_outside_mask_runs": sum(1 for row in runs if row["inpaint_outside_mask"]),
-            "layer_alpha_hole_runs": sum(1 for row in runs if row["layer_alpha_holes"]),
-            "empty_layer_alpha_runs": sum(1 for row in runs if row["empty_layer_alpha"]),
-            "low_element_recall_runs": sum(1 for row in runs if row["low_element_recall"]),
-            "qa_evidence_complete_runs": sum(1 for row in runs if row["qa_evidence_complete"]),
-            "figma_exports_present": sum(1 for row in runs if row.get("figma_export_present")),
-            "figma_exports_awaiting_manual_import": sum(
-                1 for row in runs if not row.get("figma_export_present")
-            ),
-            "mean_element_recall": _mean(runs, "element_recall"),
-            "runs_with_hard_fails": sum(1 for row in runs if row["hard_fails"]),
-            "auto_fixed_runs": sum(1 for row in runs if row.get("auto_fixed")),
-            "harness_rounds_total": sum(row.get("harness_rounds", 0) for row in runs),
-            "final_qa_passing": sum(1 for row in runs if row.get("final_qa_ok")),
-        },
-    }
-    (output / "benchmark.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    (output / "benchmark.md").write_text(_markdown(report), encoding="utf-8")
-    _emit_html_report(output)
+    def _flush_reports(*, partial: bool) -> dict:
+        # Written after EVERY fixture (not only once at the end) so a run killed from the
+        # outside (task manager, power loss) -- not just a clean Python exception -- still
+        # leaves the most current summary + contract-check evidence on disk.  See (b).
+        rep = _build_report(source_dir, output, images, requested_ids, runs,
+                            wall_s=round(time.time() - bench_t0, 3), partial=partial,
+                            aborted_reason=aborted_reason)
+        (output / "benchmark.json").write_text(json.dumps(rep, indent=2), encoding="utf-8")
+        (output / "benchmark.md").write_text(_markdown(rep), encoding="utf-8")
+        (output / "text_contract_report.json").write_text(
+            json.dumps(_build_contract_report(contract_reports), indent=2), encoding="utf-8")
+        return rep
+
+    try:
+        for image in images:
+            run_dir = output / image.stem
+            print(f"\n=== {image.name} ===", flush=True)
+            result = _run_fixture(image, run_dir, cfg, args.resume, args.fixture_timeout)
+            if result.get("timed_out"):
+                print(f"  !! fixture watchdog: exceeded {args.fixture_timeout:.0f}s in stage "
+                      f"'{result.get('failed_stage')}' -- killed, recorded as a failure, "
+                      "continuing to the next fixture", flush=True)
+            runs.append(_entry(run_dir, result))
+            contract_row = _run_text_contract_check(run_dir)
+            if contract_row is not None:
+                contract_reports.append(contract_row)
+            _flush_reports(partial=True)
+    except BaseException as exc:
+        aborted_reason = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        report = _flush_reports(partial=(len(runs) < len(images)))
+        _emit_html_report(output)
     # --contract: the Codia construction-contract verdict is the objective, printed ahead of
     # the raw summary. Always emit the one-line roll-up; --contract adds the per-image detail.
     verdicts = [contract_verdict(row) for row in runs]

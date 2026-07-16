@@ -346,6 +346,8 @@ def peel_inpaint_mode(cfg: Optional[dict] = None, meta: Optional[dict] = None) -
     meta = meta or {}
     opts = _options(cfg)
     if meta.get("text_occluder"):
+        # Also a torch Big-LaMa load — same Flux-residency collision as the photo path.
+        _release_flux_before_lama(cfg, meta)
         return "lama"
     under = str(meta.get("under_kind") or "")
     hole_px = int(meta.get("hole_px") or 0)
@@ -362,7 +364,31 @@ def peel_inpaint_mode(cfg: Optional[dict] = None, meta: Optional[dict] = None) -
     # zone vs LaMa-class 23+ with banding).
     if not _is_photo_kind(under):
         return "opencv"
+    # Flux → Big-LaMa transition: ComfyUI still holds Flux Fill (~9.5 GiB) from an earlier
+    # region in THIS peel, and LaMa is about to load its weights into what's left of the
+    # card. Measured in postfix-benchmark-6: big-lama cost 0s/2s on a free card (013, 107)
+    # but 715s and 163s directly after a flux-comfy fill (091) — 878s, 18% of the bench.
+    # Release Flux first. Best-effort and pixel-neutral: it evicts another process's
+    # weights, never an input to the fill.
+    _release_flux_before_lama(cfg, meta)
     return "lama"
+
+
+def _release_flux_before_lama(cfg: Optional[dict], meta: dict) -> None:
+    """Free ComfyUI's resident Flux before a torch Big-LaMa fill (never raises)."""
+    state = meta.get("flux_state") if isinstance(meta.get("flux_state"), dict) else {}
+    if int(state.get("used") or 0) <= 0:
+        return
+    try:
+        from src import vram as _vram
+    except Exception:
+        return
+    try:
+        _vram.release_flux_for_torch_inpaint(
+            cfg, "lama", flux_used=int(state.get("used") or 0),
+            log_fn=(cfg or {}).get("_log_fn"))
+    except Exception:
+        pass   # VRAM policy is an optimization; never fail a fill over it.
 
 
 # ── inputs / results ───────────────────────────────────────────────────────────────

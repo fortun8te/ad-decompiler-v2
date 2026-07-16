@@ -957,7 +957,22 @@ def _detect_foreign_strike_ink(crop, mask, known_strike: bool = False):
         "w": int(fx.max() - fx.min() + 1), "h": int(fy.max() - fy.min() + 1),
     }
     angle = math.degrees(math.atan2(float(axis_vec[1]), float(axis_vec[0])))
-    return glyph_mask, {"color": colour, "box": box, "angle": round(angle, 2), "kind": kind}
+    # Endpoints and mean thickness of the actual swipe, along its own (PCA) axis. A
+    # hand-drawn strike is a long diagonal marker stroke that overshoots the glyph run
+    # (091's swipe starts LEFT of "Foggy" and rises across it); a flat mid-height rule
+    # spanning the text box is a visibly different mark. These let the caller re-emit
+    # the rule as a real vector at its measured angle/length/weight instead.
+    if axis_vec[0] < 0:
+        axis_vec = -axis_vec
+        proj = -proj
+    p0 = centre + axis_vec * float(proj.min())
+    p1 = centre + axis_vec * float(proj.max())
+    thickness = float(fy.size) / max(1.0, span)
+    return glyph_mask, {
+        "color": colour, "box": box, "angle": round(angle, 2), "kind": kind,
+        "p0": [float(p0[0]), float(p0[1])], "p1": [float(p1[0]), float(p1[1])],
+        "span": round(span, 2), "thickness": round(thickness, 2),
+    }
 
 
 def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, dict, str, float, Any, dict]:
@@ -1004,6 +1019,20 @@ def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, d
                 meta["strikethrough_box"] = {
                     "x": x0 + b["x"], "y": y0 + b["y"], "w": b["w"], "h": b["h"],
                 }
+        # Record the swipe's measured geometry in IMAGE coords so the caller can emit it
+        # as a precise vector rule rather than a flat box-width line.
+        if strike_info.get("p0") and strike_info.get("p1"):
+            meta["strike_ink_shape"] = {
+                "kind": strike_info.get("kind"),
+                "x0": round(float(x0 + strike_info["p0"][0]), 2),
+                "y0": round(float(y0 + strike_info["p0"][1]), 2),
+                "x1": round(float(x0 + strike_info["p1"][0]), 2),
+                "y1": round(float(y0 + strike_info["p1"][1]), 2),
+                "color": strike_info.get("color"),
+                "thickness": strike_info.get("thickness"),
+                "angle": strike_info.get("angle"),
+                "span": strike_info.get("span"),
+            }
 
     ys, xs = np.nonzero(mask)
     lx0, ly0 = int(xs.min()), int(ys.min())
@@ -1082,6 +1111,54 @@ def _strike_span_fraction(strike_box, painted_box) -> Optional[list]:
     if f0 <= 0.04 and f1 >= 0.96:
         return None
     return [round(f0, 4), round(f1, 4)]
+
+
+def _hand_swipe_rule(meta: dict, painted_box: Optional[dict]) -> Optional[dict]:
+    """A hand-drawn strike's measured ink as a vector rule, or None to use a flat rule.
+
+    ``meta.strike_ink_shape`` is written by ``_detect_foreign_strike_ink`` when a
+    saturated foreign-hue stroke is found over achromatic glyphs — i.e. an annotation
+    drawn on top of the type, not a typographic decoration.  Such a mark differs from a
+    text-decoration line in three measurable ways, any one of which makes the flat rule
+    a visibly wrong reproduction:
+
+      * it runs at its own angle (091's swipe rises ~10° across "Foggy");
+      * it is several times thicker than a decoration line (font_size * 0.06);
+      * it overshoots the glyph run instead of stopping at the box edge, which
+        ``_strike_span_fraction`` cannot express (it clamps to [0,1] of the box).
+
+    Returns a ``native_decoration_shapes`` entry (the same schema
+    ``_native_colored_price_rules`` emits) when the measured geometry is trustworthy:
+    a real span, a sane thickness, and endpoints.  Returns None for a short/degenerate
+    detection so the caller keeps the conservative flat rule.
+    """
+    shape = meta.get("strike_ink_shape") if isinstance(meta, dict) else None
+    if not isinstance(shape, dict) or shape.get("kind") != "strikethrough":
+        return None
+    try:
+        x0, y0 = float(shape["x0"]), float(shape["y0"])
+        x1, y1 = float(shape["x1"]), float(shape["y1"])
+        thickness = float(shape.get("thickness") or 0.0)
+        span = float(shape.get("span") or 0.0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x0, y0, x1, y1, thickness, span)):
+        return None
+    # A degenerate/short detection carries no better information than the flat rule.
+    box = _clean_box(painted_box)
+    if span < max(16.0, 0.20 * max(1.0, box["w"])) or thickness < 1.0:
+        return None
+    colour = shape.get("color")
+    if not colour:
+        return None
+    return {
+        "kind": "strikethrough",
+        "x0": round(x0, 2), "y0": round(y0, 2), "x1": round(x1, 2), "y1": round(y1, 2),
+        "color": colour,
+        "thickness": round(max(1.0, min(24.0, thickness)), 2),
+        "confidence": round(min(1.0, span / max(1.0, box["w"])), 4),
+        "source": "hand-swipe-ink",
+    }
 
 
 def _native_text_decoration(mask, text: str) -> tuple[Optional[str], Optional[dict]]:
@@ -2456,6 +2533,124 @@ def _apply_line_render_fit(line: dict, mask, painted: dict, render_fit_options: 
     return fit
 
 
+def _handwriting_crop_bytes(image, painted: dict, padding: int = 6) -> Optional[bytes]:
+    """PNG bytes of a line's painted box cut from the ORIGINAL image, for the VLM.
+
+    Uses ``vlm_client.crop_box_bytes`` so the crop/encoding convention matches every
+    other VLM stage (vlm_ocr_judge et al).
+    """
+    if image is None or not isinstance(painted, dict):
+        return None
+    try:
+        from PIL import Image
+
+        from src import vlm_client
+
+        return vlm_client.crop_box_bytes(Image.fromarray(image), painted, padding)
+    except Exception:
+        return None
+
+
+def _apply_handwriting_gate(prepared: list[dict], image, cfg: Optional[dict],
+                            run_dir: Optional[str]) -> dict:
+    """Rasterize genuinely hand-lettered lines to pixel-exact chips (HARD spec §11).
+
+    A hand-drawn/marker/script word has no library equivalent, so emitting it in the
+    nearest sans is the most visible reconstruction failure there is (091's marker
+    "Sharp" rendered as Barlow Condensed).  Rather than guess a font, chip the ORIGINAL
+    ink — but ONLY for lines the VLM positively confirms as hand-drawn, because
+    rasterizing typeset copy is the worse error (see ``handwriting`` module docstring:
+    the cheap stats put "Sharp" on the *typeset* side of every threshold, so nothing
+    cheaper than the VLM may make this call).
+
+    The chip reuses the existing fidelity-fallback contract — ``meta.low_fidelity`` +
+    ``meta.fallback_src`` become an image node in ``routing._text_fidelity_fallback`` —
+    and stamps ``meta.handwriting``/``ocr_text``/``font_attempted``/``renderback_score``
+    so the chip stays greppable and editable-aware downstream.
+
+    Returns an evidence mapping for ``result["handwriting"]``.
+    """
+    try:
+        from src import handwriting
+    except Exception as exc:  # pragma: no cover - import guard
+        return {"enabled": False, "note": f"import-error:{type(exc).__name__}"}
+    if not handwriting.enabled(cfg):
+        return {"enabled": False, "note": "disabled"}
+
+    evidence: dict = {"enabled": True, "candidates": [], "checked": 0,
+                      "rasterized": [], "kept_native": []}
+
+    # Stage A on every line (cheap: no font rendering, no VLM).
+    staged: list[tuple] = []
+    for item in prepared:
+        line = item["line"]
+        stats = handwriting.ink_stats(item.get("font_mask"))
+        item["hw_stats"] = stats
+        is_candidate, signals = handwriting.stage_a_candidate(line, stats, cfg)
+        item["hw_stage_a"] = signals
+        if is_candidate:
+            staged.append((line["id"], item["painted"]))
+            evidence["candidates"].append(line["id"])
+
+    if not staged:
+        return evidence
+
+    # Stage B on a bounded, ink-area-ranked subset.
+    chosen = set(handwriting.select_candidates(staged, cfg))
+    by_id = {item["line"]["id"]: item for item in prepared}
+    for line_id in chosen:
+        item = by_id.get(line_id)
+        if item is None:
+            continue
+        line = item["line"]
+        crop = _handwriting_crop_bytes(image, item["painted"])
+        decision = handwriting.decide(line, item.get("hw_stats"), crop, cfg)
+        evidence["checked"] += 1
+        meta = line.setdefault("meta", {})
+        vlm = decision.get("vlm") or {}
+        meta["handwriting_evidence"] = {
+            "reason": decision.get("reason"),
+            "renderback_score": decision.get("renderback_score"),
+            "font_attempted": decision.get("font_attempted"),
+            "stroke_width_cv": (item.get("hw_stats") or {}).get("stroke_width_cv"),
+            "vlm": {k: vlm.get(k) for k in ("available", "handwritten", "style",
+                                            "confidence", "note")} if vlm else None,
+        }
+        if decision.get("handwriting"):
+            # Positive VLM identification is worth recording even when the line stays
+            # native: it is text-side evidence that this ink is drawn, not set, which
+            # the scene-intent/merge side consumes when deciding in-image vs overlay.
+            meta["handwriting"] = True
+        if not decision.get("rasterize"):
+            evidence["kept_native"].append({"id": line_id, "text": line.get("text"),
+                                            "reason": decision.get("reason")})
+            continue
+
+        meta["ocr_text"] = line.get("text")
+        meta["font_attempted"] = decision.get("font_attempted")
+        meta["renderback_score"] = decision.get("renderback_score")
+        reason = (f"handwriting: {decision.get('reason')} "
+                  f"(font_attempted={decision.get('font_attempted')}, "
+                  f"renderback={decision.get('renderback_score')})")
+        meta["low_fidelity"] = True
+        meta["fidelity_reason"] = reason
+        fallback_src = _save_fallback_crop(image, item["mask"], item["painted"], run_dir,
+                                           line["id"])
+        if fallback_src:
+            meta["fallback_src"] = fallback_src
+        meta["substitution"] = {
+            "from": "text", "to": "handwriting-chip", "reason": reason,
+            "confidence": meta.get("fidelity_confidence"),
+        }
+        evidence["rasterized"].append({
+            "id": line_id, "text": line.get("text"),
+            "font_attempted": decision.get("font_attempted"),
+            "renderback_score": decision.get("renderback_score"),
+            "vlm_style": vlm.get("style"), "vlm_confidence": vlm.get("confidence"),
+        })
+    return evidence
+
+
 def _platform_ui_cfg(cfg: Optional[dict]) -> dict:
     """Resolve the text_analysis mapping, accepting a bare options dict in tests."""
     tcfg = _text_cfg(cfg)
@@ -2914,7 +3109,37 @@ def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
             None,
         )
         line_class = _family_class(line_family, (line_cand or {}).get("path"))
-        forbidden = class_consistent and line_class in ("serif", "script")
+        # "Forbidden" must mean a serif family LEAKED onto sans ink — not that the ink
+        # itself is serif. The matched family's class alone cannot tell those apart, so
+        # ask the per-line class gate, which classes the SOURCE ink by fitting canonical
+        # reference faces to it. Without this the rule converts every genuine serif
+        # headline in a sans-majority ad into a sans (091's serif "Foggy and Steady" ->
+        # Noto Sans): the intended escape hatch (``strong_keep``, 0.72) is unreachable
+        # for such a line because render-back IoU falls off with string length — a
+        # 16-glyph headline tops out near 0.16 no matter how right the face is.
+        gate = ((line.get("meta") or {}).get("font_match") or {}).get("class_gate") or {}
+        source_class = str(gate.get("class") or "")
+        source_gate_conf = _num(gate.get("confidence"), 0.0)
+        protect_min_conf = _num(opts.get("source_class_protect_min_confidence"), 0.20)
+        source_is_non_sans = (source_class in ("serif", "script")
+                              and source_gate_conf >= protect_min_conf)
+        forbidden = (class_consistent and line_class in ("serif", "script")
+                     and not source_is_non_sans)
+        if source_is_non_sans and consensus_class == "sans" and line_class in ("serif", "script"):
+            # The ink is positively non-sans and the line already matched that class.
+            # A sans consensus must not overwrite it on a fit-score difference that is
+            # noise at these magnitudes (091 L25: own serif 0.161 vs consensus sans
+            # 0.131 — the consensus is *worse* and still won).
+            meta = line.setdefault("meta", {})
+            meta["font_consensus_skipped"] = {
+                "reason": "source-class-protected", "source_class": source_class,
+                "confidence": round(source_gate_conf, 3), "kept": line_family,
+            }
+            evidence.setdefault("class_protected", []).append({
+                "id": line.get("id"), "kept": line_family, "source_class": source_class,
+                "confidence": round(source_gate_conf, 3),
+            })
+            continue
 
         rep_weight = candidate.get("weight") if isinstance(candidate, dict) else None
         line_weight = style.get("fontWeight")
@@ -3687,7 +3912,22 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
             key = _style_cluster_key(item["geo"], item["colour"])
             clusters.setdefault(key, []).append(i)
         min_ink = _num(font_options.get("min_ink_confidence"), 0.25)
-        for idxs in clusters.values():
+        # Spend the bounded match budget on the text that actually SHOWS. Iterating in
+        # document order spends it on whatever OCR happened to read first — on 091 that
+        # is product-label microcopy ("FRODUCTIVITY", 1.2k px²), which exhausted all 16
+        # matches and left the ad's biggest headline ("Foggy and Steady", 76k px² — a
+        # serif) with no render match at all, falling back to a generic Inter that
+        # renders visibly wrong. Rank clusters by their most prominent member's painted
+        # ink area so the headline is matched first and the microcopy takes the leftovers.
+        def _cluster_prominence(idxs: list[int]) -> float:
+            best = 0.0
+            for i in idxs:
+                painted = prepared[i].get("painted") or {}
+                best = max(best, _num(painted.get("w")) * _num(painted.get("h")))
+            return best
+
+        ranked_clusters = sorted(clusters.values(), key=_cluster_prominence, reverse=True)
+        for idxs in ranked_clusters:
             if match_count >= max_match_lines:
                 break
             representative = max(idxs, key=lambda i: prepared[i]["ink_confidence"])
@@ -3731,14 +3971,27 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
             # strike "Foggy", not "and Steady"). Coloured price rules already emit precise
             # vector shapes (native_decoration_shapes) — defer to them, don't double-draw.
             meta = line["meta"]
-            line["style"]["textDecoration"] = "STRIKETHROUGH"
-            span = _strike_span_fraction(
-                meta.get("strikethrough_box"), line.get("painted_box") or line.get("box"))
-            if span:
-                line["style"]["decorationSpan"] = span
-            strike_col = meta.get("strike_ink_color")
-            if strike_col:
-                line["style"]["decorationColor"] = strike_col
+            swipe = _hand_swipe_rule(meta, line.get("painted_box") or line.get("box"))
+            if swipe is not None:
+                # A hand-drawn swipe is not a typographic rule: it runs at its own angle,
+                # is several times thicker than a text-decoration line, and overshoots the
+                # glyph run (091's strike starts LEFT of "Foggy"). Emitting a flat
+                # box-width STRIKETHROUGH throws all three away. Re-emit the measured ink
+                # as a real vector rule (the same shape contract the coloured price rules
+                # already use) so the mark keeps its length, angle and weight — and stays
+                # editable rather than becoming a raster chip.
+                meta.setdefault("native_decoration_shapes", []).append(swipe)
+                meta["strike_render"] = "vector-swipe"
+            else:
+                line["style"]["textDecoration"] = "STRIKETHROUGH"
+                span = _strike_span_fraction(
+                    meta.get("strikethrough_box"), line.get("painted_box") or line.get("box"))
+                if span:
+                    line["style"]["decorationSpan"] = span
+                strike_col = meta.get("strike_ink_color")
+                if strike_col:
+                    line["style"]["decorationColor"] = strike_col
+                meta["strike_render"] = "text-decoration"
         match_evidence = match_evidence_by_index.get(i)
         if match_evidence:
             line.setdefault("meta", {})["font_match"] = copy.deepcopy(match_evidence)
@@ -3848,6 +4101,15 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
                 "from": "text", "to": "masked-pixel-fallback",
                 "reason": reason, "confidence": meta["fidelity_confidence"],
             }
+
+    # Pass 3.7: handwriting gate. Runs AFTER the fidelity gate because it consumes the
+    # same render-back evidence and may override the verdict in one direction only —
+    # confirmed hand-lettering is forced to a pixel-exact chip. It never rescues a line
+    # the fidelity gate already sliced, and never rasterizes without a positive VLM
+    # identification, so typeset copy cannot be demoted by this pass.
+    handwriting_evidence = _apply_handwriting_gate(prepared, image, cfg, run_dir)
+    if handwriting_evidence:
+        result["handwriting"] = handwriting_evidence
 
     # Belt-and-suspenders Codia tracking policy: no stage may emit fitted letterSpacing.
     for line in enriched:

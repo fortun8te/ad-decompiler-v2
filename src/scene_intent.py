@@ -482,3 +482,325 @@ def hydrate(intent: dict, reconstruction: dict) -> list[dict]:
     hydrated.extend(_derived_node(candidate, None, None) for candidate in derived_roots)
     _ids(hydrated, label="hydrated tree")
     return hydrated
+
+
+# ---------------------------------------------------------------------------
+# Text placement: printed IN the photographed scene vs composited ON TOP of it
+#
+# The decision the user cares about: "for image ads with overlaid text, it must
+# accurately detect whether the text is part of the image or separate."  Both
+# error directions are expensive — a baked line recreated as editable text
+# double-strikes the photo (the original ink is still there), and an overlay line
+# left baked is uneditable copy in a batch job.
+#
+# Benchmark-6 shows the two poles, and why geometry alone cannot separate them:
+#   * 021 — handwritten sticky notes physically placed in a photo of a laptop.
+#     The ink is rotated off-axis, camera-blurred and impure.  Must stay BAKED.
+#   * 009 — an X/Twitter post screenshot.  Also "text inside a raster", but the
+#     glyphs were rendered by a compositor: axis-aligned, hairline-sharp, one
+#     pure colour.  Must stay EDITABLE.
+# Containment is true for both, which is exactly why the merge-side
+# `scene_text_inside` threshold leaks (002 promotes 'VANILLE SMAAK'/'1kg' —
+# printed on a pouch — to editable text).  The signals below are the cheap
+# physical ones that DO separate them.  Everything here is advisory evidence: a
+# VLM verdict, when present, is one more voter and never a veto, because a slow
+# local VLM must not be load-bearing for a correctness contract.
+
+_PLACEMENT_BAKED = "baked"
+_PLACEMENT_OVERLAY = "overlay"
+_PLACEMENT_UNKNOWN = "unknown"
+
+PLACEMENT_DEFAULTS = {
+    "enabled": True,
+    # A compositor never rotates body copy by accident; a camera always does.
+    "axis_tolerance_deg": 2.5,
+    "rotation_baked_deg": 4.0,
+    # Digitally rendered ink is near-binary at its edges; photographed ink ramps.
+    "sharpness_overlay_min": 0.42,
+    "sharpness_baked_max": 0.22,
+    # Flat design colour vs photographed ink under scene light.
+    "purity_overlay_min": 0.60,
+    "purity_baked_max": 0.34,
+    "grid_tolerance_px": 6.0,
+    "grid_min_peers": 2,
+    "inside_photo_min": 0.55,
+    "vlm_weight": 1.0,
+    "decisive_margin": 0.75,
+}
+
+_PRODUCT_ROLES = {"product", "package", "packshot", "bottle", "pouch", "can", "tub"}
+_SCENE_ROLES = {"photo", "photo-fragment", "photo_fragment", "person", "scene"}
+
+
+def placement_options(cfg: dict | None = None) -> dict:
+    merged = dict(PLACEMENT_DEFAULTS)
+    for key, value in (((cfg or {}).get("scene_intent") or {}).get("placement") or {}).items():
+        if key in merged and value is not None:
+            merged[key] = value
+    return merged
+
+
+def _quad_rotation_deg(quad) -> float | None:
+    """Signed rotation of a line's baseline against the canvas x-axis."""
+    import math
+
+    try:
+        points = [(float(p[0]), float(p[1])) for p in (quad or [])]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if len(points) < 2:
+        return None
+    best, best_len = None, 0.0
+    for index in range(len(points)):
+        x0, y0 = points[index]
+        x1, y1 = points[(index + 1) % len(points)]
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length > best_len:
+            best, best_len = (x0, y0, x1, y1), length
+    if not best or best_len <= 0:
+        return None
+    x0, y0, x1, y1 = best
+    angle = math.degrees(math.atan2(y1 - y0, x1 - x0))
+    # Fold into (-90, 90]: a run read right-to-left is the same baseline.
+    while angle <= -90.0:
+        angle += 180.0
+    while angle > 90.0:
+        angle -= 180.0
+    return angle
+
+
+def _grid_aligned(box: dict, peers: list[dict], opts: dict) -> bool:
+    """True when this line shares a left edge or a centre with enough peers.
+
+    A designer sets copy on a grid: left edges stack, or the block is centred.
+    Scene text lands wherever the photographed object happened to be.
+    """
+    tol = float(opts["grid_tolerance_px"])
+    x0 = float(box.get("x") or 0.0)
+    cx = x0 + float(box.get("w") or 0.0) / 2.0
+    hits = 0
+    for peer in peers:
+        pbox = peer.get("box") or {}
+        px0 = float(pbox.get("x") or 0.0)
+        pcx = px0 + float(pbox.get("w") or 0.0) / 2.0
+        if abs(px0 - x0) <= tol or abs(pcx - cx) <= tol:
+            hits += 1
+    return hits >= int(opts["grid_min_peers"])
+
+
+def ink_statistics(image, box: dict) -> dict | None:
+    """Edge sharpness and colour purity of the ink inside ``box``.
+
+    ``sharpness`` — the steepest single-pixel luminance step at an ink boundary,
+    normalised by the crop's own range.  Compositor-rendered glyphs step from
+    background to ink across ~1px of anti-aliasing and score high; a
+    photographed glyph ramps over several pixels and scores low.
+
+    ``purity`` — 1 - (chroma spread of the ink pixels).  Flat design colour is
+    one value; photographed ink varies with scene light, paper and JPEG noise.
+
+    Returns None when the crop is unusable so callers degrade to geometry-only
+    rather than guessing.  Never raises.
+    """
+    try:
+        import numpy as np
+    except Exception:
+        return None
+    try:
+        arr = np.asarray(image)
+    except Exception:
+        return None
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        return None
+    height, width = arr.shape[:2]
+    x0 = max(0, int(float(box.get("x") or 0.0)))
+    y0 = max(0, int(float(box.get("y") or 0.0)))
+    x1 = min(width, int(x0 + float(box.get("w") or 0.0)))
+    y1 = min(height, int(y0 + float(box.get("h") or 0.0)))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    crop = arr[y0:y1, x0:x1, :3].astype("float64")
+    lum = crop.mean(axis=2)
+    lo, hi = float(np.percentile(lum, 2)), float(np.percentile(lum, 98))
+    spread = hi - lo
+    if spread < 12.0:
+        return None  # no ink here worth judging
+    # Sharpness = bimodality, NOT contrast.  A compositor's glyph is background
+    # or ink with ~1px of anti-aliasing between, so the histogram is two spikes;
+    # a photographed glyph ramps through every intermediate value.  (Measuring
+    # the steepest step relative to the crop's range instead scores camera-blurred
+    # ink 0.5-0.9 — it reads contrast, which photos have plenty of.)
+    mid = np.logical_and(lum > lo + 0.30 * spread, lum < lo + 0.70 * spread)
+    mid_fraction = float(mid.mean())
+    sharpness = max(0.0, min(1.0, 1.0 - mid_fraction / 0.40))
+    ink = crop[lum <= float(lum.mean())]
+    if ink.size == 0:
+        return None
+    chroma = ink.max(axis=1) - ink.min(axis=1)
+    purity = max(0.0, min(1.0, 1.0 - float(chroma.std()) / 64.0))
+    return {"sharpness": round(sharpness, 4), "purity": round(purity, 4),
+            "ink_spread": round(spread, 2)}
+
+
+def _placement_owner(line: dict, elements: list[dict], opts: dict) -> dict | None:
+    """The smallest raster that meaningfully contains this line."""
+    box = line.get("box") or {}
+    best = None
+    for element in elements:
+        ebox = element.get("box") or {}
+        if not ebox:
+            continue
+        if _inside(box, ebox) < float(opts["inside_photo_min"]):
+            continue
+        area = float(ebox.get("w") or 0.0) * float(ebox.get("h") or 0.0)
+        if area <= 0:
+            continue
+        if best is None or area < best[0]:
+            best = (area, element)
+    return best[1] if best else None
+
+
+def placement_evidence(line: dict, canvas: dict, *, peers: list[dict] | None = None,
+                       owner: dict | None = None, image=None,
+                       cfg: dict | None = None) -> dict:
+    """Collect the cheap physical signals for one OCR line. Never raises."""
+    opts = placement_options(cfg)
+    box = line.get("box") or {}
+    signals: dict = {}
+    rotation = _quad_rotation_deg(line.get("quad"))
+    if rotation is not None:
+        signals["rotation_deg"] = round(rotation, 3)
+        signals["axis_aligned"] = abs(rotation) <= float(opts["axis_tolerance_deg"])
+    if peers:
+        signals["grid_aligned"] = _grid_aligned(box, peers, opts)
+    if owner is not None:
+        signals["owner_id"] = owner.get("id")
+        signals["owner_role"] = str((owner.get("meta") or {}).get("role")
+                                    or owner.get("role") or "")
+        signals["inside_owner"] = round(_inside(box, owner.get("box") or {}), 4)
+    if image is not None:
+        stats = ink_statistics(image, box)
+        if stats:
+            signals.update(stats)
+    return {"line_id": line.get("id"), "signals": signals}
+
+
+def classify_text_placement(line: dict, canvas: dict, *, peers: list[dict] | None = None,
+                            owner: dict | None = None, image=None,
+                            vlm_placement: str | None = None,
+                            cfg: dict | None = None) -> dict:
+    """Decide whether a line is printed in the scene or composited on top.
+
+    Returns ``{"placement", "confidence", "reasons", "signals", "votes"}``.  The
+    verdict is a weighted vote, so no single cheap signal can flip a line alone.
+    With no usable evidence the verdict is ``unknown`` and the caller keeps its
+    existing behaviour — this can be introduced without changing undecided lines.
+    """
+    opts = placement_options(cfg)
+    evidence = placement_evidence(line, canvas, peers=peers, owner=owner,
+                                  image=image, cfg=cfg)
+    signals = evidence["signals"]
+    baked, overlay, reasons = 0.0, 0.0, []
+
+    rotation = signals.get("rotation_deg")
+    if rotation is not None:
+        if abs(rotation) >= float(opts["rotation_baked_deg"]):
+            baked += 1.5
+            reasons.append("rotated %+.1f deg off canvas axis" % rotation)
+        elif signals.get("axis_aligned"):
+            # Almost everything is axis-aligned, including every label printed
+            # square-on to a pouch. Only the NEGATIVE (rotation) is informative.
+            overlay += 0.25
+            reasons.append("axis-aligned")
+
+    # Sharpness and purity are ASYMMETRIC evidence.  Soft, scene-lit ink can only
+    # come from a camera, so it is strong proof of baked.  Crisp, flat ink merely
+    # proves the line was *rendered* — which is equally true of the label printed
+    # onto 002's pouch in a product mockup.  Weighting crisp ink as strong overlay
+    # evidence scored 002 at 6.9%: every gram of nutrition microcopy is crisp.
+    sharpness = signals.get("sharpness")
+    if sharpness is not None:
+        if sharpness <= float(opts["sharpness_baked_max"]):
+            baked += 1.5
+            reasons.append("soft photographed ink edges (%.2f)" % sharpness)
+        elif sharpness >= float(opts["sharpness_overlay_min"]):
+            overlay += 0.5
+            reasons.append("rendered ink edges (%.2f)" % sharpness)
+
+    purity = signals.get("purity")
+    if purity is not None:
+        if purity <= float(opts["purity_baked_max"]):
+            baked += 1.0
+            reasons.append("scene-lit ink colour (%.2f)" % purity)
+        elif purity >= float(opts["purity_overlay_min"]):
+            overlay += 0.25
+            reasons.append("flat ink colour (%.2f)" % purity)
+
+    inside = signals.get("inside_owner")
+    role = str(signals.get("owner_role") or "").lower()
+    inside_raster = (inside is not None and inside >= float(opts["inside_photo_min"])
+                     and role in (_PRODUCT_ROLES | _SCENE_ROLES))
+    # A grid is evidence of a DESIGNER's layout only out on the canvas. Inside a
+    # package the product's own artwork supplies the alignment: 002's nutrition
+    # table shares a left edge down every row, which scored it "aligned to the
+    # copy grid" and tied the vote to unknown for 51 of 72 lines.
+    if signals.get("grid_aligned") and not inside_raster:
+        overlay += 0.5
+        reasons.append("aligned to the copy grid")
+    if inside is not None and inside >= float(opts["inside_photo_min"]):
+        # Containment is a weak PRIOR, never a verdict: 009's editable tweet copy
+        # is fully inside a screenshot raster.  It only tips lines the physical
+        # signals left undecided.
+        if role in _PRODUCT_ROLES:
+            # Ink on a package is printed on the package: the strongest single
+            # signal for a mockup render, where no physical blur exists to find.
+            baked += 2.0
+            reasons.append("inside %s raster (%.2f)" % (role, inside))
+        elif role in _SCENE_ROLES:
+            # Text inside a photographed scene is part of that scene. Note a
+            # screenshot raster carries role 'screenshot', NOT 'photo', so 009's
+            # tweet copy is deliberately untouched by this.
+            baked += 2.0
+            reasons.append("inside %s raster (%.2f)" % (role, inside))
+
+    if vlm_placement:
+        verdict = str(vlm_placement).strip().lower()
+        weight = float(opts["vlm_weight"])
+        if verdict in {"printed", "printed_on_product", "baked"}:
+            baked += weight
+            reasons.append("vlm says %s" % verdict)
+        elif verdict in {"overlay", "overlay_copy", "ui_metadata"}:
+            overlay += weight
+            reasons.append("vlm says %s" % verdict)
+
+    total = baked + overlay
+    if total <= 0:
+        placement, confidence = _PLACEMENT_UNKNOWN, 0.0
+    elif abs(baked - overlay) < float(opts["decisive_margin"]):
+        placement, confidence = _PLACEMENT_UNKNOWN, round(abs(baked - overlay) / total, 4)
+    elif baked > overlay:
+        placement, confidence = _PLACEMENT_BAKED, round(baked / total, 4)
+    else:
+        placement, confidence = _PLACEMENT_OVERLAY, round(overlay / total, 4)
+    return {"placement": placement, "confidence": confidence, "reasons": reasons,
+            "signals": signals, "votes": {"baked": baked, "overlay": overlay}}
+
+
+def classify_lines(lines: list[dict], canvas: dict, *, elements: list[dict] | None = None,
+                   image=None, cfg: dict | None = None) -> dict:
+    """Classify every OCR line.  Returns a report keyed by line id."""
+    opts = placement_options(cfg)
+    if not opts["enabled"] or not lines:
+        return {"enabled": bool(opts["enabled"]), "lines": {}, "counts": {}}
+    out: dict = {}
+    for line in lines:
+        peers = [other for other in lines if other is not line]
+        owner = _placement_owner(line, elements or [], opts)
+        vlm = ((line.get("meta") or {}).get("scene_text") or {}).get("placement")
+        out[str(line.get("id"))] = classify_text_placement(
+            line, canvas, peers=peers, owner=owner, image=image,
+            vlm_placement=vlm, cfg=cfg)
+    counts: dict = {}
+    for verdict in out.values():
+        counts[verdict["placement"]] = counts.get(verdict["placement"], 0) + 1
+    return {"enabled": True, "lines": out, "counts": counts}

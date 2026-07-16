@@ -1435,6 +1435,122 @@ def _write_mask(mask, box: dict, path: str) -> None:
     Image.fromarray(crop.astype(np.uint8) * 255).save(path)
 
 
+# ── star-rating rows → one pixel-exact chip PER STAR ──────────────────────────────────
+# sam3 detects "star rating row" / "trustpilot stars" as ONE element (role "rating"), so
+# the whole ★★★★★ run shipped as a single raster blob: you could not restyle 4-of-5, and
+# a partial/half star was frozen into the strip. The user's ask is explicit — "crop out
+# each star and rasterize it, ensuring the accompanying text remains clear" — so a rating
+# row splits into its connected components, each becoming its own alpha cutout chip.
+# Raster-first, never vectorized: a traced star is exactly the "random lines / overly
+# complex graphics" class (vectorize._DEFAULT_SCORE_MIN carries a "star" tier that this
+# keeps us out of). The adjacent review copy is a separate text candidate and is never
+# touched here.
+#
+# Fails CLOSED: anything that does not look like a clean row of similar, separated glyphs
+# (touching stars, a fused strip, one blob, wild size spread) keeps the single original
+# chip. A wrong split would shatter real artwork into debris — worse than one honest chip.
+_RATING_ROLES = frozenset({"rating", "star_rating", "stars", "star-rating"})
+_RATING_SPLIT_DEFAULTS = {
+    "enabled": True,
+    "min_stars": 2,
+    "max_stars": 10,
+    # A star is roughly as tall as it is wide; components far from the row height are
+    # specks/AA debris or a fused pair, not glyphs.
+    "min_component_frac": 0.25,   # of the row's median component area
+    "max_component_frac": 2.5,
+    "min_component_px": 12,
+    # Every component must sit on the row's baseline band (a rating row is horizontal).
+    "max_center_dev_frac": 0.35,  # of row height
+}
+
+
+def _rating_split_opts(opts) -> dict:
+    merged = dict(_RATING_SPLIT_DEFAULTS)
+    supplied = (opts or {}).get("rating_split")
+    if isinstance(supplied, dict):
+        merged.update(supplied)
+    return merged
+
+
+def _split_rating_clusters(clusters: list, opts) -> list:
+    """Replace each star-rating cluster with one cluster per star glyph (fails closed)."""
+    rcfg = _rating_split_opts(opts)
+    if not bool(rcfg.get("enabled", True)):
+        return clusters
+    np = _np()
+    try:
+        import cv2
+    except Exception:
+        return clusters  # no CC backend: keep the honest single chip
+    out = []
+    for cluster in clusters:
+        winner = cluster.get("winner") or {}
+        role = str(winner.get("role") or "").lower().replace("-", "_")
+        mask = winner.get("mask")
+        if role not in _RATING_ROLES or mask is None:
+            out.append(cluster)
+            continue
+        try:
+            binary = (np.asarray(mask) > 0).astype(np.uint8)
+            count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+        except Exception:
+            out.append(cluster)
+            continue
+        rows = []
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < int(rcfg["min_component_px"]):
+                continue  # AA speck
+            rows.append((label, area))
+        if not (int(rcfg["min_stars"]) <= len(rows) <= int(rcfg["max_stars"])):
+            out.append(cluster)
+            continue
+        areas = np.asarray([area for _, area in rows], dtype=np.float32)
+        median = float(np.median(areas))
+        if median <= 0:
+            out.append(cluster)
+            continue
+        # Uniformity: real stars in one row are near-identical glyphs.
+        if not np.all((areas >= float(rcfg["min_component_frac"]) * median)
+                      & (areas <= float(rcfg["max_component_frac"]) * median)):
+            out.append(cluster)
+            continue
+        # Horizontality: every glyph shares the row's vertical centre.
+        row_box = _mask_box(binary)
+        centres_y = np.asarray([centroids[label][1] for label, _ in rows], dtype=np.float32)
+        row_centre = row_box["y"] + row_box["h"] / 2.0
+        if row_box["h"] <= 0 or np.any(
+            np.abs(centres_y - row_centre) > float(rcfg["max_center_dev_frac"]) * row_box["h"]
+        ):
+            out.append(cluster)
+            continue
+        # Ordered left→right so ids/z read like the row does.
+        ordered = sorted(rows, key=lambda item: float(centroids[item[0]][0]))
+        for index, (label, _area) in enumerate(ordered):
+            star_mask = labels == label
+            star_winner = dict(winner)
+            star_winner["mask"] = star_mask
+            star_winner["box"] = _mask_box(star_mask)
+            star_winner["role"] = "star"
+            star_winner["kind"] = "icon"
+            star_meta = dict(winner.get("meta") or {})
+            star_meta.update({
+                "rating_star_index": index,
+                "rating_star_count": len(ordered),
+                "rating_split_from": str(winner.get("key") or winner.get("id") or "rating"),
+                # Raster-first contract: an exact alpha cutout, never a traced path.
+                "icon_chip": True,
+                "intentional_raster_cluster": True,
+            })
+            star_winner["meta"] = star_meta
+            out.append({
+                "winner": star_winner,
+                "members": [star_winner],
+                "merges": list(cluster.get("merges") or []),
+            })
+    return out
+
+
 def fuse(
     sam3=None,
     residual=None,
@@ -1530,6 +1646,9 @@ def fuse(
     # adjacent same-prompt parts (jar+lid / dual bars) collapse to one owner; product
     # alphas are sealed so Swiss-cheese SAM holes do not survive into peel/cutouts.
     _promote_product_identity(clusters)
+    # A ★★★★★ row is N glyphs, not one object: split before IDs are assigned so each star
+    # earns its own canonical id, box, alpha mask and chip asset.
+    clusters = _split_rating_clusters(clusters, opts)
     clusters, suppressed_bands = _suppress_junk_bands(clusters, opts, canvas)
     clusters = _suppress_product_shadows(clusters, opts)
     clusters = _merge_product_clusters(clusters, opts)

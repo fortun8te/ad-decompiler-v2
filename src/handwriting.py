@@ -1,28 +1,50 @@
 """Hand-drawn / marker / script text detection and the render-back rasterization gate.
 
-The text agent measured that cheap per-line statistics (stroke-width CV, baseline
-wobble) CANNOT by themselves separate genuine handwriting from legitimate display
-faces: 091's hand-marker word "Sharp" (stroke-width CV ~0.48, baseline wobble ~0.18)
-overlaps clean display headlines ("Foggy" 0.60, "ALLE" 0.55).  So a single threshold
-either misses handwriting or rasterizes editable typeset copy — and rasterizing
-editable copy is the *worse* contract violation (HARD-CREATIVES-SPEC §11).
+Cheap per-line statistics (stroke-width CV, baseline wobble) CANNOT by themselves
+separate genuine handwriting from legitimate display faces.  Measured on benchmark-6
+(``stroke_width_cv`` / ``baseline_wobble`` as computed below):
 
-This module therefore uses a two-stage classifier plus a decisive render-back gate:
+===========================  =====  =======  ======  ===================================
+line                          CV     wobble  render  verdict
+                                             -back
+===========================  =====  =======  ======  ===================================
+091 "Sharp"  (hand marker)    0.17    0.18    0.20   MUST rasterize
+091 "Foggy and Steady"        0.26    0.16    --     MUST stay native (serif typeset)
+013 "We NEVER"  (typeset)     0.22    0.20    0.33   MUST stay native
+013 "do this!"  (typeset)     0.19    0.17    0.52   MUST stay native
+025 "Why Everyone's"          0.18    0.23    0.41   MUST stay native
+===========================  =====  =======  ======  ===================================
+
+The hand-marker word has a LOWER stroke-width CV than the typeset lines it must be
+separated from — a felt-tip pen lays a very uniform stroke.  Any stats-only threshold
+that catches "Sharp" therefore also catches most typeset copy, and rasterizing editable
+copy is the *worse* contract violation (HARD-CREATIVES-SPEC §11).  Render-back IoU is
+likewise not self-sufficient: it is dominated by string length and font-match quality
+(013's typeset "+ FREE GIFTS" renders back at 0.09, far *weaker* than "Sharp" at 0.20),
+so it can gate but never decide.
+
+This module therefore uses a two-stage classifier in which the VLM is the decider:
 
 * **Stage A (cheap, high recall)** — ``stage_a_candidate`` flags a line as a *candidate*
   when loose ink/fit signals fire (a strong shape-match font that nonetheless fails to
   render back, a high stroke-width CV, or a positively script/decorative match).  It is
-  tuned for recall: it is fine to over-flag here because Stage B and the gate are
-  precise.
-* **Stage B (precise)** — ``vlm_classify`` crops the line and asks gemma-4-e4b (LM Studio
-  :1234, via ``vlm_client.ask_vlm``) "is this hand-drawn/marker/script or a typeset
-  font?" with a strict-JSON answer.  Cached per crop (``ask_vlm`` caches by image+prompt).
-* **Render-back gate (decisive)** — ``decide`` rasterizes a line as a pixel-exact chip
-  ONLY when the fitted font genuinely cannot reproduce the ink (render-back IoU below
-  ``renderback_weak``) AND either the VLM confirms handwriting OR — when the VLM is
-  unavailable — a *strong* stroke-CV corroboration is present.  When the VLM says
-  "typeset", the line stays native even if the render-back is weak (the VLM protects
-  editable copy).  When uncertain, keep native.
+  tuned for recall: it is fine to over-flag here because Stage B is precise.  It does
+  reject the lines that render back well, which is what keeps 013's "do this!" (0.52)
+  and 025's headlines (0.41+) away from the gate entirely.
+* **Stage B (decisive)** — ``vlm_classify`` crops the line and asks gemma-4-e4b (LM
+  Studio :1234, via ``vlm_client.ask_vlm``) "is this hand-drawn/marker/script or a
+  typeset font?" with a strict-JSON answer.  Cached per crop (``ask_vlm`` caches by
+  image+prompt, so a line-id maps 1:1 onto a cache entry).
+* **Render-back gate (necessary, not sufficient)** — ``decide`` rasterizes only when the
+  fitted font genuinely cannot reproduce the ink (render-back IoU below
+  ``renderback_weak``) AND the VLM confirms handwriting.  A VLM "typeset" verdict keeps
+  the line native even at a weak render-back (the VLM protects editable copy); a
+  confirmed hand-lettered line whose library font *does* reproduce the ink also stays
+  native (a script face that passes render-back is better than a chip: still editable).
+
+When the VLM is unavailable the module keeps every line NATIVE (``allow_stats_only``,
+default off).  Stats-only rasterization is exactly the false-positive machine the table
+above rules out, so the fail-safe direction is "leave it editable".
 
 The rasterization itself reuses the existing low-fidelity plumbing: the caller stamps
 ``meta.low_fidelity`` + ``meta.fallback_src`` (an alpha-matted crop of the ORIGINAL ink,
@@ -51,30 +73,62 @@ _SHAPE_SCORE_MIN = 0.60
 _STROKE_CV_STRONG = 0.42
 # Minimum alphanumeric glyphs: a 1-2 char fragment cannot be classified reliably.
 _MIN_ALNUM = 3
+# Stage-B budget per image. Stage A flags ~1/3 of all lines by design; the VLM call is
+# only worth spending on the lines a wrong font would actually show up on.
+_MAX_VLM_LINES = 8
 
+# Stage B asks for the LETTERFORM STYLE, not for authorship.
+#
+# "Was this drawn by a human hand?" is the wrong question, and measurably so. Asked that
+# way (gemma-4-e4b, benchmark-6 crops) the model answers:
+#     091 "Sharp"            -> handwritten=False, "typeset",     confidence 1.00
+#     091 "Foggy and Steady" -> handwritten=True,  "handwriting", confidence 0.95
+# i.e. exactly inverted on the two lines that matter — and the model is not being stupid:
+#   * "Sharp" IS a marker *typeface* (stroke-width CV 0.17, smooth repeatable letterforms),
+#     so "not drawn by a hand" is literally correct — yet no library font reproduces it
+#     (best fit across the whole corpus: Rock Salt 0.27, Permanent Marker 0.25, all of
+#     which render "SHARP" in caps), which is the fact that actually matters;
+#   * "Foggy and Steady" is serif type with a hand-drawn red swipe struck THROUGH it, so
+#     the crop does contain hand-drawing — the answer describes the crop, not the type.
+#
+# Authorship is therefore not the property we need. What decides whether a line can be
+# reproduced is whether its FACE is an ordinary typeface (our corpus can substitute one)
+# or a marker/script face (it cannot). Ask that, and tell the model to ignore both
+# confounders the failure above exposed: marks struck through the text, and neighbouring
+# glyphs clipped at the crop edge.
 _VLM_PROMPT = (
-    "You are shown a tight crop of ONE line of text from an advertisement. "
-    "Decide whether the lettering was DRAWN BY HAND (handwriting, felt-tip/marker, "
-    "brush, or casual hand-lettering) or set with a TYPESET DIGITAL FONT (any regular "
-    "typeface: sans, serif, display, condensed, or a clean computer script font). "
-    "Uneven strokes, wobbly baselines, and connected marker letters mean hand-drawn. "
-    "Crisp, uniform, repeatable letterforms mean typeset. When unsure, answer typeset. "
-    "Reply with STRICT JSON only."
+    "This crop shows ONE line of lettering from an advertisement. "
+    "Classify the STYLE OF THE LETTERFORMS themselves. "
+    "IGNORE any mark scribbled or struck THROUGH the text: a marker or highlighter line "
+    "drawn over the words is not part of the lettering. "
+    "IGNORE any partial letters clipped at the very top or bottom edge, which belong to a "
+    "neighbouring line. "
+    "Answer with one of:\n"
+    "  'plain_sans'  - an ordinary sans typeface (Helvetica/Arial/Inter/Roboto-like)\n"
+    "  'plain_serif' - an ordinary serif typeface (Times/Georgia/Playfair-like)\n"
+    "  'marker'      - casual brush/marker/felt-tip lettering with rounded or uneven "
+    "strokes (Permanent Marker / Caveat / Comic-like), whether hand-drawn or a "
+    "marker-style font\n"
+    "  'script'      - joined-up cursive or calligraphic lettering\n"
+    "  'other'       - none of the above\n"
+    "When unsure, answer plain_sans. Reply with STRICT JSON only."
 )
 
 _VLM_SCHEMA = {
     "type": "object",
     "properties": {
-        "handwritten": {"type": "boolean"},
         "style": {
             "type": "string",
-            "enum": ["handwriting", "marker", "brush", "script", "typeset"],
+            "enum": ["plain_sans", "plain_serif", "marker", "script", "other"],
         },
         "confidence": {"type": "number"},
     },
-    "required": ["handwritten", "style", "confidence"],
+    "required": ["style", "confidence"],
     "additionalProperties": False,
 }
+
+# Styles with no ordinary-typeface substitute in the corpus.
+_HAND_STYLES = frozenset({"marker", "script"})
 
 
 def _opts(cfg: Optional[dict]) -> dict:
@@ -95,6 +149,21 @@ def _num(value: Any, default: float) -> float:
         return f if math.isfinite(f) else default
     except (TypeError, ValueError):
         return default
+
+
+def _vlm_root_enabled(cfg: Optional[dict]) -> bool:
+    """Whether the pipeline's VLM is switched on at all (``vlm.enabled``).
+
+    Stage B is a network call, so it follows the same convention as every other VLM
+    stage (vlm_scene_text/vlm_font_judge): OFF unless configuration explicitly turns it
+    on.  This keeps ``analyze_text`` a pure local computation for unit tests and for
+    ``--no-vlm`` runs — a stage that silently dials an endpoint from a bare cfg trips
+    vlm_client's circuit breaker and poisons unrelated callers.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    root = cfg.get("vlm")
+    return bool(root.get("enabled")) if isinstance(root, dict) else False
 
 
 def enabled(cfg: Optional[dict]) -> bool:
@@ -302,6 +371,36 @@ def stage_a_candidate(line: dict, stats: Optional[dict], cfg: Optional[dict]) ->
     return bool(flags), signals
 
 
+def select_candidates(candidates: list, cfg: Optional[dict]) -> list:
+    """Bound the Stage-B VLM budget, spending it on the most consequential lines.
+
+    Stage A is deliberately loose and fires on roughly a third of all lines (26/65 on
+    091), so an unbounded Stage B would cost a VLM call per line for no benefit: a
+    mis-set body-copy word is a small blemish, while a mis-set hand-lettered HEADLINE is
+    the failure the user is asking about.  Rank by painted ink area (hand-lettering in
+    ads is prominent by construction) and keep the top ``vlm.max_lines``.
+
+    ``candidates`` is a list of ``(key, painted_box)`` pairs; the returned list is the
+    subset of keys to classify, in priority order.
+    """
+    opts = _opts(cfg)
+    vlm_opts = opts.get("vlm") if isinstance(opts.get("vlm"), dict) else {}
+    raw = vlm_opts.get("max_lines", _MAX_VLM_LINES)
+    max_lines = _MAX_VLM_LINES if raw is None else int(_num(raw, _MAX_VLM_LINES))
+    if max_lines <= 0:
+        return []
+
+    def area(entry) -> float:
+        box = entry[1] or {}
+        try:
+            return float(box.get("w", 0) or 0) * float(box.get("h", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ranked = sorted(candidates or [], key=area, reverse=True)
+    return [key for key, _box in ranked[:max_lines]]
+
+
 # --- Stage B: VLM classification ----------------------------------------------------
 
 def vlm_classify(image_bytes: bytes, cfg: Optional[dict]) -> dict:
@@ -313,8 +412,12 @@ def vlm_classify(image_bytes: bytes, cfg: Optional[dict]) -> dict:
     """
     opts = _opts(cfg)
     vlm_opts = opts.get("vlm") if isinstance(opts.get("vlm"), dict) else {}
-    if not vlm_opts.get("enabled", True):
+    # Default OFF (see _vlm_root_enabled): a VLM call must be opted into by config, and
+    # only when the pipeline's VLM is enabled at the root.
+    if not vlm_opts.get("enabled", False) or not _vlm_root_enabled(cfg):
         return {"available": False, "note": "vlm-disabled"}
+    if image_bytes is None:
+        return {"available": False, "note": "no-image"}
     try:
         from src import vlm_client
     except Exception as exc:  # pragma: no cover - import guard
@@ -341,12 +444,16 @@ def vlm_classify(image_bytes: bytes, cfg: Optional[dict]) -> dict:
         return {"available": False, "note": str(note)}
 
     parsed = _parse_json(raw)
-    if not isinstance(parsed, dict) or "handwritten" not in parsed:
+    if not isinstance(parsed, dict) or "style" not in parsed:
         return {"available": False, "note": "unparseable", "raw": (raw or "")[:200]}
+    style = str(parsed.get("style") or "").strip().lower()
     return {
         "available": True,
-        "handwritten": bool(parsed.get("handwritten")),
-        "style": str(parsed.get("style") or ""),
+        # "handwritten" here means "a face our corpus of ordinary typefaces cannot
+        # substitute" (marker/script) — see _VLM_PROMPT on why authorship is not the
+        # property being asked about.
+        "handwritten": style in _HAND_STYLES,
+        "style": style,
         "confidence": _num(parsed.get("confidence"), 0.0),
         "note": "ok",
     }
@@ -444,20 +551,27 @@ def decide(line: dict, stats: Optional[dict], image_bytes: Optional[bytes],
             result["reason"] = "vlm-typeset"
         return result
 
-    # VLM unavailable: render-back gate alone, but strict — require a strong stroke-CV
-    # corroboration so we never rasterize typeset copy whose weak fit is just OCR noise.
+    # VLM unavailable. Stats cannot decide this: 091's hand-marker "Sharp" scores a
+    # LOWER stroke-width CV (0.17) than the typeset lines it must be separated from
+    # (013 "We NEVER" 0.22, 091 "Foggy and Steady" 0.26), and its render-back (0.20) is
+    # STRONGER than typeset "+ FREE GIFTS" (0.09).  A stats-only rule that fires on
+    # "Sharp" therefore rasterizes editable copy wholesale — the exact HARD constraint
+    # this module exists to protect.  Fail safe: keep the line native and say why.
+    if not bool(opts.get("allow_stats_only", False)):
+        result["reason"] = "vlm-unavailable:keeping-native (stats cannot separate handwriting)"
+        return result
     cv = (stats or {}).get("stroke_width_cv")
     strong_cv = cv is not None and cv >= cv_strong
     if weak_renderback and strong_cv:
         result["handwriting"] = True
         result["rasterize"] = True
-        result["reason"] = "vlm-unavailable:weak-renderback+strong-stroke-cv"
+        result["reason"] = "stats-only:weak-renderback+strong-stroke-cv"
     else:
-        result["reason"] = "vlm-unavailable:insufficient-corroboration"
+        result["reason"] = "stats-only:insufficient-corroboration"
     return result
 
 
 __all__ = [
     "enabled", "stroke_width_cv", "baseline_wobble", "ink_stats",
-    "stage_a_candidate", "vlm_classify", "decide",
+    "stage_a_candidate", "select_candidates", "vlm_classify", "decide",
 ]

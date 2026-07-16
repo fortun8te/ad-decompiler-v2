@@ -400,7 +400,23 @@ def test_002_fixture_recorded_regression_triggers_the_veto():
 def test_002_fixture_full_replay_ships_best_round(tmp_path, monkeypatch):
     """CPU-only replay: seed a run dir with the fixture's REAL shipped qa.json/design.json,
     re-apply the recorded round-1 regression through the loop, and prove the shipped
-    artifacts stay at ssim 0.8174 with the rollback recorded in-round."""
+    artifacts stay at ssim 0.8174.
+
+    The invariant under test is the SHIPPING one: a regressing sam3 round must never leave
+    a worse design on disk. There are now two legitimate ways to honour it, and this test
+    accepts either:
+
+      rolled back — the round ran, regressed, and was undone (the original behaviour; the
+                    mechanism itself is still covered directly by test_harness_loop.py's
+                    test_regressing_round_rolls_back_and_best_design_is_returned)
+      refused     — postfix-benchmark-6: this fixture's only blockers are native_text_ratio
+                    and a worst-SSIM window that is not glyph residue. Neither has a config
+                    lever, so the loop now refuses BEFORE spending the round rather than
+                    regressing and undoing it. That is strictly better: the recorded
+                    round-1 regression this test replays is exactly the harm being avoided
+                    (021 lost 0.40 text_recall to the same sam3-on-a-leverless-blocker
+                    move). Prevention and rollback protect the same invariant.
+    """
     with open(os.path.join(FIXTURE, "qa.json"), encoding="utf-8") as fh:
         best_qa = json.load(fh)
     with open(os.path.join(FIXTURE, "harness_loop.json"), encoding="utf-8") as fh:
@@ -449,5 +465,11 @@ def test_002_fixture_full_replay_ships_best_round(tmp_path, monkeypatch):
     assert shipped["ssim"] == best_qa["ssim"] == BEST_SSIM
     assert shipped["text_recall"] == best_qa["text_recall"]
     assert json.loads((run_dir / "design.json").read_text(encoding="utf-8"))["marker"] == "ROUND0"
-    assert summary["convergence"]["trail"][0]["rolled_back"] is True
+    trail = summary["convergence"]["trail"]
+    if trail:
+        assert trail[0]["rolled_back"] is True          # ran, regressed, undone
+    else:
+        assert summary["stopped"] == "refused_no_lever"  # never regressed at all
+        assert summary["refusal"]["verdict"] == "refuse"
+        assert summary["refusal"]["refused"], "a refusal must name what blocked it"
     assert summary["shipped_round"] == 0
