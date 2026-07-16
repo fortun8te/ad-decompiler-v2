@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import inspect
+import json
 import os
 import time
 from typing import Any, Callable, Optional
@@ -40,7 +41,9 @@ from src.harness import (
     _qa_progress,
     _qa_accepts,
     _repair_id,
+    admission_floors,
     apply_round_budget_clamp,
+    element_growth_refused,
     execute_repairs,
     harness_enabled,
     harness_max_rounds,
@@ -91,7 +94,7 @@ _SCORE_KEYS = (
 )
 
 _DEFAULT_EPSILON = 0.005
-_DEFAULT_PLATEAU_ROUNDS = 2
+_DEFAULT_PLATEAU_ROUNDS = 1  # match config.example: stop after one no-gain round
 
 
 def convergence_epsilon(cfg: Optional[dict] = None, default: float = _DEFAULT_EPSILON) -> float:
@@ -397,6 +400,17 @@ def _fallback_critic(run_dir: str, cfg: dict) -> dict:
     }
 
 
+def _critique_evidence_fingerprint(run_dir: str) -> str:
+    """Fingerprint the crop critic's inputs so an unchanged plan skips a VLM re-call."""
+    parts = []
+    for name in ("normalized.png", "preview.png", "qa.json", "design.json"):
+        parts.append(_artifact_fingerprint(os.path.join(run_dir, name)) or "")
+    qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+    window = qa.get("local_ssim_worst_window") if isinstance(qa, dict) else None
+    parts.append(json.dumps(window, sort_keys=True, default=str) if window else "")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
 def _apply_vlm_critique(run_dir: str, cfg: dict, critic_output: dict) -> dict:
     """Fold the phase2 VLM critique into the critic output as a TIEBREAKER repair source.
 
@@ -408,9 +422,44 @@ def _apply_vlm_critique(run_dir: str, cfg: dict, critic_output: dict) -> dict:
     were prepended as the "primary driver", which let a vague medium VLM opinion outrank
     HIGH measured failures — the 002 no-op.) Failure-proof: any error leaves the critic
     output untouched.
+
+    Workstream E: skip the VLM call when the crop-critic evidence fingerprint is unchanged
+    from the last critique (structure/VLM thrash on identical inputs).
     """
     try:
         if qa_reward.reward_mode(cfg) != "phase2" or not qa_reward.critique_enabled(cfg):
+            return critic_output
+        evidence_fp = _critique_evidence_fingerprint(run_dir)
+        prior = _load_json(os.path.join(run_dir, "qa_critique.json"), {})
+        if (isinstance(prior, dict) and prior.get("evidence_fingerprint") == evidence_fp
+                and isinstance(prior.get("items"), list)):
+            critic_output["vlm_critique"] = {
+                "items": prior.get("items") or [],
+                "count": len(prior.get("items") or []),
+                "model": prior.get("model"),
+                "status": "skipped_unchanged_fingerprint",
+                "inconclusive": False,
+                "evidence_fingerprint": evidence_fp,
+            }
+            # Still fold cached items into repairs (no new VLM spend).
+            items = prior.get("items") or []
+            if not items:
+                return critic_output
+            design = _load_json(os.path.join(run_dir, "design.json"), None)
+            critique_repairs = qa_reward.critique_to_repairs(
+                items, design if isinstance(design, dict) else None)
+            if not critique_repairs:
+                return critic_output
+            merged: list = []
+            seen: set[tuple] = set()
+            for repair in list(critic_output.get("filtered_repairs") or []) + critique_repairs:
+                signature = (repair.get("stage"), repair.get("action"), repair.get("target_id"))
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                merged.append(repair)
+            qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+            critic_output["filtered_repairs"] = rank_repairs(merged, qa)
             return critic_output
         critique = qa_reward.run_critique(run_dir, cfg)
         items = critique.get("items") or []
@@ -459,6 +508,20 @@ def _apply_vlm_critique(run_dir: str, cfg: dict, critic_output: dict) -> dict:
                     "reason": "localized-vlm-issue-must-not-trigger-broad-redetection",
                 })
                 continue
+            # Gap 3 — raise floors: a VLM "missing element" that would grow SAM elements
+            # cannot convert an already-faithful render (002: ssim 0.82 / text_recall 0.96
+            # → a 15-minute element-propose storm for a noise delta). Refuse at fold time so
+            # it never reaches the ranked list. execute_repairs' admission screen enforces
+            # the same floor for metric-sourced element-growth.
+            if (repair.get("stage") == "sam3"
+                    and repair.get("action") == "rerun-detection"
+                    and params.get("source") == "vlm_critique"):
+                faithful = element_growth_refused(
+                    _load_json(os.path.join(run_dir, "qa.json"), {}),
+                    admission_floors(cfg))
+                if faithful:
+                    admission_rejected.append({"repair": repair, "reason": faithful})
+                    continue
             if (repair.get("stage") == "layout"
                     and repair.get("action") == "refit-geometry"
                     and params.get("source") == "vlm_critique"

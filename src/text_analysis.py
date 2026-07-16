@@ -662,6 +662,18 @@ def _shadow_from_mask(crop, mask) -> Optional[dict]:
         predicted = bg_rgb + max(0.0, min(1.0, t)) * axis
         if 0.03 < t < 0.97 and float(np.linalg.norm(bright_rgb - predicted)) < 24.0:
             return None
+    # Symmetric guard for INVERTED copy (white text on a dark card, 009's tweet body):
+    # the "dark satellite" is just the grey anti-aliased collar between the white fill
+    # and the black background, i.e. it sits ON the background<->fill blend line. A real
+    # drop shadow is a distinct ink offset OFF that line. Without this the collar ships a
+    # light-grey DROP_SHADOW that renders as a lighter plate/scrim beside every line.
+    axis_fill = bright_rgb - bg_rgb
+    norm_fill = float(np.dot(axis_fill, axis_fill))
+    if norm_fill > 1.0:
+        t_dark = float(np.dot(dark_rgb - bg_rgb, axis_fill) / norm_fill)
+        predicted_dark = bg_rgb + max(0.0, min(1.0, t_dark)) * axis_fill
+        if 0.03 < t_dark < 0.97 and float(np.linalg.norm(dark_rgb - predicted_dark)) < 24.0:
+            return None
     opacity = max(0.22, min(0.72, (255.0 - float(np.mean(dark_rgb))) / 255.0 * 0.85))
     radius = max(2.0, min(14.0, 0.55 * (abs(dx) + abs(dy)) + 1.5))
     return {
@@ -831,6 +843,123 @@ def _measure_shear_angle(mask) -> Optional[float]:
     return round(angle, 2)
 
 
+_FOREIGN_INK_CHROMA = 45.0
+_FOREIGN_INK_MIN_FRAC = 0.04
+_FOREIGN_INK_MIN_GLYPH_FRAC = 0.30
+_FOREIGN_INK_MAX_BG_CHROMA = 22.0
+_FOREIGN_INK_MIN_RULE_CHROMA = 100.0
+
+
+def _detect_foreign_strike_ink(crop, mask, known_strike: bool = False):
+    """Detect a saturated foreign-hue rule (a hand-drawn strike/underline) laid over
+    achromatic glyph ink and return ``(glyph_mask, info)``.
+
+    A struck word (091) carries a saturated red diagonal over black copy. Both the
+    fill sampler and the density-based weight estimate otherwise ingest that red — the
+    struck words render dark red and their inflated ink density fakes a Bold weight.
+    The strike is *chromatic* (high R/G/B spread) while body/headline glyphs are
+    *achromatic* (near-grey), so classifying ink by chroma cleanly separates them even
+    when the strike is nearly half the ink and heavily anti-aliased (a colour-axis /
+    minority test fails there because the blended median is itself reddish).
+
+    Stripping the chromatic rule fixes fill and weight at the source and lets the
+    strike be re-emitted as a decoration. Genuinely coloured text (a whole red word, a
+    blue headline) has little or no achromatic glyph mass and so fails the glyph-mass
+    gate — it is returned unchanged. A compact chromatic blob (coloured price digits
+    mid-line) fails the elongation / span gates. ``info`` is ``{"color","box","angle"}``
+    (box in crop-local pixel coords), or the mask is returned untouched with
+    ``info=None``.
+    """
+    import numpy as np
+
+    m = np.asarray(mask, dtype=bool)
+    total = int(m.sum())
+    if total < 40 or min(m.shape[:2]) < 4:
+        return mask, None
+    ch, cw = crop.shape[:2]
+    # A genuine strike is drawn over text on a clean (achromatic) plate; the strike ink
+    # is the only chroma present. Text on a COLOURED plate/photo (a product can, an
+    # orange CTA button, a lifestyle photo) also yields chromatic ink pixels — from the
+    # plate bleeding through the glyph mask — but there the BACKGROUND itself is
+    # coloured. Refuse to treat plate-bleed as a strike: require an achromatic border.
+    bw = max(1, min(3, ch // 5, cw // 5))
+    border = np.concatenate([
+        crop[:bw].reshape(-1, 3), crop[-bw:].reshape(-1, 3),
+        crop[:, :bw].reshape(-1, 3), crop[:, -bw:].reshape(-1, 3),
+    ]).astype(np.float32)
+    bg = np.median(border, axis=0)
+    if float(bg.max() - bg.min()) > _FOREIGN_INK_MAX_BG_CHROMA:
+        return mask, None
+    ink = crop[m].astype(np.float32)
+    chroma = ink.max(axis=1) - ink.min(axis=1)
+    foreign_ink = chroma > _FOREIGN_INK_CHROMA
+    foreign_frac = float(foreign_ink.mean())
+    glyph_frac = 1.0 - foreign_frac
+    min_frac = _FOREIGN_INK_MIN_FRAC
+    if foreign_frac < min_frac or glyph_frac < _FOREIGN_INK_MIN_GLYPH_FRAC:
+        return mask, None
+    foreign_pixels = ink[foreign_ink]
+    # The rule ink must be strongly saturated (a red/blue marker), not the mildly
+    # chromatic ink of type photographed on a tinted surface.
+    if float(np.median(foreign_pixels.max(axis=1) - foreign_pixels.min(axis=1))) < _FOREIGN_INK_MIN_RULE_CHROMA:
+        return mask, None
+    # The rule must be one hue, not a scatter of coloured noise: most foreign pixels
+    # should share a dominant colour channel (a red scribble is R-dominant throughout).
+    dominant = np.argmax(foreign_pixels, axis=1)
+    counts = np.bincount(dominant, minlength=3)
+    if float(counts.max()) / max(1.0, float(foreign_pixels.shape[0])) < 0.6:
+        return mask, None
+    ys, xs = np.nonzero(m)
+    foreign_full = np.zeros(m.shape[:2], dtype=bool)
+    foreign_full[ys[foreign_ink], xs[foreign_ink]] = True
+    fy, fx = np.nonzero(foreign_full)
+    if fy.size < 12:
+        return mask, None
+    points = np.column_stack([fx.astype(np.float32), fy.astype(np.float32)])
+    centre = points.mean(axis=0)
+    covariance = np.cov(points - centre, rowvar=False)
+    try:
+        evals, evecs = np.linalg.eigh(covariance)
+    except np.linalg.LinAlgError:
+        return mask, None
+    major = float(max(evals.max(), 1e-3))
+    minor = float(max(evals.min(), 1e-3))
+    # A strike is elongated (thin perpendicular to its run) even when drawn diagonally.
+    elong_gate = 2.5 if known_strike else 4.0
+    if major / minor < elong_gate:
+        return mask, None
+    axis_vec = evecs[:, int(np.argmax(evals))]
+    proj = (points - centre) @ axis_vec
+    span = float(proj.max() - proj.min())
+    span_gate = cw * (0.25 if known_strike else 0.40)
+    if span < max(16.0, span_gate):
+        return mask, None
+    glyph_mask = m & ~foreign_full
+    glyph_count = int(glyph_mask.sum())
+    if glyph_count < max(40, int(total * _FOREIGN_INK_MIN_GLYPH_FRAC)):
+        return mask, None
+    # Classify the rule by its vertical position over the GLYPH ink: a strikethrough
+    # crosses the middle, an underline rides the bottom. This keeps a coloured
+    # underline (002's "€49") from being emitted as a strike.
+    gy, _gx = np.nonzero(glyph_mask)
+    gy0, gy1 = float(gy.min()), float(gy.max())
+    denom = max(1.0, gy1 - gy0)
+    rel_centre = (float(centre[1]) - gy0) / denom
+    if rel_centre <= 0.68:
+        kind = "strikethrough"
+    elif rel_centre >= 0.74:
+        kind = "underline"
+    else:
+        kind = "strikethrough"
+    colour = _rgb_hex(np.median(foreign_pixels, axis=0))
+    box = {
+        "x": int(fx.min()), "y": int(fy.min()),
+        "w": int(fx.max() - fx.min() + 1), "h": int(fy.max() - fy.min() + 1),
+    }
+    angle = math.degrees(math.atan2(float(axis_vec[1]), float(axis_vec[0])))
+    return glyph_mask, {"color": colour, "box": box, "angle": round(angle, 2), "kind": kind}
+
+
 def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, dict, str, float, Any, dict]:
     import numpy as np
 
@@ -852,6 +981,30 @@ def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, d
         paint = {"fill": dict(_FLAT_FILL_BLACK), "stroke": None}
         return painted, baseline, "#000000", fallback_conf, None, paint
 
+    # Strip a foreign-hue strike/underline rule (091's red scribbles) BEFORE any
+    # geometry, colour, or density sampling so the struck word keeps its true black
+    # fill and regular weight, and record it so the decoration is re-emitted. OCR may
+    # already have flagged the line (meta.strikethrough) — trust that as a strong prior.
+    known_strike = bool((line.get("meta") or {}).get("strikethrough"))
+    glyph_mask, strike_info = _detect_foreign_strike_ink(crop, mask, known_strike=known_strike)
+    if strike_info is not None:
+        # Always strip the foreign rule ink so fill colour and ink-density weight are
+        # measured from the glyphs alone (fixes the dark-red fill + fake-Bold weight).
+        mask = glyph_mask
+        meta = line.setdefault("meta", {})
+        if strike_info.get("color") and not meta.get("strike_ink_color"):
+            meta["strike_ink_color"] = strike_info["color"]
+        # Only a mid-height rule authors a STRIKETHROUGH here; a coloured underline is
+        # left to the dedicated price/native-rule paths (avoids 002's "€49" underline
+        # being emitted as a strike).
+        if strike_info.get("kind") == "strikethrough" and not meta.get("strikethrough"):
+            meta["strikethrough"] = True
+            if not meta.get("strikethrough_box"):
+                b = strike_info["box"]
+                meta["strikethrough_box"] = {
+                    "x": x0 + b["x"], "y": y0 + b["y"], "w": b["w"], "h": b["h"],
+                }
+
     ys, xs = np.nonzero(mask)
     lx0, ly0 = int(xs.min()), int(ys.min())
     lx1, ly1 = int(xs.max()) + 1, int(ys.max()) + 1
@@ -866,6 +1019,7 @@ def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, d
         # Anti-aliased edge pixels are blends with the background and vary with
         # the letter shapes in a word.  Sample the most background-distant ink
         # quartile so two lines with the same authored fill get the same colour.
+        # (Foreign strike ink is already removed from ``mask`` above.)
         ch, cw = crop.shape[:2]
         bw = max(1, min(3, ch // 5, cw // 5))
         border = np.concatenate([
@@ -904,6 +1058,32 @@ def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, d
     return painted, baseline, colour, confidence, tight_mask, paint
 
 
+def _strike_span_fraction(strike_box, painted_box) -> Optional[list]:
+    """[start, end] x-fraction of a strike within its text box, or None.
+
+    OCR reports the strike's bounding box (``strikethrough_box``) in image
+    coordinates; expressing it as a fraction of the painted text box lets the
+    renderer strike only the struck words regardless of later re-fit/reposition.
+    A near-full-width strike returns None so the whole line is struck cleanly.
+    """
+    if not isinstance(strike_box, dict) or not isinstance(painted_box, dict):
+        return None
+    try:
+        sx, sw = float(strike_box["x"]), float(strike_box["w"])
+        px, pw = float(painted_box["x"]), float(painted_box["w"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    if pw <= 0 or sw <= 0:
+        return None
+    f0 = max(0.0, min(1.0, (sx - px) / pw))
+    f1 = max(0.0, min(1.0, (sx + sw - px) / pw))
+    if f1 <= f0:
+        return None
+    if f0 <= 0.04 and f1 >= 0.96:
+        return None
+    return [round(f0, 4), round(f1, 4)]
+
+
 def _native_text_decoration(mask, text: str) -> tuple[Optional[str], Optional[dict]]:
     """Recognize only an unmistakable continuous underline/strike rule.
 
@@ -912,6 +1092,10 @@ def _native_text_decoration(mask, text: str) -> tuple[Optional[str], Optional[di
     Anything ambiguous remains part of the exact text fallback/plate pixels.
     """
     if mask is None or not str(text or "").strip() or "_" in str(text):
+        return None, None
+    # A stray 1-2 char OCR fragment ("I &") whose glyph bars span the box must never
+    # become a strikethrough; a real struck token has at least two letters/digits.
+    if sum(1 for ch in str(text) if ch.isalnum()) < 2:
         return None, None
     try:
         import numpy as np
@@ -2517,6 +2701,85 @@ def _unify_block_families(enriched: list[dict], prepared: list[dict],
     return changes
 
 
+def _unify_repeated_row_labels(enriched: list[dict]) -> list[dict]:
+    """Snap repeated same-pattern labels sharing a horizontal row to one style.
+
+    Chart axis / category labels (107: WEEK 1 … WEEK 5) are short, identically
+    formatted lines on a common baseline. Independent per-line font matching lets one
+    of them (WEEK 3) fall into a different style cluster and render a visibly different
+    font or size — the row then looks jittery. Group by text pattern (digits and
+    letters normalised) plus baseline row, and force every member of a group of 3+ to
+    the group's majority family / median size / majority weight so the row reads as one
+    system. Deliberately narrow: only short labels, only rows of 3+ identical patterns.
+    """
+    from collections import Counter
+
+    def _pattern(text: str) -> str:
+        collapsed = re.sub(r"\s+", " ", str(text or "").strip())
+        return re.sub(r"\d+", "#", collapsed)
+
+    by_pattern: dict[str, list[tuple]] = {}
+    for line in enriched:
+        style = line.get("style") or {}
+        text = str(line.get("text") or "").strip()
+        if not text or len(text) > 24 or not style.get("fontFamily"):
+            continue
+        pattern = _pattern(text)
+        if len(pattern) < 2 or not any(ch.isalnum() for ch in pattern):
+            continue
+        base = line.get("baseline") or {}
+        by = _num(base.get("y0"), _num((line.get("box") or {}).get("y"), 0.0))
+        by_pattern.setdefault(pattern, []).append((by, line))
+
+    # Cluster each pattern's lines into horizontal rows by baseline proximity (a shared
+    # axis row has near-identical baselines). The tolerance uses the row's own median
+    # size, NOT each line's own (mis)measured size, so a jittery size can't split the row.
+    groups: list[tuple[str, list[dict]]] = []
+    for pattern, items in by_pattern.items():
+        items.sort(key=lambda it: it[0])
+        rows: list[list[tuple]] = []
+        for by, line in items:
+            if rows and abs(by - rows[-1][0][0]) <= 28.0:
+                rows[-1].append((by, line))
+            else:
+                rows.append([(by, line)])
+        for row in rows:
+            groups.append((pattern, [ln for _by, ln in row]))
+
+    changes: list[dict] = []
+    for pattern, members in groups:
+        if len(members) < 3:
+            continue
+        fam = Counter(str((m.get("style") or {}).get("fontFamily")) for m in members).most_common(1)[0][0]
+        weight = Counter(int(_num((m.get("style") or {}).get("fontWeight"), 400)) for m in members).most_common(1)[0][0]
+        sizes = sorted(_num((m.get("style") or {}).get("fontSize"), 16.0) for m in members)
+        med_size = sizes[len(sizes) // 2]
+        rep = next((m for m in members if str((m.get("style") or {}).get("fontFamily")) == fam), members[0])
+        rep_candidates = (rep.get("style") or {}).get("fontCandidates")
+        for m in members:
+            style = m.get("style") or {}
+            changed = []
+            if str(style.get("fontFamily")) != fam:
+                style["fontFamily"] = fam
+                if rep_candidates:
+                    style["fontCandidates"] = copy.deepcopy(rep_candidates)
+                changed.append("family")
+            if abs(_num(style.get("fontSize"), 16.0) - med_size) > 0.5:
+                style["fontSize"] = round(med_size, 2)
+                changed.append("size")
+            if int(_num(style.get("fontWeight"), 400)) != weight:
+                style["fontWeight"] = weight
+                changed.append("weight")
+            style["letterSpacing"] = 0.0
+            if changed:
+                m.setdefault("meta", {})["row_label_unified"] = {
+                    "pattern": pattern, "family": fam, "size": round(med_size, 2),
+                    "changed": changed,
+                }
+                changes.append({"text": m.get("text"), "pattern": pattern, "changed": changed})
+    return changes
+
+
 def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
                           font_options: dict) -> Optional[dict]:
     """Document-level font family consensus across all matched lines.
@@ -3458,6 +3721,24 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
         if decoration:
             line["style"]["textDecoration"] = decoration
             line.setdefault("meta", {})["text_decoration_evidence"] = decoration_evidence
+        elif (line.get("meta") or {}).get("strikethrough") and not (line.get("meta") or {}).get("native_decoration_shapes"):
+            # OCR's deterministic strike detector (_detect_strike) and the chroma-based
+            # foreign-ink detector both flag hand-drawn scribble strikes that
+            # _native_text_decoration (horizontal-rule only) cannot see (091: red
+            # diagonal scribbles over "Foggy", "NOT BACKED"...). Author the decoration
+            # here so preview and the exported Figma node both draw a strike; carry the
+            # sampled strike colour and the struck x-span so the render matches (partial:
+            # strike "Foggy", not "and Steady"). Coloured price rules already emit precise
+            # vector shapes (native_decoration_shapes) — defer to them, don't double-draw.
+            meta = line["meta"]
+            line["style"]["textDecoration"] = "STRIKETHROUGH"
+            span = _strike_span_fraction(
+                meta.get("strikethrough_box"), line.get("painted_box") or line.get("box"))
+            if span:
+                line["style"]["decorationSpan"] = span
+            strike_col = meta.get("strike_ink_color")
+            if strike_col:
+                line["style"]["decorationColor"] = strike_col
         match_evidence = match_evidence_by_index.get(i)
         if match_evidence:
             line.setdefault("meta", {})["font_match"] = copy.deepcopy(match_evidence)
@@ -3583,6 +3864,9 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
     block_unify = _unify_block_families(enriched, prepared, render_fit_options, font_options)
     if block_unify:
         result["block_font_unification"] = block_unify
+    row_label_unify = _unify_repeated_row_labels(enriched)
+    if row_label_unify:
+        result["row_label_unification"] = row_label_unify
     sections = _make_sections(blocks, canvas)
     styles = _assign_style_ids(enriched, blocks)
 

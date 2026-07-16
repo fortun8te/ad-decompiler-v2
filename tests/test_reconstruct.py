@@ -1432,3 +1432,206 @@ def test_removal_cap_becomes_plate_passthrough(tmp_path):
     plate = np.asarray(Image.open(run_dir / "background_clean.png").convert("RGB"))
     assert (plate == source).all()
     assert result["stats"]["plate_integrity"]["ok"] is True
+
+
+# ── Mandate 1: slice/z interaction — a hoisted slice must not bury live overlays ──────
+
+
+def test_collect_live_overlays_and_safe_hoist_z_keep_slice_below_overlay():
+    """A raster slice hoisted to root must never be lifted above a live native overlay it
+    intersects (013 snacks chip went blank when the sliced card jumped to z=60)."""
+    from src.reconstruct import _collect_live_overlays, _safe_hoist_z
+
+    tree = [
+        {"id": "grp", "target": "group", "z_index": 40,
+         "box": {"x": 100, "y": 100, "w": 200, "h": 120}, "children": [
+            {"id": "card", "target": "shape", "z_index": 41,
+             "box": {"x": 0, "y": 0, "w": 200, "h": 120}},
+            {"id": "chip", "target": "text", "text": "SNACKS", "z_index": 55,
+             "box": {"x": 20, "y": 20, "w": 80, "h": 30}},
+         ]},
+        {"id": "bg", "target": "image", "z_index": -1,
+         "box": {"x": 0, "y": 0, "w": 400, "h": 400}, "meta": {"is_background": True}},
+    ]
+    overlays = _collect_live_overlays(tree, {"card"})
+    ids = {o[2] for o in overlays}
+    assert "chip" in ids           # live text overlay is collected …
+    assert "card" not in ids       # … the region being sliced is excluded …
+    assert "bg" not in ids         # … and backgrounds never occlude.
+    chip = next(o for o in overlays if o[2] == "chip")
+    assert chip[0]["x"] == 120 and chip[0]["y"] == 120   # parent offset folded in
+
+    card_abs = {"x": 100, "y": 100, "w": 200, "h": 120}
+    # Preserve a legitimately lower z rather than vaulting to 60.
+    assert _safe_hoist_z({"z_index": 41}, card_abs, overlays) == 41
+    # A placeholder-z (0) slice is pinned just below the chip, not to blind foreground 60.
+    z0 = _safe_hoist_z({"z_index": 0}, card_abs, overlays)
+    assert z0 == 54.0 and z0 < 55
+    # No live overlay under it → keep the historical foreground default.
+    assert _safe_hoist_z({"z_index": 0}, {"x": 1000, "y": 1000, "w": 8, "h": 8},
+                         overlays) == 60.0
+
+
+# ── Mandate 1: a failed chrome shell with no ledger alpha must box-slice, not ghost ──
+
+
+def _chrome_fallback_run(tmp_path, monkeypatch, inpaint_box):
+    """Minimal fallback harness: one failing chrome shell, no removal-ownership ledger."""
+    from PIL import Image
+    from src import pixel_diff, render_preview
+
+    run_dir = tmp_path
+    canvas = {"w": 200, "h": 200}
+    src = Image.new("RGB", (200, 200), (240, 240, 240))
+    for yy in range(40, 100):
+        for xx in range(40, 100):
+            src.putpixel((xx, yy), (200, 40, 40))
+    source = run_dir / "source.png"
+    src.save(source)
+    Image.new("RGB", (200, 200), (240, 240, 240)).save(run_dir / "preview.png")
+
+    removal = Image.new("L", (200, 200), 0)
+    if inpaint_box:
+        for yy in range(inpaint_box[1], inpaint_box[3]):
+            for xx in range(inpaint_box[0], inpaint_box[2]):
+                removal.putpixel((xx, yy), 255)
+    removal.save(run_dir / "removal_mask.png")
+
+    (run_dir / "design.json").write_text(json.dumps({
+        "id": "d", "canvas": canvas, "layers": [
+            {"id": "c_E013__shell", "target": "image", "z_index": 59,
+             "box": {"x": 40, "y": 40, "w": 60, "h": 60},
+             "meta": {"role": "badge"}},
+        ]}), encoding="utf-8")
+    (run_dir / "reconstruction.json").write_text(json.dumps({
+        "candidates": [{"id": "c_E013__shell", "target": "image",
+                        "box": {"x": 40, "y": 40, "w": 60, "h": 60}}],
+        "removal_mask": "removal_mask.png",
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(pixel_diff, "score_layer_regions", lambda *a, **k: [
+        {"id": "c_E013__shell", "type": "image", "region_ssim": 0.30,
+         "region_color": 0.40, "region_px": 3600}])
+    monkeypatch.setattr(render_preview, "render", lambda *a, **k: {"errors": []})
+    return source
+
+
+def test_failed_chrome_shell_box_slices_instead_of_ghost_drop(tmp_path, monkeypatch):
+    """When a badge/seal shell fails its gate and its region WAS inpainted, dropping it to
+    plate-passthrough ships a ghost (016 white patch). It must box-slice the ORIGINAL."""
+    source = _chrome_fallback_run(tmp_path, monkeypatch, (40, 40, 100, 100))
+    report = reconstruct.apply_raster_slice_fallback(
+        str(tmp_path), str(source), {"fallback": {"region_ssim_min": 0.58}})
+
+    assert [s["id"] for s in report["slices"]] == ["c_E013__shell"]
+    assert "box-slice" in report["slices"][0]["note"]
+    assert report["dropped"] == []
+    design = json.loads((tmp_path / "design.json").read_text(encoding="utf-8"))
+    node = design["layers"][0]
+    assert node["target"] == "image" and node["src"]           # pixel-exact source raster
+    assert node["meta"]["fallback"] == "raster-slice"
+
+
+def test_uninpainted_chrome_still_drops_to_plate_passthrough(tmp_path, monkeypatch):
+    """Regression guard: when the plate GENUINELY holds the original (region not inpainted),
+    the drop-to-plate-passthrough fallback is still the pixel-exact answer — do not slice."""
+    source = _chrome_fallback_run(tmp_path, monkeypatch, None)
+    report = reconstruct.apply_raster_slice_fallback(
+        str(tmp_path), str(source), {"fallback": {"region_ssim_min": 0.58}})
+
+    assert report["slices"] == []
+    assert [d["id"] for d in report["dropped"]] == ["c_E013__shell"]
+    assert report["dropped"][0]["note"] == "plate-already-holds-source-pixels"
+
+
+# ── Mandate 2: foreign strike decoration ink beyond the glyph box (091) ───────────────
+
+
+_DPLATE = (238, 232, 220)
+
+
+def _strike_source(path):
+    from PIL import Image, ImageDraw
+    image = Image.new("RGB", (200, 140), _DPLATE)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((45, 48, 135, 65), fill=(20, 20, 20))       # glyph ink bar
+    draw.rectangle((28, 52, 150, 60), fill=(205, 35, 35))      # red strike, overhangs left
+    image.save(path)
+    return image
+
+
+def _strike_candidate():
+    return {
+        "id": "c_B0", "target": "text", "text": "Foggy", "z": 4,
+        "box": {"x": 45, "y": 48, "w": 91, "h": 18},
+        "visible_box": {"x": 45, "y": 48, "w": 91, "h": 18},
+        "style": {"fontSize": 16, "fontFamily": "Arial", "color": "#141414"},
+        "meta": {"source": "ocr", "role": "headline", "line_ids": ["L0"]},
+    }
+
+
+def _strike_ocr():
+    return {"lines": [{
+        "id": "L0", "box": {"x": 45, "y": 48, "w": 91, "h": 18},
+        "meta": {"strikethrough": True,
+                 "strikethrough_box": {"x": 28, "y": 50, "w": 124, "h": 12}},
+    }]}
+
+
+def _fake_glyph_only_inpaint(monkeypatch):
+    from PIL import Image
+
+    def fake_once(image_path, mask, output_path, cfg=None):
+        img = np.asarray(Image.open(image_path).convert("RGB")).copy()
+        m = np.asarray(reconstruct.inpaint.solidify_mask(mask)) > 0
+        img[m] = _DPLATE                      # cleans only inside the glyph removal mask
+        Image.fromarray(img).save(output_path)
+        return {"ok": True, "path": output_path, "backend": "fake",
+                "backend_class": "active"}
+
+    monkeypatch.setattr(reconstruct.inpaint, "inpaint_once", fake_once)
+
+
+def test_strike_scribble_overhang_is_cleaned_as_residue(tmp_path, monkeypatch):
+    """The red strike swipe overhangs the glyph box and is a different colour, so the
+    per-line glyph residue check misses it. It must be tracked as decoration residue and
+    solid-filled off the plate (091 'Foggy' squiggle fragment)."""
+    from PIL import Image
+
+    source = tmp_path / "source.png"
+    _strike_source(source)
+    _fake_glyph_only_inpaint(monkeypatch)
+
+    result = reconstruct.reconstruct(
+        str(source), _strike_ocr(), [_strike_candidate()], str(tmp_path),
+        {"inpaint": {"mode": "opencv"},
+         "reconstruct": {"text_residual": {"reinpaint": False}}},
+    )
+    residual = result["stats"]["text_residual"]
+    strike = [f for f in residual["flagged"] if str(f["id"]).endswith("__strike")]
+    assert strike, "strike overhang must be flagged as decoration residue"
+    assert strike[0]["resolved"] is True
+    assert strike[0].get("resolved_by") == "solid-plate-fill"
+    plate = np.asarray(Image.open(tmp_path / "background_clean.png").convert("RGB"))
+    overhang = plate[53:59, 30:43].astype(int)
+    assert np.abs(overhang - np.array(_DPLATE)).mean() < 25
+
+
+def test_unresolved_strike_residue_is_surfaced_not_silently_shipped(tmp_path, monkeypatch):
+    """If the strike ink cannot be cleaned (no reinpaint, no solid-fill), it must be an
+    explicit hard-fail on the report — never a silent ship (Mandate 2)."""
+    source = tmp_path / "source.png"
+    _strike_source(source)
+    _fake_glyph_only_inpaint(monkeypatch)
+
+    result = reconstruct.reconstruct(
+        str(source), _strike_ocr(), [_strike_candidate()], str(tmp_path),
+        {"inpaint": {"mode": "opencv"},
+         "reconstruct": {"text_residual": {
+             "reinpaint": False, "solid_fill_residue": False}}},
+    )
+    residual = result["stats"]["text_residual"]
+    assert residual.get("hard_fail") is True
+    assert any(i.endswith("__strike") for i in residual.get("hard_fail_ids") or [])
+    strike = [f for f in residual["flagged"] if str(f["id"]).endswith("__strike")]
+    assert strike and strike[0].get("hard_fail") is True and strike[0]["resolved"] is False

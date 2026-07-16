@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.1.0","build":77,"commit":"7dc8e70","dirty":true,"built_at":"2026-07-16T19:37:33Z","label":"v2.1.0+b77.7dc8e70-dirty","source":"git"};
+const PLUGIN_BUILD = {"version":"2.1.0","build":78,"commit":"f797249","dirty":true,"built_at":"2026-07-16T19:51:23Z","label":"v2.1.0+b78.f797249-dirty","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,

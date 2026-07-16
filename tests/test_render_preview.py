@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -218,3 +220,103 @@ def test_preview_text_clip_allows_top_overflow_inside_group(tmp_path):
     # Ascenders near the group top must still appear in the upper half of the host
     # (not sheared away by clipsContent). Group y=20; ink by ~y=32 is on-frame.
     assert ink_rows.min() <= 32
+
+
+def test_mixed_italic_runs_render_upright_run_with_its_own_font():
+    # 013 headline: run 1 "We NEVER" italic, run 2 "do this!" upright. Same weight
+    # and colour, so the weight/colour styled-trigger stays quiet; the italic-aware
+    # trigger must still activate the per-run path so the upright run keeps its own
+    # upright font instead of inheriting the node's italic slant. Differential proof:
+    # rendering run 2 as upright must differ from rendering it italic.
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    italic_path = os.path.join(windir, "Fonts", "arialbi.ttf")   # bold italic
+    upright_path = os.path.join(windir, "Fonts", "arialbd.ttf")  # bold upright
+    if not (os.path.exists(italic_path) and os.path.exists(upright_path)):
+        import pytest
+        pytest.skip("system Arial bold/italic faces unavailable")
+
+    def build(run2_upright):
+        r2_path = upright_path if run2_upright else italic_path
+        r2_style = {"fontCandidates": [{"family": "Poppins", "weight": 700, "path": r2_path}]}
+        r2_style["fontStyle"] = "Bold" if run2_upright else "Bold Italic"
+        if not run2_upright:
+            r2_style["italicShearDeg"] = -12
+        return {
+            "type": "text", "text": "NNNN\nHHHH", "box": {"x": 0, "y": 0, "w": 400, "h": 200},
+            # Non-"Arial" family so _text_font's Arial hardcode does not override the
+            # per-run candidate paths (the real 013 node is Poppins).
+            "style": {"fontFamily": "Poppins", "fontSize": 90, "fontWeight": 700,
+                      "fontStyle": "Bold Italic", "color": "#000000", "align": "left",
+                      "fontCandidates": [{"family": "Poppins", "weight": 700, "path": italic_path}]},
+            "text_runs": [
+                {"start": 0, "end": 4, "style": {"fontStyle": "Bold Italic", "italicShearDeg": -12,
+                 "fontCandidates": [{"family": "Poppins", "weight": 700, "path": italic_path}]}},
+                {"start": 5, "end": 9, "style": r2_style},
+            ],
+        }
+
+    mixed, _ = render_preview._text_tile(build(run2_upright=True), (400, 200))
+    all_italic, _ = render_preview._text_tile(build(run2_upright=False), (400, 200))
+
+    def bottom_line_ink(tile):
+        ink = np.asarray(tile)[:, :, 3] > 128
+        ys = np.where(np.any(ink, axis=1))[0]
+        mid = (int(ys.min()) + int(ys.max())) // 2
+        return ink[mid:]
+
+    a, b = bottom_line_ink(mixed), bottom_line_ink(all_italic)
+    h = min(a.shape[0], b.shape[0])
+    w = min(a.shape[1], b.shape[1])
+    diff = int(np.logical_xor(a[:h, :w], b[:h, :w]).sum())
+    # The upright run and the italic run of the same letters produce visibly different
+    # ink; a nonzero (substantial) XOR proves run 2 honoured its own upright font.
+    assert diff > 200, f"upright run should differ from italic render (xor={diff})"
+
+
+def test_same_colour_stroke_does_not_fatten_glyphs_into_a_blob():
+    # 009 "UPFRONT": a white #fefefe stroke sampled from the adjacent blue badge over
+    # white glyphs only bloats the ink until letters merge. A same-colour stroke must
+    # be dropped so glyph mass matches the plain fitted weight.
+    base = {"type": "text", "text": "UPFRONT", "box": {"x": 0, "y": 0, "w": 220, "h": 50},
+            "style": {"fontFamily": "Arial", "fontSize": 34, "fontWeight": 700, "color": "#ffffff",
+                      "align": "left"}}
+    no_stroke, _ = render_preview._text_tile(base, (220, 50))
+    with_stroke = dict(base)
+    with_stroke["stroke"] = {"kind": "flat", "color": "#fefefe", "width": 3.0, "strokeAlign": "OUTSIDE"}
+    stroked, _ = render_preview._text_tile(with_stroke, (220, 50))
+    ink_plain = int((np.asarray(no_stroke)[:, :, 3] > 128).sum())
+    ink_stroked = int((np.asarray(stroked)[:, :, 3] > 128).sum())
+    # The near-white stroke is suppressed, so ink mass stays within a few % of plain.
+    assert abs(ink_stroked - ink_plain) <= ink_plain * 0.08, (ink_plain, ink_stroked)
+
+
+def test_contrasting_stroke_is_still_painted():
+    # Guard: only SAME-colour strokes are dropped. A black outline on white text must
+    # still render (its dark ink appears where the plain fill has none).
+    layer = {"type": "text", "text": "HI", "box": {"x": 0, "y": 0, "w": 120, "h": 60},
+             "style": {"fontFamily": "Arial", "fontSize": 40, "fontWeight": 700, "color": "#ffffff",
+                       "align": "left"},
+             "stroke": {"kind": "flat", "color": "#000000", "width": 3.0, "strokeAlign": "OUTSIDE"}}
+    tile, _ = render_preview._text_tile(layer, (120, 60))
+    arr = np.asarray(tile)
+    dark = (arr[:, :, 3] > 128) & (arr[:, :, 0] < 60) & (arr[:, :, 1] < 60) & (arr[:, :, 2] < 60)
+    assert int(dark.sum()) > 30, "contrasting outline should paint dark ink"
+
+
+def test_strikethrough_draws_partial_coloured_strike():
+    # 091: a hand-drawn strike is authored as textDecoration STRIKETHROUGH with a
+    # sampled decorationColor and a decorationSpan covering only the struck words.
+    layer = {"type": "text", "text": "Foggy and Steady", "box": {"x": 0, "y": 0, "w": 780, "h": 135},
+             "style": {"fontFamily": "Arial", "fontSize": 90, "fontWeight": 700, "color": "#000000",
+                       "align": "left", "textDecoration": "STRIKETHROUGH",
+                       "decorationColor": "#d23b2f", "decorationSpan": [0.0, 0.42]}}
+    tile, _ = render_preview._text_tile(layer, (780, 135))
+    arr = np.asarray(tile)
+    red = (arr[:, :, 3] > 100) & (arr[:, :, 0] > 150) & (arr[:, :, 1] < 100) & (arr[:, :, 2] < 100)
+    xs = np.nonzero(red)[1]
+    assert xs.size > 100, "coloured strike should be drawn"
+    # Strike stays within the struck span (well left of the full width) — "and Steady"
+    # is not struck.
+    assert xs.max() < tile.width * 0.5, (int(xs.max()), tile.width)
+    black = (arr[:, :, 3] > 100) & (arr[:, :, 0] < 60) & (arr[:, :, 1] < 60) & (arr[:, :, 2] < 60)
+    assert int(black.sum()) > 500, "glyph ink still black under the strike"

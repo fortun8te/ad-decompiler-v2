@@ -1599,3 +1599,49 @@ def test_estimate_weight_emits_extra_bold_for_dense_ink():
     solid = np.ones((40, 120), dtype=bool)
     assert text_analysis._estimate_weight(solid, {"h": 40, "w": 120}) == 800
     assert "Extra" in text_analysis._style_name(800)
+
+
+def test_strike_span_fraction_covers_struck_portion_only():
+    # Strike box over the left ~40% of the painted box -> partial span, not full-line.
+    span = text_analysis._strike_span_fraction(
+        {"x": 10, "y": 26, "w": 130, "h": 12}, {"x": 10, "y": 15, "w": 280, "h": 40})
+    assert span is not None
+    assert span[0] == 0.0 and 0.4 < span[1] < 0.5
+
+
+def test_strike_span_fraction_none_for_full_width_strike():
+    # A near-full-width strike needs no partial span (whole line struck cleanly).
+    assert text_analysis._strike_span_fraction(
+        {"x": 10, "y": 26, "w": 278, "h": 12}, {"x": 10, "y": 15, "w": 280, "h": 40}) is None
+
+
+def test_strikethrough_meta_authors_decoration_and_excludes_strike_ink(tmp_path):
+    # 091: OCR flags a hand-drawn red scribble via meta.strikethrough. analyze_text must
+    # (a) author STRIKETHROUGH, (b) keep the fill BLACK despite the red ink over glyphs,
+    # (c) capture the red as decorationColor, (d) emit a partial decorationSpan.
+    img = np.full((60, 300, 3), 255, np.uint8)
+    img[15:45, 10:140] = (20, 20, 20)     # black glyphs on the left ("Foggy")
+    img[46:55, 150:290] = (20, 20, 20)    # black glyphs on the right ("and Steady")
+    for i in range(10, 140):
+        y = 28 + int((i - 10) * 0.05)
+        img[y:y + 4, i] = (210, 45, 40)   # red diagonal strike over the left glyphs only
+    path = tmp_path / "strike.png"
+    Image.fromarray(img).save(path)
+    ocr_res = {"lines": [{
+        "id": "L0", "text": "Foggy and Steady", "conf": 0.9,
+        "box": {"x": 10, "y": 15, "w": 280, "h": 40},
+        "meta": {"strikethrough": True, "strikethrough_box": {"x": 10, "y": 26, "w": 130, "h": 12}},
+    }]}
+    out = text_analysis.analyze_text(str(path), ocr_res, {})
+    style = out["lines"][0]["style"]
+    assert style.get("textDecoration") == "STRIKETHROUGH"
+    # Fill stays black (foreign red ink excluded from the colour sample).
+    fill_hex = style.get("color") or (style.get("fill") or {}).get("color") or ""
+    r, g, b = int(fill_hex[1:3], 16), int(fill_hex[3:5], 16), int(fill_hex[5:7], 16)
+    assert r < 80 and g < 80 and b < 80, f"fill should stay dark, got {fill_hex}"
+    # decorationColor is the red strike ink.
+    dc = style.get("decorationColor") or ""
+    assert dc and int(dc[1:3], 16) > 150 and int(dc[3:5], 16) < 100, f"strike colour should be red, got {dc}"
+    # Partial span covers the struck left portion, not the whole line.
+    span = style.get("decorationSpan")
+    assert span is not None and span[0] == 0.0 and span[1] < 0.75

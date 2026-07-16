@@ -654,6 +654,36 @@ def test_fail_closed_to_flat_when_generative_smears():
     assert any(b.get("backend") == "solid" for b in card.meta["fill_backends"])
 
 
+def test_icon_fully_inside_product_never_punches_the_packaging():
+    """Task §4 defense: a generic icon occluder sitting entirely within a product is
+    printed label ink — it must never punch a hole in the packaging raster, even if
+    fusion failed to absorb it. A real product cutout in front still peels."""
+    flat = np.full((H, W, 3), BG, np.uint8)
+    product = _rect_mask((40, 40, 280, 300))
+    ink = _rect_mask((90, 90, 200, 180))       # fully inside the product
+    flat[product] = GREEN
+    flat[ink] = RED
+    elements = [SceneElement(id="pack", mask=product, z=0.0, kind="product"),
+                SceneElement(id="glyph", mask=ink, z=1.0, kind="icon",
+                             meta={"role": "icon"})]
+
+    result = peel_scene.peel_scene(flat, elements, inpaint=SpyInpaint(),
+                                   cfg=_cfg(), force=True)
+    pack = result.layer("pack")
+    assert pack.fills == []                      # nothing punched into the packaging
+    assert pack.meta.get("printed_ink_occluder_kept") == 1
+    # The packaging raster is byte-identical to the flat image under the ink footprint.
+    assert np.all(pack.rgba[:, :, :3][ink] == np.asarray(RED))
+
+    # Contrast: a distinct product cutout in front is a real occluder → it peels.
+    elements2 = [SceneElement(id="pack", mask=product, z=0.0, kind="product"),
+                 SceneElement(id="mini", mask=ink, z=1.0, kind="product",
+                              meta={"role": "product"})]
+    result2 = peel_scene.peel_scene(flat, elements2, inpaint=SpyInpaint(),
+                                    cfg=_cfg(), force=True)
+    assert result2.layer("pack").fills != []
+
+
 def test_max_components_and_peel_inpaint_mode():
     frag = _fragmented_mask((20, 20, 220, 220), step=4)
     assert peel_scene.mask_integrity(frag)["components"] > 24

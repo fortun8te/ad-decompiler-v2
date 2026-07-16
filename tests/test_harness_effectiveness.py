@@ -257,3 +257,131 @@ def test_round_short_circuits_fixer_on_identical_artifacts(tmp_path):
     assert not fixer_calls, "fixer must not run for an identical-artifact round"
     # and the loop stopped instead of burning the remaining rounds on reruns
     assert summary["rounds_completed"] < 3
+
+
+# ── P1 raise-floors: gap 3 — speculative SAM element-growth admission ────────────────
+#
+# Backtest (run-4 admitted rounds, real qa numbers). Every run-4 fixture recorded a
+# single no-op round; 021's was an outright regression (rolled back). At HEAD the
+# metric-driven element-growth repairs (sam3 rerun-detection, "element recall 0.00")
+# were still admitted on already-faithful renders; the element-growth floor refuses them.
+
+def test_element_growth_refused_on_faithful_render_009_021_025():
+    floors = harness.admission_floors({})
+    # 009: ssim 1.0 / text_recall 1.0 — a perfect render; growing elements is pointless.
+    assert harness.element_growth_refused({"ssim": 1.0, "text_recall": 1.0}, floors)
+    # 021: ssim 1.0 / text_recall 1.0 — this round REGRESSED in run 4 (rolled back).
+    assert harness.element_growth_refused({"ssim": 1.0, "text_recall": 1.0}, floors)
+    # 025: ssim 0.989 / text_recall 0.933 — refused via the ssim floor.
+    assert harness.element_growth_refused({"ssim": 0.989, "text_recall": 0.933}, floors)
+
+
+def test_element_growth_admitted_when_render_is_genuinely_broken():
+    # A real missing object leaves ssim LOW — element growth stays admissible there.
+    floors = harness.admission_floors({})
+    assert harness.element_growth_refused({"ssim": 0.60, "text_recall": 0.50}, floors) is None
+
+
+def test_002_element_growth_refused_at_pre_round_qa_but_runs_on_degraded_qa():
+    # The 002 sam3 element-growth is admitted against the PRE-round qa (ssim 0.8174 /
+    # text_recall 0.963); the recall floor refuses it there, so the 15-minute round never
+    # starts. The regression-shipping tests seed the POST-regression qa (0.7712 / 0.9259)
+    # to exercise the cost-control machinery — that must still be admissible (floors sit
+    # between the two so those tests stay green).
+    floors = harness.admission_floors({})
+    assert harness.element_growth_refused({"ssim": 0.8174, "text_recall": 0.963}, floors)
+    assert harness.element_growth_refused({"ssim": 0.7712, "text_recall": 0.9259}, floors) is None
+
+
+def _seed_qa_run(tmp_path, qa, repairs):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "qa.json").write_text(json.dumps(qa), encoding="utf-8")
+    (run_dir / "repairs.json").write_text(json.dumps(repairs), encoding="utf-8")
+    return run_dir
+
+
+def test_admission_reject_reason_refuses_speculative_element_growth(tmp_path):
+    qa = {"ok": False, "ssim": 1.0, "text_recall": 1.0,
+          "hard_fails": [{"rule": "low-element-recall"}]}
+    repair = {"stage": "sam3", "action": "rerun-detection", "severity": "high",
+              "params": {"lower_confidence": True, "enable_element_propose": True}}
+    _seed_qa_run(tmp_path, qa, [repair])
+    reason = harness.admission_reject_reason(repair, run_dir=str(tmp_path / "run"))
+    assert reason and reason.startswith("element-growth")
+    # A layer-targeted sam3 rerun (acts on a known object) is NOT speculative growth.
+    targeted = {"stage": "sam3", "action": "rerun-detection", "severity": "high",
+                "params": {"layer_ids": ["c_E1"]}}
+    assert harness._is_speculative_element_growth(targeted) is False
+
+
+# ── P1 gap 1a — baked/scene-text recall shortfall is unfixable ──────────────────────
+
+def test_baked_majority_via_text_recall_detail_refuses_ocr_rerun(tmp_path):
+    # pixel_diff.text_recall_detail excludes verified scene-baked lines from the recall
+    # denominator; when they dominate the detected lines an OCR rerun cannot lift recall.
+    qa = {"ok": False, "text_recall": 0.42,
+          "text_recall_detail": {"recall": 0.42, "found": 3, "lines_total": 12,
+                                 "baked_excluded": 8, "baked_excluded_lines": ["x"] * 8}}
+    repair = {"stage": "ocr", "action": "rerun", "params": {"upscale": True}}
+    _seed_qa_run(tmp_path, qa, [repair])
+    reason = harness.admission_reject_reason(repair, run_dir=str(tmp_path / "run"))
+    assert reason == "kept-in-photo-text-deficit"
+
+
+def test_non_baked_recall_miss_still_admits_ocr_rerun(tmp_path):
+    # Genuine editable misses (baked lines a minority) keep the OCR rerun admissible.
+    qa = {"ok": False, "text_recall": 0.42,
+          "text_recall_detail": {"recall": 0.42, "found": 5, "lines_total": 12,
+                                 "baked_excluded": 1, "baked_excluded_lines": ["x"]}}
+    repair = {"stage": "ocr", "action": "rerun", "params": {"upscale": True}}
+    _seed_qa_run(tmp_path, qa, [repair])
+    assert harness.admission_reject_reason(repair, run_dir=str(tmp_path / "run")) is None
+
+
+# ── P1 gap 1b — OCR-truth mismatch: design already carries the correct text ──────────
+
+def test_ocr_truth_mismatch_refuses_recall_rerun_101(tmp_path):
+    # 101 real numbers: editable_text_recall 1.0 (render text is correct vs the design)
+    # while text_recall 0.13 (source-OCR ground-truth disagrees). A render/OCR rerun is a
+    # guaranteed no-op — the defect is the source OCR truth, not the render.
+    qa = {"ok": False, "editable_text_recall": 1.0, "text_recall": 0.1304}
+    for action in ("rerun", "restore-editable-text", "boost-stack"):
+        stage = "ocr" if action != "restore-editable-text" else "text-analysis"
+        repair = {"stage": stage, "action": action, "params": {}}
+        rd = tmp_path / action
+        rd.mkdir()
+        (rd / "qa.json").write_text(json.dumps(qa), encoding="utf-8")
+        reason = harness.admission_reject_reason(repair, run_dir=str(rd))
+        assert reason and reason.startswith("ocr-truth-mismatch"), (action, reason)
+
+
+def test_ocr_truth_not_triggered_when_editable_recall_also_low(tmp_path):
+    # 067: editable 0.778 / text_recall 0.833 — both low, the text is genuinely missing,
+    # so the OCR rerun is a legitimate (non-refused) repair.
+    qa = {"ok": False, "editable_text_recall": 0.7778, "text_recall": 0.8333}
+    rd = tmp_path / "run"
+    rd.mkdir()
+    (rd / "qa.json").write_text(json.dumps(qa), encoding="utf-8")
+    repair = {"stage": "ocr", "action": "rerun", "params": {"upscale": True}}
+    assert harness.admission_reject_reason(repair, run_dir=str(rd)) is None
+
+
+# ── P1 gap 2 — critic crop targets the genuinely-worst region (per-layer aware) ──────
+
+def test_worst_crop_prefers_worst_per_layer_over_milder_window():
+    from src import qa_reward
+    # A per-layer region (ssim 0.01) is worse than the local worst-window (ssim 0.30):
+    # the crop must target the per-layer region, not the milder window.
+    qa = {
+        "local_ssim_worst_window": {"ssim": 0.30, "bbox": {"x": 8, "y": 8, "w": 16, "h": 16}},
+        "per_layer": [
+            {"id": "c_ok", "region_ssim": 0.80, "abs_box": {"x": 500, "y": 500, "w": 40, "h": 40}},
+            {"id": "c_bad", "region_ssim": 0.01, "abs_box": {"x": 700, "y": 300, "w": 60, "h": 60}},
+        ],
+    }
+    box = qa_reward._worst_crop_box(qa)
+    assert box == {"x": 700, "y": 300, "w": 60, "h": 60}
+    # Window alone (no per-layer) is unchanged — the F9 behaviour is preserved.
+    only_window = {"local_ssim_worst_window": {"ssim": 0.05, "bbox": {"x": 8, "y": 8, "w": 16, "h": 16}}}
+    assert qa_reward._worst_crop_box(only_window) == {"x": 8, "y": 8, "w": 16, "h": 16}

@@ -177,9 +177,36 @@ def _flag(value: Any, default: bool = False) -> bool:
     return value is True
 
 
+def _glyph_residue_unresolved(qa: Any) -> bool:
+    """True when Agent-B glyph-residue hard-fail / contract still blocks acceptance."""
+    if not isinstance(qa, dict):
+        return False
+    for fail in list(qa.get("hard_fails") or []):
+        if isinstance(fail, dict) and fail.get("rule") == "glyph-residue":
+            return True
+    structural = qa.get("structural") if isinstance(qa.get("structural"), dict) else {}
+    for fail in list(structural.get("hard_fails") or []):
+        if isinstance(fail, dict) and fail.get("rule") == "glyph-residue":
+            return True
+    if structural.get("glyph_residue_unresolved"):
+        try:
+            if int(structural["glyph_residue_unresolved"]) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    contract = qa.get("contract") if isinstance(qa.get("contract"), dict) else {}
+    if contract.get("glyph_residue_clean") is False:
+        return True
+    return False
+
+
 def _qa_accepts(qa: Any, *, allow_summary: bool = False) -> bool:
     """Fail closed on missing, malformed, or contradictory QA summaries."""
     if not isinstance(qa, dict) or not _flag(qa.get("ok")):
+        return False
+    # Unresolved glyph residue is a hard structural fail (Agent B). Never declare
+    # harness success over it — even when a lightweight summary omits hard_fails.
+    if _glyph_residue_unresolved(qa):
         return False
     # Lightweight bridge/test summaries intentionally carry only the boolean
     # result.  They are not artifact QA and must be handled before requiring
@@ -198,6 +225,280 @@ def _qa_accepts(qa: Any, *, allow_summary: bool = False) -> bool:
     if any(key in qa for key in ("ssim", "visual_score", "composite")):
         return True
     return False
+
+
+def _flatten_design_layers(layers) -> list:
+    out = []
+    for layer in layers or []:
+        if not isinstance(layer, dict):
+            continue
+        out.append(layer)
+        out.extend(_flatten_design_layers(layer.get("children")))
+    return out
+
+
+def _layer_lookup(run_dir: Optional[str] = None, design: Optional[dict] = None) -> dict:
+    """id → layer dict from design.json (or an in-memory design)."""
+    if design is None and run_dir:
+        design = _load_json(os.path.join(run_dir, "design.json"), {})
+    if not isinstance(design, dict):
+        return {}
+    return {
+        str(layer["id"]): layer
+        for layer in _flatten_design_layers(design.get("layers") or [])
+        if layer.get("id") is not None
+    }
+
+
+def _meta_flags(layer: Optional[dict]) -> dict:
+    if not isinstance(layer, dict):
+        return {}
+    meta = layer.get("meta") if isinstance(layer.get("meta"), dict) else {}
+    return meta
+
+
+def is_baked_chrome_layer(layer: Optional[dict]) -> bool:
+    """Badge/seal/chip cutouts whose OCR is intentionally baked (Agent A meta)."""
+    if not isinstance(layer, dict):
+        return False
+    meta = _meta_flags(layer)
+    if layer.get("kept_in_photo") or meta.get("kept_in_photo"):
+        return True
+    return bool(
+        meta.get("shell_raster_chip")
+        or meta.get("baked_badge_text")
+        or meta.get("chrome_as_raster")
+        or meta.get("suppression_reason") == "baked-chrome-text"
+    )
+
+
+def is_already_sliced_layer(layer: Optional[dict]) -> bool:
+    """True when the layer already shipped as a confidence-gated raster slice."""
+    if not isinstance(layer, dict):
+        return False
+    meta = _meta_flags(layer)
+    try:
+        from src.schema import is_raster_slice
+        return is_raster_slice(meta) or is_raster_slice({"fallback": layer.get("fallback")})
+    except Exception:
+        fallback = meta.get("fallback") or layer.get("fallback")
+        return fallback in {"raster-slice", "raster_slice", "slice"}
+
+
+def _repair_target_ids(repair: dict) -> list[str]:
+    ids: list[str] = []
+    target = repair.get("target_id")
+    if target is not None:
+        ids.append(str(target))
+    params = repair.get("params") or {}
+    for key in ("layer_ids",):
+        for value in params.get(key) or []:
+            if value is not None:
+                ids.append(str(value))
+    for entry in params.get("regions") or []:
+        if isinstance(entry, dict) and entry.get("layer_id") is not None:
+            ids.append(str(entry["layer_id"]))
+    # Preserve order, drop dupes.
+    return list(dict.fromkeys(ids))
+
+
+_BAKED_TEXT_PROMOTE_ACTIONS = frozenset({
+    "restore-editable-text", "refit-text-box", "refit-colors-effects", "resolve-fonts",
+})
+
+# ── raise-floors admission (P1 gap 1 / gap 3) ────────────────────────────────────────
+# A repair round should only run when a *reachable, plausibly-converting* repair exists.
+# These floors refuse three classes the harness provably cannot convert:
+#   element_growth_*   speculative SAM element-growth on an already-faithful render
+#                      (run-4 021 regressed; run-5 002 burned 15 min for a noise delta)
+#   ocr_truth_*        a low text_recall whose editable text is already correct in the
+#                      design — the miss is source-OCR ground-truth, not the render, so a
+#                      render/OCR rerun is a guaranteed no-op (run-4 101: edit 1.0 / tr 0.13)
+#   baked_majority_frac fraction of detected lines that are scene-baked-by-design; an OCR
+#                      rerun cannot lift recall when the denominator is baked-dominated
+#                      (run-4 135's 32 nutrition-label lines; consumed via text_recall_detail)
+_DEFAULT_ADMISSION_FLOORS = {
+    "element_growth_ssim": 0.90,
+    "element_growth_recall": 0.95,
+    "ocr_truth_editable_recall": 0.85,
+    "ocr_truth_recall_margin": 0.05,
+    "baked_majority_frac": 0.5,
+}
+
+
+def admission_floors(cfg: Optional[dict] = None) -> dict:
+    """Admission floors from ``runtime.harness.admission.floors`` (config-only, tunable)."""
+    base = dict(_DEFAULT_ADMISSION_FLOORS)
+    admission = (((cfg or {}).get("runtime") or {}).get("harness") or {}).get("admission") or {}
+    override = admission.get("floors") if isinstance(admission.get("floors"), dict) else {}
+    for key, value in override.items():
+        if key in base:
+            try:
+                base[key] = float(value)
+            except (TypeError, ValueError):
+                pass
+    return base
+
+
+def _is_speculative_element_growth(repair: dict) -> bool:
+    """A sam3 rerun that GROWS elements (element_propose / lowered confidence / no target).
+
+    revalidate-rejected and layer-targeted reruns are excluded — those act on a specific
+    known object, not a speculative sweep for a new one."""
+    if (repair.get("stage"), repair.get("action")) != ("sam3", "rerun-detection"):
+        return False
+    params = repair.get("params") or {}
+    return bool(
+        params.get("enable_element_propose")
+        or params.get("lower_confidence")
+        or params.get("source") == "vlm_critique"
+        or not params.get("layer_ids")
+    )
+
+
+def element_growth_refused(qa: Any, floors: Optional[dict] = None) -> Optional[str]:
+    """Reason a speculative element-growth cannot convert an already-faithful render.
+
+    A missing SAM element that leaves global SSIM high (or the text essentially complete)
+    is not visible in the diff — growing it cannot raise the metric and empirically
+    regresses (021). ``qa`` supplies the render's current global evidence."""
+    if not isinstance(qa, dict):
+        return None
+    floors = floors or _DEFAULT_ADMISSION_FLOORS
+    ssim = qa.get("ssim")
+    if isinstance(ssim, (int, float)) and float(ssim) >= floors["element_growth_ssim"]:
+        return f"element-growth-on-faithful-render:ssim={float(ssim):.3f}"
+    recall = qa.get("text_recall")
+    if isinstance(recall, (int, float)) and float(recall) >= floors["element_growth_recall"]:
+        return f"element-growth-with-complete-text:text_recall={float(recall):.3f}"
+    return None
+
+
+def ocr_truth_mismatch_refused(qa: Any, floors: Optional[dict] = None) -> Optional[str]:
+    """Reason a text_recall rerun is a no-op: the design already carries the correct text.
+
+    editable_text_recall measures render-vs-DESIGN text; text_recall measures render-vs-
+    SOURCE OCR. When editable recall is high but text_recall is far lower, the shortfall is
+    a source-OCR ground-truth artifact (nondeterministic OCR / a source misread) that no
+    render or text-stage rerun can move — 101: editable 1.0, text_recall 0.13."""
+    if not isinstance(qa, dict):
+        return None
+    floors = floors or _DEFAULT_ADMISSION_FLOORS
+    edit = qa.get("editable_text_recall")
+    if not isinstance(edit, (int, float)):
+        structural = qa.get("structural") if isinstance(qa.get("structural"), dict) else {}
+        edit = structural.get("editable_text_recall")
+    recall = qa.get("text_recall")
+    if not isinstance(edit, (int, float)) or not isinstance(recall, (int, float)):
+        return None
+    if (float(edit) >= floors["ocr_truth_editable_recall"]
+            and float(recall) < float(edit) - floors["ocr_truth_recall_margin"]):
+        return (f"ocr-truth-mismatch:editable_recall={float(edit):.2f}"
+                f">text_recall={float(recall):.2f}")
+    return None
+
+
+def admission_reject_reason(
+    repair: dict,
+    *,
+    run_dir: Optional[str] = None,
+    design: Optional[dict] = None,
+    layers: Optional[dict] = None,
+    cfg: Optional[dict] = None,
+) -> Optional[str]:
+    """Return a skip reason when a repair targets kept_in_photo / baked chrome / sliced.
+
+    Workstream E: these deficits are by-design (exact cutout / baked pack copy). Re-running
+    OCR/text/slice on them thrashs the harness and can re-promote baked OCR to TEXT.
+    """
+    if not isinstance(repair, dict):
+        return "malformed-repair"
+    stage = repair.get("stage")
+    action = repair.get("action")
+    floors = admission_floors(cfg)
+    lookup = layers if layers is not None else _layer_lookup(run_dir, design)
+    target_ids = _repair_target_ids(repair)
+
+    # Gap 3 — raise floors: a speculative SAM element-growth cannot convert an already-
+    # faithful render (021 regressed; 002 burned a 15-minute round for a noise delta).
+    # Refuse before it starts, using the render's current global QA evidence. Targeted or
+    # untargeted: the check reads global ssim/text_recall, not the (usually absent) target.
+    if _is_speculative_element_growth(repair) and run_dir:
+        qa = _load_json(os.path.join(run_dir, "qa.json"), {})
+        reason = element_growth_refused(qa, floors)
+        if reason:
+            return reason
+
+    # Global OCR / editable-text restores with no target: drop when QA already attributes
+    # the shortfall to kept_in_photo / baked chrome (unfixable by rerun).
+    if not target_ids and stage in {"ocr", "text-analysis", "vlm"} and action in {
+        "rerun", "restore-editable-text", "boost-stack", "review",
+    }:
+        qa = _load_json(os.path.join(run_dir, "qa.json"), {}) if run_dir else {}
+        structural = qa.get("structural") if isinstance(qa.get("structural"), dict) else {}
+        # Gap 1b — OCR-truth mismatch: the design already renders the correct editable text,
+        # so a low text_recall is a source-OCR ground-truth artifact no rerun can move.
+        ocr_truth = ocr_truth_mismatch_refused(qa, floors)
+        if ocr_truth and action in {"rerun", "restore-editable-text", "boost-stack"}:
+            return ocr_truth
+        kept = qa.get("kept_in_photo_lines")
+        if kept is None:
+            kept = structural.get("kept_in_photo_lines")
+        total = qa.get("text_lines_total")
+        if total is None:
+            total = structural.get("text_lines_total")
+        # Gap 1a — consume pixel_diff's text_recall_detail: it already excludes verified
+        # scene-baked lines from the recall denominator, listing how many. When baked lines
+        # dominate the detected text, an OCR/text rerun cannot lift recall (135's 32
+        # nutrition-label lines). This is the live signal on new qa.json; the legacy
+        # kept_in_photo_lines/text_lines_total counts are the fallback for older artifacts.
+        detail = qa.get("text_recall_detail")
+        if isinstance(detail, dict):
+            if kept is None:
+                kept = detail.get("baked_excluded")
+            if total is None:
+                total = detail.get("lines_total")
+        try:
+            kept_n = int(kept) if kept is not None else 0
+            total_n = int(total) if total is not None else 0
+        except (TypeError, ValueError):
+            kept_n, total_n = 0, 0
+        if total_n > 0 and kept_n > 0 and kept_n >= max(1, int(floors["baked_majority_frac"] * total_n)):
+            # Majority of detected lines are intentionally baked — OCR rerun cannot help.
+            if action in {"rerun", "restore-editable-text", "boost-stack", "review"}:
+                return "kept-in-photo-text-deficit"
+        # design.kept_in_photo non-empty + restore-editable with no target: refuse promotion.
+        if design is None and run_dir:
+            design = _load_json(os.path.join(run_dir, "design.json"), {})
+        kept_texts = list((design or {}).get("kept_in_photo") or []) if isinstance(design, dict) else []
+        if action == "restore-editable-text" and kept_texts and not target_ids:
+            return "baked-ocr-must-not-promote-to-text"
+
+    if not target_ids:
+        return None
+
+    for lid in target_ids:
+        layer = lookup.get(lid)
+        if layer is None:
+            continue
+        if is_already_sliced_layer(layer):
+            return f"already-sliced:{lid}"
+        if is_baked_chrome_layer(layer):
+            # Never re-promote baked badge/pack OCR to editable TEXT; also drop
+            # reconstruct/slice thrash on an exact chrome cutout.
+            if stage == "text-analysis" and action in _BAKED_TEXT_PROMOTE_ACTIONS:
+                return f"baked-chrome-text:{lid}"
+            if stage == "ocr":
+                return f"kept-in-photo:{lid}"
+            if stage in {"reconstruct", "vectorize", "qwen"} and action in {
+                "inspect-worst-regions", "raster-fallback", "retry", "restage-assets",
+            }:
+                meta = _meta_flags(layer)
+                if meta.get("shell_raster_chip") or meta.get("baked_badge_text") or meta.get("chrome_as_raster"):
+                    return f"shell-raster-chip:{lid}"
+                if layer.get("kept_in_photo") or meta.get("kept_in_photo"):
+                    return f"kept-in-photo:{lid}"
+    return None
 
 
 def deep_merge(base: dict, patch: dict) -> dict:
@@ -673,6 +974,10 @@ def _repair_plan_fingerprint(run_dir: str, choice: dict) -> tuple[str, dict]:
     If neither the plan nor its stage inputs changed, repeating the repair cannot add
     information. Persisting this across harness invocations prevents identical OCR/SAM/
     reconstruction reruns from burning another full pass after a plateau or interruption.
+
+    Structure/VLM resumes (merge → structure → layout) include ``scene_intent.json`` and
+    ``merged.json`` so an unchanged planning fingerprint skips the expensive VLM grouping
+    replay (CRITIC F13 / workstream E).
     """
     resume = str(choice.get("resume") or "")
     inputs = {
@@ -680,16 +985,23 @@ def _repair_plan_fingerprint(run_dir: str, choice: dict) -> tuple[str, dict]:
         "text": ("ocr_raw.json", "normalized.png"),
         "sam": ("residual.json", "qwen.json", "ocr.json"),
         "elements": ("residual.json", "qwen.json", "ocr.json"),
-        "reconstruct": ("merged.json", "ocr.json"),
-        "layout": ("reconstruction.json",),
+        "merge": ("fused_elements.json", "ocr.json", "scene_intent.json"),
+        "structure": ("merged.json", "scene_intent.json"),
+        "reconstruct": ("merged.json", "ocr.json", "scene_intent.json"),
+        "layout": ("reconstruction.json", "merged.json", "scene_intent.json"),
         "design": ("layout.json", "reconstruction.json"),
         "figma": ("design.json",),
     }.get(resume, ("qa.json",))
     evidence = {name: _artifact_fingerprint(os.path.join(run_dir, name)) for name in inputs}
+    # Prefer the planner's own fingerprint when present — byte-identical scene_intent with
+    # the same planning_fingerprint is conclusive "structure/VLM inputs unchanged".
+    intent = _load_json(os.path.join(run_dir, "scene_intent.json"), {})
+    planning_fp = intent.get("planning_fingerprint") if isinstance(intent, dict) else None
     payload = {
         "stage": choice.get("stage"), "action": choice.get("action"),
         "target_id": choice.get("target_id"), "resume": resume,
         "patches": choice.get("patches") or {}, "inputs": evidence,
+        "planning_fingerprint": planning_fp,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest(), payload
@@ -1067,6 +1379,22 @@ def execute_repairs(
                 _write_json(admission_path, admission)
                 continue
 
+            # Workstream E: drop kept_in_photo / baked chrome / already-sliced deficits —
+            # they cannot improve via OCR promote / re-slice thrash.
+            baked_reason = admission_reject_reason(choice, run_dir=run_dir, cfg=cfg)
+            if baked_reason:
+                exhausted.add((choice.get("stage"), choice.get("action"), choice.get("target_id")))
+                skipped = {
+                    "iteration": iteration, "resume": resume,
+                    "repair": {key: choice.get(key) for key in ("stage", "action", "target_id")},
+                    "reason": "baked-or-sliced-deficit",
+                    "detail": baked_reason,
+                }
+                attempts.append({**skipped, "admission_skipped": True})
+                admission.setdefault("skipped", []).append(skipped)
+                _write_json(admission_path, admission)
+                continue
+
             # Semantic no-repeat for VLM opinions: two equivalent whole-image opinions (same
             # operator class, different target — the €63 vs €49 case) must not each burn a
             # pass once the class is proven non-improving.
@@ -1093,10 +1421,18 @@ def execute_repairs(
             plan_fingerprint, plan_payload = _repair_plan_fingerprint(run_dir, choice)
             if plan_fingerprint in seen_plans:
                 exhausted.add((choice.get("stage"), choice.get("action"), choice.get("target_id")))
+                # Structure/VLM resumes share the planning fingerprint — surface that reason
+                # so the audit trail shows we skipped an unchanged structure plan, not a
+                # generic "same repair".
+                skip_reason = "unchanged-repair-plan-and-inputs"
+                if resume in {"merge", "structure", "layout", "reconstruct"} and (
+                        plan_payload.get("planning_fingerprint")
+                        or "scene_intent.json" in (plan_payload.get("inputs") or {})):
+                    skip_reason = "unchanged-structure-vlm-plan"
                 skipped = {
                     "iteration": iteration, "resume": resume,
                     "repair": {key: choice.get(key) for key in ("stage", "action", "target_id")},
-                    "reason": "unchanged-repair-plan-and-inputs",
+                    "reason": skip_reason,
                     "plan_fingerprint": plan_fingerprint,
                 }
                 attempts.append({**skipped, "admission_skipped": True})

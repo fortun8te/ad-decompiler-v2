@@ -1762,7 +1762,20 @@ def _structural_audit(
             _photo_scene = bool(json.load(fh).get("photographic_scene_text"))
     except Exception:
         _photo_scene = False
-    if _photo_scene:
+    # Scene-baked verdict: merge's explicit ``photographic_scene_text`` flag OR a
+    # ``caption_over_photo`` archetype whose merge routing baked EVERY confident source
+    # line into the photo (021: in-scene sticky-note / printed copy). merge does not
+    # always raise the top-level flag even when it correctly bakes every line via the
+    # geometric cutout / scene-text path, so a caption_over_photo whose kept_in_photo
+    # already accounts for all source text is just as legitimately scene-baked. The
+    # archetype allowlist mirrors _photographic_scene_text_mode (merge): comparison_grid
+    # (025), social_screenshot (009), lifestyle overlays keep full editability strictness
+    # — a design that rasterized their genuinely-editable copy still hard-fails. The
+    # per-fixture proof is condition-2 below (all source lines baked) plus the block-reason
+    # gate (real, non-empty photographic tree).
+    _archetype = _read_archetype(run_dir)
+    _scene_baked_verdict = _photo_scene or _archetype == "caption_over_photo"
+    if _scene_baked_verdict:
         kept_norm = [_norm(t) for t in ((design or {}).get("kept_in_photo") or [])]
         src_norm = [_norm(l.get("text", "")) for l in source_lines
                     if l.get("conf", 1) >= 0.5 and len(_norm(l.get("text", ""))) >= 3]

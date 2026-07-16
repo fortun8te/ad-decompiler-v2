@@ -799,6 +799,112 @@ def test_partially_overlapping_logo_is_not_absorbed():
     assert sorted(e["role"] for e in fused) == ["logo", "product"]
 
 
+# ── generalized invariant: every non-product decoration inside a product folds ───────
+
+
+def test_icon_glyph_nested_in_product_absorbs_as_decoration(tmp_path):
+    """135/094: a generic on-pack icon (not a logo, not a wide flavor bar) rides the
+    product cutout instead of shipping as a punchable element."""
+    import json
+
+    product = _sam_el("S0", 20, 20, 60, 60, "product", 0.9, "text-prompt", prompt="product")
+    glyph = _sam_el("S1", 34, 34, 12, 12, "icon", 0.8, "text-prompt", prompt="icon")
+    glyph["kind"] = "icon"
+
+    fused = element_fusion.fuse({"elements": [product, glyph]}, [], [], CANVAS,
+                                run_dir=str(tmp_path))
+
+    assert [e["role"] for e in fused] == ["product"]
+    parent = fused[0]
+    assert (parent.get("meta") or {}).get("printed_lockup") is True
+    assert [d["role"] for d in parent["meta"]["absorbed_decorations"]] == ["icon"]
+    report = json.load(open(tmp_path / "fusion_report.json"))
+    assert report["counts"]["absorbed_product_decorations"] == 1
+    assert report["absorbed_product_decorations"][0]["reason"] == "printed-on-product-decoration"
+
+
+def test_checkmark_and_cross_glyphs_on_pack_absorb():
+    """On-pack ✓/✗ list glyphs (135 nutrition panel) never punch the packaging."""
+    product = _sam_el("S0", 15, 15, 70, 70, "product", 0.9, "text-prompt", prompt="product")
+    check = _sam_el("S1", 30, 30, 10, 10, "verified", 0.8, "text-prompt", prompt="check")
+    check["kind"] = "icon"
+    cross = _sam_el("S2", 30, 50, 10, 10, "cross", 0.8, "text-prompt", prompt="cross")
+    cross["kind"] = "icon"
+
+    fused = element_fusion.fuse({"elements": [product, check, cross]}, [], [], CANVAS)
+
+    assert [e["role"] for e in fused] == ["product"]
+    roles = {d["role"] for d in fused[0]["meta"]["absorbed_decorations"]}
+    assert roles == {"verified", "cross"}
+
+
+def test_transitive_glyph_under_panel_under_product_folds_to_product():
+    """135: ✓/✗ chips nested in a nutrition panel that is itself nested in the bar all
+    fold into the bar once the intermediate panel is absorbed (fixed-point)."""
+    product = _sam_el("S0", 10, 10, 80, 80, "product", 0.9, "text-prompt", prompt="product")
+    panel = _sam_el("S1", 28, 28, 30, 30, "shape", 0.8, "text-prompt", prompt="panel")
+    panel["kind"] = "shape"
+    glyph = _sam_el("S2", 32, 32, 8, 8, "verified", 0.8, "text-prompt", prompt="check")
+    glyph["kind"] = "icon"
+
+    fused = element_fusion.fuse({"elements": [product, panel, glyph]}, [], [], CANVAS)
+
+    assert [e["role"] for e in fused] == ["product"]
+    roles = sorted(d["role"] for d in fused[0]["meta"]["absorbed_decorations"])
+    assert roles == ["shape", "verified"]
+
+
+def test_edge_straddling_label_folds_by_box_containment():
+    """A label sticking ~20% over the product edge (mask containment below the nesting
+    threshold, so no nested-in link) still folds by box containment — it must not punch
+    the bag."""
+    product = _sam_el("S0", 20, 20, 40, 40, "product", 0.9, "text-prompt", prompt="product")
+    # x44..64 vs product x20..60 → 16/20 = 0.80 box-contained, ~0.80 mask (< 0.90 link).
+    label = _sam_el("S1", 44, 30, 20, 10, "icon", 0.8, "text-prompt", prompt="label")
+    label["kind"] = "icon"
+
+    fused = element_fusion.fuse({"elements": [product, label]}, [], [], CANVAS)
+
+    assert [e["role"] for e in fused] == ["product"]
+    assert (fused[0].get("meta") or {}).get("printed_lockup") is True
+
+
+def test_low_overlap_decoration_stays_a_separate_element():
+    """A glyph only ~1/3 over the product edge is a genuine overlay layer — untouched."""
+    product = _sam_el("S0", 20, 20, 40, 40, "product", 0.9, "text-prompt", prompt="product")
+    icon = _sam_el("S1", 50, 30, 30, 10, "icon", 0.8, "text-prompt", prompt="icon")
+    icon["kind"] = "icon"
+
+    fused = element_fusion.fuse({"elements": [product, icon]}, [], [], CANVAS)
+
+    assert sorted(e["role"] for e in fused) == ["icon", "product"]
+
+
+def test_distinct_product_inside_product_is_not_absorbed():
+    """A distinct SKU is never a decoration — a bottle nested in a box stays its own
+    alpha (product-instance roles are excluded from decoration absorption)."""
+    box = _sam_el("S0", 10, 10, 80, 80, "product", 0.9, "text-prompt", prompt="box")
+    bottle = _sam_el("S1", 30, 30, 20, 20, "bottle", 0.88, "text-prompt", prompt="bottle")
+
+    fused = element_fusion.fuse({"elements": [box, bottle]}, [], [], CANVAS)
+
+    assert sorted(e["role"] for e in fused) == ["bottle", "product"]
+    for e in fused:
+        assert not (e.get("meta") or {}).get("absorbed_decorations")
+
+
+def test_product_decoration_absorb_can_be_disabled():
+    product = _sam_el("S0", 20, 20, 60, 60, "product", 0.9, "text-prompt", prompt="product")
+    glyph = _sam_el("S1", 34, 34, 12, 12, "icon", 0.8, "text-prompt", prompt="icon")
+    glyph["kind"] = "icon"
+
+    fused = element_fusion.fuse(
+        {"elements": [product, glyph]}, [], [], CANVAS,
+        cfg={"element_fusion": {"absorb_product_decorations": False}})
+
+    assert sorted(e["role"] for e in fused) == ["icon", "product"]
+
+
 # ── product cluster hull merge + alpha sealing (135 / packaging) ────────────────────
 
 

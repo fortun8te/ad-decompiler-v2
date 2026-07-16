@@ -415,6 +415,14 @@ def _tag_lines(lines: Iterable[dict], engine: str) -> list:
     tagged = []
     for raw in lines:
         line = copy.deepcopy(raw)
+        # Interpunct restoration lives in _make_line, but cached payloads (written
+        # by an older code path) and the single-line targeted-retry collapse both
+        # bypass _make_line, so a UI meta line's centered '·' can survive as '.'/'-'
+        # all the way to the render (benchmark 009's timestamp row). Re-run the
+        # separator restore here — it is idempotent, so freshly parsed lines that
+        # already carry '·' are unaffected — guaranteeing every engine line gets it.
+        if "text" in line:
+            line["text"] = _restore_interpuncts(str(line.get("text") or ""))
         line.setdefault("words", [])
         line.setdefault("quad", _rect_quad(line.get("box") or {}))
         line.setdefault("box", _quad_to_box(line["quad"]))
@@ -1463,6 +1471,51 @@ def _strip_stray_punct_tokens(winner: dict, member_texts: list[str]) -> Optional
     return None
 
 
+_STRAY_TRAILING_PUNCT = re.compile(r"^[,.;:·•]$")
+
+
+def _strip_stray_trailing_punct(winner: dict, member_texts: list[str]) -> Optional[dict]:
+    """Drop a trailing punctuation artifact that near-identical peers lack.
+
+    The trailing-token sibling of ``_strip_stray_punct_tokens``: an engine can
+    hallucinate a comma/period past the last glyph (benchmark 002's
+    "KRACHTSPORT BUNDEL,").  Fires only when a peer reading agrees on the line
+    without it AND either the winner's own word confidence for that token is weak
+    or two peers lack it — so genuine sentence punctuation, which peers also read,
+    is never stripped.  Attached punctuation ("uur.") is left alone: only a
+    detached token is considered, mirroring the interior rule.
+    """
+    text = str(winner.get("text") or "")
+    tokens = text.split()
+    if len(tokens) < 2 or not _STRAY_TRAILING_PUNCT.match(tokens[-1]):
+        return None
+    words = winner.get("words") or []
+    peers = [str(value or "") for value in member_texts
+             if str(value or "").strip() and _text_key(value) != _text_key(text)]
+    token = tokens[-1]
+    removed_text = " ".join(tokens[:-1])
+    lacking = sum(1 for peer in peers if _text_key(peer) == _text_key(removed_text))
+    if not lacking:
+        return None
+    word_conf = None
+    for word in words:
+        if str(word.get("text") or "").strip() == token:
+            word_conf = _float(word.get("conf"), 1.0)
+            break
+    weak_word = word_conf is not None and word_conf < 0.6
+    if not weak_word and lacking < 2:
+        return None
+    new_words = [word for word in words
+                 if str(word.get("text") or "").strip() != token]
+    return {
+        "text": removed_text,
+        "words": new_words,
+        "dropped": token,
+        "word_conf": word_conf,
+        "peers_without": lacking,
+    }
+
+
 def _targeted_retry(img_path: str, lines: list, engine: str, cfg: dict,
                     runner: Optional[Callable] = None) -> list:
     options = _retry_options(cfg)
@@ -1775,6 +1828,18 @@ def _reconcile(primary_lines, challenger_sets, iou_thresh=0.42, cfg=None):
             }
             winner["text"] = stray["text"]
             winner["words"] = stray["words"]
+        trailing = _strip_stray_trailing_punct(winner, [m.get("text", "") for m in members])
+        if trailing is not None:
+            fix_meta = winner.setdefault("meta", {})
+            fix_meta["stray_trailing_punct_dropped"] = {
+                "from": str(winner.get("text") or ""),
+                "to": trailing["text"],
+                "token": trailing["dropped"],
+                "word_conf": trailing["word_conf"],
+                "peers_without": trailing["peers_without"],
+            }
+            winner["text"] = trailing["text"]
+            winner["words"] = trailing["words"]
 
         # A singleton/orphan winner can have no peer above the agreement
         # threshold.  Treat the winner itself as the only supporting reading
@@ -1889,14 +1954,25 @@ def _is_fragment_pair(left: dict, right: dict, options: dict) -> bool:
         return False
     left_box, right_box = _clean_box(left.get("box")), _clean_box(right.get("box"))
     left_h, right_h = max(1.0, left_box["h"]), max(1.0, right_box["h"])
-    if _rotation_delta(_line_rotation(left), _line_rotation(right)) > _float(
-            options.get("max_rotation_delta"), 7.5):
+    gap = right_box["x"] - (left_box["x"] + left_box["w"])
+    # Two same-engine detections whose boxes overlap horizontally (negative gap)
+    # are almost certainly one split line.  Short-fragment baseline angles from
+    # easyocr are noisy, so the strict rotation gate wrongly rejects them and the
+    # halves survive as separate overlapping lines that the renderer glues — box
+    # overlap eating the seam characters (benchmark 025: "Industrial-grade" +
+    # "design" -> "Industrial-gradesign").  Relax the rotation tolerance once the
+    # boxes actually overlap, where the overlap itself is the strong "same line"
+    # signal.
+    rotation_limit = _float(options.get("max_rotation_delta"), 7.5)
+    if gap < 0:
+        rotation_limit = max(rotation_limit,
+                             _float(options.get("overlap_max_rotation_delta"), 15.0))
+    if _rotation_delta(_line_rotation(left), _line_rotation(right)) > rotation_limit:
         return False
     if _vertical_overlap(left_box, right_box) < _float(options.get("min_vertical_overlap"), 0.72):
         return False
     if max(left_h, right_h) / min(left_h, right_h) > _float(options.get("max_height_ratio"), 1.55):
         return False
-    gap = right_box["x"] - (left_box["x"] + left_box["w"])
     max_gap = max(left_h, right_h) * _float(options.get("max_gap_factor"), 0.9)
     if gap < -min(left_h, right_h) * 0.16 or gap > max_gap:
         return False
@@ -1918,15 +1994,19 @@ def _is_fragment_pair(left: dict, right: dict, options: dict) -> bool:
     return True
 
 
-def _join_fragment_text(left: str, right: str) -> str:
+def _join_fragment_text(left: str, right: str, *, gap_em: Optional[float] = None) -> str:
     left, right = str(left or "").rstrip(), str(right or "").lstrip()
     if not left:
         return right
     if not right:
         return left
     # A visible same-line hyphen is normally authored ("high-quality"), not a
-    # line-wrap hyphen.  Preserve it while avoiding a bogus extra space.
-    if left.endswith(("-", "‐", "‑", "/")):
+    # line-wrap hyphen.  Preserve it while avoiding a bogus extra space — UNLESS the
+    # source boxes show a real inter-fragment gap (>= ~0.3 em): a gap that wide means
+    # the glyph is a spaced dash/separator, not a joined hyphenate, so the space is
+    # authored and must survive the join.
+    wide_gap = gap_em is not None and gap_em >= 0.3
+    if left.endswith(("-", "‐", "‑", "/")) and not wide_gap:
         return left + right
     return left + " " + right
 
@@ -1939,8 +2019,15 @@ def _merge_fragment_chain(lines: list[dict], options: dict) -> dict:
     words = []
     weights = []
     original = []
+    previous_box: Optional[dict] = None
     for line in fragments:
-        text = _join_fragment_text(text, line.get("text", ""))
+        current_box = _clean_box(line.get("box") or {})
+        gap_em = None
+        if previous_box is not None:
+            reference_h = max(1.0, min(previous_box["h"], current_box["h"]))
+            gap_em = (current_box["x"] - (previous_box["x"] + previous_box["w"])) / reference_h
+        text = _join_fragment_text(text, line.get("text", ""), gap_em=gap_em)
+        previous_box = current_box
         words.extend(copy.deepcopy(line.get("words") or []))
         weights.append(max(1, len(str(line.get("text") or "").strip())))
         original.append({

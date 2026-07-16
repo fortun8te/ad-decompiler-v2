@@ -29,6 +29,16 @@ def _rgba(size, value, alpha=255):
     return Image.new("RGBA", size, _color(value, alpha))
 
 
+def _color_close(rgba_a, rgba_b, tol=30.0):
+    """True when two RGBA colours are within ``tol`` Euclidean RGB distance."""
+    if rgba_a is None or rgba_b is None:
+        return False
+    try:
+        return math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(rgba_a[:3], rgba_b[:3]))) <= tol
+    except (TypeError, ValueError):
+        return False
+
+
 def _number(value, default=0.0):
     try:
         return float(value)
@@ -527,6 +537,26 @@ def _run_segments(layer, text):
 _RUN_STYLE_KEYS = ("fontWeight", "color")
 
 
+def _style_is_italic(style):
+    """Whether a (run or node) style is italic/oblique.
+
+    Italic is a real per-run axis that ``_RUN_STYLE_KEYS`` deliberately excludes
+    (it only carries weight/colour): a run's italic-ness is encoded by the font
+    FILE its ``fontCandidates`` resolve to. This predicate lets the styled path
+    activate when runs differ in slant even at the same weight/colour, so a mixed
+    headline ("We NEVER" italic / "do this!" upright, 013) renders each run with
+    its own upright/italic candidate instead of forcing the node's slant on all.
+    """
+    token = str((style or {}).get("fontStyle") or "").lower()
+    if "italic" in token or "oblique" in token:
+        return True
+    shear = (style or {}).get("italicShearDeg")
+    try:
+        return shear is not None and abs(float(shear)) > 0.5
+    except (TypeError, ValueError):
+        return False
+
+
 def _text_tile(layer, size):
     """Rasterize a text layer without ever clipping its glyphs.
 
@@ -592,12 +622,32 @@ def _text_tile(layer, size):
             if align_stroke in {"OUTSIDE", "CENTER", "CENTRE", ""} and stroke_width > 0:
                 stroke_width = max(stroke_width, stroke_width * 1.15)
 
+    # A stroke whose colour matches the glyph fill contributes no visible outline —
+    # it only fattens the ink. Sampling contamination from an adjacent element (009:
+    # the blue verified badge produced a white #fefefe stroke over white "UPFRONT")
+    # then bloats same-colour glyphs until they merge into an unreadable blob that
+    # even OCR-of-render can't recover. Drop it; the fitted weight already carries mass.
+    if stroke_colour is not None and _color_close(stroke_colour, colour, 30.0):
+        stroke_colour, stroke_width = None, 0.0
+
     decoration = _text_decoration_kind(style)
     lines = text.split("\n")
     segments = _run_segments(layer, text)
-    styled = bool(segments) and any(
-        run_style.get(key) is not None and run_style.get(key) != style.get(key)
-        for _, _, run_style in segments for key in _RUN_STYLE_KEYS)
+    base_italic = _style_is_italic(style)
+
+    def _segment_italic(run_style):
+        # Only an explicit per-run slant signal overrides the node's italic-ness;
+        # gap-filled segments ({}) inherit the base style and must not count as a
+        # difference.
+        if run_style and ("fontStyle" in run_style or run_style.get("italicShearDeg") is not None):
+            return _style_is_italic(run_style)
+        return base_italic
+
+    styled = bool(segments) and (
+        any(run_style.get(key) is not None and run_style.get(key) != style.get(key)
+            for _, _, run_style in segments for key in _RUN_STYLE_KEYS)
+        or any(_segment_italic(run_style) != base_italic
+               for _, _, run_style in segments))
 
     # Per line: [(segment_text, font, colour, tracking, ascent, descent)]
     line_specs = []
@@ -666,9 +716,28 @@ def _text_tile(layer, size):
                                stroke_fill=stroke_colour, stroke_width=stroke_width)
             x += _line_advance(seg_font, seg_text, seg_tracking)
         if decoration and width > 0:
+            deco_colour = colour
+            deco_x0, deco_x1 = line_x0, line_x0 + width
+            if decoration == "STRIKETHROUGH":
+                # Hand-drawn strikes (091) are a foreign ink over the glyphs, not the
+                # text colour; honour the sampled decorationColor when analysis carried
+                # it. A partial decorationSpan strikes only the struck words (091's
+                # "Foggy", not "and Steady"); applied only on single-line nodes where
+                # one span is unambiguous.
+                override = style.get("decorationColor")
+                if override:
+                    deco_colour = _color(override)
+                span = style.get("decorationSpan")
+                if (isinstance(span, (list, tuple)) and len(span) == 2
+                        and len(lines) == 1):
+                    f0 = max(0.0, min(1.0, _number(span[0], 0.0)))
+                    f1 = max(0.0, min(1.0, _number(span[1], 1.0)))
+                    if f1 > f0:
+                        deco_x0 = line_x0 + f0 * width
+                        deco_x1 = line_x0 + f1 * width
             _paint_text_decoration(
-                draw, decoration, line_x0, line_x0 + width, baseline,
-                max_ascent, max_descent, colour, font_size,
+                draw, decoration, deco_x0, deco_x1, baseline,
+                max_ascent, max_descent, deco_colour, font_size,
             )
         y += line_height
 

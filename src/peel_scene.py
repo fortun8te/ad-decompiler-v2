@@ -197,6 +197,10 @@ SCENE_DEFAULTS = {
     # plate is exempt: it is never emitted as a movable layer, so bake stays its
     # honest fallback there.
     "bake_under_layers": False,
+    # Invariant defense (task §4): a non-object occluder whose footprint is at least
+    # this fraction inside a product/package under is that product's own printed ink —
+    # it never punches the packaging raster, even if fusion did not absorb it.
+    "printed_on_under_containment": 0.9,
 }
 
 #: Archetypes whose plates are Codia-style solid/banded chrome — peel holes prefer
@@ -1067,6 +1071,35 @@ def _may_punch_into(
     return True
 
 
+def _printed_on_product_under(occluder: SceneElement, under: SceneElement,
+                              opts: dict) -> bool:
+    """Defensive net for the invariant: a non-object occluder lying (near-)entirely
+    inside a product/package under is that product's own printed label ink and must
+    never punch the packaging raster — even if fusion failed to absorb it as a
+    decoration.  ``_may_punch_into`` already hard-denies text and logo/wordmark
+    artwork; this closes the gap for generic icons / glyphs / shapes that peel would
+    otherwise treat as eligible occluders over a product (task §4: an E fully contained
+    in a product is contained ink, refused not peeled).
+
+    Distinct product/person cutouts in front (real object-over-object occlusion) and
+    occluders that extend beyond the product silhouette are unaffected — only fully
+    contained non-object graphics are held back.
+    """
+    if not _carries_printed_ink(under.kind, under.meta):
+        return False
+    kind = str(occluder.kind or "").lower().replace("_", "-")
+    role = str((occluder.meta or {}).get("role") or "").lower().replace("_", "-")
+    if kind in _HARD_PRODUCT_INK_KINDS or role in _PRODUCT_INK_ROLES:
+        return False  # a real cutout in front of the product — legitimate occlusion
+    _, np, _ = _deps()
+    om = np.asarray(occluder.mask, bool)
+    occ_area = int(om.sum())
+    if occ_area <= 0:
+        return False
+    inside = int(np.logical_and(om, np.asarray(under.mask, bool)).sum()) / occ_area
+    return inside >= float(opts.get("printed_on_under_containment", 0.9))
+
+
 def _flat_fill_allowed(write, element_mask, visible, meta, opts,
                        cfg=None) -> bool:
     """Whether the solid-median fast path may run for this hole.
@@ -1446,6 +1479,12 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
                     if not _may_punch_into(
                         occluder, element.kind, opts, under_meta=element.meta,
                     ):
+                        continue
+                    if _printed_on_product_under(occluder, element, opts):
+                        # Occluder sits entirely inside this product — printed ink, not
+                        # a real occlusion. Never punch the packaging raster.
+                        meta["printed_ink_occluder_kept"] = int(
+                            meta.get("printed_ink_occluder_kept") or 0) + 1
                         continue
                     sub = occluder_map == number
                     if not sub.any():

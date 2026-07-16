@@ -506,6 +506,17 @@ _SHELL_SHAPE_ROLES = frozenset({
     "vs", "vs-badge", "vs-chip", "seal", "starburst", "star_badge", "label",
 })
 
+# Raster-first chrome (user P1): these roles are the badge/seal/chip/pill/wordmark
+# family that MUST resolve to a pixel-exact raster of the source region rather than an
+# analytic recreation, unless the recreation is trivially exact (a genuine flat disc /
+# pill). ``button``/``cta``/``banner``/``label`` are deliberately EXCLUDED — those are
+# UI chrome that stays an editable native primitive. ``_refine_native_shells`` applies
+# the verification gate only to this set; everything else keeps its prior native path.
+_BADGE_CHROME_ROLES = frozenset({
+    "badge", "chip", "pill", "sticker", "tag", "seal", "starburst", "star_badge",
+    "sale-burst", "price-burst", "burst", "vs", "vs-badge", "vs-chip",
+})
+
 
 def _flat_fill_color(fill):
     """Hex colour of a flat fill spec, or None (gradients/images are not flat chrome)."""
@@ -514,6 +525,53 @@ def _flat_fill_color(fill):
         if isinstance(color, str) and color.strip():
             return color.strip()
     return None
+
+
+def _hex_to_rgb(value):
+    """(r,g,b) tuple from a #rrggbb string, or None."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lstrip("#")
+    if len(v) != 6:
+        return None
+    try:
+        return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _hex_sum_dist(a, b):
+    """Sum of absolute channel differences between two #rrggbb colours (None → inf)."""
+    ra, rb = _hex_to_rgb(a), _hex_to_rgb(b)
+    if ra is None or rb is None:
+        return float("inf")
+    return sum(abs(x - y) for x, y in zip(ra, rb))
+
+
+def _correct_solid_shell_fill(node, measured, report, tolerance=120.0):
+    """Correct a solid shell's flat fill to the MEASURED source plate colour on mismatch.
+
+    A native pill/badge/banner shell whose declared flat fill disagrees with the plate
+    colour actually photographed in the source renders the wrong background — and when the
+    wrong fill is dark, the (correct, dark) text on top vanishes (091 "GET YOURS FOR £29.99"
+    shipped a #280100 fill over an orange button, hiding the price). Only fires on a CLEAR
+    mismatch so a genuinely-correct native pill is left untouched (mandate: keep clean
+    native pills native). Verdict must be ``solid``; outlined/phantom have their own paths.
+    """
+    if not isinstance(measured, dict) or measured.get("verdict") != "solid":
+        return False
+    fill_hex = measured.get("fill_color")
+    if not _hex_to_rgb(fill_hex):
+        return False
+    declared = _flat_fill_color(node.fill)
+    if declared is not None and _hex_sum_dist(declared, fill_hex) <= tolerance:
+        return False  # native fill already matches the source plate — keep it
+    node.fill = {"kind": "flat", "color": fill_hex}
+    node.meta = {**(node.meta or {}), "measured_shell_fill": fill_hex,
+                 "shell_fill_corrected_from": declared}
+    report.setdefault("corrected_fills", []).append(
+        {"id": node.id, "from": declared, "to": fill_hex})
+    return True
 
 
 def _shell_silhouette(run_dir, abs_box, color):
@@ -637,24 +695,41 @@ def _measure_rect_shell(run_dir, abs_box):
         # because only the largest component is kept.
         if cov < 0.45 or bbox_fill < 0.72:
             return {"verdict": "phantom", "coverage": cov, "bbox_fill": bbox_fill}
+        def _hexof(vec):
+            return "#%02x%02x%02x" % tuple(int(v) for v in np.clip(vec, 0, 255))
+
         # Rim vs interior paint.
         it = max(2, min(4, min(w, h) // 12))
         er = ndimage.binary_erosion(sil, iterations=it)
         band = sil & ~er
         if int(band.sum()) < 16 or int(er.sum()) < 16:
             return {"verdict": "solid", "coverage": cov, "bbox_fill": bbox_fill,
-                    "sil": sil}
+                    "sil": sil, "fill_color": _hexof(np.median(crop[sil], axis=0))}
         rim = np.median(crop[band], axis=0)
         inner_px = crop[er]
+        # Robust interior colour = median of ALL interior pixels. Sparse TEXT ink inside a
+        # solid pill is a MINORITY and does not move the median off the plate colour (091:
+        # a solid orange "GET YOURS FOR £29.99" button whose near-black text used to be
+        # sampled as a dark #280100 "outlined" interior — the plate then rendered black and
+        # the dark text vanished). A genuinely differently-painted interior (013 "snacks":
+        # near-black interior under a white rim) shifts the median because it fills most of
+        # the inside, so this stays honest for real outlined chips.
+        inner_med = np.median(inner_px, axis=0)
+        if float(np.abs(inner_med - rim).sum()) <= 150:
+            return {"verdict": "solid", "coverage": cov, "bbox_fill": bbox_fill,
+                    "sil": sil, "fill_color": _hexof(inner_med)}
         rim_like = np.abs(inner_px - rim).sum(axis=1) < 110
         distinct = inner_px[~rim_like]
-        if distinct.shape[0] < max(16, int(0.10 * inner_px.shape[0])):
+        # Outlined requires the differently-painted interior to be the MAJORITY of the
+        # inside; a rim-dominated interior with only a minority of off-rim pixels (heavy
+        # text ink on a solid plate) is a solid plate, not an outline.
+        if distinct.shape[0] < max(16, int(0.5 * inner_px.shape[0])):
             return {"verdict": "solid", "coverage": cov, "bbox_fill": bbox_fill,
-                    "sil": sil}
+                    "sil": sil, "fill_color": _hexof(inner_med)}
         interior = np.median(distinct, axis=0)
         if float(np.abs(rim - interior).sum()) <= 150:
             return {"verdict": "solid", "coverage": cov, "bbox_fill": bbox_fill,
-                    "sil": sil}
+                    "sil": sil, "fill_color": _hexof(inner_med)}
         # Outlined: measure the stroke width as how many 1px erosion shells stay
         # rim-coloured. The OUTERMOST shell is antialiased against the background
         # (013's white ring reads (135,179,154) there), so a non-rim shell only ends
@@ -2005,6 +2080,32 @@ _GROUP_BG_MIN_AREA_PX = 2000
 _GROUP_BG_MAX_CANVAS_FRAC = 0.72
 _GROUP_BG_COLOR_DELTA = 8.0
 _GROUP_BG_TEXTURE_STD = 10.0
+# A text-only group (a headline/label band with no plate anchor of its own) over a
+# PHOTOGRAPHIC region has no real backdrop: the copy sits directly on the photo. Slicing
+# a rectangle of that photo and parking it behind the text manufactures a false plate
+# (025 "Why Everyone's Switching to Hears" over the man's hair → a dark rectangle). A
+# genuine card/band plate is flat/near-uniform (low texture) even when colour-distinct;
+# a slice this textured is unmistakably a photo, so text-only groups skip it. Real flat
+# card plates (texture ~0, e.g. testimonial cards) stay well under this and are untouched.
+_GROUP_BG_TEXT_ONLY_MAX_TEXTURE = 18.0
+
+
+def _group_subtree_is_text_only(layer) -> bool:
+    """True when every leaf under ``layer`` is native TEXT (no image/shape plate anchor).
+
+    Nested text bands recurse; any image/shape/photo leaf (a real plate, product, icon or
+    emoji cutout) means the group owns a genuine surface and may keep a manufactured
+    backdrop."""
+    children = layer.children or []
+    if not children:
+        return layer.type == "text"
+    for child in children:
+        if child.type == "group":
+            if not _group_subtree_is_text_only(child):
+                return False
+        elif child.type != "text":
+            return False
+    return True
 
 
 def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings, plate_rgb=None) -> int:
@@ -2087,6 +2188,11 @@ def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings, plate_rg
         color_delta = float(np.abs(tile.mean(axis=(0, 1)) - np.median(ring_all, axis=0)).max())
         texture = float(tile.std(axis=(0, 1)).mean())
         if color_delta < _GROUP_BG_COLOR_DELTA and texture < _GROUP_BG_TEXTURE_STD:
+            return
+        # A text-only band over a photographic slice (high texture) has no real plate —
+        # the headline just sits on the photo. Manufacturing a backdrop here paints a
+        # false rectangle (025). Only a flat/near-uniform plate backs a text-only group.
+        if texture >= _GROUP_BG_TEXT_ONLY_MAX_TEXTURE and _group_subtree_is_text_only(layer):
             return
         assets = os.path.join(run_dir, "assets")
         os.makedirs(assets, exist_ok=True)
@@ -2440,6 +2546,109 @@ def _materialize_source_crop(run_dir, abs_box, layer_id, warnings, min_std=6.0,
         return "no-source", None
 
 
+def _source_for_run(run_dir):
+    """Absolute path of the ORIGINAL source raster for this run (or None)."""
+    for name in ("original.png", "normalized.png"):
+        cand = os.path.join(run_dir, name)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _rasterize_badge_shell(run_dir, abs_box, node, text_boxes, shape_kind,
+                           reason, report, warnings):
+    """Replace a native badge/seal/chip shell with a PIXEL-EXACT raster of its source box.
+
+    Enforces the user's P1: badge/seal chrome is rastered, never half-recreated as an
+    analytic shape whose fill/edge may not match the source. The crop comes from the
+    ORIGINAL pixels (the real chrome, not the inpainted plate). Any sibling TEXT boxes are
+    painted out with the local chrome colour (median of the shell area minus the text
+    boxes) so the native text siblings render cleanly ON TOP without double-striking the
+    baked copy — i.e. raster chrome + native editable text, the contract the user asked
+    for. Returns True when the node was converted, False when the source is unreadable
+    (the caller then keeps the node conservatively — never destroy what we cannot read).
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception:
+        return False
+    source = _source_for_run(run_dir)
+    if not source:
+        return False
+    try:
+        rgb = np.asarray(Image.open(source).convert("RGB"), dtype=np.uint8)
+        H, W = rgb.shape[:2]
+        x = int(round(float(abs_box.get("x", 0) or 0)))
+        y = int(round(float(abs_box.get("y", 0) or 0)))
+        w = int(round(float(abs_box.get("w", 1) or 1)))
+        h = int(round(float(abs_box.get("h", 1) or 1)))
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(W, x + w), min(H, y + h)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return False
+        crop = rgb[y0:y1, x0:x1].copy()
+        ch, cw = crop.shape[:2]
+        # De-double: paint each sibling text box with the local chrome colour.
+        boxes = []
+        for tb in text_boxes or []:
+            bx = int(round(float(tb.get("x", 0) or 0)))
+            by = int(round(float(tb.get("y", 0) or 0)))
+            bw = int(round(float(tb.get("w", 0) or 0)))
+            bh = int(round(float(tb.get("h", 0) or 0)))
+            # text boxes are relative to the group == relative to this crop origin
+            tx0, ty0 = max(0, bx), max(0, by)
+            tx1, ty1 = min(cw, bx + bw), min(ch, by + bh)
+            if tx1 - tx0 >= 2 and ty1 - ty0 >= 2:
+                boxes.append((tx0, ty0, tx1, ty1))
+        if boxes:
+            if shape_kind == "ellipse":
+                yy, xx = np.mgrid[0:ch, 0:cw]
+                cx, cy = (cw - 1) / 2.0, (ch - 1) / 2.0
+                shell_mask = ((xx - cx) / max(1.0, cw / 2.0)) ** 2 + \
+                             ((yy - cy) / max(1.0, ch / 2.0)) ** 2 <= 1.0
+            else:
+                shell_mask = np.ones((ch, cw), dtype=bool)
+            text_mask = np.zeros((ch, cw), dtype=bool)
+            for tx0, ty0, tx1, ty1 in boxes:
+                text_mask[ty0:ty1, tx0:tx1] = True
+            chrome_px = crop[shell_mask & ~text_mask]
+            if chrome_px.shape[0] >= 16:
+                chrome = np.median(chrome_px, axis=0).astype(np.uint8)
+            else:
+                chrome = np.median(crop.reshape(-1, 3), axis=0).astype(np.uint8)
+            for tx0, ty0, tx1, ty1 in boxes:
+                crop[ty0:ty1, tx0:tx1] = chrome
+        tile = np.dstack([crop, np.full((ch, cw), 255, dtype=np.uint8)])
+        assets = os.path.join(run_dir, "assets")
+        os.makedirs(assets, exist_ok=True)
+        rel = os.path.join("assets", f"{node.id}_chromeraster.png")
+        Image.fromarray(tile, "RGBA").save(os.path.join(run_dir, rel))
+    except Exception as exc:
+        warnings.append({"code": "badge-raster-failed", "layer_id": node.id,
+                         "detail": str(exc)})
+        return False
+    # Mutate the shell into an exact raster slice: drop every analytic-shape field.
+    node.type = "image"
+    node.src = rel
+    node.shape_kind = None
+    node.path = None
+    node.svg = None
+    node.fill = None
+    node.stroke = None
+    node.radius = None
+    node.mask = None
+    node.meta = {**(node.meta or {}),
+                 "rebuilt_from": "raster-badge-chrome",
+                 "fallback": "raster-slice",
+                 "fallback_reasons": [reason],
+                 "shell_raster_chip": True,
+                 "layer_disposition": "foreground_raster",
+                 "ownership_cutout": True}
+    report.setdefault("rastered_shells", []).append({"id": node.id, "reason": reason})
+    return True
+
+
 def _refine_native_shells(layers, run_dir, warnings):
     """Refine native badge/chip shells against the ORIGINAL source pixels.
 
@@ -2504,6 +2713,91 @@ def _refine_native_shells(layers, run_dir, warnings):
             if rebuilt not in ("flat-ellipse-shell", "flat-rect-shell") or not color:
                 kept.append(node)
                 continue
+            role = str((node.meta or {}).get("role") or "").strip().lower().replace("_", "-")
+            if role in _BADGE_CHROME_ROLES:
+                # ── Raster-first badge chrome verification gate (user P1) ──────────────
+                # A badge/seal/chip shell that reaches the design stage UNFLAGGED (upstream
+                # did not already route it to the always-raster path) is VERIFIED against
+                # the source here. Only a trivially-exact flat disc/pill stays a native
+                # primitive; a scalloped seal (016's spiky-star mismatch), artwork under a
+                # sampled-background fill (013's yellow bear painted over as a green
+                # ellipse), or an outlined chip whose interior upstream mis-averaged (013
+                # "snacks") ships as a PIXEL-EXACT raster of the badge region, with sibling
+                # text de-doubled and kept native on top. Never a wrong-fill/edge shell.
+                shape_now = "ellipse" if rebuilt == "flat-ellipse-shell" else "rect"
+                text_boxes = [dict(c.box) for c in (nodes or [])
+                              if isinstance(c, Layer) and c.type == "text" and c.box]
+                measured = _measure_rect_shell(run_dir, abs_box)
+                if measured is None:
+                    # Unverifiable (no source / scipy) → conservative keep, as before.
+                    kept.append(node)
+                    _measured_radius(node, _shell_silhouette(run_dir, abs_box, color))
+                    continue
+                scalloped = False
+                if shape_now == "ellipse":
+                    aspect = abs_box["w"] / max(1.0, abs_box["h"])
+                    if 0.75 <= aspect <= 1.34:
+                        scalloped = _starburst_path_for_shell(
+                            run_dir, abs_box, color) is not None
+                verdict = measured["verdict"]
+                if verdict == "phantom":
+                    if text_boxes:
+                        # 104 "Cadence" class: no chrome exists — the sibling text owns the
+                        # ink. Drop the phantom shell (the text layer already carries it).
+                        warnings.append({
+                            "code": "phantom-shell-dropped", "layer_id": node.id,
+                            "detail": "no chrome in source (coverage %.2f, bbox_fill %.2f);"
+                                      " sibling text owns the ink" % (
+                                          measured["coverage"], measured["bbox_fill"]),
+                        })
+                        report["phantom_shells"].append(
+                            {"id": node.id, "coverage": round(measured["coverage"], 3),
+                             "bbox_fill": round(measured["bbox_fill"], 3)})
+                        continue  # DROP
+                    # Unowned artwork under a sampled-background fill (013 bear): the flat
+                    # fill == the surrounding page colour, so the "shell" would paint over
+                    # real art. Raster the exact region so the artwork survives.
+                    if _rasterize_badge_shell(
+                            run_dir, abs_box, node, [], shape_now,
+                            "phantom-fill-over-artwork (coverage %.2f)" % measured["coverage"],
+                            report, warnings):
+                        kept.append(node)
+                        continue
+                    kept.append(node)  # raster unreadable → conservative keep
+                    continue
+                if verdict == "solid" and not scalloped:
+                    # A genuine flat disc/pill whose analytic shape matches the source:
+                    # trivially exact, so it stays a native editable primitive — but first
+                    # verify its declared fill against the measured source plate colour so a
+                    # wrong (e.g. dark) fill that would hide the text is corrected.
+                    kept.append(node)
+                    _correct_solid_shell_fill(node, measured, report)
+                    _measured_radius(node, measured.get("sil"))
+                    continue
+                # scalloped seal / outlined chip / non-solid interior → exact raster.
+                reason = ("scalloped-seal" if scalloped else
+                          "outlined-chip" if verdict == "outlined" else
+                          "chrome-interior-mismatch")
+                if _rasterize_badge_shell(run_dir, abs_box, node, text_boxes,
+                                          shape_now, reason, report, warnings):
+                    kept.append(node)
+                    continue
+                # Raster unreadable → fall through to the conservative native handling.
+                kept.append(node)
+                if verdict == "outlined":
+                    node.stroke = {"color": measured["stroke_color"],
+                                   "width": measured["stroke_width"]}
+                    node.fill = ({"kind": "flat", "color": measured["fill_color"]}
+                                 if measured["fill_color"] else None)
+                    node.meta = {**(node.meta or {}),
+                                 "rebuilt_from": "outlined-rect-shell",
+                                 "measured_stroke": dict(node.stroke)}
+                    out_radius = measured.get("radius")
+                    if node.radius in (None, 0, 0.0) and out_radius:
+                        node.radius = out_radius
+                else:
+                    _measured_radius(node, measured.get("sil"))
+                continue
             if rebuilt == "flat-ellipse-shell":
                 kept.append(node)
                 aspect = abs_box["w"] / max(1.0, abs_box["h"])
@@ -2561,6 +2855,9 @@ def _refine_native_shells(layers, run_dir, warnings):
                     report["measured_radii"].append(
                         {"id": node.id, "radius": out_radius})
                 continue
+            # solid verdict: keep it native, but verify the declared fill against the
+            # measured source plate colour (091 dark-fill-over-orange-button class).
+            _correct_solid_shell_fill(node, measured, report)
             _measured_radius(node, measured.get("sil"))
         return kept
 
@@ -2627,8 +2924,14 @@ def _enforce_asset_materialization(layers, run_dir, canvas, warnings, plate_path
                         warnings.append({"code": "empty-asset-group-unverified",
                                          "layer_id": node.id})
                 else:
-                    # A non-photo empty group (pure layout wrapper) is legitimate; keep it.
-                    kept.append(node)
+                    # A non-photo empty group (band / layout wrapper with zero children and
+                    # no visual of its own) renders NOTHING. Keeping it only pollutes the
+                    # tree and trips the acceptance gate's empty-group check — the exact
+                    # 021 false-shape (two empty ``band`` wrappers denied a legitimately
+                    # scene-baked caption_over_photo output its exemption). Drop it with a
+                    # recorded reason so the layer tree honestly reflects what renders.
+                    report["dropped"].append(
+                        {"id": node.id, "reason": "empty-layout-wrapper-group"})
                     continue
             # 2) Blank / ghost image in a pixel-required role → opaque source slice or drop.
             if node.type == "image" and role in _PIXEL_REQUIRED_ROLES:

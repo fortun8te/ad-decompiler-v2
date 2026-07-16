@@ -68,12 +68,13 @@ _WEIGHT_KEYS = ("local_ssim", "lpips", "text")
 # every good run passes with margin; per-archetype floors (archetype.PRESETS) override them
 # and are the values actually used when a preset is applied.
 _DEFAULT_LPIPS_SIMILARITY_MIN = 0.80
-_DEFAULT_LOCAL_SSIM_MIN = 0.50
-# F6 (002 audit): worst-local floor. Aggregate local SSIM 0.6064 passed the 0.55 gate
-# while the worst 64px window sat at 0.0091 — a giant, high-scoring host raster covering
-# ~70% of the canvas bought the aggregate. The gate must also look at the worst window /
-# worst layer; 0.10 mirrors pixel_diff's own local-ssim-worst-region hard-fail threshold.
-_DEFAULT_WORST_LOCAL_SSIM_MIN = 0.10
+_DEFAULT_LOCAL_SSIM_MIN = 0.55
+# F6 / workstream E: worst-local floor. Aggregate local SSIM 0.6064 passed while the worst
+# 64px window sat at 0.0091 (002). Raised from 0.10→0.15 so erased/seamed windows fail the
+# gate without always-failing good runs (009/013/052 locals ≥ 0.60, worst windows ≫ 0.15).
+# Local aggregate floor raised 0.50→0.55 into the gap below good runs (0.60–0.74) and above
+# known-bad 002 (0.465).
+_DEFAULT_WORST_LOCAL_SSIM_MIN = 0.15
 # One layer may contribute at most this share of the local-component weight, so a single
 # huge raster cannot dominate the weighted mean (the reward-buying vector on 002).
 _LOCAL_WEIGHT_SHARE_CAP = 0.25
@@ -756,7 +757,26 @@ def acceptance_gate(run_dir: str, cfg: Optional[dict] = None, *,
         if hard_fails:
             checks["hard_fails"] = {"value": hard_fails, "max": 0, "ok": False}
             ok = False
+        # Agent B: unresolved glyph residue is a hard structural fail — the harness must
+        # never declare success over it even if a summary omitted the hard_fails list.
+        residue = False
+        for fail in list(qa.get("hard_fails") or []):
+            if isinstance(fail, dict) and fail.get("rule") == "glyph-residue":
+                residue = True
+                break
+        structural = qa.get("structural") if isinstance(qa.get("structural"), dict) else {}
+        try:
+            if int(structural.get("glyph_residue_unresolved") or 0) > 0:
+                residue = True
+        except (TypeError, ValueError):
+            pass
         contract = qa.get("contract") if isinstance(qa.get("contract"), dict) else {}
+        if contract.get("glyph_residue_clean") is False:
+            residue = True
+        if residue:
+            checks["glyph_residue"] = {"value": True, "ok": False,
+                                       "detail": "unresolved glyph residue under removed text"}
+            ok = False
         if contract.get("pass") is False:
             checks["contract"] = {
                 "value": False, "ok": False,
@@ -970,20 +990,32 @@ _CROP_NOTE = (
 )
 
 
+def _valid_box(box: Any) -> bool:
+    return isinstance(box, dict) and all(
+        isinstance(box.get(k), (int, float)) for k in ("x", "y", "w", "h"))
+
+
 def _worst_crop_box(qa: Optional[dict]) -> Optional[dict]:
-    """Box of the worst measured evidence: worst local window, else worst per-layer box.
+    """Box of the worst measured evidence across the worst local window AND per-layer rows.
 
     F9: the whole-image critique missed local defects (seam, broken plate, wrong fonts)
-    and produced vague whole-image opinions. Feeding the VLM a crop of the worst
-    measured window makes its report local and checkable — and cheap (fewer pixels)."""
+    and produced vague whole-image opinions. Feeding the VLM a crop of the worst measured
+    region makes its report local and checkable — and cheap (fewer pixels).
+
+    P1 gap 2: the crop now targets the genuinely-worst evidence. The single worst window
+    (``local_ssim_worst_window``, produced alongside qa_worst_window.png) and every scored
+    per-layer region are ranked together by measured score; the lowest-scoring region wins,
+    so a per-layer region that is worse than the window drives the crop instead of being
+    ignored. The window wins ties (unchanged behaviour when it is the sole/worst evidence)."""
     qa = qa or {}
+    candidates: list[tuple[float, int, dict]] = []
     window = qa.get("local_ssim_worst_window")
     if isinstance(window, dict):
         box = window.get("bbox") or window.get("box")
-        if isinstance(box, dict) and all(
-                isinstance(box.get(k), (int, float)) for k in ("x", "y", "w", "h")):
-            return dict(box)
-    worst_box, worst_value = None, None
+        if _valid_box(box):
+            score = window.get("ssim")
+            candidates.append(
+                (float(score) if isinstance(score, (int, float)) else 0.0, 0, dict(box)))
     for row in qa.get("per_layer") or []:
         if not isinstance(row, dict):
             continue
@@ -991,12 +1023,14 @@ def _worst_crop_box(qa: Optional[dict]) -> Optional[dict]:
         if not isinstance(value, (int, float)):
             continue
         box = row.get("abs_box") or row.get("box")
-        if not (isinstance(box, dict) and all(
-                isinstance(box.get(k), (int, float)) for k in ("x", "y", "w", "h"))):
+        if not _valid_box(box):
             continue
-        if worst_value is None or value < worst_value:
-            worst_value, worst_box = value, dict(box)
-    return worst_box
+        candidates.append((float(value), 1, dict(box)))
+    if not candidates:
+        return None
+    # Worst (lowest) score first; the window (rank 0) wins ties for back-compat.
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2]
 
 
 def _crop_image_bytes(image_bytes: bytes, box: dict, pad: int = _CROP_PAD_PX) -> bytes:
@@ -1094,6 +1128,27 @@ def _run_critique(run_dir, cfg, source_path, preview_path, design, write) -> dic
     }
     if crop_box:
         result["crop"] = crop_box
+    # Evidence fingerprint lets the harness skip a repeat VLM call when the crop critic's
+    # inputs (source/preview/qa worst-window) are unchanged across rounds.
+    if run_dir:
+        try:
+            import hashlib as _hashlib
+            parts = []
+            for name in ("normalized.png", "preview.png", "qa.json", "design.json"):
+                path = os.path.join(run_dir, name)
+                try:
+                    with open(path, "rb") as handle:
+                        parts.append(_hashlib.sha256(handle.read()).hexdigest())
+                except OSError:
+                    parts.append("")
+            qa_for_fp = _load_json(os.path.join(run_dir, "qa.json"), {})
+            window = (qa_for_fp.get("local_ssim_worst_window")
+                      if isinstance(qa_for_fp, dict) else None)
+            parts.append(json.dumps(window, sort_keys=True, default=str) if window else "")
+            result["evidence_fingerprint"] = _hashlib.sha256(
+                "|".join(parts).encode("utf-8")).hexdigest()
+        except Exception:
+            pass
     if write and run_dir:
         try:
             _write_json(os.path.join(run_dir, "qa_critique.json"), result)
@@ -1108,9 +1163,23 @@ def critique_to_repairs(items: Optional[list], design: Optional[dict] = None) ->
     Every emitted (stage, action) is in ``harness.ACTIONABLE``, so the loop resumes the
     same pipeline stages metric-driven repairs use; unmapped issues are skipped rather
     than invented. Pure and deterministic (the VLM call already happened).
+
+    Workstream E: never re-promote baked chrome / kept_in_photo OCR to editable TEXT —
+    those cutouts are the intended representation (Agent A).
     """
     if items and design is not None:
         _attach_layer_ids([i for i in items if isinstance(i, dict)], design)
+    baked_ids: set[str] = set()
+    if isinstance(design, dict):
+        try:
+            from src.harness import is_baked_chrome_layer, is_already_sliced_layer
+            for layer in _flatten_layers(design.get("layers") or []):
+                if not isinstance(layer, dict) or not layer.get("id"):
+                    continue
+                if is_baked_chrome_layer(layer) or is_already_sliced_layer(layer):
+                    baked_ids.add(str(layer["id"]))
+        except Exception:
+            baked_ids = set()
     out: list[dict] = []
     for item in items or []:
         if not isinstance(item, dict):
@@ -1127,6 +1196,12 @@ def critique_to_repairs(items: Optional[list], design: Optional[dict] = None) ->
         for needles, stage, action, rule_severity in _CRITIQUE_RULES:
             if not any(needle in haystack for needle in needles):
                 continue
+            # Baked chrome / already-sliced: skip TEXT promote and re-slice thrash.
+            if layer_ids and baked_ids.intersection(layer_ids):
+                if stage == "text-analysis" or action in {
+                    "restore-editable-text", "refit-text-box", "resolve-fonts",
+                }:
+                    break
             severity = _strictest_severity(item_severity, rule_severity)
             params: dict[str, Any] = {"source": "vlm_critique", "layer_ids": layer_ids}
             if fix:

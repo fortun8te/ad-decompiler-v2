@@ -122,6 +122,18 @@ _SAVE_BADGE_RE = re.compile(
 # Product/person cutouts that must NEVER be promoted to editable-shell chrome.
 _BAKE_CUTOUT_ROLES = _PRODUCT_CUTOUT_ROLES - {"logo"}
 
+# Physical package/product faces whose PRINTED LABELS (flavour strip, ingredient panel,
+# on-pack brand) are photographed ink, not editable overlay copy. When the VLM says a line
+# is printed_on_product, a line sitting inside any such element must never be peeled — the
+# plate inpaint would wipe the label off the pack and leave the strip blank (002 "VANILLE
+# SMAAK" flavour strip rendered empty). This is deliberately the package family only:
+# generic "photo"/"person" panels can carry composited overlay copy, so they are excluded
+# and keep the corroboration requirement.
+_PACKAGE_LABEL_HOST_ROLES = frozenset({
+    "product", "package", "packaging", "bottle", "jar", "tube", "can", "canister",
+    "pouch", "sachet", "shaker", "box", "carton", "product-cluster", "label", "device",
+})
+
 # Photographic PANEL owners (comparison sides, lifestyle crops). A person/photo panel
 # rarely carries printed copy of its own: checklist/card/label text sitting on it is
 # normally composited by the designer, not photographed ink. Product/pack faces are
@@ -3227,6 +3239,44 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                 c["meta"]["role"] = "scene-text"
                 c["meta"]["scene_text_corroborated"] = True
                 continue
+            # Never-peel-product-label guard: strict scene_regions corroboration missed
+            # (the product cutout was not confidently detected or the VLM crop bounds are
+            # loose), but the VLM already ruled this line printed_on_product. If the box
+            # sits mostly inside ANY package/product-face element — even an uncorroborated,
+            # low-confidence one that never reached product_regions — the ink is on the
+            # pack. Fail toward KEEPING it baked: peeling it makes the plate inpaint erase
+            # the on-pack label and ship a blank strip (002 "VANILLE SMAAK"). Never
+            # removal_required for on-pack printed copy.
+            pkg_host = None
+            for host in elem_cands:
+                if host is c:
+                    continue
+                hbox = host.get("box") or {}
+                if not (float(hbox.get("w", 0) or 0) > 0 and float(hbox.get("h", 0) or 0) > 0):
+                    continue
+                if _is_full_bleed(hbox, canvas):
+                    continue
+                hrole = str((host.get("meta") or {}).get("role") or host.get("role") or "").lower()
+                if hrole not in _PACKAGE_LABEL_HOST_ROLES:
+                    continue
+                if _inside_frac(c["box"], hbox) >= scene_text_inside:
+                    pkg_host = host
+                    break
+            if pkg_host is not None:
+                c["kept_in_photo"] = True
+                c["meta"]["origin"] = "scene"
+                c["meta"]["role"] = "scene-text"
+                c["meta"]["baked_owner_id"] = pkg_host.get("id")
+                c["meta"]["scene_text_printed_label"] = True
+                c["meta"]["suppression_reason"] = "printed-label-inside-package"
+                for tentative in ("overlay_text", "removal_required"):
+                    c["meta"].pop(tentative, None)
+                diagnostics.setdefault("scene_text_contract", []).append({
+                    "id": c.get("id"), "host": pkg_host.get("id"),
+                    "action": "keep-printed-label", "host_role": str(
+                        (pkg_host.get("meta") or {}).get("role") or ""),
+                })
+                continue
             c["meta"]["scene_text_uncorroborated"] = True
             c["meta"]["overlay_text"] = True
             c["meta"]["removal_required"] = True
@@ -3412,6 +3462,46 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                     for tentative in ("overlay_text", "removal_required"):
                         c["meta"].pop(tentative, None)
                     continue
+        # Rotated/curved text on a photographic carrier (ribbon, tape, sticker, curved
+        # label) is scene ink, not overlay copy. Overlay headlines/offers/CTAs are laid
+        # out axis-aligned; a meaningfully rotated OCR line almost always sits on a
+        # printed photographic surface — 088's Black-Friday ribbons cross the can with the
+        # SAME phrase repeated at -31°/+11° etc. When such a carrier is fragmented (not
+        # captured as one product/photo cutout) the fragments reach here and would be
+        # promoted to editable TEXT + removal, producing the mangled result the user
+        # flagged: recreated glyphs pasted over the ribbon and smudge/solid-fill patches
+        # where sibling fragments were inpainted out. Bake instead: keep the carrier's
+        # exact pixels, never inpaint its text out, never re-render it. Positive
+        # external-overlay evidence still wins, and an axis-aligned line (|rot| below the
+        # threshold, e.g. the flat grey-plate 'Black Friday SALE 21% OFF' headline) is
+        # untouched so genuine overlay copy stays native.
+        _rot = abs(float(c.get("rotation") or c["meta"].get("rotation") or 0.0))
+        _rot_scene_min = float(
+            (cfg.get("merge") or {}).get("rotated_scene_ink_deg", 8.0))
+        if _rot >= _rot_scene_min:
+            meta = c["meta"]
+            positive_overlay = bool(
+                ownership_action == "recreate"
+                or meta.get("scene_text_role") == "overlay_copy"
+                or meta.get("overlay_text") or meta.get("promote_text")
+                or meta.get("editable_text") or meta.get("text_promoted")
+                or meta.get("external_overlay")
+            )
+            if not positive_overlay:
+                c["kept_in_photo"] = True
+                meta["origin"] = "scene"
+                meta["role"] = "scene-text"
+                meta["scene_text_geometric"] = True
+                meta["suppression_reason"] = "rotated-text-on-photographic-carrier"
+                meta["ownership_enforced"] = True
+                for tentative in ("overlay_text", "removal_required"):
+                    meta.pop(tentative, None)
+                diagnostics["scene_text_contract"].append({
+                    "id": c.get("id"),
+                    "action": "rotated-carrier-bake",
+                    "rotation": round(_rot, 1),
+                })
+                continue
         if c["meta"].get("role") in overlay_text_roles:
             # Overlay copy must be painted back as editable text, so its original
             # glyphs have to be removed from the Big-LaMa plate first.  Keep this
