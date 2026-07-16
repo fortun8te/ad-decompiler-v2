@@ -100,12 +100,54 @@ DEFAULTS = {
     "absorb_printed_artwork": True,
     "printed_artwork_min_containment": 0.95,
     "printed_artwork_max_area_ratio": 0.5,
+    # The invariant, generalized: ANY non-product, non-text child that rides inside a
+    # product cutout (icon / checkmark-cross glyph / nutrition panel / small printed
+    # photo or shape — not just logos and flavor bars) is that product's own packaging
+    # ink and must ride the cutout, never ship as a separate element that reconstruct /
+    # peel would punch out of the packaging (091 on-pack photos+icon, 094 on-pack chip,
+    # 135's seven printed glyphs/shapes). Runs after the logo + shell absorbers and
+    # sweeps up everything they leave behind. A decoration that straddles the product
+    # edge so no nesting link formed still folds when its BOX sits mostly inside the
+    # product (box_containment) — a label sticking 20% over the edge must not punch the
+    # bag. Distinct SKUs (product-instance roles) and anything larger than
+    # max_area_ratio of the product are never decorations.
+    "absorb_product_decorations": True,
+    "product_decoration_min_containment": 0.80,
+    "product_decoration_box_containment": 0.80,
+    "product_decoration_max_area_ratio": 0.60,
+    # Adjacent product parts that share a text-prompt (jar+lid, dual chocolate bars)
+    # are one physical owner when their hulls nearly touch. Multi-SKU layouts with
+    # larger gaps (067's three jars) stay separate — gap is relative to object size.
+    "product_cluster_merge": True,
+    "product_cluster_gap_px": 4,
+    "product_cluster_gap_frac": 0.18,
+    "product_cluster_min_area_ratio": 0.08,
+    # Swiss-cheese SAM halves can leave a mask gap while boxes still heavily overlap
+    # (135 dual protein bars). Box IoU above this merges even when hulls do not touch.
+    "product_cluster_box_iou": 0.22,
+    # SAM packaging masks often have Swiss-cheese interior holes (stroke art, gummy
+    # cuts). Seal them so the product alpha is a tight solid silhouette.
+    "seal_product_holes": True,
+    "product_hole_close_px": 5,
+    # Flavor bars / on-pack chips SAM labels as buttons (002 VANILLE SMAAK yellow
+    # highlight) are packaging ink, not CTA chrome — fold into the product owner.
+    "absorb_packaging_shells": True,
+    "packaging_shell_min_containment": 0.92,
+    "packaging_shell_max_area_ratio": 0.18,
+    "packaging_shell_min_aspect": 3.2,
     "canonical_prefix": "E",
 }
 
 _GRAPHIC_ROLES = {"logo", "icon", "arrow", "badge", "symbol", "pictogram", "sticker",
                   # list-row glyphs (src/icon_detect.py): ✓ / ✗ / ? marks
                   "verified", "checkmark", "cross", "question-mark"}
+_LIST_ROW_ICON_ROLES = frozenset({
+    "verified", "checkmark", "check", "check-mark", "check_mark", "tick",
+    "cross", "question-mark", "question_mark",
+})
+_CHECKLIST_CARD_ROLES = frozenset({
+    "card", "panel", "frame", "container", "plate", "shape", "badge", "",
+})
 _RASTER_ROLES = {
     "photo",
     "product",
@@ -778,6 +820,213 @@ def _suppress_product_shadows(clusters: list, opts: dict) -> list:
     return [c for keep, c in zip(alive, clusters) if keep]
 
 
+def _cluster_product_prompts(cluster: dict) -> set[str]:
+    """Normalized text-prompt strings that tagged this cluster as a product instance."""
+    prompts = set()
+    for member in cluster["members"]:
+        if member.get("mode") != "text-prompt":
+            continue
+        if normalized_role(member.get("role")) not in _PRODUCT_INSTANCE_ROLES:
+            continue
+        prompt = str(member.get("prompt") or "").strip().lower()
+        if prompt:
+            prompts.add(prompt)
+    return prompts
+
+
+def _hull_gap_budget(box_a: dict, box_b: dict, opts: dict) -> int:
+    """Max mask gap (px) still considered 'one product' for cluster merge."""
+    floor = int(opts.get("product_cluster_gap_px", 4))
+    frac = float(opts.get("product_cluster_gap_frac", 0.12))
+    sides = []
+    for box in (box_a, box_b):
+        w, h = int(box.get("w", 0) or 0), int(box.get("h", 0) or 0)
+        if w > 0 and h > 0:
+            sides.append(min(w, h))
+    if not sides:
+        return max(0, floor)
+    return max(floor, int(round(frac * min(sides))))
+
+
+def _masks_hull_adjacent(a, b, gap_px: int) -> bool:
+    """True when masks already touch/overlap or their dilated hulls meet within gap_px."""
+    if gap_px < 0:
+        return False
+    if int((a & b).sum()) > 0:
+        return True
+    if gap_px == 0:
+        return False
+    # Dilate the smaller mask only — cheaper, same contact test.
+    aa, ab = int(a.sum()), int(b.sum())
+    if aa <= ab:
+        return bool(((_dilate(a, gap_px) & b).sum()))
+    return bool(((_dilate(b, gap_px) & a).sum()))
+
+
+def _merge_product_clusters(clusters: list, opts: dict) -> list:
+    """Collapse adjacent same-prompt product parts into one owner (135 dual bars / jar+lid).
+
+    Distinct SKUs with larger gaps (067's spaced jars) stay separate because the gap
+    budget scales with object size. Only clusters that already carry product-instance
+    identity *and* a shared text-prompt string are eligible.
+    """
+    if not opts.get("product_cluster_merge", True) or len(clusters) < 2:
+        return clusters
+    min_ratio = float(opts.get("product_cluster_min_area_ratio", 0.08))
+    product_idx = [
+        i
+        for i, c in enumerate(clusters)
+        if normalized_role(c["winner"]["role"]) in _PRODUCT_INSTANCE_ROLES
+        and _cluster_product_prompts(c)
+    ]
+    if len(product_idx) < 2:
+        return clusters
+
+    parent = list(range(len(clusters)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    box_iou_min = float(opts.get("product_cluster_box_iou", 0.22))
+    for ai, a_i in enumerate(product_idx):
+        a = clusters[a_i]
+        a_prompts = _cluster_product_prompts(a)
+        a_area = max(1, int(a["winner"]["mask"].sum()))
+        for b_i in product_idx[ai + 1 :]:
+            b = clusters[b_i]
+            shared = a_prompts & _cluster_product_prompts(b)
+            if not shared:
+                continue
+            b_area = max(1, int(b["winner"]["mask"].sum()))
+            ratio = min(a_area, b_area) / max(a_area, b_area)
+            if ratio < min_ratio:
+                continue
+            gap = _hull_gap_budget(a["winner"]["box"], b["winner"]["box"], opts)
+            adjacent = _masks_hull_adjacent(
+                a["winner"]["mask"], b["winner"]["mask"], gap,
+            )
+            if not adjacent:
+                # Masks may be perforated / gapped while the painted boxes still overlap
+                # as one packshot (135). Spaced multi-SKU layouts (067) stay near-zero IoU.
+                ab, bb = a["winner"]["box"], b["winner"]["box"]
+                ax0, ay0 = float(ab["x"]), float(ab["y"])
+                ax1, ay1 = ax0 + float(ab["w"]), ay0 + float(ab["h"])
+                bx0, by0 = float(bb["x"]), float(bb["y"])
+                bx1, by1 = bx0 + float(bb["w"]), by0 + float(bb["h"])
+                iw = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+                ih = max(0.0, min(ay1, by1) - max(ay0, by0))
+                inter = iw * ih
+                union_a = (
+                    float(ab["w"]) * float(ab["h"])
+                    + float(bb["w"]) * float(bb["h"])
+                    - inter
+                )
+                iou = inter / max(1.0, union_a)
+                if iou < box_iou_min:
+                    continue
+            union(a_i, b_i)
+
+    groups: dict[int, list[int]] = {}
+    for i in product_idx:
+        groups.setdefault(find(i), []).append(i)
+    absorb_into: dict[int, int] = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        # Keep the highest-priority winner; union every sibling mask into it.
+        root = max(members, key=lambda i: (_priority(clusters[i]["winner"]),
+                                           int(clusters[i]["winner"]["mask"].sum())))
+        for i in members:
+            if i != root:
+                absorb_into[i] = root
+
+    if not absorb_into:
+        return clusters
+
+    alive = [True] * len(clusters)
+    for child_i, root_i in absorb_into.items():
+        # Path-compress through any chain (A→B, B→C) created by the grouping above.
+        while root_i in absorb_into:
+            root_i = absorb_into[root_i]
+        child = clusters[child_i]
+        parent_c = clusters[root_i]
+        shared = sorted(_cluster_product_prompts(parent_c) & _cluster_product_prompts(child))
+        parent_c["winner"]["mask"] = parent_c["winner"]["mask"] | child["winner"]["mask"]
+        parent_c["winner"]["box"] = _mask_box(parent_c["winner"]["mask"])
+        parent_c["members"].extend(child["members"])
+        parent_c["merges"].extend(child["merges"])
+        metrics = _mask_metrics(child["winner"]["mask"], parent_c["winner"]["mask"])
+        parent_c["merges"].append(
+            {
+                "key": child["winner"]["key"],
+                "mask_iou": round(metrics["iou"], 4),
+                "containment": round(metrics["containment"], 4),
+                "area_ratio": round(metrics["area_ratio"], 4),
+                "reason": "product-cluster-hull-merge",
+                "shared_prompts": shared,
+            }
+        )
+        alive[child_i] = False
+    return [c for keep, c in zip(alive, clusters) if keep]
+
+
+def _fill_mask_holes(mask):
+    """Fill interior background components not reachable from the silhouette border."""
+    np = _np()
+    box = _mask_box(mask)
+    if not box["w"] or not box["h"]:
+        return mask
+    # Work on a 1px-padded crop so exterior background always touches the crop border.
+    y0, x0, bh, bw = box["y"], box["x"], box["h"], box["w"]
+    crop = np.zeros((bh + 2, bw + 2), dtype=bool)
+    crop[1:-1, 1:-1] = mask[y0 : y0 + bh, x0 : x0 + bw]
+    h, w = crop.shape
+    reachable = np.zeros_like(crop, dtype=bool)
+    stack = [(0, 0)]
+    while stack:
+        y, x = stack.pop()
+        if y < 0 or y >= h or x < 0 or x >= w or reachable[y, x] or crop[y, x]:
+            continue
+        reachable[y, x] = True
+        stack.extend(((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)))
+    filled = crop | (~crop & ~reachable)
+    out = mask.copy()
+    out[y0 : y0 + bh, x0 : x0 + bw] = filled[1:-1, 1:-1]
+    return out
+
+
+def _seal_product_masks(clusters: list, opts: dict) -> None:
+    """Close thin notches and fill Swiss-cheese holes on product winner masks."""
+    if not opts.get("seal_product_holes", True):
+        return
+    close_px = int(opts.get("product_hole_close_px", 3))
+    for cluster in clusters:
+        winner = cluster["winner"]
+        if normalized_role(winner["role"]) not in _PRODUCT_INSTANCE_ROLES:
+            continue
+        if winner.get("mask_quality") == "box":
+            continue  # rectangular fallback — nothing to seal
+        sealed = winner["mask"]
+        if close_px > 0:
+            # Morphological close ≈ dilate then erode via dual dilate on complement.
+            sealed = _dilate(sealed, close_px)
+            # Erode: dilate the complement, invert.
+            sealed = ~_dilate(~sealed, close_px)
+        sealed = _fill_mask_holes(sealed)
+        if int(sealed.sum()) <= 0:
+            continue
+        winner["mask"] = sealed
+        winner["box"] = _mask_box(sealed)
+
+
 _JUNK_BAND_ROLES = frozenset({"photo", "image", "object", "photo-fragment"})
 
 
@@ -828,6 +1077,151 @@ def _suppress_junk_bands(clusters: list, opts: dict, canvas: dict) -> tuple[list
 
 #: Brand lettering / lockup roles that read as printed ink when nested in a product.
 _PRINTED_ARTWORK_ROLES = frozenset({"logo", "wordmark", "brandmark", "monogram"})
+#: On-pack highlight bars / chips SAM often labels as CTA chrome (002 flavor bar).
+_PACKAGING_SHELL_ROLES = frozenset({
+    "button", "badge", "chip", "pill", "sticker", "shape", "seal", "tag",
+})
+
+
+def _absorb_into_product_parent(
+    results: list,
+    opts: dict,
+    *,
+    roles: frozenset,
+    min_containment: float,
+    max_ratio: float,
+    reason: str,
+    role_filter=None,
+) -> tuple[list, list]:
+    """Fold nested child roles into a product parent; record printed_lockup decorations."""
+    by_id = {r["id"]: r for r in results}
+    absorbed = []
+    for r in results:
+        role = str(r.get("role") or "").lower()
+        if role not in roles:
+            continue
+        parent = by_id.get(str(r.get("parent_id") or ""))
+        rel = next((link for link in (r.get("relationships") or [])
+                    if link.get("type") == "nested-in"
+                    and link.get("target") == r.get("parent_id")), None)
+        if parent is None or rel is None:
+            continue
+        if str(parent.get("role") or "").lower() not in _PRODUCT_INSTANCE_ROLES:
+            continue
+        if float(rel.get("containment") or 0.0) < min_containment:
+            continue
+        if float(rel.get("area_ratio") or 1.0) > max_ratio:
+            continue
+        if role_filter is not None and not role_filter(r, parent, rel):
+            continue
+        absorbed.append({
+            "id": r["id"], "role": role, "parent": parent["id"],
+            "containment": rel.get("containment"), "area_ratio": rel.get("area_ratio"),
+            "reason": reason,
+        })
+        meta = dict(parent.get("meta") or {})
+        meta["printed_lockup"] = True
+        decorations = list(meta.get("absorbed_decorations") or [])
+        decorations.append({"id": r["id"], "role": role, "box": dict(r.get("box") or {})})
+        meta["absorbed_decorations"] = decorations
+        parent["meta"] = meta
+    if not absorbed:
+        return results, []
+    gone = {a["id"] for a in absorbed}
+    kept = [r for r in results if r["id"] not in gone]
+    for r in kept:
+        if str(r.get("parent_id") or "") in gone:
+            r["parent_id"] = by_id[str(r["parent_id"])].get("parent_id")
+            r["relationships"] = [link for link in (r.get("relationships") or [])
+                                  if not (link.get("type") == "nested-in"
+                                          and link.get("target") in gone)]
+    return kept, absorbed
+
+
+def _box_inside_frac(inner: dict, outer: dict) -> float:
+    """Fraction of ``inner`` covered by ``outer`` (axis-aligned boxes)."""
+    ix0 = float(inner.get("x", 0) or 0)
+    iy0 = float(inner.get("y", 0) or 0)
+    ix1 = ix0 + float(inner.get("w", 0) or 0)
+    iy1 = iy0 + float(inner.get("h", 0) or 0)
+    ox0 = float(outer.get("x", 0) or 0)
+    oy0 = float(outer.get("y", 0) or 0)
+    ox1 = ox0 + float(outer.get("w", 0) or 0)
+    oy1 = oy0 + float(outer.get("h", 0) or 0)
+    iw = max(0.0, min(ix1, ox1) - max(ix0, ox0))
+    ih = max(0.0, min(iy1, oy1) - max(iy0, oy0))
+    area = max(0.0, float(inner.get("w", 0) or 0) * float(inner.get("h", 0) or 0))
+    return (iw * ih) / area if area > 0 else 0.0
+
+
+def _absorb_list_icons_into_cards(results: list, opts: dict) -> tuple[list, list]:
+    """Fold checklist ✓/✗ chips into their hosting card before peel (066).
+
+    icon_detect emits one chip per row. Peeling those chips out of a white card
+    destroys the card raster; merge/reconstruct cannot restore source ink once the
+    under-layer is hole-punched. Absorbing here keeps a single card element.
+    """
+    if not results:
+        return results, []
+    min_icons = int(opts.get("list_icon_card_min_icons", 2))
+    min_inside = float(opts.get("list_icon_card_min_inside", 0.85))
+    cards = []
+    icons = []
+    for item in results:
+        role = normalized_role(item.get("role") or (item.get("meta") or {}).get("role"))
+        kind = str(item.get("kind") or "").lower()
+        box = item.get("box") or {}
+        area = float(box.get("w", 0) or 0) * float(box.get("h", 0) or 0)
+        if area <= 0:
+            continue
+        if role in _LIST_ROW_ICON_ROLES or (
+            kind == "icon" and role in _LIST_ROW_ICON_ROLES | {""}
+            and (item.get("meta") or {}).get("icon_cv")
+        ):
+            icons.append(item)
+            continue
+        if role in _CHECKLIST_CARD_ROLES or kind in {"shape", "card"}:
+            cards.append(item)
+    if not cards or not icons:
+        return results, []
+    absorbed = []
+    gone = set()
+    for card in cards:
+        card_box = card.get("box") or {}
+        card_area = float(card_box.get("w", 0) or 0) * float(card_box.get("h", 0) or 0)
+        if card_area <= 0:
+            continue
+        nested = []
+        for icon in icons:
+            if icon.get("id") in gone:
+                continue
+            ibox = icon.get("box") or {}
+            iarea = float(ibox.get("w", 0) or 0) * float(ibox.get("h", 0) or 0)
+            if iarea <= 0 or iarea / card_area > 0.20 or card_area < iarea * 8:
+                continue
+            if _box_inside_frac(ibox, card_box) >= min_inside:
+                nested.append(icon)
+        if len(nested) < min_icons:
+            continue
+        meta = card.setdefault("meta", {})
+        # Icons stay in the card raster (avoid hole-punch), but checklist *copy*
+        # must remain editable TEXT — never mark the card as a chrome text bake.
+        meta["checklist_editable"] = True
+        meta.pop("checklist_raster_chip", None)
+        meta.setdefault("absorbed_list_icons", [])
+        for icon in nested:
+            gone.add(icon.get("id"))
+            meta["absorbed_list_icons"].append(icon.get("id"))
+            absorbed.append({
+                "id": icon.get("id"),
+                "host": card.get("id"),
+                "reason": "list-icon-absorbed-into-card",
+                "role": icon.get("role"),
+            })
+    if not gone:
+        return results, []
+    kept = [r for r in results if r.get("id") not in gone]
+    return kept, absorbed
 
 
 def _absorb_printed_artwork(results: list, opts: dict) -> tuple[list, list]:
@@ -843,49 +1237,158 @@ def _absorb_printed_artwork(results: list, opts: dict) -> tuple[list, list]:
     (floating brand marks on photos/backgrounds) are untouched — those are genuine
     overlay layers.
     """
-    min_containment = float(opts.get("printed_artwork_min_containment", 0.95))
-    max_ratio = float(opts.get("printed_artwork_max_area_ratio", 0.5))
-    by_id = {r["id"]: r for r in results}
-    absorbed = []
-    for r in results:
-        role = str(r.get("role") or "").lower()
-        if role not in _PRINTED_ARTWORK_ROLES:
-            continue
-        parent = by_id.get(str(r.get("parent_id") or ""))
-        rel = next((link for link in (r.get("relationships") or [])
-                    if link.get("type") == "nested-in"
-                    and link.get("target") == r.get("parent_id")), None)
-        if parent is None or rel is None:
-            continue
-        if str(parent.get("role") or "").lower() not in _PRODUCT_INSTANCE_ROLES:
-            continue
-        if float(rel.get("containment") or 0.0) < min_containment:
-            continue
-        if float(rel.get("area_ratio") or 1.0) > max_ratio:
-            continue
-        absorbed.append({
-            "id": r["id"], "role": role, "parent": parent["id"],
-            "containment": rel.get("containment"), "area_ratio": rel.get("area_ratio"),
-            "reason": "printed-on-product-artwork",
-        })
-        meta = dict(parent.get("meta") or {})
-        meta["printed_lockup"] = True
-        decorations = list(meta.get("absorbed_decorations") or [])
-        decorations.append({"id": r["id"], "role": role, "box": dict(r.get("box") or {})})
-        meta["absorbed_decorations"] = decorations
-        parent["meta"] = meta
-    if not absorbed:
+    return _absorb_into_product_parent(
+        results,
+        opts,
+        roles=_PRINTED_ARTWORK_ROLES,
+        min_containment=float(opts.get("printed_artwork_min_containment", 0.95)),
+        max_ratio=float(opts.get("printed_artwork_max_area_ratio", 0.5)),
+        reason="printed-on-product-artwork",
+    )
+
+
+def _absorb_packaging_shells(results: list, opts: dict) -> tuple[list, list]:
+    """Fold on-pack SAM 'button'/chip false positives into the product (002 flavor bar)."""
+    if not opts.get("absorb_packaging_shells", True):
         return results, []
-    gone = {a["id"] for a in absorbed}
-    kept = [r for r in results if r["id"] not in gone]
-    for r in kept:
-        # Orphans of an absorbed element re-parent to the absorbed element's parent.
-        if str(r.get("parent_id") or "") in gone:
-            r["parent_id"] = by_id[str(r["parent_id"])].get("parent_id")
-            r["relationships"] = [link for link in (r.get("relationships") or [])
-                                  if not (link.get("type") == "nested-in"
-                                          and link.get("target") in gone)]
-    return kept, absorbed
+    min_aspect = float(opts.get("packaging_shell_min_aspect", 3.2))
+
+    def _eligible(child: dict, parent: dict, rel: dict) -> bool:
+        box = child.get("box") or {}
+        w = float(box.get("w", 0) or 0)
+        h = float(box.get("h", 0) or 0)
+        if w <= 0 or h <= 0:
+            return False
+        aspect = max(w, h) / max(1.0, min(w, h))
+        role = str(child.get("role") or "").lower()
+        # Wide/thin flavor bars and seals are packaging; square-ish badges/stickers too.
+        # Tall CTA buttons (aspect < threshold) on a pack face stay separate.
+        if role in {"badge", "chip", "pill", "sticker", "seal", "tag"}:
+            return True
+        if role in {"button", "shape"} and aspect >= min_aspect:
+            return True
+        return False
+
+    return _absorb_into_product_parent(
+        results,
+        opts,
+        roles=_PACKAGING_SHELL_ROLES,
+        min_containment=float(opts.get("packaging_shell_min_containment", 0.92)),
+        max_ratio=float(opts.get("packaging_shell_max_area_ratio", 0.18)),
+        reason="printed-on-product-shell",
+        role_filter=_eligible,
+    )
+
+
+def _absorb_product_decorations(results: list, opts: dict) -> tuple[list, list]:
+    """Fold EVERY remaining non-product child that rides inside a product cutout.
+
+    The invariant made total: one SKU = one alpha, so nothing inside a product's mask
+    ships as a separate design element.  ``_absorb_printed_artwork`` and
+    ``_absorb_packaging_shells`` cover the two special cases SAM most often mislabels
+    (brand lockups, on-pack flavor bars); this pass runs after them and sweeps up
+    whatever they left — checkmark / cross list glyphs, generic icons, small printed
+    photo scraps, and shapes too narrow for the flavor-bar aspect gate (091 / 094 /
+    135).  Each such child is the product's own label ink; emitting it separately makes
+    reconstruct hole-punch it out of the packaging and hands peel an inside-the-product
+    occlusion pair — the exact "peeling inside products" the mandate forbids.
+
+    A child is absorbed into a product parent when either:
+      * it is nested (its ``nested-in`` link, i.e. mask containment ≥ nested_containment),
+        or
+      * it has no product link but its BOX sits ≥ ``product_decoration_box_containment``
+        inside a product — a label that straddles the product edge (containment dips
+        under the nesting threshold) must still ride the cutout, never punch the bag.
+
+    Distinct SKUs (product-instance roles) and full-bleed backgrounds are never
+    decorations; a child larger than ``product_decoration_max_area_ratio`` of the
+    product is a container, not printed ink, and is left alone.  Iterated to a fixed
+    point so a glyph nested in a panel that is itself nested in the product folds in
+    once its intermediate parent is absorbed (135: ✓/✗ chips under a nutrition panel
+    under the bar).
+    """
+    if not opts.get("absorb_product_decorations", True):
+        return results, []
+    min_cont = float(opts.get("product_decoration_min_containment", 0.80))
+    box_cont = float(opts.get("product_decoration_box_containment", 0.80))
+    max_ratio = float(opts.get("product_decoration_max_area_ratio", 0.60))
+    absorbed: list = []
+    for _ in range(8):  # fixed-point: absorbing a panel reparents its glyphs to the product
+        by_id = {r["id"]: r for r in results}
+        product_ids = {
+            r["id"] for r in results
+            if str(r.get("role") or "").lower() in _PRODUCT_INSTANCE_ROLES
+        }
+        if not product_ids:
+            break
+        gone: dict = {}
+        for r in results:
+            if r["id"] in product_ids:
+                continue
+            role = str(r.get("role") or "").lower()
+            if role in _PRODUCT_INSTANCE_ROLES or role == "background":
+                continue
+            target = None
+            containment = None
+            area_ratio = None
+            parent = by_id.get(str(r.get("parent_id") or ""))
+            if parent is not None and parent["id"] in product_ids:
+                rel = next((link for link in (r.get("relationships") or [])
+                            if link.get("type") == "nested-in"
+                            and link.get("target") == parent["id"]), None)
+                cont = (float(rel["containment"]) if rel and rel.get("containment") is not None
+                        else _box_inside_frac(r.get("box") or {}, parent.get("box") or {}))
+                if cont >= min_cont:
+                    target, containment = parent, cont
+                    if rel and rel.get("area_ratio") is not None:
+                        area_ratio = float(rel["area_ratio"])
+            if target is None:
+                # Edge-straddling decoration with no product link: fold on box containment.
+                best = None
+                for pid in product_ids:
+                    frac = _box_inside_frac(r.get("box") or {}, by_id[pid].get("box") or {})
+                    if frac >= box_cont and (best is None or frac > best[1]):
+                        best = (by_id[pid], frac)
+                if best is not None:
+                    target, containment = best[0], best[1]
+            if target is None:
+                continue
+            if area_ratio is None:
+                pbox = target.get("box") or {}
+                cbox = r.get("box") or {}
+                parea = float(pbox.get("w", 0) or 0) * float(pbox.get("h", 0) or 0)
+                carea = float(cbox.get("w", 0) or 0) * float(cbox.get("h", 0) or 0)
+                area_ratio = (carea / parea) if parea > 0 else 1.0
+            if area_ratio > max_ratio:
+                continue  # a container the size of the product, not printed ink
+            gone[r["id"]] = (target, role, containment, area_ratio)
+        if not gone:
+            break
+        for cid, (target, role, containment, area_ratio) in gone.items():
+            child = by_id[cid]
+            meta = dict(target.get("meta") or {})
+            meta["printed_lockup"] = True
+            decorations = list(meta.get("absorbed_decorations") or [])
+            decorations.append({"id": cid, "role": role, "box": dict(child.get("box") or {})})
+            meta["absorbed_decorations"] = decorations
+            target["meta"] = meta
+            absorbed.append({
+                "id": cid, "role": role, "parent": target["id"],
+                "containment": round(float(containment), 4) if containment is not None else None,
+                "area_ratio": round(float(area_ratio), 4),
+                "reason": "printed-on-product-decoration",
+            })
+        goneset = set(gone)
+        kept = [r for r in results if r["id"] not in goneset]
+        for r in kept:
+            pid = str(r.get("parent_id") or "")
+            if pid in goneset:
+                r["parent_id"] = by_id[pid].get("parent_id")
+                r["relationships"] = [link for link in (r.get("relationships") or [])
+                                      if not (link.get("type") == "nested-in"
+                                              and link.get("target") in goneset)]
+        results = kept
+    return results, absorbed
 
 
 def _infer_canvas(sam3, residual, qwen) -> dict:
@@ -1023,10 +1526,14 @@ def fuse(
 
     # Canonical product geometry: a heuristic-labelled winner takes the product identity
     # of a merged text-prompt observation; full-bleed no-evidence background bands drop;
-    # duplicate raster coverage of product pixels is absorbed into the products.
+    # duplicate raster coverage of product pixels is absorbed into the products;
+    # adjacent same-prompt parts (jar+lid / dual bars) collapse to one owner; product
+    # alphas are sealed so Swiss-cheese SAM holes do not survive into peel/cutouts.
     _promote_product_identity(clusters)
     clusters, suppressed_bands = _suppress_junk_bands(clusters, opts, canvas)
     clusters = _suppress_product_shadows(clusters, opts)
+    clusters = _merge_product_clusters(clusters, opts)
+    _seal_product_masks(clusters, opts)
 
     # Stable IDs are based on final geometry, not model/source order.
     clusters.sort(
@@ -1155,9 +1662,13 @@ def fuse(
     # Printed-on-product artwork folds into its parent product (needs the nesting
     # links above): the "logo" prompt firing on packaging print must not ship as a
     # separate element (013's bag lockups) — see _absorb_printed_artwork.
+    # Packaging highlight shells (002 VANILLE bar mislabeled as button) fold the same way.
     absorbed_artwork = []
+    absorbed_shells = []
     if opts.get("absorb_printed_artwork", True):
         results, absorbed_artwork = _absorb_printed_artwork(results, opts)
+    if opts.get("absorb_packaging_shells", True):
+        results, absorbed_shells = _absorb_packaging_shells(results, opts)
 
     # Post-fusion glyph/chart refinement (src/icon_detect.py): ✓ / ✗ / ? list glyphs
     # become role-tagged icon elements attached to their text rows, stacked duplicate
@@ -1171,6 +1682,20 @@ def fuse(
         except Exception:
             pass
 
+    # 066: checklist cards owning many ✓/✗ chips must keep those pixels. Emitting the
+    # chips as peelable siblings punches holes that later stages cannot heal.
+    absorbed_list_icons = []
+    if opts.get("absorb_list_icons_into_cards", True):
+        results, absorbed_list_icons = _absorb_list_icons_into_cards(results, opts)
+
+    # Generalized invariant (runs LAST, after icon_detect re-roles ✓/✗ glyphs and the
+    # checklist-card absorber): every remaining non-product child that rides inside a
+    # product cutout folds into the product so nothing inside a SKU is ever emitted as a
+    # separate element that reconstruct/peel would punch out of the packaging.
+    absorbed_decorations = []
+    if opts.get("absorb_product_decorations", True):
+        results, absorbed_decorations = _absorb_product_decorations(results, opts)
+
     if run_dir:
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "fused_elements.json"), "w", encoding="utf-8") as fh:
@@ -1179,10 +1704,16 @@ def fuse(
             "kind": "fusion-diagnostics",
             "suppressed_junk_bands": suppressed_bands,
             "absorbed_printed_artwork": absorbed_artwork,
+            "absorbed_packaging_shells": absorbed_shells,
+            "absorbed_product_decorations": absorbed_decorations,
+            "absorbed_list_icons": absorbed_list_icons,
             "counts": {
                 "canonical": len(results),
                 "suppressed_junk_bands": len(suppressed_bands),
                 "absorbed_printed_artwork": len(absorbed_artwork),
+                "absorbed_packaging_shells": len(absorbed_shells),
+                "absorbed_product_decorations": len(absorbed_decorations),
+                "absorbed_list_icons": len(absorbed_list_icons),
             },
         }
         with open(os.path.join(run_dir, "fusion_report.json"), "w", encoding="utf-8") as fh:

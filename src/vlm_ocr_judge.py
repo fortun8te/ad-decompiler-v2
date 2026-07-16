@@ -244,6 +244,34 @@ def _looks_plausible(original: str, candidate: str, *, max_len_factor: float = 3
     return True
 
 
+def _is_stutter_expansion(original: str, candidate: str) -> bool:
+    """Reject VLM answers that duplicate a syllable/suffix inside a token.
+
+    EasyOCR + brand proofread can stutter a long ALLCAPS wordmark into a longer
+    near-match that still clears the similarity floor — e.g. ``ALLE ESSENTIALS``
+    → ``ALLE ESSENTIALSENTIALS`` (tail ``ENTIALS`` is a suffix of ``ESSENTIALS``).
+    Those expansions must never replace a clean engine reading.
+    """
+    o_words = str(original or "").casefold().split()
+    a_words = str(candidate or "").casefold().split()
+    if not o_words or not a_words:
+        return False
+    if len(a_words) == len(o_words):
+        for ow, aw in zip(o_words, a_words):
+            if aw == ow or len(aw) <= len(ow) + 2:
+                continue
+            if aw.startswith(ow):
+                tail = aw[len(ow):]
+                if tail and (ow.endswith(tail) or tail in ow):
+                    return True
+            # Consecutive repeated block of length >= 3 inside the expanded token.
+            for n in range(3, len(aw) // 2 + 1):
+                for i in range(0, len(aw) - 2 * n + 1):
+                    if aw[i:i + n] == aw[i + n:i + 2 * n]:
+                        return True
+    return False
+
+
 def _box_iou(a: dict, b: dict) -> float:
     ax0, ay0 = float(a.get("x", 0)), float(a.get("y", 0))
     ax1, ay1 = ax0 + float(a.get("w", 0)), ay0 + float(a.get("h", 0))
@@ -439,6 +467,12 @@ def _judge_disagreements(
         if answer is not None and _looks_plausible(original, answer):
             # Hygiene after VLM: collapse ``do do this!`` and un-smash ``WeNEVER``.
             answer = _cleanup_text(answer)
+            if _is_stutter_expansion(original, answer):
+                disagreements += 1
+                notes.append({"line_id": line.get("id"), "note": "vlm_stutter_expansion",
+                              "answer": answer, "readings": readings,
+                              "ocr_text": original})
+                continue
             normalized_answer = answer.casefold().strip()
             # Measure against the engine readings AND the current line text. A
             # force-included display line has no readings at all — comparing only
@@ -558,6 +592,10 @@ def _judge_uncertain(
         if answer is None or not _looks_plausible(original, answer):
             continue
         answer = _cleanup_text(answer)
+        if _is_stutter_expansion(original, answer):
+            notes.append({"line_id": line.get("id"), "note": "vlm_stutter_expansion",
+                          "answer": answer, "ocr_text": original})
+            continue
         similarity = SequenceMatcher(
             None, answer.casefold().strip(), original.casefold().strip()
         ).ratio()

@@ -207,9 +207,11 @@ def test_sale_circle_shell_plus_offer_text():
         "box": {"x": 850, "y": 220, "w": 120, "h": 50},
     }]}
     m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
-    assert m["c_off"]["target"] == "text"
-    assert m["c_SALE"]["target"] == "shape"
-    assert m["c_SALE"]["meta"].get("text_bearing_shell") is True
+    # Raster-first chrome policy: the seal ships as a pixel-exact raster and its
+    # offer text rides the raster instead of half-rebuilding an SVG shell.
+    assert m["c_SALE"]["target"] == "image"
+    assert m["c_off"]["target"] == "drop"
+    assert m["c_off"]["meta"].get("kept_in_photo") is True
     assert m["c_SALE"]["meta"].get("role") in {
         "sale_burst", "seal", "badge", "starburst", "price_burst",
     }
@@ -274,9 +276,10 @@ def test_pink_valentines_seal_promotes_like_badge_shell():
         "box": {"x": 810, "y": 190, "w": 140, "h": 60},
     }]}
     m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
-    assert m["c_vday"]["target"] == "text"
-    assert m["c_SEAL"]["target"] == "shape"
-    assert m["c_SEAL"]["meta"].get("text_bearing_shell") is True
+    # Raster-first chrome policy: seal rasters whole, its text rides the raster.
+    assert m["c_SEAL"]["target"] == "image"
+    assert m["c_vday"]["target"] == "drop"
+    assert m["c_vday"]["meta"].get("kept_in_photo") is True
 
 
 # ── SAM prompts + cluster contracts ──────────────────────────────────────────────

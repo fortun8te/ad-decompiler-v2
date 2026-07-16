@@ -143,7 +143,7 @@ def test_apply_preset_exposes_reward_weights_and_gate_floors_to_qa():
     assert qa_reward.reward_weights(cfg) == cfg["qa"]["reward_weights"]
     floors = qa_reward.gate_thresholds(cfg)
     assert floors == {"lpips_similarity_min": 0.60, "local_ssim_min": 0.50,
-                      "worst_local_ssim_min": 0.10}
+                      "worst_local_ssim_min": qa_reward._DEFAULT_WORST_LOCAL_SSIM_MIN}
 
 
 def test_apply_preset_exposes_text_recall_min_flat_for_metrics_layer():

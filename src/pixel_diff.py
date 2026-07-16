@@ -728,6 +728,14 @@ def _candidate_element_lineage(candidate):
     # NMS/dedup retains the winning candidate but records canonical ids it
     # absorbed.  They are survived observations, not dropped elements.
     values.extend(meta.get("merged_observations") or [])
+    # 066: comparison column chips / checklist rasters record the photo+card+icon
+    # ids they folded in. Those detections survived inside the chip, not as drops.
+    values.extend(meta.get("merged_from") or [])
+    values.extend(meta.get("absorbed_list_icons") or [])
+    if meta.get("absorbed_into"):
+        values.append(meta.get("absorbed_into"))
+    if meta.get("baked_owner_id"):
+        values.append(meta.get("baked_owner_id"))
 
     provenance = meta.get("provenance") or {}
     if isinstance(provenance, list):
@@ -1898,12 +1906,18 @@ def _structural_audit(
     # F15: unresolved glyph residue under a removed text region is a structural failure, not
     # a bare repair suggestion. QA must not report ok while it stands (009 shipped ok with a
     # high-severity glyph-residue repair still outstanding after no-op harness rounds).
+    # Honesty: treat ``hard_fail: True`` OR ``resolved`` falsy as unresolved — a closer that
+    # greenwashes by flipping resolved while leaving hard_fail set still blocks acceptance.
+    glyph_residue_unresolved = 0
     if thresholds.get("glyph_residue_gate", True):
         text_residual = reconstruction_stats.get("text_residual") or {}
-        unresolved_residue = [
-            entry for entry in (text_residual.get("flagged") or [])
-            if isinstance(entry, dict) and not entry.get("resolved")
-        ]
+        unresolved_residue = []
+        for entry in (text_residual.get("flagged") or []):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("hard_fail") or not entry.get("resolved"):
+                unresolved_residue.append(entry)
+        glyph_residue_unresolved = len(unresolved_residue)
         if unresolved_residue:
             ids = ", ".join(str(entry.get("id")) for entry in unresolved_residue[:4])
             _add_fail(
@@ -1963,6 +1977,7 @@ def _structural_audit(
         "element_survival": element_survival,
         "background": background,
         "layer_alpha": alpha_layers,
+        "glyph_residue_unresolved": glyph_residue_unresolved,
         "hard_fails": fails,
     }
 
@@ -2005,12 +2020,22 @@ def _contract_summary(design_data, structure, source_ocr, per_layer, ssim, thres
             construction = None
 
     # Glyph-residue cleanliness: a removed text region still showing glyph ghosts is a
-    # contract failure (the plate is not clean). Mirror the glyph-residue hard-fail gate.
-    residue_unresolved = 0
+    # contract failure (the plate is not clean). Prefer the auditor count; also fail if
+    # any glyph-residue hard-fail row is present (harness cannot greenwash via count=0).
+    residue_unresolved = structure.get("glyph_residue_unresolved")
+    if not isinstance(residue_unresolved, int):
+        residue_unresolved = 0
+    has_residue_fail = False
     for fail in structure.get("hard_fails") or []:
         if isinstance(fail, dict) and fail.get("rule") == "glyph-residue":
-            residue_unresolved += 1
-    glyph_residue_clean = residue_unresolved == 0
+            has_residue_fail = True
+            if residue_unresolved <= 0:
+                detail = str(fail.get("detail") or "")
+                n = next((int(t) for t in detail.split() if t.isdigit()), 1)
+                residue_unresolved += n if n > 0 else 1
+    if has_residue_fail and residue_unresolved <= 0:
+        residue_unresolved = 1
+    glyph_residue_clean = (residue_unresolved == 0) and not has_residue_fail
 
     placement_iou = _placement_ink_iou(per_layer)
     placement_min = thresholds.get("contract_placement_ink_iou_min")

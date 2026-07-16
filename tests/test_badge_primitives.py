@@ -1,14 +1,12 @@
-"""Badge/pill/seal native primitives + the empty-asset materialization ban.
+"""Always-raster chrome cutouts + the empty-asset materialization ban.
 
-Covers the audit findings on runs/postfix-benchmark-4:
-  * 101 "BOGO badge -> square"      — a circular badge shipped as a square raster
-  * 013 61%-OFF ellipse / "snacks" pill
-  * 016 "45% Off" scalloped starburst seal shipped as a teal square
+Policy (locked): badges / seals / chips / pills / starbursts ship as exact IMAGE
+cutouts — no native ellipse/pill/star shells, no editable badge copy.
+
+Still covered from postfix-benchmark-4:
   * 104/107/021 empty asset groups + blank 8KB ghost PNGs
   * 088 c_E011 "unexplained-raster-fallback" on a nested plate-passthrough drop
 """
-import math
-
 import numpy as np
 import pytest
 from PIL import Image
@@ -23,204 +21,77 @@ def _plate(tmp_path, size=(400, 400), color="white"):
 
 
 def _source(tmp_path, size=(400, 400), color=(240, 240, 240)):
-    """A normalized.png the materialization gate / starburst fitter can read."""
+    """A normalized.png the materialization gate can read."""
     src = tmp_path / "normalized.png"
     Image.new("RGB", size, color).save(src)
     return src
 
 
-# ── 101 / 013: flat circular badge → native ellipse, never a raster hostbg ──────────
-def test_circular_flat_badge_emits_native_ellipse_not_raster_square(tmp_path):
+def _opaque_cutout(tmp_path, name, size, color):
+    path = tmp_path / name
+    Image.new("RGBA", size, (*color, 255)).save(path)
+    return str(path)
+
+
+# ── Always-raster chrome: no native shell, exact source crop only ───────────────────
+def test_circular_badge_keeps_exact_raster_not_native_ellipse(tmp_path):
     _plate(tmp_path)
     _source(tmp_path)
-    # The matte for a small saturated plate routinely comes back near-empty: this is the
-    # exact asset that shipped 101's BOGO badge as an invisible ghost inside a teal SQUARE.
-    ghost = tmp_path / "badge.png"
-    Image.new("RGBA", (87, 87), (12, 162, 177, 0)).save(ghost)
+    cutout = _opaque_cutout(tmp_path, "badge.png", (87, 87), (12, 162, 177))
     tree = [{
         "id": "c_E005", "target": "group", "box": {"x": 288, "y": 408, "w": 87, "h": 87},
         "shape_kind": "ellipse", "fill": {"kind": "flat", "color": "#0ca2b1"},
-        "src": str(ghost),
-        "meta": {"role": "badge", "plate_shell": True, "text_bearing_shell": True},
-        "children": [
-            {"id": "c_B4", "target": "text", "z": 40, "text": "BUY 3, GET 1",
-             "box": {"x": 8, "y": 20, "w": 70, "h": 20}, "style": {"fontSize": 12}},
-        ],
+        "src": cutout,
+        "meta": {
+            "role": "badge", "shell_raster_chip": True, "baked_badge_text": True,
+        },
+        "children": [],
     }]
     doc = build_design_json.build(tree, {"w": 400, "h": 400}, str(tmp_path),
                                   base_src=str(_plate(tmp_path)))
     group = next(layer for layer in doc.layers if layer.id == "c_E005")
-    shells = [c for c in group.children if c.meta.get("rebuilt_from") == "flat-ellipse-shell"]
-    assert len(shells) == 1, "a flat circular badge must be rebuilt as a native ellipse"
-    shell = shells[0]
-    assert shell.type == "shape" and shell.shape_kind == "ellipse"
-    assert shell.fill == {"kind": "flat", "color": "#0ca2b1"}
-    assert shell.box == {"x": 0.0, "y": 0.0, "w": 87.0, "h": 87.0}
-    # The blank hostbg raster must NOT be emitted alongside it.
-    assert not any(c.meta.get("preserved_host_raster") for c in group.children)
-    # The FRAME must not paint the flat fill as a square behind the ellipse (101's bug).
-    assert group.fill is None and group.radius is None
-    # The badge's copy stays native TEXT.
-    assert any(c.type == "text" for c in group.children)
-    # ...and the ellipse sits behind the text.
-    assert shell.z_index < min(c.z_index for c in group.children if c.id != shell.id)
+    assert not any(c.meta.get("rebuilt_from") for c in group.children), \
+        "chrome-as-raster badges must not emit native ellipse/pill shells"
+    hosts = [c for c in group.children if c.meta.get("preserved_host_raster")]
+    assert len(hosts) == 1
+    assert hosts[0].type == "image"
+    assert group.radius is None
 
 
-def _rounded_rect_source(tmp_path, box, radius, color, size=(800, 900)):
-    """Paint a real rounded-rect plate into normalized.png so geometry can be MEASURED."""
-    img = Image.new("RGB", size, (240, 240, 240))
-    from PIL import ImageDraw
-    d = ImageDraw.Draw(img)
-    x, y, w, h = box
-    d.rounded_rectangle([x, y, x + w - 1, y + h - 1], radius=radius, fill=color)
-    img.save(tmp_path / "normalized.png")
+def test_shell_raster_chip_skips_native_shell_shape_helper():
+    assert build_design_json._native_shell_shape(
+        {"id": "b", "shape_kind": "ellipse",
+         "fill": {"kind": "flat", "color": "#0ca2b1"},
+         "meta": {"role": "badge", "shell_raster_chip": True, "baked_badge_text": True}},
+        {"x": 0, "y": 0, "w": 80, "h": 80}, 1.0) is None
+    assert build_design_json._native_shell_shape(
+        {"id": "b2", "shape_kind": "rect",
+         "fill": {"kind": "flat", "color": "#1a1a1a"},
+         "meta": {"role": "badge", "chrome_as_raster": True, "plate_shell": True}},
+        {"x": 0, "y": 0, "w": 114, "h": 50}, 1.0) is None
 
 
-# ── 013: a real stadium chip → native pill rrect with a MEASURED radius ─────────────
-def test_wide_flat_chip_emits_native_pill_rrect_from_measured_corners(tmp_path):
+def test_wide_chip_keeps_exact_raster_not_native_pill(tmp_path):
     _plate(tmp_path, (800, 900))
-    box = (413, 719, 114, 50)
-    _rounded_rect_source(tmp_path, box, 25, (26, 26, 26))   # a true stadium pill
+    _source(tmp_path, (800, 900))
+    cutout = _opaque_cutout(tmp_path, "chip.png", (114, 50), (26, 26, 26))
     tree = [{
         "id": "c_E006", "target": "group", "box": {"x": 413, "y": 719, "w": 114, "h": 50},
         "shape_kind": "rect", "fill": {"kind": "flat", "color": "#1a1a1a"},
-        "meta": {"role": "badge", "plate_shell": True, "text_bearing_shell": True},
-        "children": [
-            {"id": "c_B9", "target": "text", "z": 40, "text": "snacks",
-             "box": {"x": 20, "y": 12, "w": 70, "h": 24}, "style": {"fontSize": 18}},
-        ],
+        "src": cutout,
+        "meta": {"role": "badge", "shell_raster_chip": True, "baked_badge_text": True},
+        "children": [],
     }]
     doc = build_design_json.build(tree, {"w": 800, "h": 900}, str(tmp_path),
                                   base_src=str(_plate(tmp_path, (800, 900))))
     group = next(layer for layer in doc.layers if layer.id == "c_E006")
-    shell = next(c for c in group.children if "shell" in str(c.id))
-    assert shell.type == "shape" and shell.shape_kind == "rect"
-    # A stadium end snaps to min(h,w)/2 == 25 — MEASURED from the pixels, not guessed.
-    assert shell.radius == pytest.approx(25.0, abs=1.5)
-    assert shell.meta["measured_corner_radius"] == pytest.approx(25.0, abs=1.5)
-    assert shell.fill == {"kind": "flat", "color": "#1a1a1a"}
+    assert not any("shell" in str(c.id) for c in group.children)
+    assert any(c.meta.get("preserved_host_raster") for c in group.children)
 
 
-def test_wide_square_cornered_plate_is_not_wrongly_rounded(tmp_path):
-    """A wide, short but HARD-CORNERED plate must stay square: 104's "Cadence" plate is
-    145x35, so an aspect-based "wide == pill" guess would falsely round it."""
-    _plate(tmp_path, (800, 900))
-    box = (467, 267, 145, 35)
-    _rounded_rect_source(tmp_path, box, 0, (6, 6, 6))       # square corners
-    tree = [{
-        "id": "c_E000", "target": "group", "box": {"x": 467, "y": 267, "w": 145, "h": 35},
-        "shape_kind": "rect", "fill": {"kind": "flat", "color": "#060606"},
-        "meta": {"role": "badge", "plate_shell": True, "text_bearing_shell": True},
-        "children": [
-            {"id": "c_B1", "target": "text", "z": 40, "text": "Cadence",
-             "box": {"x": 20, "y": 8, "w": 100, "h": 20}, "style": {"fontSize": 14}},
-        ],
-    }]
-    doc = build_design_json.build(tree, {"w": 800, "h": 900}, str(tmp_path),
-                                  base_src=str(_plate(tmp_path, (800, 900))))
-    group = next(layer for layer in doc.layers if layer.id == "c_E000")
-    shell = next(c for c in group.children if "shell" in str(c.id))
-    assert not shell.radius, "a hard-cornered wide plate must not be rounded into a pill"
-    assert doc.meta["asset_materialization"]["measured_radii"] == []
-
-
-def test_phantom_shell_over_bare_text_ink_is_dropped(tmp_path):
-    """104 "Cadence": the wordmark sits DIRECTLY on the white background — there is no
-    plate at all. Upstream sampled the text ink into a flat near-black fill and the
-    shell shipped a black rect at region_ssim 0.14. The measured shell must be dropped
-    (with a recorded reason); the sibling text layer owns that ink."""
-    _plate(tmp_path, (800, 900))
-    box = (467, 267, 145, 35)
-    img = Image.new("RGB", (800, 900), (250, 250, 250))
-    from PIL import ImageDraw
-    d = ImageDraw.Draw(img)
-    # Fat fake "wordmark" ink: a few disjoint letter blobs, NOT a plate.
-    for i in range(7):
-        x0 = 467 + 4 + i * 20
-        d.ellipse([x0, 267 + 6, x0 + 14, 267 + 29], fill=(6, 6, 6))
-    img.save(tmp_path / "normalized.png")
-    tree = [{
-        "id": "c_E000", "target": "group", "box": {"x": 467, "y": 267, "w": 145, "h": 35},
-        "shape_kind": "rect", "fill": {"kind": "flat", "color": "#060606"},
-        "meta": {"role": "badge", "plate_shell": True, "text_bearing_shell": True},
-        "children": [
-            {"id": "c_B1", "target": "text", "z": 40, "text": "Cadence",
-             "box": {"x": 20, "y": 8, "w": 100, "h": 20}, "style": {"fontSize": 14}},
-        ],
-    }]
-    doc = build_design_json.build(tree, {"w": 800, "h": 900}, str(tmp_path),
-                                  base_src=str(_plate(tmp_path, (800, 900))))
-    group = next(layer for layer in doc.layers if layer.id == "c_E000")
-    assert not any("shell" in str(c.id) for c in group.children), \
-        "a shell with no plate in the source pixels must be dropped"
-    assert any(c.type == "text" for c in group.children)
-    phantoms = doc.meta["asset_materialization"]["phantom_shells"]
-    assert [p["id"] for p in phantoms] == ["c_E000__shell"]
-    assert any(w.get("code") == "phantom-shell-dropped"
-               for w in doc.meta.get("warnings", []))
-
-
-def test_outlined_chip_gets_stroke_and_measured_fill(tmp_path):
-    """013 "snacks": a white-STROKED pill with a near-black interior on a green photo.
-    Upstream averaged the paint into a wrong flat grey; the measured shell must carry
-    stroke=white + fill=near-black instead."""
-    _plate(tmp_path, (800, 900))
-    box = (413, 719, 114, 50)
-    img = Image.new("RGB", (800, 900), (30, 120, 70))
-    from PIL import ImageDraw
-    d = ImageDraw.Draw(img)
-    x, y, w, h = box
-    d.rounded_rectangle([x, y, x + w - 1, y + h - 1], radius=25,
-                        fill=(20, 20, 20), outline=(255, 255, 255), width=4)
-    img.save(tmp_path / "normalized.png")
-    tree = [{
-        "id": "c_E006", "target": "group", "box": {"x": 413, "y": 719, "w": 114, "h": 50},
-        "shape_kind": "rect", "fill": {"kind": "flat", "color": "#4e5553"},
-        "meta": {"role": "badge", "plate_shell": True, "text_bearing_shell": True},
-        "children": [
-            {"id": "c_B9", "target": "text", "z": 40, "text": "snacks",
-             "box": {"x": 20, "y": 12, "w": 70, "h": 24}, "style": {"fontSize": 18}},
-        ],
-    }]
-    doc = build_design_json.build(tree, {"w": 800, "h": 900}, str(tmp_path),
-                                  base_src=str(_plate(tmp_path, (800, 900))))
-    group = next(layer for layer in doc.layers if layer.id == "c_E006")
-    shell = next(c for c in group.children if "shell" in str(c.id))
-    assert shell.meta.get("rebuilt_from") == "outlined-rect-shell"
-    stroke = shell.stroke or {}
-    sr, sg, sb = (int(stroke["color"][i:i + 2], 16) for i in (1, 3, 5))
-    assert min(sr, sg, sb) > 200, "stroke must be the measured near-white rim"
-    assert 2 <= float(stroke["width"]) <= 8
-    fill = shell.fill or {}
-    fr, fg, fb = (int(fill["color"][i:i + 2], 16) for i in (1, 3, 5))
-    assert max(fr, fg, fb) < 80, "fill must be the measured near-black interior, not grey"
-    # Stadium end still snaps to the measured pill radius.
-    assert shell.radius == pytest.approx(25.0, abs=2.0)
-    restyled = doc.meta["asset_materialization"]["restyled_shells"]
-    assert [r["id"] for r in restyled] == ["c_E006__shell"]
-
-
-# ── 016: a scalloped seal → analytic star polygon (vectorize's verified fitter) ─────
-def test_scalloped_seal_emits_native_starburst_path(tmp_path):
+def test_scalloped_seal_keeps_exact_raster_not_starburst_path(tmp_path):
     _plate(tmp_path, (400, 400))
-    # Paint a real 26-point scalloped seal into the source so the fitter has a silhouette.
-    src = tmp_path / "normalized.png"
-    img = Image.new("RGB", (400, 400), (240, 240, 240))
-    arr = np.asarray(img).copy()
-    cy, cx, points = 200.0, 200.0, 26
-    yy, xx = np.mgrid[0:400, 0:400]
-    ang = np.arctan2(yy - cy, xx - cx)
-    rad = np.hypot(yy - cy, xx - cx)
-    # r(theta) oscillates between 100 and 125 → a clearly scalloped (not round) edge.
-    r_theta = 112.5 + 12.5 * np.cos(points * ang)
-    arr[rad <= r_theta] = (46, 181, 126)  # #2eb57e
-    Image.fromarray(arr).save(src)
-
-    _plate(tmp_path, (400, 400))
-    # NEST the badge inside a parent so its compiled box is PARENT-RELATIVE — the seal
-    # sits at abs (74,74) but rel (24,24). The star fitter must sample absolute pixels;
-    # sampling the relative box reads the wrong region and silently degrades to an ellipse
-    # (the bug that shipped 016's seal as an ellipse on the first pass).
+    cutout = _opaque_cutout(tmp_path, "seal.png", (252, 252), (46, 181, 126))
     tree = [{
         "id": "asset-group-c_E000", "target": "group",
         "box": {"x": 50, "y": 50, "w": 320, "h": 320}, "meta": {"role": "card"},
@@ -228,54 +99,37 @@ def test_scalloped_seal_emits_native_starburst_path(tmp_path):
             "id": "c_E014", "target": "group",
             "box": {"x": 24, "y": 24, "w": 252, "h": 252},
             "shape_kind": "ellipse", "fill": {"kind": "flat", "color": "#2eb57e"},
-            "meta": {"role": "badge", "plate_shell": True, "text_bearing_shell": True},
-            "children": [
-                {"id": "c_B2", "target": "text", "z": 40, "text": "45% Off",
-                 "box": {"x": 80, "y": 110, "w": 90, "h": 30}, "style": {"fontSize": 16}},
-            ],
+            "src": cutout,
+            "meta": {
+                "role": "badge", "shell_raster_chip": True, "baked_badge_text": True,
+            },
+            "children": [],
         }],
     }]
     doc = build_design_json.build(tree, {"w": 400, "h": 400}, str(tmp_path),
                                   base_src=str(_plate(tmp_path, (400, 400))))
     group = next(l for l in doc.layers if l.id == "asset-group-c_E000")
     badge = next(c for c in group.children if c.id == "c_E014")
-    shell = next(c for c in badge.children if "shell" in str(c.id))
-    assert shell.meta.get("rebuilt_from") == "starburst-seal", (
-        "a scalloped seal must fit an analytic star, not fall back to an ellipse")
-    assert shell.shape_kind == "path" and shell.path and shell.path.startswith("M")
-    prim = shell.meta["star_primitive"]
-    assert prim["kind"] == "star" and prim["points"] == 26
-    assert prim["iou"] >= 0.90
-    assert shell.fill == {"kind": "flat", "color": "#2eb57e"}
-    assert doc.meta["asset_materialization"]["starburst_seals"][0]["points"] == 26
+    assert not any("shell" in str(c.id) for c in badge.children)
+    assert any(c.meta.get("preserved_host_raster") for c in badge.children)
+    assert doc.meta["asset_materialization"].get("starburst_seals", []) == []
 
 
-def test_plain_disc_is_an_ellipse_not_a_starburst(tmp_path):
-    """A solid circle must NOT be mistaken for a scalloped seal (no false stars)."""
-    src = tmp_path / "normalized.png"
-    img = Image.new("RGB", (400, 400), (240, 240, 240))
-    arr = np.asarray(img).copy()
-    yy, xx = np.mgrid[0:400, 0:400]
-    arr[np.hypot(yy - 200, xx - 200) <= 110] = (12, 162, 177)
-    Image.fromarray(arr).save(src)
-    tree = [{
-        "id": "c_E005", "target": "group", "box": {"x": 90, "y": 90, "w": 220, "h": 220},
-        "shape_kind": "ellipse", "fill": {"kind": "flat", "color": "#0ca2b1"},
-        "meta": {"role": "badge", "plate_shell": True},
-        "children": [{"id": "t", "target": "text", "z": 40, "text": "hi",
-                      "box": {"x": 90, "y": 100, "w": 40, "h": 16},
-                      "style": {"fontSize": 12}}],
-    }]
-    doc = build_design_json.build(tree, {"w": 400, "h": 400}, str(tmp_path),
-                                  base_src=str(_plate(tmp_path, (400, 400))))
-    badge = next(l for l in doc.layers if l.id == "c_E005")
-    shell = next(c for c in badge.children if "shell" in str(c.id))
-    assert shell.shape_kind == "ellipse"
-    assert shell.meta.get("rebuilt_from") == "flat-ellipse-shell"
-    assert doc.meta["asset_materialization"]["starburst_seals"] == []
+def test_button_shell_still_emits_native_shape_without_chrome_raster_flags():
+    """Buttons stay editable native primitives (not chrome-as-raster)."""
+    shell = build_design_json._native_shell_shape(
+        {"id": "c_cta", "shape_kind": "rect",
+         "fill": {"kind": "flat", "color": "#111111"}, "radius": 12,
+         "meta": {"role": "button", "plate_shell": True, "text_bearing_shell": True,
+                  "button_shell": True}},
+        {"x": 0, "y": 0, "w": 160, "h": 48}, 1.0,
+    )
+    assert shell is not None
+    assert shell.type == "shape" and shell.shape_kind == "rect"
+    assert shell.fill == {"kind": "flat", "color": "#111111"}
 
 
-# ── Guards: only flat chrome is rebuilt; photographic/gradient hosts keep their raster ─
+# ── Guards: photographic/gradient hosts keep their raster ─
 def test_non_flat_and_non_shell_hosts_keep_their_raster(tmp_path):
     _plate(tmp_path)
     _source(tmp_path)

@@ -155,3 +155,37 @@ def test_repair_per_layer_element_recall_targets_sam3(tmp_path):
         and item["target_id"] == "logo"
         for item in repairs
     )
+
+
+def test_repair_skips_ocr_rerun_when_kept_in_photo_dominates_deficit():
+    design = {"kept_in_photo": ["INGREDIENTS", "NUTRITION", "NET WT"], "layers": []}
+    qa = {
+        "text_recall": 0.70,
+        "editable_text_recall": 0.95,
+        "kept_in_photo_lines": 8,
+        "text_lines_total": 10,
+        "hard_fails": [],
+        "per_layer": [],
+    }
+    repairs = repair.assess(design, qa, {"lines": []}, {})
+    assert ("ocr", "rerun") not in _actions(repairs)
+    assert ("text-analysis", "restore-editable-text") not in _actions(repairs)
+
+
+def test_repair_skips_local_score_thrash_on_shell_raster_chip():
+    design = {
+        "layers": [{
+            "id": "c_badge", "type": "image",
+            "meta": {"role": "badge", "shell_raster_chip": True, "baked_badge_text": True},
+        }],
+    }
+    qa = {
+        "hard_fails": [],
+        "per_layer": [{
+            "id": "c_badge", "type": "image", "role": "badge",
+            "region_ssim": 0.10, "region_px": 400,
+            "abs_box": {"x": 0, "y": 0, "w": 40, "h": 40},
+        }],
+    }
+    repairs = repair.assess(design, qa, {"lines": []}, {})
+    assert not any(item.get("target_id") == "c_badge" for item in repairs)

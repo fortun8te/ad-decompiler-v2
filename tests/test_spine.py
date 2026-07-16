@@ -136,7 +136,8 @@ def test_photo_fragment_is_image_with_mask():
 def test_small_icon_vectorized_big_not():
     small = routing.route({"id": "E2", "kind": "icon", "box": {"x": 10, "y": 10, "w": 60, "h": 60}}, CANVAS)
     big = routing.route({"id": "E3", "kind": "icon", "box": {"x": 0, "y": 0, "w": 900, "h": 900}}, CANVAS)
-    assert small["target"] == "icon" and big["target"] != "icon"
+    # Raster-first chrome policy: small icons ship as pixel-exact image chips.
+    assert small["target"] == "image" and big["target"] != "icon"
 
 
 def test_build_design_json_orders_and_keeps_scene():

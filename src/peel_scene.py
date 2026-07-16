@@ -588,9 +588,27 @@ _PHOTO_KINDS = frozenset({
     "chart", "graph", "screenshot",
 })
 
-#: Product cutouts that carry printed label ink — OCR/wordmarks must not punch these
-#: (ghost-text still punches plates and overlay photo panels).
-_PRODUCT_INK_KINDS = frozenset({"product", "photo-fragment", "cutout"})
+#: Soft gate kinds for ``punch_*_into_photos`` (generic photo panels + products).
+_PRODUCT_INK_KINDS = frozenset({
+    "product", "photo-fragment", "cutout", "package", "packaging",
+    "bottle", "jar", "can", "tube", "pouch", "carton", "box", "packshot",
+    "product-cluster", "canister", "device", "sachet",
+})
+#: Hard product kinds — OCR/artwork never punch these, even if punch_* is enabled.
+#: Excludes generic ``photo-fragment`` so overlay panels can still peel text when
+#: ``punch_text_into_photos`` is explicitly turned on.
+_HARD_PRODUCT_INK_KINDS = frozenset({
+    "product", "package", "packaging", "bottle", "jar", "can", "tube", "pouch",
+    "carton", "box", "packshot", "product-cluster", "canister", "device", "sachet",
+    "cutout",
+})
+#: Detector roles that mean "this raster is packaging / product" even when kind is a
+#: generic photo-fragment (fusion's usual kind for SAM product winners).
+_PRODUCT_INK_ROLES = frozenset({
+    "product", "package", "packaging", "bottle", "jar", "can", "tube", "pouch",
+    "carton", "box", "packshot", "product-cluster", "canister", "device", "sachet",
+    "pill-cloud", "body-progression", "body-morph",
+})
 
 
 def element_eligibility(element: SceneElement, cfg: Optional[dict] = None) -> dict:
@@ -1002,19 +1020,47 @@ def _is_plate_kind(kind) -> bool:
     return str(kind or "").lower() in _PLATE_KINDS
 
 
-def _may_punch_into(occluder: SceneElement, under_kind: str, opts: dict) -> bool:
+def _carries_printed_ink(under_kind: str, under_meta: Optional[dict] = None) -> bool:
+    """True when the under-layer is a product/package raster that owns label ink.
+
+    Hard invariant: OCR and artwork must never punch holes out of packaging
+    interiors. ``meta.printed_lockup`` and product-instance roles win even when
+    kind is a generic ``photo-fragment``. Overlay photo panels (kind photo-
+    fragment, no product role) are NOT hard-denied — they still honour
+    ``punch_*_into_photos``.
+    """
+    meta = under_meta or {}
+    if meta.get("printed_lockup"):
+        return True
+    kind = str(under_kind or "").lower().replace("_", "-")
+    role = str(meta.get("role") or "").lower().replace("_", "-")
+    return kind in _HARD_PRODUCT_INK_KINDS or role in _PRODUCT_INK_ROLES
+
+
+def _may_punch_into(
+    occluder: SceneElement,
+    under_kind: str,
+    opts: dict,
+    under_meta: Optional[dict] = None,
+) -> bool:
     """Whether ``occluder`` should punch a hole into an under-layer of ``under_kind``.
 
     Peel objects only: OCR text and logo/wordmark artwork still punch plates and
     overlay photo panels (ghost-text invariant), but never product cutouts —
-    printed label ink stays on the product raster.
+    printed label ink stays on the product raster. Product/package ink is a hard
+    deny for text/artwork regardless of ``punch_*_into_photos`` (those flags only
+    gate generic photo panels).
     """
-    kind = str(under_kind or "").lower()
+    kind = str(under_kind or "").lower().replace("_", "-")
     if occluder.is_text:
+        if _carries_printed_ink(under_kind, under_meta):
+            return False
         if kind in _PRODUCT_INK_KINDS and not opts.get("punch_text_into_photos"):
             return False
         return True
     if is_artwork_element(occluder):
+        if _carries_printed_ink(under_kind, under_meta):
+            return False
         if kind in _PRODUCT_INK_KINDS and not opts.get("punch_artwork_into_photos"):
             return False
         return True
@@ -1397,7 +1443,9 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
                 for number, occluder in enumerate(occ_order, start=1):
                     if occluder.is_text != is_text_class:
                         continue
-                    if not _may_punch_into(occluder, element.kind, opts):
+                    if not _may_punch_into(
+                        occluder, element.kind, opts, under_meta=element.meta,
+                    ):
                         continue
                     sub = occluder_map == number
                     if not sub.any():

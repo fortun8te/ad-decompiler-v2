@@ -321,3 +321,163 @@ def test_high_confidence_giant_raster_is_not_capped(tmp_path):
     by_id = {c["id"]: c for c in result["candidates"]}
     assert result["stats"]["removal_capped"] == 0
     assert by_id["sure"]["meta"].get("keep_in_background") is not True
+
+
+# ── crowded / edge glyph closer (002 ESSENTIALS, 025, 131 class) ──────────────────────
+
+
+def _crowded_edge_source(path, size=(180, 80)):
+    """Dark display ink crammed against the top edge — ring sampling is hostile."""
+    image = Image.new("RGB", size, PLATE)
+    draw = ImageDraw.Draw(image)
+    # Top-edge headline bar (131 / 002 class): ink touches y=0 so a tight ring is tiny.
+    draw.rectangle((8, 0, 170, 22), fill=INK)
+    # Crowded sibling ink just below — contaminates a naive ring median with black.
+    draw.rectangle((8, 26, 170, 44), fill=INK)
+    image.save(path)
+    return image
+
+
+def _edge_headline_candidate(**overrides):
+    candidate = {
+        "id": "c_ESSENTIALS", "target": "text", "text": "ALLE ESSENTIALS", "z": 4,
+        "box": {"x": 8, "y": 0, "w": 162, "h": 22},
+        "visible_box": {"x": 8, "y": 0, "w": 162, "h": 22},
+        "style": {"fontSize": 20, "fontFamily": "Arial", "color": "#141414"},
+        "meta": {"source": "ocr", "role": "headline", "line_ids": ["L0"]},
+    }
+    candidate.update(overrides)
+    return candidate
+
+
+def test_crowded_edge_headline_solid_fills_with_plate_not_ink(tmp_path, monkeypatch):
+    """002/131-class: edge + crowded ink must solid-fill with PLATE colour, not black.
+
+    A naive ring median samples neighbouring glyph ink and "repairs" by repainting the
+    ghost — QA would then mark resolved while the double-render remains. The closer must
+    reject ink-like fills and sample farther / outside the box for plate colour.
+    """
+    source = tmp_path / "source.png"
+    _crowded_edge_source(source)
+
+    def fake_once(image_path, mask, output_path, cfg=None):
+        # Leave the source glyphs fully in the plate (worst-case inpaint miss).
+        Image.open(image_path).save(output_path)
+        return {"ok": True, "path": output_path, "backend": "fake-noop",
+                "backend_class": "active"}
+
+    monkeypatch.setattr(reconstruct.inpaint, "inpaint_once", fake_once)
+    monkeypatch.setattr(
+        reconstruct.inpaint, "inpaint_role_aware",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no reinpaint on flat")),
+    )
+
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, [_edge_headline_candidate()], str(tmp_path),
+        {"inpaint": {"mode": "opencv"},
+         "scene": {"archetype": "product_on_flat"}},
+    )
+    residual = result["stats"]["text_residual"]
+    assert residual["flagged"], residual
+    assert residual["flagged"][0]["resolved"] is True
+    assert residual["flagged"][0].get("resolved_by") == "solid-plate-fill"
+    assert "c_ESSENTIALS" in (residual.get("solid_filled_ids") or [])
+
+    plate = np.asarray(Image.open(tmp_path / result["background"]).convert("RGB"))
+    # Top headline band must be plate-coloured, not leftover black ink.
+    band = plate[0:22, 8:170]
+    assert float(band.mean()) > 180.0, f"ghost ink remains: mean={band.mean():.1f}"
+    assert float(np.abs(band.astype(np.int16) - np.array(INK)).mean()) > 80.0
+
+
+def test_inky_ring_cannot_greenwash_residue_as_resolved(tmp_path, monkeypatch):
+    """When every ring sample is glyph-coloured, closer must leave unresolved + hard_fail.
+
+    Harness/QA greenwash path: mark resolved after painting black into the hole.
+    """
+    source = tmp_path / "source.png"
+    # Full-frame ink: no plate-coloured exterior exists at any ring radius.
+    Image.new("RGB", (60, 40), INK).save(source)
+
+    def fake_once(image_path, mask, output_path, cfg=None):
+        Image.open(image_path).save(output_path)
+        return {"ok": True, "path": output_path, "backend": "fake-noop",
+                "backend_class": "active"}
+
+    monkeypatch.setattr(reconstruct.inpaint, "inpaint_once", fake_once)
+
+    cand = _text_candidate(
+        id="c_INK", box={"x": 10, "y": 10, "w": 40, "h": 16},
+        visible_box={"x": 10, "y": 10, "w": 40, "h": 16},
+    )
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, [cand], str(tmp_path),
+        {"inpaint": {"mode": "opencv"},
+         "scene": {"archetype": "product_on_flat"},
+         "reconstruct": {"text_residual": {
+             "solid_fill_ring": 4, "solid_fill_dilate": 1, "min_px": 8, "min_ratio": 0.1,
+         }}},
+    )
+    residual = result["stats"]["text_residual"]
+    flagged = residual.get("flagged") or []
+    assert flagged, residual
+    assert flagged[0]["resolved"] is False
+    assert flagged[0].get("hard_fail") is True
+    assert "c_INK" not in (residual.get("solid_filled_ids") or [])
+
+
+def test_unresolved_glyph_residue_hard_fails_qa_and_contract(tmp_path):
+    """pixel_diff must hard-fail + contract_pass=false; harness cannot greenwash."""
+    from src import pixel_diff
+    from src.schema import dump as schema_dump
+
+    source = tmp_path / "source.png"
+    render = tmp_path / "preview.png"
+    Image.new("RGB", (40, 30), "white").save(source)
+    Image.new("RGB", (40, 30), "white").save(render)
+    schema_dump({
+        "stats": {"text_residual": {
+            "enabled": True, "checked": 1, "reinpainted": False,
+            "flagged": [{"id": "c_ESSENTIALS", "residual_px": 400,
+                         "resolved": False, "hard_fail": True}],
+        }},
+    }, str(tmp_path / "reconstruction.json"))
+
+    result = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [], "meta": {"editable_ratio": 0.5}},
+    )
+    rules = {f.get("rule") for f in (result.get("hard_fails") or [])}
+    assert "glyph-residue" in rules
+    assert result["structural"].get("glyph_residue_unresolved") == 1
+    assert result["contract"]["glyph_residue_clean"] is False
+    assert result["contract_pass"] is False
+
+    # Greenwash attempt: resolved=True but hard_fail still set → still fails.
+    schema_dump({
+        "stats": {"text_residual": {
+            "enabled": True, "checked": 1,
+            "flagged": [{"id": "c_ESSENTIALS", "residual_px": 400,
+                         "resolved": True, "hard_fail": True}],
+        }},
+    }, str(tmp_path / "reconstruction.json"))
+    washed = pixel_diff.compare(
+        str(source), str(render), str(tmp_path),
+        design={"layers": [], "meta": {"editable_ratio": 0.5}},
+    )
+    assert "glyph-residue" in {f.get("rule") for f in (washed.get("hard_fails") or [])}
+    assert washed["contract_pass"] is False
+
+
+def test_display_edge_text_coverage_is_dilated(tmp_path):
+    """_ensure_text_removal_coverage dilates display/edge headlines past sparse ink."""
+    rgb = np.asarray(_crowded_edge_source(tmp_path / "src.png").convert("RGB"))
+    # Sparse 1px ink strip — clears a tiny area floor but misses the stem fringe.
+    mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+    mask[8:14, 20:160] = 255
+    cand = _edge_headline_candidate()
+    out = reconstruct._ensure_text_removal_coverage(
+        cand, mask, rgb, {"reconstruct": {"force_text_removal_coverage": True}},
+    )
+    assert int(np.count_nonzero(out)) > int(np.count_nonzero(mask))
+    assert (cand.get("meta") or {}).get("removal_coverage_dilated", {}).get("edge") is True

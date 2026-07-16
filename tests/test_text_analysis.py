@@ -679,6 +679,19 @@ def test_floating_side_callouts_align_toward_center():
     assert text_analysis._infer_alignment(edge_right, 1080) == "RIGHT"
 
 
+def test_social_left_column_and_wide_body_stay_left():
+    """009: username + wide body lines must not flip to RIGHT/CENTER."""
+    upfront = [{"box": {"x": 183.5, "y": 158.0, "w": 194.0, "h": 25.0}}]
+    handle = [{"box": {"x": 185.6, "y": 198.0, "w": 225.0, "h": 29.0}}]
+    # Geometric center near mid-canvas, but left-anchored body (Daarbovenop…).
+    wide_body = [{"box": {"x": 47.46, "y": 552.66, "w": 915.47, "h": 33.75}}]
+    post = [{"box": {"x": 487.3, "y": 54.8, "w": 101.3, "h": 34.8}}]
+    assert text_analysis._infer_alignment(upfront, 1080) == "LEFT"
+    assert text_analysis._infer_alignment(handle, 1080) == "LEFT"
+    assert text_analysis._infer_alignment(wide_body, 1080) == "LEFT"
+    assert text_analysis._infer_alignment(post, 1080) == "CENTER"
+
+
 def test_disclaimer_role_for_bottom_fda_copy():
     lines = [{
         "text": "*These statements have not been evaluated by the FDA.",
@@ -1508,6 +1521,43 @@ def test_aa_edge_is_not_emitted_as_text_stroke(tmp_path):
         str(path), ocr, {"text_analysis": {"font_matching": {"enabled": False}}}
     )
     assert result["lines"][0]["style"].get("stroke") is None
+
+
+def test_prefer_plain_editable_text_suppresses_weak_body_stroke():
+    """Body/headline keep plain editable text — weak understroke rims are dropped."""
+    lines = [{
+        "id": "L0", "text": "Everyday curl cream for soft hair",
+        "role": "body",
+        "style": {
+            "fontSize": 18, "color": "#222222",
+            "fill": {"kind": "flat", "color": "#222222"},
+            "stroke": {"kind": "flat", "color": "#3a3a3a", "width": 1.5,
+                       "align": "OUTSIDE", "strokeAlign": "OUTSIDE"},
+        },
+        "meta": {},
+        "words": [],
+    }]
+    text_analysis._prefer_plain_editable_text(lines)
+    assert lines[0]["style"]["stroke"] is None
+    assert lines[0]["meta"].get("plain_text_stroke_suppressed") is True
+
+
+def test_prefer_plain_editable_text_keeps_strong_authored_outline():
+    lines = [{
+        "id": "L0", "text": "OFF",
+        "role": "headline",
+        "style": {
+            "fontSize": 64, "color": "#fafafa",
+            "fill": {"kind": "flat", "color": "#fafafa"},
+            "stroke": {"kind": "flat", "color": "#101010", "width": 4.0,
+                       "align": "OUTSIDE", "strokeAlign": "OUTSIDE"},
+        },
+        "meta": {},
+        "words": [],
+    }]
+    text_analysis._prefer_plain_editable_text(lines)
+    assert lines[0]["style"]["stroke"] is not None
+    assert lines[0]["style"]["stroke"]["width"] == 4.0
 
 
 def test_offset_text_shadow_emits_drop_shadow_effect(tmp_path):

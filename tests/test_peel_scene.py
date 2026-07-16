@@ -1208,3 +1208,81 @@ def test_unflagged_product_over_plain_background_still_skips():
 
     result = peel_scene.peel_scene(flat, elements, inpaint=SpyInpaint(), cfg=_cfg())
     assert result.skipped and result.skip_reason == "no-overlap"
+
+
+# ── never punch OCR/artwork out of product interiors ───────────────────────────────
+
+
+def test_text_never_punches_product_role_photo_fragment():
+    """Label OCR sitting on a product cutout must leave the product alpha intact."""
+    card = _rect_mask((20, 20, 300, 360))
+    product = _rect_mask((40, 40, 220, 280))
+    label = _rect_mask((80, 100, 180, 140))
+    flat = np.full((H, W, 3), BG, np.uint8)
+    flat[card] = BLUE
+    flat[product] = RED
+    flat[label] = INK
+    elements = [
+        SceneElement(id="card", mask=card, z=0.0, kind="shape"),
+        SceneElement(id="prod", mask=product, z=1.0, kind="photo-fragment",
+                     meta={"role": "product"}),
+        SceneElement(id="t", mask=label, z=2.0, kind="text", is_text=True),
+    ]
+    # Even with punch_text_into_photos forced ON, product-role ink is a hard deny.
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=SpyInpaint(),
+        cfg=_cfg(punch_text_into_photos=True, punch_artwork_into_photos=True,
+                 flat_fill_tol=6.0))
+    assert not result.skipped
+    prod = result.layer("prod")
+    assert prod is not None
+    assert not any(b.get("text_occluder") for b in (prod.meta.get("fill_backends") or []))
+    # Flat already has label ink on the product — peel must keep those pixels
+    # (alpha 255, original INK), not punch a hole or inpaint them away.
+    assert np.all(prod.rgba[:, :, :3][label & product] == INK)
+    assert np.all(prod.rgba[:, :, 3][label & product] == 255)
+
+
+def test_artwork_never_punches_printed_lockup_product():
+    """Absorbed on-pack logo must not carve a hole out of the product raster."""
+    product = _rect_mask((40, 40, 220, 280))
+    logo = _rect_mask((90, 90, 150, 130))
+    card = _rect_mask((20, 20, 300, 360))
+    flat = np.full((H, W, 3), BG, np.uint8)
+    flat[card] = BLUE
+    flat[product] = RED
+    flat[logo] = INK
+    elements = [
+        SceneElement(id="card", mask=card, z=0.0, kind="shape"),
+        SceneElement(id="prod", mask=product, z=1.0, kind="photo-fragment",
+                     meta={"role": "product", "printed_lockup": True}),
+        SceneElement(id="logo", mask=logo, z=2.0, kind="icon",
+                     meta={"role": "logo"}),
+    ]
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=SpyInpaint(),
+        cfg=_cfg(punch_artwork_into_photos=True, flat_fill_tol=6.0))
+    prod = result.layer("prod")
+    assert prod is not None
+    # Artwork occluder was denied — no fill backends attributed to the logo on prod.
+    assert not any(
+        "logo" in (b.get("occluder_ids") or [])
+        for b in (prod.meta.get("fill_backends") or [])
+    )
+    assert np.all(prod.rgba[:, :, 3][logo & product] == 255)
+
+
+def test_may_punch_into_hard_denies_product_ink():
+    text = SceneElement(id="t", mask=_rect_mask((0, 0, 10, 10)), z=1.0,
+                        kind="text", is_text=True)
+    logo = SceneElement(id="l", mask=_rect_mask((0, 0, 10, 10)), z=1.0,
+                        kind="icon", meta={"role": "logo"})
+    opts = {"punch_text_into_photos": True, "punch_artwork_into_photos": True}
+    assert peel_scene._may_punch_into(
+        text, "photo-fragment", opts, under_meta={"role": "product"}) is False
+    assert peel_scene._may_punch_into(
+        logo, "photo-fragment", opts,
+        under_meta={"role": "product", "printed_lockup": True}) is False
+    # Generic photo panel (no product role) still honours the punch flag.
+    assert peel_scene._may_punch_into(
+        text, "photo-fragment", opts, under_meta={"role": "photo"}) is True

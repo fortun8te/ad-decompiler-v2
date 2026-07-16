@@ -55,7 +55,7 @@ def test_targets_assigned():
     m = _by_id(cands)
     assert m["c_L0"]["target"] == "text"
     assert m["c_E0"]["target"] == "shape"
-    assert m["c_E2"]["target"] == "icon"
+    assert m["c_E2"]["target"] == "image"  # chrome_as_raster: icons → exact cutouts
     # photo element gets Qwen alpha + image target + z from the qwen layer
     assert m["c_E1"]["target"] == "image"
     assert m["c_E1"]["src"] == "qwen_layers/Q0.png"
@@ -217,8 +217,61 @@ def test_internal_ui_chrome_is_not_rebuilt_out_of_screenshot_but_external_overla
         "baked-in-raster-owner"
     assert merged["c_internal_button"]["target"] == "drop"
     assert merged["c_internal_button"]["meta"]["baked_owner_id"] == "c_shot"
-    assert merged["c_offer_badge"]["target"] in {"shape", "icon"}
+    assert merged["c_offer_badge"]["target"] == "image"  # chrome_as_raster badge cutout
     assert merged["c_offer_badge"]["meta"]["parent_id"] == "c_shot"
+
+
+def test_verified_icon_inside_screenshot_extracts_as_chrome_raster():
+    """009: verified badge must not punch-then-drop inside a social screenshot."""
+    elements = [
+        {"id": "shot", "box": {"x": 0, "y": 0, "w": 500, "h": 500},
+         "kind": "photo-fragment", "area": 250000, "coverage": .9, "role": "screenshot"},
+        {"id": "verified", "box": {"x": 200, "y": 80, "w": 28, "h": 28},
+         "kind": "icon", "area": 784, "coverage": .003, "role": "icon"},
+    ]
+    ocr = {"lines": [{
+        "id": "name", "text": "UPFRONT", "conf": .99, "role": "label",
+        "box": {"x": 80, "y": 78, "w": 160, "h": 32},
+        # Positive overlay evidence — same as editable UI copy on a social crop.
+        "meta": {"ownership_decision": {
+            "placement": "overlay", "owner": "none", "action": "recreate",
+            "confidence": .99,
+        }},
+    }]}
+    merged = _by_id(merge_layers.merge(ocr, elements, [], CANVAS, {
+        "routing": {"chrome_as_raster": True},
+    }))
+    assert merged["c_verified"]["target"] == "image"
+    assert merged["c_verified"]["meta"].get("extract_from_cluster") is True
+    assert merged["c_verified"]["meta"].get("suppression_reason") != \
+        "internal-chrome-contained-in-raster-cluster"
+    assert merged["c_name"]["target"] == "text"
+    # Username box must not swallow the verified slot.
+    assert merged["c_name"]["meta"].get("clipped_for_chrome_icon") == "c_verified"
+    assert merged["c_name"]["box"]["x"] + merged["c_name"]["box"]["w"] <= 200 + 1
+
+
+def test_packaging_flavor_bar_text_bakes_into_product_not_button_shell():
+    """002: VANILLE SMAAK on a wide in-product 'button' bakes into the product."""
+    elements = [
+        {"id": "E005", "box": {"x": 60, "y": 900, "w": 500, "h": 400},
+         "kind": "photo-fragment", "area": 200000, "coverage": .2, "role": "product",
+         "meta": {"printed_lockup": True}},
+        {"id": "E006", "box": {"x": 100, "y": 1100, "w": 220, "h": 28},
+         "kind": "shape", "area": 6160, "coverage": .01, "role": "button"},
+    ]
+    ocr = {"lines": [{
+        "id": "van", "text": "VANILLE SMAAK", "conf": .9, "role": "label",
+        "box": {"x": 110, "y": 1104, "w": 140, "h": 20},
+    }]}
+    merged = _by_id(merge_layers.merge(ocr, elements, [], {"w": 1080, "h": 1920}, {}))
+    node = merged["c_van"]
+    assert node.get("kept_in_photo") is True or node["target"] == "drop"
+    assert node["meta"].get("shell_text_host") != "c_E006"
+    assert node["meta"].get("baked_owner_id") == "c_E005" or \
+        node["meta"].get("suppression_reason") in {
+            "printed-lockup-product-text", "text-inside-product-cutout", "baked-chrome-text",
+        }
 
 
 def test_source_detected_outer_shell_around_screenshot_remains_native():
@@ -528,6 +581,34 @@ def test_scene_text_is_never_also_an_editable_overlay():
     assert "overlay_text" in printed["meta"]["scene_text_contract_enforced"]
 
 
+def test_printed_lockup_product_bakes_overlayish_ocr_early():
+    """Fusion printed_lockup → contained headline-ish OCR bakes into the product.
+
+    Overlayish semantic roles (subheadline) must not escape as editable TEXT when the
+    host product already absorbed on-pack artwork — that would double-print the label.
+    """
+    elements = [{
+        "id": "bag", "box": {"x": 100, "y": 100, "w": 280, "h": 320},
+        "kind": "photo-fragment", "area": 89600, "coverage": .22, "role": "product",
+        "meta": {"printed_lockup": True, "role": "product"},
+    }]
+    ocr = {"lines": [{
+        "id": "brand", "text": "GRUNS", "conf": .97, "role": "subheadline",
+        "box": {"x": 140, "y": 180, "w": 120, "h": 28},
+        "meta": {"role": "subheadline"},
+    }]}
+    brand = _by_id(merge_layers.merge(
+        ocr, elements, [], CANVAS,
+        {"scene": {"facts": {"flat_background_fraction": 0.55, "photo_coverage": 0.40}}},
+    ))["c_brand"]
+    assert brand.get("kept_in_photo") is True
+    assert brand["target"] == "drop"
+    assert brand["meta"].get("baked_owner_id") == "c_bag"
+    assert brand["meta"].get("suppression_reason") == "printed-lockup-product-text"
+    assert not brand["meta"].get("overlay_text")
+    assert not brand["meta"].get("removal_required")
+
+
 def test_merge_layer_order_is_deterministic():
     """Stable sort keys (z, area, reading order, id) make the merged layer list reproducible
     for identical inputs, so downstream runs diff cleanly."""
@@ -647,9 +728,8 @@ def test_positive_overlay_evidence_beats_product_geometry():
     assert not node.get("kept_in_photo")
 
 
-def test_text_bearing_logo_badge_extracts_ocr_as_native_text():
-    """Benchmark 016 green seal: a mislabeled 'logo' hosting 'Get up to' / '45%' / 'Off'
-    must become TEXT + plate shell, never bake OCR into the badge raster."""
+def test_text_bearing_logo_badge_bakes_ocr_into_cutout():
+    """Benchmark 016 green seal: logo hosting offer copy → IMAGE cutout, OCR baked in."""
     canvas = {"w": 1080, "h": 1080}
     elements = [{"id": "E014", "box": {"x": 774, "y": 540, "w": 256, "h": 254},
                  "kind": "icon", "area": 65024, "coverage": .06, "role": "logo"}]
@@ -664,21 +744,19 @@ def test_text_bearing_logo_badge_extracts_ocr_as_native_text():
     m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
     for cid in ("c_get", "c_pct", "c_off"):
         node = m[cid]
-        assert node["target"] == "text", cid
-        assert not node.get("kept_in_photo"), cid
-        assert node["meta"].get("overlay_text") is True, cid
-        assert node["meta"].get("removal_required") is True, cid
-        assert node["meta"].get("shell_text_host") == "c_E014", cid
-        assert node["meta"].get("suppression_reason") != "text-inside-product-cutout", cid
+        assert node["target"] == "drop", cid
+        assert node.get("kept_in_photo") is True, cid
+        assert node["meta"].get("baked_owner_id") == "c_E014", cid
+        assert node["meta"].get("suppression_reason") == "baked-chrome-text", cid
     shell = m["c_E014"]
-    assert shell["meta"].get("text_bearing_shell") is True
-    assert shell["meta"].get("plate_shell") is True
     assert shell["meta"].get("role") == "badge"
-    assert shell["target"] == "shape"
+    assert shell["target"] == "image"
+    assert shell["meta"].get("shell_raster_chip") is True
+    assert shell["meta"].get("baked_badge_text") is True
 
 
-def test_ad013_circular_offer_badge_extracts_native_text():
-    """Ad 013: ``61% OFF`` / ``+ FREE GIFTS`` on a circular logo seal must stay editable."""
+def test_ad013_circular_offer_badge_bakes_ocr_into_cutout():
+    """Ad 013: ``61% OFF`` / ``+ FREE GIFTS`` on a circular seal stays in the cutout."""
     canvas = {"w": 1080, "h": 1920}
     elements = [{"id": "E007", "box": {"x": 97, "y": 730, "w": 303, "h": 304},
                  "kind": "icon", "area": 71757, "coverage": .03, "role": "logo"}]
@@ -691,11 +769,12 @@ def test_ad013_circular_offer_badge_extracts_native_text():
     m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
     for cid in ("c_off", "c_gifts"):
         node = m[cid]
-        assert node["target"] == "text", cid
-        assert not node.get("kept_in_photo"), cid
-        assert node["meta"].get("shell_text_host") == "c_E007", cid
+        assert node["target"] == "drop", cid
+        assert node.get("kept_in_photo") is True, cid
+        assert node["meta"].get("baked_owner_id") == "c_E007", cid
     assert m["c_E007"]["meta"].get("role") == "badge"
-    assert m["c_E007"]["meta"].get("text_bearing_shell") is True
+    assert m["c_E007"]["target"] == "image"
+    assert m["c_E007"]["meta"].get("shell_raster_chip") is True
 
 
 def test_badge_shell_preferred_over_enclosing_product_for_ocr():
@@ -713,11 +792,12 @@ def test_badge_shell_preferred_over_enclosing_product_for_ocr():
     ]}
     m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
     node = m["c_pct"]
-    assert node["target"] == "text"
-    assert node["meta"].get("shell_text_host") == "c_E014"
-    assert node["meta"].get("suppression_reason") != "text-inside-product-cutout"
-    assert m["c_E014"]["meta"].get("text_bearing_shell") is True
-    assert m["c_E014"]["target"] == "shape"
+    assert node["target"] == "drop"
+    assert node.get("kept_in_photo") is True
+    assert node["meta"].get("baked_owner_id") == "c_E014"
+    assert node["meta"].get("suppression_reason") == "baked-chrome-text"
+    assert m["c_E014"]["target"] == "image"
+    assert m["c_E014"]["meta"].get("shell_raster_chip") is True
 
 
 def test_brushstroke_banner_shape_pairs_editable_text():
@@ -793,8 +873,39 @@ def test_explicit_broad_banner_can_still_host_editable_text():
     assert merged["c_headline"]["meta"].get("shell_text_host") == "c_E_banner"
 
 
-def test_starburst_seal_shape_pairs_editable_text():
-    """028-style starburst seal: square irregular badge + inset offer copy."""
+def test_comparison_card_checklist_stays_editable_text():
+    """066: multi-line checklist on a comparison card must not chrome-bake into the card."""
+    canvas = {"w": 1080, "h": 1920}
+    elements = [{
+        "id": "E_card", "box": {"x": 60, "y": 520, "w": 420, "h": 900},
+        "kind": "shape", "area": 420 * 900, "coverage": 0.18, "role": "card",
+        "source": "sam3",
+    }]
+    ocr = {"lines": [
+        {"id": "r1", "text": "Smudge proof", "conf": 0.95, "role": "body",
+         "box": {"x": 100, "y": 600, "w": 300, "h": 36}},
+        {"id": "r2", "text": "Clump-free & buildable", "conf": 0.94, "role": "body",
+         "box": {"x": 100, "y": 660, "w": 320, "h": 36}},
+        {"id": "r3", "text": "Feathery lashes", "conf": 0.93, "role": "body",
+         "box": {"x": 100, "y": 720, "w": 280, "h": 36}},
+        {"id": "r4", "text": "Easy to remove", "conf": 0.92, "role": "body",
+         "box": {"x": 100, "y": 780, "w": 260, "h": 36}},
+    ]}
+    cfg = {"scene": {"archetype": "comparison_grid", "facts": {"before_after_labels": True}}}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, cfg))
+    shell = m["c_E_card"]
+    assert shell["meta"].get("text_bearing_shell") is True
+    assert shell["meta"].get("shell_raster_chip") is not True
+    assert shell["meta"].get("role") == "card"
+    for tid in ("c_r1", "c_r2", "c_r3", "c_r4"):
+        assert m[tid]["target"] == "text"
+        assert not m[tid].get("kept_in_photo")
+        assert m[tid]["meta"].get("suppression_reason") != "baked-chrome-text"
+        assert m[tid]["meta"].get("shell_text_host") == "c_E_card"
+
+
+def test_starburst_seal_shape_bakes_offer_copy_into_cutout():
+    """028-style starburst seal: square irregular badge + inset offer → IMAGE + baked OCR."""
     canvas = {"w": 1080, "h": 1350}
     elements = [{
         "id": "E_seal", "box": {"x": 780, "y": 520, "w": 240, "h": 240},
@@ -806,11 +917,12 @@ def test_starburst_seal_shape_pairs_editable_text():
         "box": {"x": 810, "y": 590, "w": 180, "h": 100},
     }]}
     m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
-    assert m["c_ltd"]["target"] == "text"
-    assert m["c_ltd"]["meta"].get("shell_text_host") == "c_E_seal"
-    assert m["c_E_seal"]["meta"].get("text_bearing_shell") is True
+    assert m["c_ltd"]["target"] == "drop"
+    assert m["c_ltd"].get("kept_in_photo") is True
+    assert m["c_ltd"]["meta"].get("baked_owner_id") == "c_E_seal"
     assert m["c_E_seal"]["meta"].get("role") == "badge"
-    assert m["c_E_seal"]["target"] == "shape"
+    assert m["c_E_seal"]["target"] == "image"
+    assert m["c_E_seal"]["meta"].get("shell_raster_chip") is True
 
 
 def test_product_box_inset_text_stays_kept_in_photo():
@@ -1288,8 +1400,8 @@ def test_biomel_stroke_outline_pill_shell_plus_text_not_guide_dropped():
     assert text["meta"].get("role") == "callout"
 
 
-def test_biomel_scalloped_save_badge_promotes_like_seal():
-    """Scalloped SAVE / price badge: near-square sparse chrome + offer copy → seal/badge shell."""
+def test_biomel_scalloped_save_badge_bakes_into_raster_cutout():
+    """Scalloped SAVE / price badge: near-square chrome + offer copy → IMAGE cutout."""
     canvas = {"w": 1080, "h": 1350}
     elements = [{
         "id": "E_save", "box": {"x": 820, "y": 180, "w": 200, "h": 200},
@@ -1301,10 +1413,11 @@ def test_biomel_scalloped_save_badge_promotes_like_seal():
         "box": {"x": 850, "y": 250, "w": 140, "h": 60},
     }]}
     m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
-    assert m["c_save"]["target"] == "text"
-    assert m["c_save"]["meta"].get("shell_text_host") == "c_E_save"
-    assert m["c_E_save"]["target"] == "shape"
-    assert m["c_E_save"]["meta"].get("text_bearing_shell") is True
+    assert m["c_save"]["target"] == "drop"
+    assert m["c_save"].get("kept_in_photo") is True
+    assert m["c_save"]["meta"].get("baked_owner_id") == "c_E_save"
+    assert m["c_E_save"]["target"] == "image"
+    assert m["c_E_save"]["meta"].get("shell_raster_chip") is True
     assert m["c_E_save"]["meta"].get("role") in {"seal", "badge", "starburst", "price_burst"}
 
 
@@ -1456,3 +1569,136 @@ def test_biomel_outlined_pill_stroke_only_meta_without_area_still_shells():
     assert shell["meta"].get("stroke_outline_shell") or shell["meta"].get("stroke_only")
     assert m["c_digest"]["target"] == "text"
     assert not m["c_digest"].get("kept_in_photo")
+
+
+def test_066_avatar_panel_bakes_competitor_label():
+    """066: 'OUR COMPETITOR' on an avatar eye panel stays in the photo, not native TEXT."""
+    canvas = {"w": 1440, "h": 1440}
+    elements = [{
+        "id": "E001", "box": {"x": 723, "y": 284, "w": 692, "h": 547},
+        "kind": "icon", "role": "avatar", "area": 379000, "coverage": 0.18,
+        "score": 0.9, "source": "sam3",
+    }]
+    ocr = {"lines": [{
+        "id": "comp", "text": "OUR COMPETITOR", "conf": 0.95, "role": "subheadline",
+        "box": {"x": 836, "y": 746, "w": 484, "h": 38},
+    }]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    label = m["c_comp"]
+    assert label["target"] == "drop"
+    assert label.get("kept_in_photo") is True
+    assert label["meta"].get("baked_owner_id") == "c_E001"
+    assert not label["meta"].get("overlay_text")
+    assert not label["meta"].get("removal_required")
+
+
+def test_066_list_icons_absorb_into_baked_checklist_card():
+    """066 safety: ✓/✗ chips inside an already chrome-baked card stay in that raster."""
+    cands = [
+        {"id": "c_E002", "box": {"x": 47, "y": 831, "w": 631, "h": 557},
+         "kind": "shape", "target": "image",
+         "meta": {"role": "badge", "baked_badge_text": True, "shell_raster_chip": True}},
+        {"id": "c_E004", "box": {"x": 117, "y": 890, "w": 36, "h": 37},
+         "kind": "icon", "target": "image",
+         "meta": {"role": "verified", "icon_chip": True}},
+        {"id": "c_E025", "box": {"x": 120, "y": 950, "w": 33, "h": 33},
+         "kind": "icon", "target": "image",
+         "meta": {"role": "cross", "icon_chip": True}},
+    ]
+    diag = {"scene_text_contract": []}
+    n = merge_layers._absorb_list_icons_into_baked_shells(cands, diag)
+    assert n == 2
+    card = cands[0]
+    for icon in cands[1:]:
+        assert icon["target"] == "drop"
+        assert icon["meta"].get("suppression_reason") == "list-icon-absorbed-into-baked-shell"
+        assert icon["meta"].get("baked_owner_id") == "c_E002"
+    assert set(card["meta"].get("absorbed_list_icons") or []) >= {"c_E004", "c_E025"}
+    assert any(r.get("action") == "absorb-list-icon-into-baked-shell" for r in diag["scene_text_contract"])
+
+
+def test_066_checklist_card_with_row_icons_keeps_editable_text():
+    """066: card + checklist copy + list icons → plate shell + native TEXT; icons stay IMAGE."""
+    canvas = {"w": 1440, "h": 1440}
+    elements = [
+        {"id": "E002", "box": {"x": 47, "y": 831, "w": 631, "h": 557},
+         "kind": "shape", "role": "card", "area": 350000, "coverage": 0.17,
+         "score": 0.9, "source": "sam3"},
+        {"id": "E004", "box": {"x": 117, "y": 890, "w": 36, "h": 37},
+         "kind": "icon", "role": "verified", "area": 1300, "coverage": 0.001,
+         "score": 0.85, "source": "icon_detect"},
+        {"id": "E008", "box": {"x": 117, "y": 948, "w": 37, "h": 36},
+         "kind": "icon", "role": "verified", "area": 1300, "coverage": 0.001,
+         "score": 0.84, "source": "icon_detect"},
+    ]
+    ocr = {"lines": [
+        {"id": "L18", "text": "Tubing technology", "conf": 0.95, "role": "body",
+         "box": {"x": 182, "y": 888, "w": 360, "h": 40}},
+        {"id": "L19", "text": "Enhances lash growth", "conf": 0.95, "role": "body",
+         "box": {"x": 182, "y": 948, "w": 380, "h": 40}},
+    ]}
+    cfg = {"scene": {"archetype": "comparison_grid"}}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, cfg))
+    card = m["c_E002"]
+    assert card["meta"].get("text_bearing_shell") is True
+    assert card["meta"].get("checklist_editable") is True
+    assert card["meta"].get("baked_badge_text") is not True
+    assert card["meta"].get("checklist_raster_chip") is not True
+    for cid in ("c_E004", "c_E008"):
+        icon = m[cid]
+        assert icon["target"] == "image", cid
+        assert icon["meta"].get("suppression_reason") != "list-icon-absorbed-into-baked-shell"
+    for cid in ("c_L18", "c_L19"):
+        assert m[cid]["target"] == "text"
+        assert not m[cid].get("kept_in_photo")
+        assert m[cid]["meta"].get("shell_text_host") == "c_E002"
+
+
+def test_009_verified_peer_icon_not_absorbed_into_tiny_badge():
+    """009-style peer verified chip next to username must stay extractable."""
+    canvas = {"w": 1080, "h": 1920}
+    elements = [
+        {"id": "E_badge", "box": {"x": 200, "y": 120, "w": 40, "h": 40},
+         "kind": "icon", "role": "verified", "area": 1600, "coverage": 0.001,
+         "score": 0.9, "source": "sam3"},
+    ]
+    ocr = {"lines": [{
+        "id": "user", "text": "@brand", "conf": 0.95, "role": "handle",
+        "box": {"x": 80, "y": 125, "w": 110, "h": 30},
+    }]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    badge = m["c_E_badge"]
+    assert badge["target"] != "drop"
+    assert badge["meta"].get("suppression_reason") != "list-icon-absorbed-into-baked-shell"
+
+
+def test_066_photo_stays_separate_from_editable_checklist_card():
+    """066: photo above checklist stays IMAGE; card hosts editable TEXT (not column bake)."""
+    canvas = {"w": 1440, "h": 1440}
+    elements = [
+        {"id": "E000", "box": {"x": 25, "y": 284, "w": 691, "h": 547},
+         "kind": "icon", "role": "avatar", "area": 378000, "coverage": 0.18,
+         "score": 0.9, "source": "sam3"},
+        {"id": "E002", "box": {"x": 47, "y": 831, "w": 631, "h": 557},
+         "kind": "shape", "role": "card", "area": 350000, "coverage": 0.17,
+         "score": 0.9, "source": "sam3"},
+        {"id": "E004", "box": {"x": 117, "y": 890, "w": 36, "h": 37},
+         "kind": "icon", "role": "verified", "area": 1300, "coverage": 0.001,
+         "score": 0.85, "source": "icon_detect"},
+        {"id": "E008", "box": {"x": 117, "y": 948, "w": 37, "h": 36},
+         "kind": "icon", "role": "verified", "area": 1300, "coverage": 0.001,
+         "score": 0.84, "source": "icon_detect"},
+    ]
+    ocr = {"lines": [
+        {"id": "L18", "text": "Tubing technology", "conf": 0.95, "role": "body",
+         "box": {"x": 182, "y": 888, "w": 360, "h": 40}},
+        {"id": "L19", "text": "Enhances lash growth", "conf": 0.95, "role": "body",
+         "box": {"x": 182, "y": 948, "w": 380, "h": 40}},
+    ]}
+    cfg = {"scene": {"archetype": "comparison_grid"}}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, cfg))
+    assert m["c_E000"]["target"] == "image"
+    assert m["c_E002"]["meta"].get("text_bearing_shell") is True
+    assert "c_E002__column" not in m
+    assert m["c_L18"]["target"] == "text"
+    assert m["c_L19"]["target"] == "text"

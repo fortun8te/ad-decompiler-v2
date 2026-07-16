@@ -329,8 +329,11 @@ def test_no_op_repair_is_not_retried_and_plateau_stops(tmp_path, monkeypatch):
     monkeypatch.setattr(harness_loop, "_run_fixer_pass",
                         lambda rd, cfg, c: {"cfg": cfg, "fixes": ["keep-going"]})
 
+    # plateau_rounds=2 so the loop reaches a second round (needed to observe the
+    # blocked-repair handoff); production default remains 1 (workstream E).
+    cfg = {"runtime": {"harness": {"plateau_rounds": 2}}}
     summary = harness_loop.run_until_acceptable(
-        input_path, run_dir, {}, max_rounds=5,
+        input_path, run_dir, cfg, max_rounds=5,
         run_one=run_one, execute_repairs_fn=exec_repairs)
 
     # (b) the no-op ocr:rerun applied in round 1 is blocked for every later round.
@@ -352,6 +355,25 @@ def test_convergence_config_keys_are_reportable():
 def test_default_harness_budget_is_bounded_to_two_measured_repairs():
     assert harness_loop.max_harness_rounds({}) == 2
     assert harness_loop.repair_iterations({}) == 1
+    # Workstream E: plateau after 1 no-gain round (matches config.example.yaml).
+    assert harness_loop._DEFAULT_PLATEAU_ROUNDS == 1
+    assert harness_loop.plateau_round_limit({}) == 1
+
+
+def test_config_example_harness_budget_is_at_most_two_rounds():
+    import os
+    import yaml
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    with open(os.path.join(root, "config.example.yaml"), encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+    harness_cfg = cfg["runtime"]["harness"]
+    assert harness_cfg["max_rounds"] <= 2
+    assert harness_cfg["plateau_rounds"] == 1
+    reward = cfg["qa"]["reward"]
+    assert reward["local_ssim_min"] >= 0.55
+    assert reward["worst_local_ssim_min"] >= 0.15
+    assert reward["critique"].get("crop_worst", True) is True
 
 
 # ── regression: rollback must cover every artifact a report reads, not just qa.json ─────

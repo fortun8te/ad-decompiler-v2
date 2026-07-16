@@ -116,8 +116,11 @@ def test_noop_repair_is_blocked_and_not_rerun_next_round(tmp_path, monkeypatch):
         _write_qa(rd, qa)                              # nothing improves, ever
         return {"ok": True}
 
+    # Need plateau_rounds≥2 to observe the blocked handoff into round 2; production
+    # default is 1 (workstream E / config.example).
+    cfg = {"runtime": {"harness": {"plateau_rounds": 2}}}
     summary = harness_loop.run_until_acceptable(
-        input_path, run_dir, {}, max_rounds=3,
+        input_path, run_dir, cfg, max_rounds=3,
         run_one=run_one, execute_repairs_fn=exec_repairs)
 
     assert len(received) >= 2

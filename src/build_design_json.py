@@ -786,6 +786,13 @@ def _native_shell_shape(candidate, box, z_index):
     this frame would read the wrong pixels.
     """
     meta = candidate.get("meta") or {}
+    # Always-raster chrome: exact source cutout only — never a native ellipse/pill/star.
+    if (
+        meta.get("shell_raster_chip")
+        or meta.get("baked_badge_text")
+        or meta.get("chrome_as_raster")
+    ):
+        return None
     role = str(meta.get("role") or "").strip().lower().replace("_", "-")
     is_shell = bool(meta.get("plate_shell") or meta.get("text_bearing_shell")
                     or role in _SHELL_SHAPE_ROLES)
@@ -925,9 +932,23 @@ def _promote_weight_candidate(style: dict) -> None:
         except (TypeError, ValueError):
             return 400
 
+    preferred_family = str(style.get("fontFamily") or "").strip()
+
+    def _family_rank(candidate: dict) -> int:
+        if not preferred_family:
+            return 0
+        return 0 if str(candidate.get("family") or "").strip().casefold() == preferred_family.casefold() else 1
+
+    # Prefer the declared family (platform-UI Inter prior) over a better weight
+    # match from a drifted forensic face — otherwise design silently rewrites
+    # Inter → Open Sans / Lato on social chrome (009).
     ranked = sorted(
         cands,
-        key=lambda c: (abs(_cand_weight(c) - weight), -float(c.get("score") or 0.0)),
+        key=lambda c: (
+            _family_rank(c),
+            abs(_cand_weight(c) - weight),
+            -float(c.get("score") or 0.0),
+        ),
     )
     top = dict(ranked[0])
     if abs(_cand_weight(top) - weight) > _WEIGHT_CANDIDATE_MATCH_TOL:
@@ -945,9 +966,13 @@ def _promote_weight_candidate(style: dict) -> None:
         italic_path = _italic_variant_path(top.get("path"), weight)
         if italic_path:
             top["path"] = italic_path
+    if preferred_family:
+        top["family"] = preferred_family
     rest = [c for c in ranked[1:]]
     style["fontCandidates"] = [top] + rest
-    if top.get("family"):
+    if preferred_family:
+        style["fontFamily"] = preferred_family
+    elif top.get("family"):
         style["fontFamily"] = top["family"]
 
 
@@ -1340,8 +1365,147 @@ def _reanchor_decorations(children: list) -> int:
 _TEXT_BOX_HEIGHT_FACTOR = 1.6
 _TEXT_BOX_WIDTH_SLACK = 0.06
 
+# Transparent text containers always expand to their child union (anti-clip).
+_TEXT_STACK_EXPAND_ROLES = frozenset({
+    "text-stack", "text-row", "stat-stack", "stat-column", "copy-stack", "caption-stack",
+})
+# Non-stack hosts expand only when children overflow (067/131 top-line / 002 band).
+# Chrome shells (badge/chip/…) stay Agent A's always-raster path — do not expand those.
+_OVERFLOW_EXPAND_ROLES = frozenset({
+    "", "group", "band", "section", "hero", "card", "panel", "callout", "button", "cta",
+    "frame", "asset-group", "offer-block", "copy-block", "content", "residual",
+})
+_CHROME_NO_EXPAND_ROLES = frozenset({
+    "badge", "chip", "pill", "seal", "sticker", "tag", "logo", "wordmark", "brand",
+    "icon", "symbol", "pictogram", "starburst", "price_burst", "sale_burst", "burst",
+    "splat", "sticker_burst", "chrome",
+})
 
-def _generous_text_box(box: dict, style: dict, text: str, stroke=None) -> dict:
+
+def _text_paint_overflow(child) -> tuple[float, float, float, float]:
+    """Extra (L,T,R,B) so parent frames don't clip glyph/stroke/shadow/decoration paint.
+
+    Preview tiles text with a ~0.12·fs+stroke pad and may return a negative local
+    offset under vertical CENTER; Figma frames clip that overflow. Inflate the union
+    used for host expand by the same budget.
+    """
+    if getattr(child, "type", None) != "text":
+        return 0.0, 0.0, 0.0, 0.0
+    style = getattr(child, "style", None) or {}
+    try:
+        font_size = float(style.get("fontSize") or 0) or 16.0
+    except (TypeError, ValueError):
+        font_size = 16.0
+    stroke = getattr(child, "stroke", None) or style.get("stroke")
+    stroke_w = 0.0
+    if isinstance(stroke, dict):
+        try:
+            stroke_w = max(0.0, float(stroke.get("width", stroke.get("weight", 0)) or 0))
+        except (TypeError, ValueError):
+            stroke_w = 0.0
+    pad = max(2.0, font_size * 0.20 + stroke_w)
+    decoration = str(style.get("textDecoration") or style.get("text_decoration") or "").upper()
+    if decoration in {"UNDERLINE", "UNDERLINE_SOLID", "STRIKETHROUGH", "LINE_THROUGH", "LINE-THROUGH"}:
+        pad = max(pad, font_size * 0.28)
+    eff_l = eff_t = eff_r = eff_b = 0.0
+    for effect in list(getattr(child, "effects", None) or []) + list(style.get("effects") or []):
+        if not isinstance(effect, dict) or effect.get("visible") is False:
+            continue
+        kind = str(effect.get("type", effect.get("kind", ""))).lower().replace("_", "-")
+        if kind not in {"drop-shadow", "shadow", "inner-shadow"}:
+            continue
+        offset = effect.get("offset") or {}
+        try:
+            dx = float(offset.get("x", effect.get("x", effect.get("offsetX", 0))) or 0)
+            dy = float(offset.get("y", effect.get("y", effect.get("offsetY", 0))) or 0)
+            spread = max(0.0, float(effect.get("spread", 0) or 0))
+            blur = max(0.0, float(effect.get("radius", effect.get("blur", 8)) or 0))
+        except (TypeError, ValueError):
+            continue
+        extent = spread + blur * 2.0
+        eff_l = max(eff_l, extent - min(0.0, dx))
+        eff_r = max(eff_r, extent + max(0.0, dx))
+        eff_t = max(eff_t, extent - min(0.0, dy))
+        eff_b = max(eff_b, extent + max(0.0, dy))
+    return pad + eff_l, pad + eff_t, pad + eff_r, pad + eff_b
+
+
+def _child_union_bounds(children, group_box: dict) -> tuple[float, float, float, float]:
+    """Return (min_x, min_y, max_x, max_y) covering group box + padded children."""
+    min_x = 0.0
+    min_y = 0.0
+    max_x = float(group_box.get("w", 0) or 0)
+    max_y = float(group_box.get("h", 0) or 0)
+    for child in children:
+        box = child.box or {}
+        x = float(box.get("x", 0) or 0)
+        y = float(box.get("y", 0) or 0)
+        w = float(box.get("w", 0) or 0)
+        h = float(box.get("h", 0) or 0)
+        left, top, right, bottom = _text_paint_overflow(child)
+        min_x = min(min_x, x - left)
+        min_y = min(min_y, y - top)
+        max_x = max(max_x, x + w + right)
+        max_y = max(max_y, y + h + bottom)
+    return min_x, min_y, max_x, max_y
+
+
+def _expand_group_to_child_union(common: dict, children: list) -> bool:
+    """Grow a group box to its child union; shift children to keep absolute poses.
+
+    Returns True when the group was expanded.
+    """
+    group_box = common["box"]
+    min_x, min_y, max_x, max_y = _child_union_bounds(children, group_box)
+    gw = float(group_box.get("w", 0) or 0)
+    gh = float(group_box.get("h", 0) or 0)
+    if not (min_x < -0.01 or min_y < -0.01 or max_x > gw + 0.01 or max_y > gh + 0.01):
+        return False
+    group_box["x"] = float(group_box.get("x", 0) or 0) + min_x
+    group_box["y"] = float(group_box.get("y", 0) or 0) + min_y
+    group_box["w"] = max_x - min_x
+    group_box["h"] = max_y - min_y
+    for child in children:
+        child.box["x"] = float((child.box or {}).get("x", 0) or 0) - min_x
+        child.box["y"] = float((child.box or {}).get("y", 0) or 0) - min_y
+        # prefit_ink_box lives in the SAME parent frame as child.box; QA
+        # (pixel_diff) scores placement against it. Leaving it unshifted
+        # after the union shift made QA crop ~min_y px away from the real
+        # ink (107 text-stack: 58% headline scored a region 130px above
+        # its glyphs → placement_ink_iou 0.14 on a correct render).
+        prefit = (child.meta or {}).get("prefit_ink_box")
+        if isinstance(prefit, dict):
+            prefit["x"] = float(prefit.get("x", 0) or 0) - min_x
+            prefit["y"] = float(prefit.get("y", 0) or 0) - min_y
+        if child.visible_box and isinstance(child.visible_box, dict):
+            # Keep visible_box in the same parent space as box after the shift.
+            if child.visible_box is not child.box:
+                child.visible_box = dict(child.visible_box)
+                child.visible_box["x"] = float(child.visible_box.get("x", 0) or 0) - min_x
+                child.visible_box["y"] = float(child.visible_box.get("y", 0) or 0) - min_y
+    common["meta"]["expanded_to_child_union"] = True
+    return True
+
+
+def _should_expand_host(role: str, children: list, group_box: dict, meta: dict) -> bool:
+    """Whether a compiled group should grow to its (padded) child union."""
+    role = str(role or "").lower()
+    if meta.get("shell_raster_chip") or meta.get("baked_badge_text"):
+        return False
+    if role in _CHROME_NO_EXPAND_ROLES:
+        return False
+    if role in _TEXT_STACK_EXPAND_ROLES:
+        return True
+    if role not in _OVERFLOW_EXPAND_ROLES and role not in _GENERIC_GROUP_ROLES:
+        return False
+    min_x, min_y, max_x, max_y = _child_union_bounds(children, group_box)
+    gw = float(group_box.get("w", 0) or 0)
+    gh = float(group_box.get("h", 0) or 0)
+    return min_x < -0.01 or min_y < -0.01 or max_x > gw + 0.01 or max_y > gh + 0.01
+
+
+def _generous_text_box(box: dict, style: dict, text: str, stroke=None,
+                       *, min_y: float = 0.0) -> dict:
     """Grow a fitted text box Codia-style without moving the visible text.
 
     Height grows symmetrically around the ink center to >= 1.6x lineHeight per line
@@ -1349,11 +1513,16 @@ def _generous_text_box(box: dict, style: dict, text: str, stroke=None) -> dict:
     Width gains ~6% slack away from the horizontal anchor (LEFT keeps the left edge,
     RIGHT the right edge, CENTER splits), so anchor-based placement is unchanged.
     Outside strokes get extra padding so outline ink is not clipped by the text frame.
+
+    When symmetric growth would push ``y`` above ``min_y`` (top-of-frame lines like
+    067/131), growth shifts downward and ``style['verticalAlign']`` is set to TOP so
+    the visible baseline stays on-canvas instead of being clipped off-frame.
     """
     out = dict(box or {})
     try:
         w = float(out.get("w", 0) or 0)
         h = float(out.get("h", 0) or 0)
+        y = float(out.get("y", 0) or 0)
         lines = max(1, str(text or "").count("\n") + 1)
         font_size = float(style.get("fontSize") or 0) or max(1.0, h / lines)
         line_height = float(style.get("lineHeight") or 0) or font_size * 1.2
@@ -1380,7 +1549,14 @@ def _generous_text_box(box: dict, style: dict, text: str, stroke=None) -> dict:
                 stroke_pad = 0.0
         min_h += 2.0 * stroke_pad
         if h < min_h:
-            out["y"] = float(out.get("y", 0) or 0) - (min_h - h) / 2.0
+            top_grow = (min_h - h) / 2.0
+            new_y = y - top_grow
+            if new_y < min_y:
+                # Prefer on-frame ink over symmetric CENTER slack (067/131 top lines).
+                new_y = min_y
+                if isinstance(style, dict):
+                    style["verticalAlign"] = "TOP"
+            out["y"] = new_y
             out["h"] = min_h
         if w > 0:
             extra = w * _TEXT_BOX_WIDTH_SLACK + 2.0 * stroke_pad
@@ -1528,10 +1704,9 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         # panel promoted to a container compiles to an empty group and the removal mask +
         # inpaint erase the real product (benchmark 002: 1025x1418 panel emptied).
         #
-        # BUT flat chrome shells (badge / chip / pill / seal) are rebuilt as NATIVE solid
-        # primitives, never a raster hostbg: their matte comes back near-empty and the
-        # FRAME paints its flat fill as a coloured SQUARE, so the real circle/seal is lost
-        # (101 BOGO, 013 61%-OFF + "snacks" pill, 016 45% starburst, 104/107 rect badges).
+        # Flat button/banner/callout shells may still rebuild as native primitives.
+        # Always-raster chrome (shell_raster_chip / baked_badge_text) keeps the exact
+        # source crop only — never a native ellipse/pill/star and never an empty hostbg.
         raster_src = candidate.get("src")
         bg_z_shell = min((child.z_index for child in children), default=z_index) - 1.0
         native_shell = _native_shell_shape(candidate, box, bg_z_shell)
@@ -1565,49 +1740,18 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
                 ))
         children.sort(key=lambda child: child.z_index)
         role = str((candidate.get("meta") or {}).get("role") or "").lower()
-        if children and role in {
-            "text-stack", "text-row", "stat-stack", "stat-column", "copy-stack",
-        }:
+        if children and role in _TEXT_STACK_EXPAND_ROLES:
             z_index = max(float(z_index), max(float(child.z_index) for child in children))
             common["z_index"] = z_index
             common["meta"]["z"] = z_index
-            # Text boxes are deliberately generous to survive font substitution, but
-            # layout groups were sized from the original tight ink boxes. A FRAME-sized
-            # group therefore clips its own enlarged children (002 lost half of BUNDEL).
-            # Expand the transparent text container to the compiled child union while
-            # shifting children when the union extends left/up, preserving absolute
-            # positions and keeping the group non-painting/editable.
-            group_box = common["box"]
-            min_x = min([0.0] + [float((child.box or {}).get("x", 0) or 0) for child in children])
-            min_y = min([0.0] + [float((child.box or {}).get("y", 0) or 0) for child in children])
-            max_x = max(
-                [float(group_box.get("w", 0) or 0)]
-                + [float((child.box or {}).get("x", 0) or 0)
-                   + float((child.box or {}).get("w", 0) or 0) for child in children]
-            )
-            max_y = max(
-                [float(group_box.get("h", 0) or 0)]
-                + [float((child.box or {}).get("y", 0) or 0)
-                   + float((child.box or {}).get("h", 0) or 0) for child in children]
-            )
-            if min_x < 0 or min_y < 0 or max_x > float(group_box.get("w", 0) or 0) or max_y > float(group_box.get("h", 0) or 0):
-                group_box["x"] = float(group_box.get("x", 0) or 0) + min_x
-                group_box["y"] = float(group_box.get("y", 0) or 0) + min_y
-                group_box["w"] = max_x - min_x
-                group_box["h"] = max_y - min_y
-                for child in children:
-                    child.box["x"] = float((child.box or {}).get("x", 0) or 0) - min_x
-                    child.box["y"] = float((child.box or {}).get("y", 0) or 0) - min_y
-                    # prefit_ink_box lives in the SAME parent frame as child.box; QA
-                    # (pixel_diff) scores placement against it. Leaving it unshifted
-                    # after the union shift made QA crop ~min_y px away from the real
-                    # ink (107 text-stack: 58% headline scored a region 130px above
-                    # its glyphs → placement_ink_iou 0.14 on a correct render).
-                    prefit = (child.meta or {}).get("prefit_ink_box")
-                    if isinstance(prefit, dict):
-                        prefit["x"] = float(prefit.get("x", 0) or 0) - min_x
-                        prefit["y"] = float(prefit.get("y", 0) or 0) - min_y
-                common["meta"]["expanded_to_child_union"] = True
+        # Text boxes are deliberately generous to survive font substitution, but
+        # layout groups were sized from the original tight ink boxes. A FRAME-sized
+        # group therefore clips its own enlarged children (002 lost half of BUNDEL;
+        # band hosts clipped top lines in 067/131). Expand text-stack containers
+        # always, and other non-chrome hosts only when children overflow — including
+        # stroke/shadow/decoration paint pad beyond the nominal text box.
+        if children and _should_expand_host(role, children, common["box"], common["meta"]):
+            _expand_group_to_child_union(common, children)
         # When a native shell primitive now carries the shell paint, the FRAME must NOT
         # also paint its flat fill/stroke/radius — a frame paints its fill as a rectangle
         # and would re-introduce the coloured square behind the ellipse/star.
@@ -1705,7 +1849,11 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         # center (vertical CENTER alignment keeps the visual baseline put), with ~6%
         # width slack away from the horizontal anchor. Preview, plugin and QA all read
         # the same grown box; the pre-fit ink evidence survives in meta.
-        generous = _generous_text_box(fitted_box, style, text_value, stroke=stroke)
+        # Never grow a text box above its parent origin — symmetric CENTER slack
+        # otherwise pushes top-of-frame lines (067/131) off-canvas / into clip.
+        generous = _generous_text_box(
+            fitted_box, style, text_value, stroke=stroke, min_y=0.0,
+        )
         common["box"] = generous
         common["visible_box"] = dict(generous)
         common["meta"]["prefit_ink_box"] = dict(fitted_box)

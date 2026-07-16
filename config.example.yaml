@@ -222,6 +222,21 @@ element_fusion:
   containment: 0.92
   nested_max_area_ratio: 0.62
 
+# Routing: badges / seals / chips / logos / icons / wordmarks → exact IMAGE cutouts.
+# Buttons, dividers, and flat brand headlines stay editable. Callout leaders keep the
+# vector→render-back→raster gate. Set chrome_as_raster: false to restore native shells.
+routing:
+  chrome_as_raster: true
+  # icons_as_chips is forced ON while chrome_as_raster is true
+  # min_text_fidelity: 0.40          # also set by archetype presets
+
+merge:
+  bake_chrome_text: true             # OCR on badge/seal hosts stays in the cutout
+  geometric_text_shells: true        # banners/callouts still pair editable TEXT + plate
+  # dedup_iou: 0.6
+  # photo_inside_frac: 0.82
+  # scene_text_inside_frac: 0.55
+
 # Post-fusion ✓ / ✗ / ? glyph icons + chart-region clusters (src/icon_detect.py).
 # Deterministic CPU pass: list-row glyphs become role-tagged icon elements attached
 # to their text lines (comparison ads), stacked duplicate fragments collapse, and a
@@ -443,13 +458,15 @@ qa:
       enabled: true                   # LPIPS perceptual term (pip lpips; CPU-capable)
       net: squeeze                    # squeeze (~5 MB, CPU-fast) | alex | vgg
       max_edge: 256                   # downscale bound so CPU scoring stays cheap
-    lpips_similarity_min: 0.20        # gate floor on 1 - LPIPS distance
-    local_ssim_min: 0.30              # gate floor on the per-element local score
+    lpips_similarity_min: 0.80        # gate floor on 1 - LPIPS distance (anti-degenerate)
+    local_ssim_min: 0.55              # per-element local score floor (good runs ≥0.60)
+    worst_local_ssim_min: 0.15        # worst 64px window floor (002 erased window ~0.01)
     critique:
-      enabled: true                   # VLM diff critique (original vs preview) mapped to
-      max_items: 8                    # repair actions — the primary repair driver; falls
-      timeout_s: 45                   # back to tool-only repairs when LM Studio is
-      max_tokens: 900                 # unavailable or the model was evicted
+      enabled: true                   # VLM diff critique on worst-region CROPS (not full
+      crop_worst: true                # frame) mapped to repair actions; falls back to
+      max_items: 8                    # tool-only repairs when LM Studio is unavailable
+      timeout_s: 45                   # or the model was evicted for Flux inpaint
+      max_tokens: 900
 
 qa_ocr: true                          # OCR the render for text-recall QA
 export_wait_s: 0                      # >0 to poll for the plugin's figma_export.png

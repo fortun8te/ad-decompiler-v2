@@ -74,6 +74,8 @@ STORY_CHROME_ROLES = (
 EXTENDED_VECTOR_ROLES = {
     # These are commonly much larger than a small UI icon in advertising.  They still
     # enter the render-back gate; the larger ceiling only prevents premature flattening.
+    # Callout leaders / thin arrows keep this gate. Badges/bursts/icons are forced to
+    # exact IMAGE cutouts when routing.chrome_as_raster is on (default).
     "arrow", "callout_leader", "leader", "leader_line", "connector",
     "string", "thread", "string_leader", "leader_string", "callout_string",
     "leader_dot", "endpoint_dot",
@@ -82,6 +84,62 @@ EXTENDED_VECTOR_ROLES = {
     # eligible for the same render-back gate (fail → exact raster, never a fake rect).
     "plot_line", "data_line", "data_point", "marker",
 }
+
+# Badges / seals / chips / logos / icons / wordmarks → always exact IMAGE cutouts.
+# Buttons, dividers, callout leaders, and flat brand headlines stay on their own paths.
+CHROME_AS_RASTER_ROLES = frozenset({
+    "badge", "chip", "seal", "pill", "sticker", "tag",
+    "logo", "wordmark", "brand", "logotype",
+    "icon", "symbol", "pictogram",
+    "verified", "checkmark", "cross", "question-mark", "question_mark",
+    "emoji",
+    "starburst", "price_burst", "sale_burst", "burst", "splat", "sticker_burst",
+    "chrome",
+    *STORY_CHROME_ROLES,
+})
+
+
+def chrome_as_raster_enabled(cfg: dict | None = None) -> bool:
+    """Default ON: chrome artwork ships as source cutouts, never native shells / VTracer."""
+    routing_cfg = (cfg or {}).get("routing") or {}
+    return bool(routing_cfg.get("chrome_as_raster", True))
+
+
+def is_chrome_as_raster_role(role: str | None) -> bool:
+    """True for badge/seal/chip/logo/icon/wordmark/story chrome roles (not buttons)."""
+    key = str(role or "").lower().replace("-", "_")
+    if key in CHROME_AS_RASTER_ROLES:
+        return True
+    return key.startswith("story_")
+
+
+def _is_vs_comparison_shell(meta: dict) -> bool:
+    """Comparison VS chips stay editable TEXT + SHAPE (not baked chrome cutouts)."""
+    if str(meta.get("role") or "").lower() in {"vs", "vs_badge", "vs_chip"}:
+        return True
+    if str(meta.get("semantic_name") or "").strip().upper() == "VS":
+        return True
+    snippet = str(meta.get("shell_text_snippet") or meta.get("text") or "").strip().upper()
+    return snippet in {"VS", "V.S.", "V.S", "VERSUS"}
+
+
+def _apply_chrome_raster(c: dict, meta: dict, canvas: dict, *, baked_text: bool = False) -> dict:
+    """Force an exact IMAGE cutout for chrome-as-raster roles."""
+    c["target"] = "image"
+    meta["shell_raster_chip"] = True
+    if baked_text or meta.get("text_bearing_shell") or meta.get("plate_shell"):
+        meta["baked_badge_text"] = True
+        # Shell cutouts keep an alpha matte (seals/starbursts are irregular).
+        mask = dict(c.get("mask")) if isinstance(c.get("mask"), dict) else {}
+        if not mask.get("kind") or str(mask.get("kind")).lower() == "alpha":
+            mask["kind"] = "alpha"
+            c["mask"] = mask
+        else:
+            c["mask"] = _image_mask(c, canvas)
+    else:
+        c["mask"] = _image_mask(c, canvas)
+    meta.setdefault("layer_disposition", "foreground_raster")
+    return c
 
 
 def _image_mask(candidate: dict, canvas: dict) -> dict:
@@ -156,9 +214,14 @@ _CHIP_ARCHETYPES = {"social_screenshot", "product_on_flat", "comparison_grid"}
 
 
 def _icons_as_chips(cfg) -> bool:
-    """Config gate for icon→image-chip routing (default: ON for flat-plate archetypes)."""
+    """Config gate for icon→image-chip routing (default: ON for flat-plate archetypes).
+
+    ``routing.chrome_as_raster`` (default ON) forces chips so icons never enter VTracer.
+    """
     from src import format_readiness
 
+    if chrome_as_raster_enabled(cfg):
+        return True
     routing_cfg = (cfg or {}).get("routing") or {}
     if routing_cfg.get("icons_as_chips") is not None:
         return bool(routing_cfg.get("icons_as_chips"))
@@ -169,7 +232,12 @@ def _icons_as_chips(cfg) -> bool:
 
 
 def _wordmark_as_raster(cfg: dict | None) -> bool:
-    """Raster is the conservative default when brand artwork has no explicit override."""
+    """Wordmarks always raster when chrome_as_raster (default); else cfg override."""
+    if chrome_as_raster_enabled(cfg):
+        return True
+    routing_cfg = (cfg or {}).get("routing") or {}
+    if "wordmark_as_raster" in routing_cfg:
+        return bool(routing_cfg.get("wordmark_as_raster"))
     return bool((cfg or {}).get("wordmark_as_raster", True))
 
 
@@ -279,25 +347,15 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
             meta.pop("wordmark", None)
             c["target"] = "text"
             return c
-        # wordmark / brand lettering → artwork, not editable text, never font-matched
+        # wordmark / brand lettering → artwork cutout, never editable text / VTracer
         if meta.get("scene_text_role") == "wordmark" or meta.get("wordmark"):
-            # A platform lockup such as X.com is normally a logo glyph plus domain
-            # lettering. Keep an exact cropped asset rather than risking a lossy
-            # trace or treating the lettering as UI text.
-            force_raster = bool(meta.get("platform_lockup"))
-            c["target"] = "image" if force_raster or _wordmark_as_raster(cfg) else "icon"
             meta["wordmark"] = True
             meta["role"] = meta.get("role") or "logo"
-            if c["target"] == "image":
-                c["mask"] = _image_mask(c, canvas)
-            return c
+            return _apply_chrome_raster(c, meta, canvas)
         if is_wordmark_candidate({"text": c.get("text"), "box": c.get("box"), "id": c.get("id")}, canvas):
-            c["target"] = "image" if _wordmark_as_raster(cfg) else "icon"
             meta["wordmark"] = True
             meta["role"] = meta.get("role") or "logo"
-            if c["target"] == "image":
-                c["mask"] = _image_mask(c, canvas)
-            return c
+            return _apply_chrome_raster(c, meta, canvas)
         # confidence/fidelity gate: a font/effect we cannot faithfully reproduce as
         # editable text falls back to the original painted pixels instead of a guess.
         fallback = _text_fidelity_fallback(c, meta, cfg)
@@ -338,9 +396,18 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
         c["mask"] = _image_mask(c, canvas)
         return c
     if disposition in {"foreground_vector", "vector", "icon"}:
+        role = str(meta.get("role") or "").lower().replace("-", "_")
+        if chrome_as_raster_enabled(cfg) and is_chrome_as_raster_role(role):
+            return _apply_chrome_raster(c, meta, canvas)
         c["target"] = "icon"
         return c
     if disposition in {"native_shape", "shape", "primitive"}:
+        role = str(meta.get("role") or "").lower().replace("-", "_")
+        if chrome_as_raster_enabled(cfg) and is_chrome_as_raster_role(role):
+            return _apply_chrome_raster(
+                c, meta, canvas,
+                baked_text=bool(meta.get("text_bearing_shell") or meta.get("plate_shell")),
+            )
         c["target"] = "shape"
         return c
 
@@ -407,13 +474,11 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
         meta["native_divider"] = True
         return c
 
-    # 4. Text-bearing badge/button/logo/banner chrome → native SHAPE plate (not a
-    #    traced/rasterized seal with OCR baked in). Contained OCR stays TEXT with removal.
-    #    Irregular brushstrokes/starbursts may later fall back to an alpha CHIP in
-    #    reconstruct when primitive/path fidelity fails — never a full-image slice.
+    # 4. Text-bearing chrome → IMAGE cutout for badge/seal/chip/logo roles (OCR baked
+    #    upstream), or native SHAPE plate for buttons / banners / callout outlines.
     if meta.get("text_bearing_shell") or meta.get("plate_shell"):
         role = str(meta.get("role") or "").lower().replace("-", "_")
-        if role in {"logo", "wordmark", "brand"}:
+        if role in {"logo", "wordmark", "brand", "logotype"}:
             meta["reclassified_from"] = meta.get("reclassified_from") or role
             meta["role"] = "badge"
             role = "badge"
@@ -427,8 +492,14 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
                 meta.setdefault("reclassified_from", role or "shape")
             meta["role"] = new_role
             role = new_role
-        c["target"] = "shape"
         meta["plate_shell"] = True
+        if (
+            chrome_as_raster_enabled(cfg)
+            and is_chrome_as_raster_role(role)
+            and not _is_vs_comparison_shell(meta)
+        ):
+            return _apply_chrome_raster(c, meta, canvas, baked_text=True)
+        c["target"] = "shape"
         if role == "button":
             meta["button_shell"] = True
         radius = c.get("radius")
@@ -440,19 +511,23 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
                 c["radius"] = radius
         return c
 
-    # 5. Icons / badges / simple graphics → vectorize (small only) ------------------
+    # 5. Icons / badges / simple graphics ------------------------------------------
     if kind in {"icon", "line"} or meta.get("role") in VECTORIZE_ROLES:
         role = str(meta.get("role") or "").lower().replace("-", "_")
+        # Always-raster chrome: badges/icons/bursts/logos → exact cutout. Callout
+        # leaders / thin arrows stay on the vector→render-back→raster gate.
+        if chrome_as_raster_enabled(cfg) and is_chrome_as_raster_role(role):
+            story_chrome = role in STORY_CHROME_ROLES or bool(meta.get("story_chrome"))
+            out = _apply_chrome_raster(c, meta, canvas)
+            meta["icon_chip"] = True
+            if story_chrome:
+                meta["story_chrome_chip"] = True
+            meta.setdefault("intentional_raster_cluster", True)
+            return out
         # Codia confidence ladder: on flat-plate archetypes an icon ships as an exact
         # IMAGE chip with its local plate surround baked in — vector tracing is a
-        # declared non-goal (chips are pixel-exact and trivially swappable; Codia's
-        # engagement icons/badges are all cutouts). Leaders/bursts keep the vector
-        # path (they are often diagonal linework a chip box would mangle).
-        # Codia confidence ladder: on flat-plate archetypes an icon ships as an exact
-        # IMAGE chip with its local plate surround baked in — vector tracing is a
-        # declared non-goal (chips are pixel-exact and trivially swappable; Codia's
-        # engagement icons/badges are all cutouts). Leaders/bursts keep the vector
-        # path (they are often diagonal linework a chip box would mangle).
+        # declared non-goal. Leaders/bursts keep the vector path when chrome_as_raster
+        # is off (diagonal linework a chip box would mangle).
         story_chrome = role in STORY_CHROME_ROLES or bool(meta.get("story_chrome"))
         if (_icons_as_chips(cfg) and role not in EXTENDED_VECTOR_ROLES
                 and _area_frac(c.get("box", {}), canvas) <= 0.20):
@@ -478,7 +553,9 @@ def route(candidate: dict, canvas: dict, cfg: dict | None = None) -> dict:
 
     # 6. Shapes / cards / buttons → primitive when fill is solid/gradient -----------
     if kind == "shape":
-        role = meta.get("role")
+        role = str(meta.get("role") or "").lower().replace("-", "_")
+        if chrome_as_raster_enabled(cfg) and is_chrome_as_raster_role(role):
+            return _apply_chrome_raster(c, meta, canvas)
         small = _area_frac(c.get("box", {}), canvas) <= ICON_MAX_AREA_FRAC
         # A solid button/card/chip is already an editable native primitive. Tracing it
         # creates needless paths and worse corner geometry. Only explicitly non-primitive

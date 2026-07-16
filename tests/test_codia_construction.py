@@ -175,6 +175,24 @@ def test_promote_weight_candidate_rewrites_mismatched_regular_file():
     assert "path" not in style["fontCandidates"][0]
 
 
+def test_promote_weight_candidate_keeps_platform_family_over_weight_drift():
+    """009: weight promotion must not rewrite Inter → Open Sans from a bold peer."""
+    style = {
+        "fontFamily": "Inter", "fontWeight": 700, "fontStyle": "Bold",
+        "fontCandidates": [
+            {"family": "Inter", "style": "Regular", "weight": 400,
+             "source": "platform-ui-prior", "score": 0.55},
+            {"family": "Open Sans", "style": "Bold", "weight": 700,
+             "source": "local-render", "path": "opensans-bold.ttf", "score": 0.9},
+        ],
+    }
+    _promote_weight_candidate(style)
+    assert style["fontFamily"] == "Inter"
+    assert style["fontCandidates"][0]["family"] == "Inter"
+    assert style["fontCandidates"][0]["weight"] == 700
+
+
+
 def test_normalize_text_stroke_outside_and_fat_to_effect():
     thin, effects = _normalize_text_stroke(
         {"kind": "flat", "color": "#0f0f0f", "width": 2.0, "align": "CENTER"},
@@ -224,6 +242,42 @@ def test_generous_box_pads_for_outside_stroke():
     assert out["h"] >= style["fontSize"] * 1.25 - 0.01
     assert out["w"] > box["w"] + 3.0
     assert out["x"] <= box["x"]
+
+
+def test_generous_box_clamps_top_of_frame_growth():
+    """Top lines must not grow upward off-frame (067/131 anti-clip)."""
+    style = {"fontSize": 40.0, "lineHeight": 48.0, "align": "LEFT"}
+    box = {"x": 10.0, "y": 2.0, "w": 200.0, "h": 36.0}
+    out = _generous_text_box(box, style, "HELLO", min_y=0.0)
+    assert out["y"] >= 0.0
+    assert out["h"] > box["h"]
+    assert style.get("verticalAlign") == "TOP"
+
+
+def test_band_host_expands_when_text_children_overflow(tmp_path):
+    """Non-stack hosts (band) expand to padded child union when text overflows."""
+    run_dir = tmp_path / "run"
+    candidates = [{
+        "id": "band", "target": "group",
+        "box": {"x": 40, "y": 80, "w": 300, "h": 60},
+        "meta": {"role": "band"},
+        "children": [{
+            "id": "headline", "target": "text", "text": "WE'RE SAYING GOODBYE",
+            "box": {"x": 0, "y": 0, "w": 280, "h": 50},
+            "visible_box": {"x": 0, "y": 0, "w": 280, "h": 50},
+            "style": {"fontSize": 42.0, "fontWeight": 700, "color": "#111111",
+                      "lineHeight": 50.0, "align": "LEFT"},
+            "meta": {"role": "headline"},
+        }],
+    }]
+    doc = build_design_json.build(candidates, {"w": 400, "h": 240}, str(run_dir))
+    band = next(l for l in doc.layers if l.id == "band")
+    assert band.meta.get("expanded_to_child_union") is True
+    child = band.children[0]
+    assert child.box["y"] >= 0
+    assert child.box["y"] + child.box["h"] <= band.box["h"] + 0.5
+    # Paint pad must leave room above the nominal text box (ascender/stroke budget).
+    assert child.box["y"] >= 4.0
 
 
 def test_weight_run_split_ignores_small_delta_and_multiline():
@@ -383,19 +437,24 @@ def test_routing_emoji_is_image_cutout():
 
 
 def test_routing_icon_chip_on_flat_plate_archetype():
+    import copy
     from src.routing import route
-    candidate = {"id": "i0", "kind": "icon", "box": {"x": 10, "y": 10, "w": 40, "h": 40},
-                 "meta": {"role": "icon"}}
+
+    def _icon():
+        return {"id": "i0", "kind": "icon", "box": {"x": 10, "y": 10, "w": 40, "h": 40},
+                "meta": {"role": "icon"}}
+
     cfg = {"scene": {"archetype": "social_screenshot"}}
-    routed = route(dict(candidate), {"w": 1000, "h": 1000}, cfg)
+    routed = route(_icon(), {"w": 1000, "h": 1000}, cfg)
     assert routed["target"] == "image"
     assert routed["meta"].get("icon_chip") is True
-    # photographic archetype keeps the vector path
-    routed2 = route(dict(candidate), {"w": 1000, "h": 1000},
+    # chrome_as_raster (default ON) forces icon cutouts on every archetype.
+    routed2 = route(_icon(), {"w": 1000, "h": 1000},
                     {"scene": {"archetype": "caption_over_photo"}})
-    assert routed2["target"] == "icon"
-    # explicit config override wins
-    routed3 = route(dict(candidate), {"w": 1000, "h": 1000},
+    assert routed2["target"] == "image"
+    assert routed2["meta"].get("shell_raster_chip") is True
+    # Opt out of chrome-as-raster to restore the vector gate + icons_as_chips off.
+    routed3 = route(copy.deepcopy(_icon()), {"w": 1000, "h": 1000},
                     {"scene": {"archetype": "social_screenshot"},
-                     "routing": {"icons_as_chips": False}})
+                     "routing": {"chrome_as_raster": False, "icons_as_chips": False}})
     assert routed3["target"] == "icon"

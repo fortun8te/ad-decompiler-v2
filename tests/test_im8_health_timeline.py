@@ -113,10 +113,10 @@ def test_im8_get_up_to_off_seal_is_text_bearing_shell():
         "box": {"x": 810, "y": 200, "w": 140, "h": 70},
     }]}
     m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
-    assert m["c_off"]["target"] == "text"
-    assert not m["c_off"].get("kept_in_photo")
-    assert m["c_SEAL"]["target"] == "shape"
-    assert m["c_SEAL"]["meta"].get("text_bearing_shell") is True
+    # Raster-first chrome policy: compact seal rasters whole, offer text rides it.
+    assert m["c_SEAL"]["target"] == "image"
+    assert m["c_off"]["target"] == "drop"
+    assert m["c_off"]["meta"].get("kept_in_photo") is True
     assert m["c_SEAL"]["meta"].get("role") in {
         "sale_burst", "seal", "badge", "starburst", "price_burst",
     }
@@ -134,9 +134,10 @@ def test_im8_subscribe_save_seal_promotes_like_badge():
         "box": {"x": 60, "y": 210, "w": 140, "h": 70},
     }]}
     m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
-    assert m["c_sub"]["target"] == "text"
-    assert m["c_sub"]["meta"].get("shell_text_host") == "c_SAVE"
-    assert m["c_SAVE"]["meta"].get("text_bearing_shell") is True
+    # Raster-first chrome policy: seal rasters whole, its label rides the raster.
+    assert m["c_SAVE"]["target"] == "image"
+    assert m["c_sub"]["target"] == "drop"
+    assert m["c_sub"]["meta"].get("kept_in_photo") is True
     assert m["c_SAVE"]["meta"].get("role") in {"seal", "badge", "starburst", "price_burst", "sale_burst"}
 
 

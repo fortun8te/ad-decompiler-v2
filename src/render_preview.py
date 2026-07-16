@@ -441,6 +441,8 @@ def _draw_tracked_line(draw, origin, line, font, fill, tracking, ascent,
     x, baseline = origin
     # Draw outline first (Pillow strokes under the fill when both are set), so a
     # CENTER-style stroke never plates opaque ink over the glyph interior.
+    # OUTSIDE-align strokes are approximated by a slightly thicker Pillow stroke
+    # under the fill so the glyph interior stays readable (Codia / Figma parity).
     stroke_kwargs = {}
     if stroke_fill is not None and stroke_width and stroke_width > 0:
         stroke_kwargs = {
@@ -461,6 +463,29 @@ def _draw_tracked_line(draw, origin, line, font, fill, tracking, ascent,
             except (ValueError, TypeError, OSError):
                 continue
         x += glyph_font.getlength(char) + tracking
+
+
+def _text_decoration_kind(style):
+    raw = style.get("textDecoration", style.get("text_decoration", style.get("decoration")))
+    kind = str(raw or "NONE").upper().replace(" ", "_").replace("-", "_")
+    if kind in {"UNDERLINE", "UNDERLINE_SOLID"}:
+        return "UNDERLINE"
+    if kind in {"STRIKETHROUGH", "LINE_THROUGH", "LINETHROUGH"}:
+        return "STRIKETHROUGH"
+    return None
+
+
+def _paint_text_decoration(draw, kind, x0, x1, baseline, ascent, descent, colour, font_size):
+    """Draw a native underline / strike so QA preview matches Figma textDecoration."""
+    if kind is None or x1 <= x0:
+        return
+    thickness = max(1, int(round(font_size * 0.06)))
+    if kind == "UNDERLINE":
+        y = baseline + max(1.0, descent * 0.35)
+    else:
+        y = baseline - ascent * 0.35
+    y0 = int(round(y))
+    draw.line((x0, y0, x1, y0), fill=colour, width=thickness)
 
 
 def _run_segments(layer, text):
@@ -547,6 +572,9 @@ def _text_tile(layer, size):
     stroke_colour = None
     stroke_width = 0.0
     stroke_spec = layer.get("stroke") or style.get("stroke")
+    if not stroke_spec:
+        strokes = layer.get("strokes") or style.get("strokes") or []
+        stroke_spec = strokes[0] if strokes else None
     if isinstance(stroke_spec, str):
         stroke_colour, stroke_width = _color(stroke_spec), max(1.0, font_size * 0.04)
     elif isinstance(stroke_spec, dict):
@@ -557,7 +585,14 @@ def _text_tile(layer, size):
             stroke_colour = _color(raw)
             stroke_width = max(0.0, _number(
                 stroke_spec.get("width", stroke_spec.get("weight", 1)), 1))
+            align_stroke = str(
+                stroke_spec.get("strokeAlign", stroke_spec.get("align", "OUTSIDE"))
+            ).upper()
+            # Pillow grows stroke both ways; bias OUTSIDE so fill stays readable.
+            if align_stroke in {"OUTSIDE", "CENTER", "CENTRE", ""} and stroke_width > 0:
+                stroke_width = max(stroke_width, stroke_width * 1.15)
 
+    decoration = _text_decoration_kind(style)
     lines = text.split("\n")
     segments = _run_segments(layer, text)
     styled = bool(segments) and any(
@@ -604,11 +639,12 @@ def _text_tile(layer, size):
     line_count = max(1, len(lines))
     max_ascent = max([ascent] + [seg[4] for spec in line_specs for seg in spec])
     max_descent = max([descent] + [seg[5] for spec in line_specs for seg in spec])
-    content_h = (line_count - 1) * line_height + max_ascent + max_descent
+    deco_extra = font_size * 0.22 if decoration else 0.0
+    content_h = (line_count - 1) * line_height + max_ascent + max_descent + deco_extra
 
     # A small margin guards side bearings, negative-tracking overshoot, descenders
     # and outside strokes so measured content never touches the tile edge.
-    pad = max(2, int(math.ceil(font_size * 0.12 + stroke_width)))
+    pad = max(2, int(math.ceil(font_size * 0.12 + stroke_width + (deco_extra * 0.5))))
     tile_w = max(1, int(math.ceil(content_w)) + 2 * pad)
     tile_h = max(1, int(math.ceil(content_h)) + 2 * pad)
     tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
@@ -623,11 +659,17 @@ def _text_tile(layer, size):
         else:
             x = float(pad)
         baseline = y + max_ascent
+        line_x0 = x
         for seg_text, seg_font, seg_colour, seg_tracking, seg_ascent, _ in spec:
             _draw_tracked_line(draw, (x, baseline), seg_text, seg_font, seg_colour,
                                seg_tracking, seg_ascent,
                                stroke_fill=stroke_colour, stroke_width=stroke_width)
             x += _line_advance(seg_font, seg_text, seg_tracking)
+        if decoration and width > 0:
+            _paint_text_decoration(
+                draw, decoration, line_x0, line_x0 + width, baseline,
+                max_ascent, max_descent, colour, font_size,
+            )
         y += line_height
 
     if align == "center":
@@ -715,6 +757,45 @@ def _with_effects(tile, effects):
     return padded, (-left, -top)
 
 
+def _layer_effects(layer):
+    """Merge layer-level and style-level effects (design.json may keep either)."""
+    style = layer.get("style") or {}
+    effects = list(layer.get("effects") or [])
+    for effect in style.get("effects") or []:
+        if effect not in effects:
+            effects.append(effect)
+    return effects
+
+
+def _group_text_overflow_pad(children):
+    """Extra (L,T,R,B) so a clipsContent group tile does not shear top-line glyphs."""
+    left = top = right = bottom = 0
+    for child in children or []:
+        if child.get("type") != "text":
+            continue
+        style = child.get("style") or {}
+        box = child.get("box") or {}
+        font_size = _number(style.get("fontSize", box.get("h", 12)), max(12, _number(box.get("h", 12))))
+        stroke_spec = child.get("stroke") or style.get("stroke")
+        stroke_w = 0.0
+        if isinstance(stroke_spec, dict):
+            stroke_w = max(0.0, _number(stroke_spec.get("width", stroke_spec.get("weight", 0)), 0))
+        pad = max(2, int(math.ceil(font_size * 0.22 + stroke_w)))
+        if _text_decoration_kind(style):
+            pad = max(pad, int(math.ceil(font_size * 0.30)))
+        el, et, er, eb = _effect_padding(_layer_effects(child))
+        cx = _number(box.get("x", 0))
+        cy = _number(box.get("y", 0))
+        # Only pad the sides where the child sits against / past the group edge.
+        if cy < pad:
+            top = max(top, int(math.ceil(pad - min(0.0, cy) + et)))
+        if cx < pad:
+            left = max(left, int(math.ceil(pad - min(0.0, cx) + el)))
+        right = max(right, er)
+        bottom = max(bottom, int(math.ceil(pad * 0.5 + eb)))
+    return left, top, right, bottom
+
+
 def _render_tile(layer, run_dir):
     from PIL import Image
     box = layer.get("box", {}) or {}
@@ -722,19 +803,25 @@ def _render_tile(layer, run_dir):
     kind = layer.get("type")
     text_offset = (0.0, 0.0)
     if kind == "group":
-        tile = Image.new("RGBA", size, (0, 0, 0, 0))
+        children = layer.get("children") or []
+        pad_l, pad_t, pad_r, pad_b = _group_text_overflow_pad(children)
+        tile_w = size[0] + pad_l + pad_r
+        tile_h = size[1] + pad_t + pad_b
+        tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
         if _layer_fill(layer) is not None:
             base = _shape_tile({**layer, "shape_kind": "rect"}, size, run_dir)
-            tile.alpha_composite(base)
-        for child in sorted(layer.get("children") or [], key=lambda entry: _number(entry.get("z_index", entry.get("z", 0)))):
-            _draw_layer(tile, child, run_dir)
+            tile.alpha_composite(base, (pad_l, pad_t))
+        child_offset = (pad_l, pad_t)
+        for child in sorted(children, key=lambda entry: _number(entry.get("z_index", entry.get("z", 0)))):
+            _draw_layer(tile, child, run_dir, offset=child_offset)
+        text_offset = (-float(pad_l), -float(pad_t))
     elif kind == "image":
         tile = _image_tile(layer, size, run_dir)
     elif kind == "text":
         tile, text_offset = _text_tile(layer, size)
     else:
         tile = _shape_tile(layer, size, run_dir)
-    padded, effect_offset = _with_effects(tile, layer.get("effects") or [])
+    padded, effect_offset = _with_effects(tile, _layer_effects(layer))
     return padded, (effect_offset[0] + text_offset[0], effect_offset[1] + text_offset[1])
 
 
@@ -748,12 +835,29 @@ def _layer_paint_clip(layer, offset=(0, 0)):
         _number(vis.get("y", 0)) + _number(vis.get("h", 0)),
     )
     if layer.get("type") == "text":
+        # Text tiles intentionally paint past box edges (ascenders, OUTSIDE stroke,
+        # underline, drop-shadow). Clipping to the nominal box was the 067/131
+        # off-frame class; keep horizontal unbounded and give vertical room for
+        # stroke + decoration + shadow padding.
         style = layer.get("style") or {}
         font_size = _number(style.get("fontSize", box.get("h", 12)), max(12, _number(box.get("h", 12))))
-        pad = max(2, int(math.ceil(font_size * 0.20)))
-        top_bound -= pad
-        bottom_bound += pad
-        return (-1_000_000, int(math.floor(top_bound - 1)), 1_000_000, int(math.ceil(bottom_bound)))
+        stroke_spec = layer.get("stroke") or style.get("stroke")
+        stroke_w = 0.0
+        if isinstance(stroke_spec, dict):
+            stroke_w = max(0.0, _number(stroke_spec.get("width", stroke_spec.get("weight", 0)), 0))
+        pad = max(2, int(math.ceil(font_size * 0.35 + stroke_w)))
+        if _text_decoration_kind(style):
+            pad = max(pad, int(math.ceil(font_size * 0.45)))
+        left_pad, top_pad, right_pad, bottom_pad = _effect_padding(_layer_effects(layer))
+        top_bound -= pad + top_pad
+        bottom_bound += pad + bottom_pad
+        # Unbounded horizontal (letterSpacing / overflow runs); vertical padded only.
+        return (
+            -1_000_000,
+            int(math.floor(top_bound - 1)),
+            1_000_000,
+            int(math.ceil(bottom_bound + 1)),
+        )
     left = ox + min(_number(box.get("x", 0)), _number(vis.get("x", box.get("x", 0))))
     right = ox + max(
         _number(box.get("x", 0)) + _number(box.get("w", 0)),
@@ -872,7 +976,7 @@ def _apply_backdrop_blur(canvas, region, figma_radius):
 
 def _draw_layer(canvas, layer, run_dir, offset=(0, 0)):
     tile, x, y, mode, clip = _prepare_layer_draw(layer, run_dir, offset)
-    blur_radius = _background_blur_radius(layer.get("effects") or [])
+    blur_radius = _background_blur_radius(_layer_effects(layer))
     if blur_radius > 0:
         cx0, cy0 = max(0, x), max(0, y)
         cx1, cy1 = min(canvas.width, x + tile.width), min(canvas.height, y + tile.height)

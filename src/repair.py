@@ -311,6 +311,41 @@ def _unclean_background_signal(structural):
     return None
 
 
+def _baked_chrome_layer_ids(design) -> set:
+    """Layer ids whose OCR/chrome is intentionally baked (Agent A meta flags)."""
+    try:
+        from src.harness import is_baked_chrome_layer, is_already_sliced_layer
+    except Exception:
+        return set()
+    out = set()
+    for layer in _flatten_layers((design or {}).get("layers") or []):
+        lid = layer.get("id")
+        if lid is None:
+            continue
+        if is_baked_chrome_layer(layer) or is_already_sliced_layer(layer):
+            out.add(str(lid))
+    return out
+
+
+def _kept_in_photo_dominates_text_deficit(qa, structural, design) -> bool:
+    """True when a text-recall shortfall is explained by baked/kept_in_photo lines."""
+    kept = qa.get("kept_in_photo_lines")
+    if kept is None:
+        kept = structural.get("kept_in_photo_lines")
+    total = qa.get("text_lines_total")
+    if total is None:
+        total = structural.get("text_lines_total")
+    try:
+        kept_n = int(kept) if kept is not None else 0
+        total_n = int(total) if total is not None else 0
+    except (TypeError, ValueError):
+        kept_n, total_n = 0, 0
+    if total_n > 0 and kept_n >= max(1, int(0.5 * total_n)):
+        return True
+    kept_texts = list((design or {}).get("kept_in_photo") or []) if isinstance(design, dict) else []
+    return bool(kept_texts) and total_n > 0 and kept_n > 0
+
+
 def assess(design, qa, ocr, cfg: Optional[dict] = None):
     cfg = cfg or {}
     # Qwen is an optional, separately hosted layer proposal service.  A failed visual
@@ -350,10 +385,13 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             hard_fails.append(failure)
             seen_hard.add(key)
     per_layer = qa.get("per_layer", []) or []
+    baked_ids = _baked_chrome_layer_ids(design)
+    kip_text_deficit = _kept_in_photo_dominates_text_deficit(qa, structural, design)
 
     # ── global text recall ────────────────────────────────────────────────────────────
     text_recall = qa.get("text_recall")
-    if text_recall is not None and text_recall < t["text_recall_min"]:
+    if (text_recall is not None and text_recall < t["text_recall_min"]
+            and not kip_text_deficit):
         out.append(
             {
                 "stage": "ocr",
@@ -380,7 +418,9 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
     editable_text_recall = qa.get("editable_text_recall")
     if editable_text_recall is None:
         editable_text_recall = structural.get("editable_text_recall")
-    if editable_text_recall is not None and editable_text_recall < t["editable_text_recall_min"]:
+    # Do not re-promote baked OCR (kept_in_photo / chrome cutouts) to editable TEXT.
+    if (editable_text_recall is not None and editable_text_recall < t["editable_text_recall_min"]
+            and not kip_text_deficit):
         out.append(
             {
                 "stage": "text-analysis",
@@ -655,8 +695,9 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             out.append({"stage": "design", "action": "restore-native-nodes", "reason": detail,
                         "severity": "high"})
         elif rule == "missing-editable-text":
-            out.append({"stage": "text-analysis", "action": "restore-editable-text", "reason": detail,
-                        "severity": "high"})
+            if not kip_text_deficit:
+                out.append({"stage": "text-analysis", "action": "restore-editable-text",
+                            "reason": detail, "severity": "high"})
         elif rule == "duplicate-ownership":
             out.append({"stage": "merge", "action": "enforce-single-owner", "reason": detail,
                         "severity": "high"})
@@ -779,6 +820,10 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
         if lid in terminal_ids:
             # fallback.json already dropped/refused this layer; the inspect/focus lever
             # would reach the identical decision again (the 013 no-op loop).
+            continue
+        if lid in baked_ids:
+            # Exact chrome cutout / kept_in_photo / already-sliced — local score thrash
+            # cannot promote baked OCR to TEXT or improve a finished slice.
             continue
         local = _local_layer_score(pl)
         if local is None or local >= t["local_layer_min"]:
@@ -950,6 +995,23 @@ def assess(design, qa, ocr, cfg: Optional[dict] = None):
             seen.add(key)
             unique.append(item)
     out = unique
+
+    # Workstream E admission: drop repairs that target baked chrome / kept_in_photo /
+    # already-sliced layers so the harness never re-promotes intentional rasters to TEXT.
+    # (Global kip-dominated OCR/restore emits are already suppressed above; only targeted
+    # repairs are screened here so a stale qa.json on disk cannot false-skip them.)
+    try:
+        from src.harness import admission_reject_reason, _repair_target_ids
+        filtered = []
+        for item in out:
+            if _repair_target_ids(item):
+                if admission_reject_reason(item, run_dir=run_dir, design=design):
+                    continue
+            filtered.append(item)
+        out = filtered
+    except Exception:
+        pass
+
     # Severity first, then measured local badness: at equal severity the repair that
     # targets the worst measured region/layer is acted on first (worst first).
     out.sort(key=lambda r: (_sev(r.get("severity")), _repair_badness(r)), reverse=True)

@@ -57,20 +57,23 @@ def test_flat_button_stays_native_primitive_instead_of_being_traced():
     assert out["meta"]["button_shell"] is True
 
 
-def test_text_bearing_logo_shell_routes_to_shape_plate_not_icon():
-    """Sale seals mislabeled as logo/icon must become a SHAPE plate when they host OCR."""
+def test_text_bearing_logo_shell_routes_to_image_cutout_not_shape():
+    """Sale seals mislabeled as logo → exact IMAGE cutout (OCR baked upstream)."""
     out = routing.route(
         {"id": "E014", "kind": "icon", "box": {"x": 774, "y": 540, "w": 256, "h": 254},
          "meta": {"role": "logo", "text_bearing_shell": True, "plate_shell": True}},
         CANVAS,
     )
-    assert out["target"] == "shape"
+    assert out["target"] == "image"
     assert out["meta"]["role"] == "badge"
-    assert out["meta"]["plate_shell"] is True
+    assert out["meta"]["shell_raster_chip"] is True
+    assert out["meta"]["baked_badge_text"] is True
     assert out["meta"].get("reclassified_from") == "logo"
+    assert out["mask"]["kind"] == "alpha"
 
 
 def test_text_bearing_wide_shape_routes_as_banner_plate():
+    """Wide brushstroke banners stay editable SHAPE plates (not chrome-as-raster)."""
     out = routing.route(
         {"id": "E_ban", "kind": "shape", "box": {"x": 80, "y": 220, "w": 920, "h": 140},
          "meta": {"role": "shape", "text_bearing_shell": True, "plate_shell": True}},
@@ -79,6 +82,30 @@ def test_text_bearing_wide_shape_routes_as_banner_plate():
     assert out["target"] == "shape"
     assert out["meta"]["role"] == "banner"
     assert out["meta"]["plate_shell"] is True
+    assert out["meta"].get("shell_raster_chip") is not True
+
+
+def test_badge_icon_wordmark_always_image_under_chrome_as_raster():
+    for role, kind in (("badge", "icon"), ("icon", "icon"), ("wordmark", "icon"),
+                       ("starburst", "icon"), ("price_burst", "icon")):
+        out = routing.route(
+            {"id": role, "kind": kind, "box": {"x": 20, "y": 20, "w": 120, "h": 120},
+             "meta": {"role": role}},
+            CANVAS,
+        )
+        assert out["target"] == "image", role
+        assert out["meta"].get("shell_raster_chip") is True, role
+
+
+def test_chrome_as_raster_can_be_disabled_for_legacy_shells():
+    out = routing.route(
+        {"id": "E014", "kind": "icon", "box": {"x": 774, "y": 540, "w": 256, "h": 254},
+         "meta": {"role": "logo", "text_bearing_shell": True, "plate_shell": True}},
+        CANVAS,
+        {"routing": {"chrome_as_raster": False}},
+    )
+    assert out["target"] == "shape"
+    assert out["meta"]["role"] == "badge"
 
 
 def test_thin_divider_stays_a_native_bar_instead_of_vector_tracing():
@@ -226,24 +253,25 @@ def test_plate_disposition_is_never_materialized_as_an_independent_layer():
     assert out["meta"]["keep_in_background"] is True
 
 
-def test_large_ad_arrow_and_burst_reach_vector_gate_not_fake_rectangle():
-    for role in ("arrow", "callout_leader", "price_burst", "sale_burst"):
+def test_large_ad_arrow_and_callout_leader_reach_vector_gate_not_fake_rectangle():
+    """Thin arrows / leaders keep the vector gate; bursts are always-raster chrome."""
+    for role in ("arrow", "callout_leader"):
         out = routing.route(
             {"id": role, "kind": "icon", "box": {"x": 20, "y": 20, "w": 360, "h": 300},
              "meta": {"role": role, "flat_fill": True}},
             CANVAS,
         )
-        assert out["target"] == "icon"
+        assert out["target"] == "icon", role
 
 
-def test_oversized_burst_uses_exact_raster_instead_of_rectangle():
+def test_price_burst_is_exact_raster_under_chrome_as_raster():
     out = routing.route(
         {"id": "burst", "kind": "icon", "box": {"x": 0, "y": 0, "w": 700, "h": 700},
          "meta": {"role": "price_burst", "flat_fill": True}},
         CANVAS,
     )
     assert out["target"] == "image"
-    assert out["meta"]["vector_fallback"] is True
+    assert out["meta"]["shell_raster_chip"] is True
 
 
 def test_monte_flat_brand_headline_stays_editable_text_not_wordmark_raster():

@@ -444,6 +444,24 @@ def test_sam_verified_product_matte_is_retained_even_when_small():
     assert result[0]["target"] == "image"
 
 
+def test_066_list_row_icon_chips_survive_photo_scene_flatten():
+    """066: chrome_as_raster ✓/✗ chips are target=image — must not flatten into the plate."""
+    candidates = [
+        {"id": "check", "target": "image", "box": {"x": 117, "y": 890, "w": 36, "h": 37},
+         "meta": {"role": "verified", "icon_chip": True, "confidence": 0.8}},
+        {"id": "cross", "target": "image", "box": {"x": 824, "y": 950, "w": 33, "h": 33},
+         "meta": {"role": "cross", "icon_chip": True, "confidence": 0.9}},
+    ]
+    result, count = reconstruct._flatten_photo_scene(
+        candidates, {"canvas": {"w": 1440, "h": 1440}},
+    )
+    by_id = {item["id"]: item for item in result}
+    assert count == 0
+    assert by_id["check"]["target"] == "image"
+    assert by_id["cross"]["target"] == "image"
+    assert by_id["check"]["meta"].get("raster_fallback") != "background-root-or-fragment"
+
+
 def test_comparison_grid_photo_exports_before_and_after_as_separate_crops(tmp_path):
     source = tmp_path / "comparison.png"
     image = Image.new("RGB", (200, 160), "white")

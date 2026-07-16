@@ -166,3 +166,55 @@ def test_preview_does_not_draw_fake_gray_for_missing_image(tmp_path):
         "src": "does-not-exist.png",
     }])
     assert preview.getpixel((15, 15)) == (255, 255, 255)
+
+
+def test_preview_paints_underline_text_decoration(tmp_path):
+    preview = np.asarray(_render(tmp_path, [{
+        "id": "link", "type": "text", "box": {"x": 8, "y": 10, "w": 120, "h": 36},
+        "text": "SALE", "style": {
+            "fontSize": 28, "align": "left", "verticalAlign": "top",
+            "color": "#111111", "textDecoration": "UNDERLINE",
+        },
+    }], size=(160, 60)))
+    # Underline sits below the glyph baseline — ink must appear in the lower band.
+    lower = preview[32:55, 8:130]
+    assert np.any(lower < 180), "underline decoration missing from preview"
+
+
+def test_preview_paints_text_stroke_and_drop_shadow(tmp_path):
+    plain = np.asarray(_render(tmp_path / "plain", [{
+        "id": "t", "type": "text", "box": {"x": 20, "y": 16, "w": 100, "h": 40},
+        "text": "OFF", "style": {"fontSize": 32, "color": "#ffffff", "align": "left"},
+    }], size=(160, 80)))
+    stroked = np.asarray(_render(tmp_path / "stroke", [{
+        "id": "t", "type": "text", "box": {"x": 20, "y": 16, "w": 100, "h": 40},
+        "text": "OFF",
+        "style": {"fontSize": 32, "color": "#ffffff", "align": "left"},
+        "stroke": {"color": "#000000", "width": 3, "align": "OUTSIDE"},
+        "effects": [{"type": "DROP_SHADOW", "color": "#00000099",
+                     "offset": {"x": 3, "y": 3}, "radius": 2, "visible": True}],
+    }], size=(160, 80)))
+    # Stroke + shadow add dark ink beyond the plain white fill footprint.
+    assert int((stroked.mean(2) < 80).sum()) > int((plain.mean(2) < 80).sum()) + 40
+
+
+def test_preview_text_clip_allows_top_overflow_inside_group(tmp_path):
+    """067/131 class: CENTER text with pad must not be clipped by a tight host frame."""
+    preview = np.asarray(_render(tmp_path, [{
+        "id": "host", "type": "group",
+        "box": {"x": 0, "y": 20, "w": 200, "h": 40},
+        "children": [{
+            "id": "headline", "type": "text",
+            "box": {"x": 4, "y": 0, "w": 190, "h": 40},
+            "text": "TOP LINE",
+            "style": {
+                "fontSize": 30, "align": "left", "verticalAlign": "center",
+                "color": "#111111", "lineHeight": 36,
+            },
+        }],
+    }], size=(220, 90)))
+    ink_rows = np.where(np.any(preview < 200, axis=(1, 2)))[0]
+    assert ink_rows.size, "headline should paint"
+    # Ascenders near the group top must still appear in the upper half of the host
+    # (not sheared away by clipsContent). Group y=20; ink by ~y=32 is on-frame.
+    assert ink_rows.min() <= 32

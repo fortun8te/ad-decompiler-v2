@@ -464,6 +464,11 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
         "arrow", "leader", "leader_line", "connector",
         "text_backplate", "panel", "image-panel", "photo-panel", "triptych-panel",
         "comparison-panel", "comparison-column",
+        # List-row chrome chips (066 ✓/✗). chrome_as_raster routes them to target=image,
+        # so they must stay semantic here — otherwise _flatten drops them as
+        # background-root-or-fragment and the checklist loses every icon.
+        "verified", "checkmark", "check", "check-mark", "check_mark", "tick",
+        "cross", "question-mark", "question_mark", "emoji", "symbol", "pictogram",
     } | set(INTENTIONAL_RASTER_CLUSTER_ROLES)
     min_photo_fraction = float(photo_policy.get("min_separate_photo_fraction", 0.012))
     max_photo_fraction = float(photo_policy.get("max_separate_photo_fraction", 0.62))
@@ -589,8 +594,13 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
             continue
         promoted = bool(meta.get("promote_element") or meta.get("editable_element")
                         or meta.get("verified_mask") or exact_text_fallback)
-        is_semantic = (role in separate_roles or is_intentional_raster_cluster(role)
-                       or target == "icon")
+        is_semantic = (
+            role in separate_roles
+            or is_intentional_raster_cluster(role)
+            or target == "icon"
+            # chrome_as_raster marks chips with icon_chip even when target is image
+            or bool(meta.get("icon_chip"))
+        )
         is_photo_frame = role in {"photo", "image"} and (
             not box or min_photo_fraction <= area_fraction <= max_photo_fraction
         )
@@ -741,47 +751,107 @@ def _is_text_removal(item):
     )
 
 
+def _strike_ink_regions(ocr):
+    """Strikethrough decoration boxes OCR flagged (091: red strike scribble on a headline).
+
+    The scribble is FOREIGN ink — a different colour than the glyph and extending past the
+    glyph box (a hand-drawn swipe). The per-line glyph-ink residue check keys on the glyph
+    colour, so leftover strike ink is invisible to it and ships as a squiggle fragment.
+    When the struck line is promoted to native TEXT the whole scribble must leave the plate;
+    the residual audit consumes these regions to hunt that leftover decoration ink."""
+    regions = []
+    for line in (ocr or {}).get("lines") or []:
+        meta = line.get("meta") or {}
+        sbox = meta.get("strikethrough_box")
+        if not (meta.get("strikethrough") and isinstance(sbox, dict)):
+            continue
+        if not (float(sbox.get("w", 0) or 0) > 0 and float(sbox.get("h", 0) or 0) > 0):
+            continue
+        regions.append({
+            "box": {k: float(sbox.get(k, 0) or 0) for k in ("x", "y", "w", "h")},
+            "line_box": line.get("box") or {},
+            "line_id": line.get("id"),
+            "kind": "strikethrough",
+        })
+    return regions
+
+
 def _ensure_text_removal_coverage(candidate, mask, rgb, cfg):
     """Every EMITTED text layer must have its source pixels in the removal mask.
 
     Ghost/duplicate text (009 timestamp row) happens exactly when the ink mask misses
     low-contrast or tiny glyphs: the original stays in the plate AND the editable text
     is re-rendered on top.  When the estimated ink under-covers the candidate box,
-    force the OCR polygon (or, failing that, the box) so removal is guaranteed.  The
-    repair is recorded in meta for QA/harness visibility.  Config-gated, default ON
+    force the OCR polygon (or, failing that, the box) so removal is guaranteed.
+    Display / edge-touching copy also gets a small coverage dilate so antialias fringe
+    and cramped headline stems (002 ESSENTIALS, 131 ENDS TODAY) cannot stay in the plate
+    while the sparse ink count still clears the area floor. Config-gated, default ON
     (``reconstruct.force_text_removal_coverage``).
     """
-    _, np, _ = _deps()
+    cv2, np, _ = _deps()
     rcfg = (cfg or {}).get("reconstruct") or {}
     if not bool(rcfg.get("force_text_removal_coverage", True)):
         return mask
     if _keeps_underlay(candidate):
         return mask
     box = candidate.get("visible_box") or candidate.get("ink_box") or candidate.get("box", {})
+    height, width = rgb.shape[:2]
     area = max(1.0, float(box.get("w", 0) or 0) * float(box.get("h", 0) or 0))
     required = max(12, int(area * float(rcfg.get("min_text_mask_area_fraction", 0.015))))
     covered = int(np.count_nonzero(mask))
-    if covered >= required:
-        return mask
-    height, width = rgb.shape[:2]
     meta = candidate.setdefault("meta", {})
-    forced = inpaint.text_ink_mask(
-        rgb, box, candidate.get("quad") or meta.get("quad"), allow_box_fallback=True,
+    bx = int(round(float(box.get("x", 0) or 0)))
+    by = int(round(float(box.get("y", 0) or 0)))
+    bw = max(1, int(round(float(box.get("w", 0) or 0))))
+    bh = max(1, int(round(float(box.get("h", 0) or 0))))
+    edge_pad = int(rcfg.get("text_coverage_edge_pad", 4))
+    touches_edge = (
+        bx <= edge_pad or by <= edge_pad
+        or (bx + bw) >= (width - edge_pad) or (by + bh) >= (height - edge_pad)
     )
-    if int(np.count_nonzero(forced)) < required:
-        forced = np.maximum(forced, inpaint.box_fill_mask((height, width), box, pad=1))
-    merged = np.maximum(np.asarray(mask, dtype=np.uint8), np.asarray(forced, dtype=np.uint8))
-    meta["removal_coverage_forced"] = {
-        "reason": "text-ink-mask-under-coverage",
-        "mask_px_before": covered,
-        "mask_px_after": int(np.count_nonzero(merged)),
-        "required_px": required,
-    }
+    display = bh > float(rcfg.get("display_text_coverage_min_h", 48))
+    under = covered < required
+    if under:
+        forced = inpaint.text_ink_mask(
+            rgb, box, candidate.get("quad") or meta.get("quad"), allow_box_fallback=True,
+        )
+        if int(np.count_nonzero(forced)) < required:
+            # Edge / cramped headlines: pad the box so fringe outside the OCR box is
+            # claimed (131 top banner, 025 overlay gutters).
+            pad = 2 if (display or touches_edge) else 1
+            forced = np.maximum(forced, inpaint.box_fill_mask((height, width), box, pad=pad))
+        merged = np.maximum(np.asarray(mask, dtype=np.uint8), np.asarray(forced, dtype=np.uint8))
+        meta["removal_coverage_forced"] = {
+            "reason": "text-ink-mask-under-coverage",
+            "mask_px_before": covered,
+            "mask_px_after": int(np.count_nonzero(merged)),
+            "required_px": required,
+        }
+    else:
+        merged = np.asarray(mask, dtype=np.uint8)
+    # Sparse ink can clear ``required`` yet miss stem/antialias fringe. Dilate coverage
+    # for display + edge-touching copy so removal owns the readable halo.
+    cov_dilate = int(rcfg.get("text_coverage_dilate", 0))
+    if cov_dilate <= 0:
+        if display:
+            cov_dilate = int(rcfg.get("display_text_coverage_dilate", 3))
+        elif touches_edge:
+            cov_dilate = int(rcfg.get("edge_text_coverage_dilate", 2))
+        else:
+            cov_dilate = 0
+    if cov_dilate > 0 and np.any(merged):
+        kernel = np.ones((2 * cov_dilate + 1, 2 * cov_dilate + 1), np.uint8)
+        dilated = cv2.dilate(merged, kernel)
+        if int(np.count_nonzero(dilated)) > int(np.count_nonzero(merged)):
+            meta["removal_coverage_dilated"] = {
+                "px": cov_dilate, "display": bool(display), "edge": bool(touches_edge),
+            }
+            merged = dilated
     return merged
 
 
 def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
-                                ledger, cfg):
+                                ledger, cfg, decoration_regions=None):
     """Ghost-text guard: detect glyph residue left on the clean plate under removed text.
 
     A glyph-ink plate pixel is leftover ghost when it either (a) still matches the
@@ -852,9 +922,16 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         solid_first = default_solid_first
     default_passes = 0 if solid_first else (1 if solid_fill else 3)
     max_passes = max(0, int(audit_cfg.get("reinpaint_max_passes", default_passes)))
+    # Crowded / edge glyphs (002 ESSENTIALS, 025, 066, 131): wipe a halo around the
+    # glyph footprint so LaMa/Telea smear bleed outside residual ink clears too.
     fill_dilate = max(0, int(audit_cfg.get(
-        "solid_fill_dilate", 4 if solid_first else 2,
+        "solid_fill_dilate", 5 if solid_first else 3,
     )))
+    min_ring_samples = max(4, int(audit_cfg.get("solid_fill_min_ring", 8)))
+    ink_away = max(ink_tolerance, float(audit_cfg.get("solid_fill_ink_away", 32.0)))
+    # Foreign decoration ink (strike scribble) is a strong mark against the plate colour.
+    deco_mark_tol = float(audit_cfg.get("decoration_mark_tolerance", 48.0))
+    deco_min_px = int(audit_cfg.get("decoration_min_px", 32))
 
     def _residue(plate_arr, ink, ink_color):
         nonlocal plate_f32
@@ -866,6 +943,17 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
             d_ink = np.abs(plate_f32 - ink_color).mean(axis=2)
             res = res | (ink & (d_ink <= ink_tolerance))
         return res
+
+    def _ink_safe_exterior(samples, ink_color):
+        """Keep ring samples that are clearly plate-coloured, not leftover glyph ink."""
+        if samples is None or getattr(samples, "shape", (0,))[0] == 0:
+            return None
+        if ink_color is None:
+            return samples if samples.shape[0] >= min_ring_samples else None
+        ink_rgb = np.asarray(ink_color, dtype=np.float32).reshape(3)
+        away = np.abs(samples.astype(np.float32) - ink_rgb).mean(axis=1) > ink_away
+        filtered = samples[away]
+        return filtered if filtered.shape[0] >= min_ring_samples else None
 
     def _solid_fill_unresolved(tracked_rows, unresolved_rows, report_dict):
         """Paint local plate colour under leftover glyph ink; keep native TEXT."""
@@ -879,55 +967,82 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         except Exception:
             return unresolved_rows
         filled_ids = []
+        skipped_ids = []
         ring_k = np.ones((2 * ring_radius + 1, 2 * ring_radius + 1), np.uint8)
-        max_ring = max(ring_radius * 3, ring_radius + 12)
+        # Crowded dark UI (009 "krijgen") + edge banners need a wider search.
+        max_ring = max(ring_radius * 5, ring_radius + 24)
         for t in unresolved_rows:
             residue = t["residue"]
-            if not np.any(residue):
+            ink = t["ink"]
+            if not np.any(residue) and not np.any(ink):
                 continue
-            # On a flat plate the full glyph footprint (plus antialias halo) is the
-            # owned repair region. Using residue alone leaves readable fringe pixels.
-            seed = (t["ink"] if solid_first else residue).astype(np.uint8)
+            # Prefer full glyph footprint (+ halo): residue-only leaves readable fringe
+            # on crowded display copy. solid_fill_first always uses ink; after reinpaint
+            # still union ink∪residue so smear outside the residual mask clears.
+            if solid_first and np.any(ink):
+                seed = ink.astype(np.uint8)
+            else:
+                seed = np.maximum(ink.astype(np.uint8), residue.astype(np.uint8))
             if fill_dilate:
                 fill_k = np.ones((2 * fill_dilate + 1, 2 * fill_dilate + 1), np.uint8)
                 fill_area = cv2.dilate(seed * 255, fill_k) > 0
             else:
                 fill_area = seed > 0
             binary = fill_area.astype(np.uint8)
-            ring = (cv2.dilate(binary * 255, ring_k) > 0) & (~fill_area)
-            # Sample the already-cleaned plate (so text inside a removed button does
-            # not reintroduce the button's source colour), then exclude pixels close
-            # to the known glyph colour. Tight/crowded display copy otherwise makes
-            # the ring median black and the "repair" repaints the ghost black.
-            exterior = plate_u8[ring]
-            if exterior.shape[0] >= 8 and t.get("ink_color") is not None:
-                ink_rgb = np.asarray(t["ink_color"], dtype=np.float32).reshape(3)
-                away_from_ink = np.abs(
-                    exterior.astype(np.float32) - ink_rgb,
-                ).mean(axis=1) > max(ink_tolerance, 32.0)
-                filtered = exterior[away_from_ink]
-                if filtered.shape[0] >= 8:
-                    exterior = filtered
-            # Glyph residue near edges / crowded ink can leave <8 ring samples at the
-            # default radius (009 "krijgen"); expand sampling before giving up.
+            ink_color = t.get("ink_color")
+
+            def _sample_ring(radius):
+                k = (ring_k if radius == ring_radius
+                     else np.ones((2 * radius + 1, 2 * radius + 1), np.uint8))
+                ring = (cv2.dilate(binary * 255, k) > 0) & (~fill_area)
+                return plate_u8[ring]
+
+            # Expand until we have ink-safe plate samples (never accept an inky median —
+            # that greenwashes residue as "resolved" while repainting the ghost).
+            exterior = _ink_safe_exterior(_sample_ring(ring_radius), ink_color)
             expand_r = ring_radius
-            while exterior.shape[0] < 8 and expand_r < max_ring:
+            while exterior is None and expand_r < max_ring:
                 expand_r = min(max_ring, expand_r + max(2, ring_radius // 2))
-                ring_k_exp = np.ones((2 * expand_r + 1, 2 * expand_r + 1), np.uint8)
-                ring = (cv2.dilate(binary * 255, ring_k_exp) > 0) & (~fill_area)
-                exterior = plate_u8[ring]
-                if exterior.shape[0] >= 8 and t.get("ink_color") is not None:
-                    ink_rgb = np.asarray(t["ink_color"], dtype=np.float32).reshape(3)
-                    filtered = exterior[
-                        np.abs(exterior.astype(np.float32) - ink_rgb).mean(axis=1)
-                        > max(ink_tolerance, 32.0)
-                    ]
-                    if filtered.shape[0] >= 8:
-                        exterior = filtered
-            if exterior.shape[0] < 8:
+                exterior = _ink_safe_exterior(_sample_ring(expand_r), ink_color)
+            # Last resort: sample the box neighbourhood outside fill (edge banners where
+            # the ring hugs the canvas). Still ink-safe — else leave unresolved.
+            if exterior is None:
+                box = t["item"].get("box") or {}
+                x0 = max(0, int(box.get("x", 0) or 0) - max_ring)
+                y0 = max(0, int(box.get("y", 0) or 0) - max_ring)
+                x1 = min(plate_u8.shape[1], int((box.get("x", 0) or 0)
+                         + (box.get("w", 0) or 0) + max_ring))
+                y1 = min(plate_u8.shape[0], int((box.get("y", 0) or 0)
+                         + (box.get("h", 0) or 0) + max_ring))
+                if x1 > x0 and y1 > y0:
+                    neigh = np.ones(plate_u8.shape[:2], dtype=bool)
+                    neigh[:] = False
+                    neigh[y0:y1, x0:x1] = True
+                    neigh &= ~fill_area
+                    exterior = _ink_safe_exterior(plate_u8[neigh], ink_color)
+            if exterior is None or exterior.shape[0] < min_ring_samples:
+                skipped_ids.append(str(t["item"].get("id")))
                 continue
             fill = np.median(exterior.astype(np.float32), axis=0).astype(np.uint8)
+            # Refuse an ink-like fill colour — that is the crowded-glyph greenwash.
+            if ink_color is not None:
+                fill_dist = float(np.abs(
+                    fill.astype(np.float32) - np.asarray(ink_color, dtype=np.float32).reshape(3)
+                ).mean())
+                if fill_dist <= ink_away:
+                    skipped_ids.append(str(t["item"].get("id")))
+                    continue
+            # Trial paint + residue check before committing union/ledger.
+            before = plate_u8[fill_area].copy()
             plate_u8[fill_area] = fill
+            plate_f32 = None  # trial pixels must be scored, not a stale cache
+            remaining = int(_residue(plate_u8.astype(np.int16), ink, ink_color).sum())
+            rem_ratio = remaining / max(1, t["total"])
+            if remaining >= resolved_abs_px and rem_ratio >= resolved_ratio:
+                plate_u8[fill_area] = before
+                plate_f32 = None
+                skipped_ids.append(str(t["item"].get("id")))
+                continue
             fill_u8 = fill_area.astype(np.uint8) * 255
             owner = int(t["item"].get("removal_owner") or 0)
             if owner:
@@ -938,7 +1053,7 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
             t["flag"]["resolved"] = True
             t["flag"]["resolved_by"] = "solid-plate-fill"
             t["flag"]["hard_fail"] = False
-            t["flag"]["residual_px_after"] = 0
+            t["flag"]["residual_px_after"] = remaining
             filled_ids.append(str(t["item"].get("id")))
         if filled_ids:
             Image.fromarray(plate_u8).save(background_path)
@@ -948,10 +1063,15 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
                 list(report_dict.get("solid_filled_ids") or []) + filled_ids
             ))
             report_dict["solid_fill_first"] = bool(solid_first and max_passes == 0)
+        if skipped_ids:
+            report_dict["solid_fill_skipped_ids"] = list(dict.fromkeys(
+                list(report_dict.get("solid_fill_skipped_ids") or []) + skipped_ids
+            ))
         return [t for t in tracked_rows if not t["resolved"]]
 
     checked = 0
     tracked = []
+    source_u8 = None
     for item in text_records:
         # Use the pre-dilation glyph-ink mask: the ledger's dilated halo is plate-
         # coloured on both sides and would count as false "residue".
@@ -959,12 +1079,33 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         if ink_mask is None:
             continue
         ink = np.asarray(ink_mask) > 0
+        # Fat candidate masks (box-promoted / AA fringe) include plate-coloured holes
+        # that still match the source plate after a clean inpaint — 066's cream
+        # headline flagged 42% "residue" while background_clean had zero dark glyphs.
+        # Intersect with a fresh tight ink estimate so only real glyph pixels gate.
+        box = item.get("box") or {}
+        if box and (box.get("w") or 0) > 0 and (box.get("h") or 0) > 0:
+            try:
+                if source_u8 is None:
+                    source_u8 = np.clip(source, 0, 255).astype(np.uint8)
+                tight = inpaint.text_ink_mask(
+                    source_u8, box, allow_box_fallback=False,
+                ) > 0
+                if np.count_nonzero(tight) >= 8:
+                    ink = ink & tight if np.any(ink & tight) else tight
+            except Exception:
+                pass
         total = int(ink.sum())
         if total < 8:
             continue
         checked += 1
         ink_color = np.median(source[ink].astype(np.float32), axis=0).reshape(1, 1, 3)
         residue = _residue(plate, ink, ink_color)
+        # Plate-coloured fringe inside the mask is not glyph ghosting.
+        source_inkish = np.abs(
+            source.astype(np.float32) - ink_color
+        ).mean(axis=2) <= ink_tolerance
+        residue = residue & source_inkish
         count = int(residue.sum())
         ratio = count / total
         if count < min_px or ratio < min_ratio:
@@ -979,6 +1120,66 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
             },
             "resolved": False,
         })
+
+    # Foreign decoration ink (091 red strike scribble): a different colour than the glyph
+    # and reaching past the glyph box, so the per-line loop above cannot see it. Only clean
+    # it when the struck LINE was actually promoted to native text (a text removal record
+    # overlaps its box) — otherwise the scribble is legitimately part of a raster slice.
+    for region in (decoration_regions or []):
+        sbox = region.get("box") or {}
+        sw = int(round(float(sbox.get("w", 0) or 0)))
+        sh = int(round(float(sbox.get("h", 0) or 0)))
+        if sw <= 0 or sh <= 0:
+            continue
+        line_box = region.get("line_box") or sbox
+        owner_item = None
+        for item in text_records:
+            ibox = item.get("box") or {}
+            if not ibox:
+                continue
+            if _inside_frac(line_box, ibox) > 0.35 or _inside_frac(ibox, line_box) > 0.35:
+                owner_item = item
+                break
+        if owner_item is None:
+            continue
+        x0 = max(0, int(round(float(sbox.get("x", 0) or 0))))
+        y0 = max(0, int(round(float(sbox.get("y", 0) or 0))))
+        x1 = min(source.shape[1], x0 + sw)
+        y1 = min(source.shape[0], y0 + sh)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        region_mask = np.zeros(source.shape[:2], dtype=bool)
+        region_mask[y0:y1, x0:x1] = True
+        plate_bg = np.median(
+            plate[y0:y1, x0:x1].reshape(-1, 3).astype(np.float32), axis=0)
+        mark = region_mask & (
+            np.abs(source.astype(np.float32) - plate_bg).mean(axis=2) > deco_mark_tol)
+        # Still uncleaned == plate pixel still equals source (inpaint skipped it).
+        still = np.abs(plate - source).mean(axis=2) <= tolerance
+        deco_residue = mark & still
+        resid_px = int(deco_residue.sum())
+        if resid_px < deco_min_px:
+            continue
+        ink_color = np.median(
+            source[deco_residue].astype(np.float32), axis=0).reshape(1, 1, 3)
+        total = int(mark.sum()) or resid_px
+        deco_id = f"{owner_item.get('id')}__strike"
+        deco_flag = {
+            "id": deco_id, "box": {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0},
+            "residual_px": resid_px, "residual_ratio": round(resid_px / max(1, total), 4),
+            "kind": "decoration-strikethrough", "resolved": False,
+        }
+        tracked.append({
+            "item": {
+                "id": deco_id,
+                "box": {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0},
+                "removal_owner": owner_item.get("removal_owner"),
+                "target": "text",
+            },
+            "ink": deco_residue, "ink_color": ink_color, "total": total,
+            "residue": deco_residue, "flag": deco_flag, "resolved": False,
+        })
+        checked += 1
 
     expand_total = np.zeros(union.shape, dtype=np.uint8)
     report = {
@@ -1048,6 +1249,17 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
     unresolved = _solid_fill_unresolved(tracked, unresolved, report)
     for t in unresolved:
         t["flag"]["hard_fail"] = True
+    # Explicit top-level surfacing: residue that could NOT be re-inpainted or solid-filled
+    # is a reconstruction failure, not a silent ship. pixel_diff already reads per-flag
+    # hard_fail, but a top-level roster lets QA/harness/repair see the honest count directly
+    # (Mandate 2: never silently ship unresolved glyph/decoration ghosts).
+    if unresolved:
+        report["hard_fail"] = True
+        report["hard_fail_ids"] = sorted(str(t["item"].get("id")) for t in unresolved)
+        report["unresolved_px"] = int(sum(
+            int(t["flag"].get("residual_px_after", t["flag"].get("residual_px", 0)) or 0)
+            for t in unresolved
+        ))
     if force_raster:
         report["force_raster_ids"] = sorted({
             str(t["item"].get("id")) for t in unresolved
@@ -1324,6 +1536,15 @@ def _source_rgba(candidate, rgb, mask, run_dir):
         # Peeling can estimate a white/grey foreground for a black mark when the mark
         # overlaps OCR. SAM already supplies the verified matte; retain the original
         # authored pixels inside it instead of trusting the colour-hallucinated peel.
+        return _crop_rgba(rgb, mask, candidate.get("box", {}), element_role=role)
+    # Chrome-baked checklist cards (066): peel may have already punched ✓/✗ holes into
+    # the under-layer before merge absorbed those chips. Always take the authored
+    # source crop so icons + copy stay intact in the shell raster.
+    if (
+        cluster_meta.get("checklist_raster_chip")
+        or cluster_meta.get("baked_badge_text")
+        or cluster_meta.get("shell_raster_chip")
+    ):
         return _crop_rgba(rgb, mask, candidate.get("box", {}), element_role=role)
     if (is_intentional_raster_cluster(cluster_meta.get("role"))
             or cluster_meta.get("intentional_raster_cluster")):
@@ -3177,6 +3398,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     # so the artifacts written below always describe the final plate.
     text_residual = _post_inpaint_text_residual(
         rgb, background_path, removal, masks, union, removal_ownership, cfg,
+        decoration_regions=_strike_ink_regions(ocr),
     )
     # Clean-plate cover pass: a low-confidence opaque raster kept in the plate (removal
     # cap) leaves a ghost SILHOUETTE in background_clean (002 product panel). Because that
@@ -3377,6 +3599,91 @@ def _apply_drop_mutation(node, scores, reasons):
     return node
 
 
+def _boxes_intersect(a, b) -> bool:
+    """True when two canvas-space boxes share any area."""
+    ax0 = float(a.get("x", 0) or 0)
+    ay0 = float(a.get("y", 0) or 0)
+    ax1 = ax0 + float(a.get("w", 0) or 0)
+    ay1 = ay0 + float(a.get("h", 0) or 0)
+    bx0 = float(b.get("x", 0) or 0)
+    by0 = float(b.get("y", 0) or 0)
+    bx1 = bx0 + float(b.get("w", 0) or 0)
+    by1 = by0 + float(b.get("h", 0) or 0)
+    return ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1
+
+
+_LIVE_OVERLAY_KINDS = frozenset({"text", "shape", "icon", "vector"})
+
+
+def _collect_live_overlays(nodes, exclude_ids, offset=(0.0, 0.0), out=None):
+    """Absolute ``(box, z, id)`` of every content-bearing leaf that re-renders natively.
+
+    Used to keep a hoisted raster slice BELOW the live native overlays it intersects.
+    A slice lifted to a blind foreground z (a failed badge card sliced up to z=60)
+    otherwise buries the live chip/badge text painted on top of it — 013's snacks chip
+    went blank exactly this way. Groups are descended (child boxes are parent-relative);
+    only real editable leaves count as overlays, never backgrounds or the slices we are
+    currently producing (``exclude_ids``)."""
+    out = [] if out is None else out
+    for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
+        box = node.get("box") or {}
+        ax = offset[0] + float(box.get("x") or 0)
+        ay = offset[1] + float(box.get("y") or 0)
+        children = node.get("children") or []
+        if children:
+            _collect_live_overlays(children, exclude_ids, (ax, ay), out)
+            continue
+        nid = str(node.get("id"))
+        if nid in exclude_ids:
+            continue
+        meta = node.get("meta") or {}
+        if meta.get("is_background") or str(meta.get("role") or "") == "background":
+            continue
+        if meta.get("fallback") in ("raster-slice", "plate-passthrough"):
+            continue
+        kind = str(node.get("target") or node.get("type") or "")
+        if kind not in _LIVE_OVERLAY_KINDS:
+            continue
+        z_raw = node.get("z_index")
+        if z_raw is None:
+            z_raw = node.get("z")
+        try:
+            z = float(z_raw) if z_raw is not None else 0.0
+        except (TypeError, ValueError):
+            z = 0.0
+        out.append(({
+            "x": ax, "y": ay,
+            "w": float(box.get("w") or 0), "h": float(box.get("h") or 0),
+        }, z, nid))
+    return out
+
+
+def _safe_hoist_z(node, abs_box, overlays, default=60.0):
+    """Root z for a hoisted slice that never rises above an intersecting live overlay.
+
+    Preserves a legitimately lower original z; otherwise sits just under the lowest
+    live overlay the slice intersects. Falls back to ``default`` foreground z only when
+    nothing live overlaps (the historical behaviour, safe when there is nothing to bury)."""
+    z_raw = node.get("z_index")
+    if z_raw is None:
+        z_raw = node.get("z")
+    try:
+        base = float(z_raw) if z_raw not in (None, "", "0", "0.0") else 0.0
+    except (TypeError, ValueError):
+        base = 0.0
+    ceil = None
+    for obox, oz, _oid in overlays:
+        if _boxes_intersect(obox, abs_box):
+            ceil = oz if ceil is None else min(ceil, oz)
+    if ceil is not None:
+        if base and base < ceil:
+            return base
+        return ceil - 1.0
+    return base if base > 0 else default
+
+
 def _removal_ledger_numbers(run_dir, reconstruction, shape):
     """Load the removal-ownership ledger as owner numbers plus id → numbers map."""
     _, np, Image = _deps()
@@ -3537,6 +3844,13 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
     tree = load(layout_path) if os.path.exists(layout_path) else None
     candidates = [c for c in reconstruction.get("candidates") or [] if isinstance(c, dict)]
     candidates_by_id = {str(c.get("id")): c for c in candidates}
+    # Live native overlays (chips/badges/copy that re-render on top) so a hoisted slice
+    # is never lifted above the very overlay it sits under (013 snacks chip). The regions
+    # we are about to slice/drop are NOT overlays — exclude them.
+    failing_ids = {str(r.get("id")) for r, _ in failing}
+    live_overlays = _collect_live_overlays(tree, failing_ids) if tree is not None else []
+    plate_passthrough_max_inpaint = float(
+        thresholds.get("plate_passthrough_max_inpaint_frac", 0.12))
 
     changed = False
     for row, reasons in failing:
@@ -3565,9 +3879,68 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
             continue
 
         if alpha is None:
-            # This layer's pixels were never inpainted out of the plate (e.g. a
-            # keep_underlay overlay): the plate already shows the original, so
-            # dropping the wrong reconstruction is the pixel-exact fallback.
+            # No ledger cutout for this layer. Two very different situations hide here:
+            #   (a) the layer's pixels were never removed (keep_underlay overlay, plate
+            #       cap): the plate genuinely still shows the ORIGINAL, so dropping the
+            #       broken recreation is the pixel-exact fallback; OR
+            #   (b) the region WAS inpainted (its content was removed for a recreation
+            #       that then failed its gate): the plate there is a hole/smear, so a
+            #       silent drop ships a ghost. This is the badge/seal shell case
+            #       (016 c_E013__shell white patch). Chrome must never drop to a ghost —
+            #       box-slice the ORIGINAL source for the region instead.
+            abs_box = None
+            for (container, index, node, off), _root in targets:
+                b = node.get("box") or {}
+                abs_box = {
+                    "x": float(b.get("x") or 0) + off[0],
+                    "y": float(b.get("y") or 0) + off[1],
+                    "w": float(b.get("w") or 0), "h": float(b.get("h") or 0),
+                }
+                break
+            inpainted_frac = 0.0
+            if (removal_union is not None and abs_box
+                    and abs_box["w"] > 0 and abs_box["h"] > 0):
+                bx0 = max(0, int(round(abs_box["x"])))
+                by0 = max(0, int(round(abs_box["y"])))
+                bx1 = min(removal_union.shape[1], int(round(abs_box["x"] + abs_box["w"])))
+                by1 = min(removal_union.shape[0], int(round(abs_box["y"] + abs_box["h"])))
+                if bx1 > bx0 and by1 > by0:
+                    sub = removal_union[by0:by1, bx0:bx1]
+                    inpainted_frac = float(np.count_nonzero(sub)) / max(1, sub.size)
+            if inpainted_frac >= plate_passthrough_max_inpaint and abs_box:
+                bx0 = max(0, int(round(abs_box["x"])))
+                by0 = max(0, int(round(abs_box["y"])))
+                bx1 = min(rgb.shape[1], int(round(abs_box["x"] + abs_box["w"])))
+                by1 = min(rgb.shape[0], int(round(abs_box["y"] + abs_box["h"])))
+                if bx1 > bx0 and by1 > by0:
+                    tile = np.dstack([
+                        rgb[by0:by1, bx0:bx1],
+                        np.full((by1 - by0, bx1 - bx0), 255, dtype=np.uint8),
+                    ])
+                    src_rel = _write_asset(
+                        Image.fromarray(tile), assets_dir, f"{rid}_boxslice")
+                    box_slice = {"x": bx0, "y": by0, "w": bx1 - bx0, "h": by1 - by0}
+                    hoist_z = _safe_hoist_z(targets[0][0][2], box_slice, live_overlays)
+                    for (container, index, node, _offset), root in targets:
+                        _apply_slice_mutation(node, box_slice, src_rel, scores, reasons)
+                        node["meta"]["fallback_slice_kind"] = "box-no-ledger-alpha"
+                        if root is not None and container is not root:
+                            container.pop(index)
+                            node["z_index"] = hoist_z
+                            node["z"] = hoist_z
+                            root.append(node)
+                    if candidate is not None and not any(
+                            node is candidate for (_c, _i, node, _o), _r in targets):
+                        _apply_slice_mutation(candidate, box_slice, src_rel, scores, reasons)
+                    report["slices"].append({
+                        "id": rid, "reasons": reasons, "scores": scores, "box": box_slice,
+                        "src": src_rel, "alpha_px": int((bx1 - bx0) * (by1 - by0)),
+                        "covered_by_removal_mask": True, "hoist_z": hoist_z,
+                        "note": "box-slice (no ledger alpha; plate was inpainted)",
+                    })
+                    changed = True
+                    continue
+            # (a) plate genuinely holds the original — drop.
             for (container, index, node, _offset), _root in targets:
                 if "target" in node:
                     _apply_drop_mutation(node, scores, reasons)
@@ -3597,11 +3970,15 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
         # every parent-relative child (013: c_E007__hostbg_P12 rendered as a displaced
         # plain-green square over the bag's printed bear logo). Hoist each slice to its
         # tree ROOT with its absolute box: root placement cannot drift.
+        hoist_z = _safe_hoist_z(targets[0][0][2], abs_box, live_overlays) if targets else 60.0
         for (container, index, node, _offset), root in targets:
             _apply_slice_mutation(node, abs_box, src_rel, scores, reasons)
             if root is not None and container is not root:
                 container.pop(index)
-                node["z_index"] = float(node.get("z_index") or node.get("z") or 60.0)
+                # Keep the slice below any live native overlay it intersects — hoisting
+                # blindly to z=60 buried the 013 snacks chip painted on top of it.
+                node["z_index"] = hoist_z
+                node["z"] = hoist_z
                 root.append(node)
         if candidate is not None and not any(node is candidate for (_c, _i, node, _o), _r in targets):
             _apply_slice_mutation(candidate, abs_box, src_rel, scores, reasons)
@@ -3612,7 +3989,7 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
         report["slices"].append({
             "id": rid, "reasons": reasons, "scores": scores, "box": abs_box,
             "src": src_rel, "alpha_px": int(alpha.sum()),
-            "covered_by_removal_mask": covered,
+            "covered_by_removal_mask": covered, "hoist_z": hoist_z,
         })
         changed = True
 

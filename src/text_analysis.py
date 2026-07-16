@@ -345,6 +345,15 @@ _GRADIENT_COLOR_DISTANCE = 36.0
 _STROKE_COLOR_DISTANCE = 55.0
 _STROKE_MIN_RIM_FRAC = 0.08
 _STROKE_MAX_RIM_STD = 45.0
+# Body/headline copy should stay plain editable text. Thin "understroke" bands from
+# AA / peel edges become exploded stroke layers downstream; only keep clear authored
+# outlines (wider rim + strong fill↔stroke split).
+_PLAIN_EDITABLE_ROLES = frozenset({
+    "body", "headline", "subheadline", "caption", "footer", "disclaimer",
+    "eyebrow", "offer", "cta",
+})
+_PLAIN_TEXT_STROKE_MIN_WIDTH = 2.5
+_PLAIN_TEXT_STROKE_MIN_DISTANCE = 85.0
 
 
 def _erode_mask(mask):
@@ -532,6 +541,59 @@ def _stroke_from_mask(crop, mask) -> Optional[tuple[dict, str]]:
         "align": "OUTSIDE",
         "strokeAlign": "OUTSIDE",
     }, fill_hex
+
+
+def _stroke_is_authored_outline(stroke: Optional[dict], fill_hex: Optional[str]) -> bool:
+    """True when a detected stroke looks like a real marketing outline, not AA peel."""
+    if not isinstance(stroke, dict):
+        return False
+    try:
+        width = float(stroke.get("width", stroke.get("weight", 0)) or 0)
+    except (TypeError, ValueError):
+        return False
+    if width < _PLAIN_TEXT_STROKE_MIN_WIDTH:
+        return False
+    stroke_hex = stroke.get("color") or stroke.get("paint")
+    if isinstance(stroke_hex, dict):
+        stroke_hex = stroke_hex.get("color")
+    if not stroke_hex or not fill_hex:
+        return width >= _PLAIN_TEXT_STROKE_MIN_WIDTH + 0.5
+    return _colour_distance(str(stroke_hex), str(fill_hex)) >= _PLAIN_TEXT_STROKE_MIN_DISTANCE
+
+
+def _prefer_plain_editable_text(lines: list[dict]) -> None:
+    """Drop weak stroke/understroke effects on body/headline so text stays editable.
+
+    Effects that fail a strong local outline match are left off the style (plate /
+    slice paths handle lockups elsewhere) instead of inventing peel stroke layers.
+    """
+    for line in lines:
+        role = str(line.get("role") or (line.get("meta") or {}).get("role") or "").lower()
+        if role and role not in _PLAIN_EDITABLE_ROLES:
+            continue
+        style = line.get("style")
+        if not isinstance(style, dict):
+            continue
+        stroke = style.get("stroke")
+        if not stroke:
+            continue
+        fill = style.get("fill") if isinstance(style.get("fill"), dict) else {}
+        fill_hex = fill.get("color") if isinstance(fill, dict) else None
+        if fill_hex is None:
+            fill_hex = style.get("color")
+        if _stroke_is_authored_outline(stroke, fill_hex):
+            continue
+        style["stroke"] = None
+        meta = line.setdefault("meta", {})
+        meta["plain_text_stroke_suppressed"] = True
+        meta["suppressed_stroke"] = stroke
+        # Word-level stroke copies of the same weak rim would re-explode runs.
+        for word in line.get("words") or []:
+            if not isinstance(word, dict):
+                continue
+            wstyle = word.get("style")
+            if isinstance(wstyle, dict) and wstyle.get("stroke"):
+                wstyle["stroke"] = None
 
 
 def _shadow_from_mask(crop, mask) -> Optional[dict]:
@@ -2266,8 +2328,33 @@ def _apply_platform_ui_font_prior(prepared: list[dict], cfg: Optional[dict],
         current = str(style.get("fontFamily") or "")
         if not current:
             continue
+        def _force_words_to_family() -> None:
+            for word in line.get("words") or []:
+                if not isinstance(word, dict):
+                    continue
+                wstyle = word.get("style")
+                if not isinstance(wstyle, dict):
+                    continue
+                w_current = str(wstyle.get("fontFamily") or "")
+                if w_current and _norm_family(w_current) != _norm_family(family):
+                    w_class = _family_class(
+                        w_current,
+                        ((wstyle.get("fontCandidates") or [{}])[0] or {}).get("path"),
+                    )
+                    if w_class in ("serif", "script"):
+                        continue
+                wstyle["fontFamily"] = family
+                wstyle["letterSpacing"] = 0.0
+                wcands = [c for c in (wstyle.get("fontCandidates") or []) if isinstance(c, dict)]
+                if wcands:
+                    w_promoted = dict(wcands[0])
+                    w_promoted["family"] = family
+                    wstyle["fontCandidates"] = [w_promoted] + wcands[1:]
+                _reconcile_style_weight(wstyle)
+
         if _norm_family(current) == _norm_family(family):
             style["letterSpacing"] = 0.0
+            _force_words_to_family()
             continue
         candidates = [c for c in (style.get("fontCandidates") or []) if isinstance(c, dict)]
         top = candidates[0] if candidates else {}
@@ -2318,6 +2405,9 @@ def _apply_platform_ui_font_prior(prepared: list[dict], cfg: Optional[dict],
         meta["platform_ui_prior"] = {
             "from": current, "to": family, "previous_class": line_class,
         }
+        # Word-level styles inherit forensic faces; force them too so weight-split
+        # design nodes (121K / engagement counts) stay on the platform family.
+        _force_words_to_family()
         applied.append(line.get("id"))
     if not applied and not skipped:
         return None
@@ -2924,14 +3014,31 @@ def _infer_alignment(lines: list[dict], canvas_w: float) -> str:
         center = _box_center(box)[0]
         left = float(box.get("x", 0) or 0)
         right = left + float(box.get("w", 0) or 0)
-        if box["w"] < canvas_w * 0.88 and abs(center - canvas_w / 2.0) <= canvas_w * 0.055:
+        # True centered labels have *symmetric* side margins. Wide left-anchored
+        # body lines (009 "Daarbovenop…") also have a geometric center near mid
+        # canvas — requiring margin symmetry avoids flipping them to CENTER.
+        left_margin = left
+        right_margin = canvas_w - right
+        if (
+            box["w"] < canvas_w * 0.88
+            and abs(center - canvas_w / 2.0) <= canvas_w * 0.055
+            and abs(left_margin - right_margin) <= canvas_w * 0.06
+            and min(left_margin, right_margin) >= canvas_w * 0.08
+        ):
             return "CENTER"
         # Edge-flush columns keep outward alignment (007 left rail, edge callouts).
         if left <= canvas_w * 0.08:
             return "LEFT"
         if abs(right - canvas_w) <= canvas_w * 0.08:
             return "RIGHT"
+        # Indented left-column UI (009 username / @handle under an avatar, ~0.14–0.35
+        # of canvas width). These must stay LEFT — the older "center < mid → RIGHT"
+        # floating-callout heuristic flipped them and made tracking look broken.
+        if canvas_w * 0.14 <= left <= canvas_w * 0.38:
+            return "LEFT"
         # Floating side callouts (014): align toward the product / canvas center.
+        # True floaters sit just off the margin (left > 8%) with their center still
+        # in the left half — not in the avatar-indented band above.
         if center < canvas_w * 0.45:
             return "RIGHT"
         if center > canvas_w * 0.55:
@@ -3471,6 +3578,7 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
                 word["style"]["letterSpacing"] = 0.0
 
     _assign_roles(enriched, canvas)
+    _prefer_plain_editable_text(enriched)
     blocks = _make_blocks(enriched, canvas, config)
     block_unify = _unify_block_families(enriched, prepared, render_fit_options, font_options)
     if block_unify:

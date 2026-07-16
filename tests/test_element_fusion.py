@@ -797,3 +797,138 @@ def test_partially_overlapping_logo_is_not_absorbed():
     fused = element_fusion.fuse({"elements": [product, logo]}, [], [], CANVAS)
 
     assert sorted(e["role"] for e in fused) == ["logo", "product"]
+
+
+# ── product cluster hull merge + alpha sealing (135 / packaging) ────────────────────
+
+
+def test_adjacent_same_prompt_products_merge_into_one_owner():
+    """135: dual bars / jar+lid with shared product prompt + hull proximity → 1 owner."""
+    # Two bars 2px apart (gap < budget); same text-prompt "product".
+    left = _sam_el("S0", 10, 30, 28, 40, "product", 0.9, "text-prompt", prompt="product")
+    right = _sam_el("S1", 40, 30, 28, 40, "product", 0.88, "text-prompt", prompt="product")
+
+    fused = element_fusion.fuse({"elements": [left, right]}, [], [], CANVAS)
+
+    assert len(fused) == 1
+    assert fused[0]["role"] == "product"
+    reasons = [m.get("reason") for m in fused[0]["provenance"]["nms"]["merges"]]
+    assert "product-cluster-hull-merge" in reasons
+    # Union bbox covers both bars.
+    box = fused[0]["box"]
+    assert box["x"] <= 10 and box["x"] + box["w"] >= 68
+
+
+def test_jar_and_lid_same_prompt_merge():
+    """Jar body + lid stacked with a tiny gap share one product owner."""
+    jar = _sam_el("S0", 30, 40, 30, 40, "product", 0.9, "text-prompt", prompt="product")
+    lid = _sam_el("S1", 32, 28, 26, 14, "product", 0.85, "text-prompt", prompt="product")
+
+    fused = element_fusion.fuse({"elements": [jar, lid]}, [], [], CANVAS)
+
+    assert len(fused) == 1
+    assert fused[0]["role"] == "product"
+    reasons = [m.get("reason") for m in fused[0]["provenance"]["nms"]["merges"]]
+    assert "product-cluster-hull-merge" in reasons
+
+
+def test_spaced_same_prompt_skus_stay_separate():
+    """067 regression: three jars with a larger gap must not hull-merge."""
+    jars = [
+        _sam_el(f"S{i}", 5 + i * 32, 40, 26, 30, "product", 0.8, "text-prompt",
+                prompt="product")
+        for i in range(3)
+    ]
+
+    fused = element_fusion.fuse({"elements": jars}, [], [], CANVAS)
+
+    assert len(fused) == 3
+
+
+def test_different_product_prompts_do_not_hull_merge():
+    """Adjacent cutouts with distinct prompts are different objects."""
+    a = _sam_el("S0", 10, 30, 28, 40, "product", 0.9, "text-prompt", prompt="chocolate bar")
+    b = _sam_el("S1", 40, 30, 28, 40, "product", 0.88, "text-prompt", prompt="earplug")
+
+    fused = element_fusion.fuse({"elements": [a, b]}, [], [], CANVAS)
+
+    assert len(fused) == 2
+
+
+def test_product_mask_swiss_cheese_holes_are_sealed():
+    """Interior SAM holes on packaging fill so the product alpha stays solid."""
+    solid = _mask(20, 20, 40, 40)
+    # Punch two interior holes (Swiss cheese).
+    solid[30:34, 30:34] = False
+    solid[40:45, 40:44] = False
+    product = {
+        "id": "S0", "box": _box(20, 20, 40, 40), "role": "product",
+        "kind": "photo-fragment", "score": 0.9, "_mask": solid,
+        "provenance": {"mode": "text-prompt", "prompt": "product"},
+    }
+
+    fused = element_fusion.fuse({"elements": [product]}, [], [], CANVAS)
+
+    assert len(fused) == 1
+    # Winner mask is not exported as ndarray on the result — re-run seal helper on a
+    # reconstructed observation via fuse internals: area must grow past the holed mask.
+    assert fused[0]["area"] >= float(solid.sum())
+    # Stronger check: materialize via a private seal on a copy of the input mask.
+    sealed = element_fusion._fill_mask_holes(solid.copy())
+    assert int(sealed[30:34, 30:34].sum()) == 16
+    assert int(sealed[40:45, 40:44].sum()) == 20
+
+
+def test_overlapping_gapped_product_masks_merge_via_box_iou():
+    """135: dual bars with Swiss-cheese mask gap still merge when boxes overlap."""
+    # Non-touching masks whose declared boxes still heavily overlap.
+    left = _mask(10, 20, 30, 50)
+    right = _mask(55, 30, 30, 50)
+    clusters = [
+        {
+            "winner": {
+                "key": "a", "role": "product", "kind": "photo-fragment",
+                "mask": left, "box": _box(10, 20, 55, 50), "score": 0.9,
+                "source": "sam3", "mask_quality": "mask",
+            },
+            "members": [{
+                "key": "a", "role": "product", "mode": "text-prompt",
+                "prompt": "product", "score": 0.9, "source": "sam3",
+            }],
+            "merges": [],
+        },
+        {
+            "winner": {
+                "key": "b", "role": "product", "kind": "photo-fragment",
+                "mask": right, "box": _box(40, 30, 45, 50), "score": 0.88,
+                "source": "sam3", "mask_quality": "mask",
+            },
+            "members": [{
+                "key": "b", "role": "product", "mode": "text-prompt",
+                "prompt": "product", "score": 0.88, "source": "sam3",
+            }],
+            "merges": [],
+        },
+    ]
+    opts = dict(element_fusion.DEFAULTS)
+    merged = element_fusion._merge_product_clusters(clusters, opts)
+    assert len(merged) == 1
+    assert merged[0]["winner"]["box"]["w"] >= 55
+
+
+def test_packaging_flavor_bar_button_absorbs_into_product(tmp_path):
+    """002: wide on-pack 'button' (VANILLE SMAAK bar) folds into the product."""
+    import json
+
+    product = _sam_el("S0", 10, 20, 70, 60, "product", 0.9, "text-prompt", prompt="product")
+    bar = _sam_el("S1", 15, 50, 50, 8, "button", 0.8, "text-prompt", prompt="button")
+    bar["kind"] = "shape"
+
+    fused = element_fusion.fuse({"elements": [product, bar]}, [], [], CANVAS,
+                                run_dir=str(tmp_path))
+
+    assert [e["role"] for e in fused] == ["product"]
+    assert (fused[0].get("meta") or {}).get("printed_lockup") is True
+    report = json.load(open(tmp_path / "fusion_report.json"))
+    assert report["counts"]["absorbed_packaging_shells"] == 1
+    assert report["absorbed_packaging_shells"][0]["reason"] == "printed-on-product-shell"

@@ -627,6 +627,11 @@ def critic_review(repairs: list[dict], critic_output: dict) -> list[dict]:
     blockers = critic_output.get("blockers") or []
     blocked_categories = _blocked_categories(blockers)
     blocked_ids = _blocked_fix_ids(blockers)
+    run_dir = critic_output.get("run_dir")
+    try:
+        from src.harness import admission_reject_reason
+    except Exception:
+        admission_reject_reason = None
 
     sorted_repairs = sorted(
         repairs,
@@ -645,6 +650,10 @@ def critic_review(repairs: list[dict], critic_output: dict) -> list[dict]:
         cat = _category_for_stage(repair.get("stage"))
         if cat in blocked_categories:
             continue
+        # Workstream E: drop kept_in_photo / baked chrome / already-sliced deficits.
+        if admission_reject_reason is not None and run_dir:
+            if admission_reject_reason(repair, run_dir=str(run_dir)):
+                continue
         confidence = _repair_confidence(repair, scores)
         if confidence < LOW_CONFIDENCE_CUTOFF:
             continue

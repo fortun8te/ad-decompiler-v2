@@ -142,8 +142,8 @@ def test_routing_and_inpaint_respect_format_capabilities():
     assert _icons_as_chips(cfg) is True
     assert _solid_flat_enabled(cfg) is True
 
-    # Explicit routing override still wins.
-    cfg["routing"] = {"icons_as_chips": False}
+    # Explicit opt-out requires chrome_as_raster off (it forces chips when on).
+    cfg["routing"] = {"chrome_as_raster": False, "icons_as_chips": False}
     assert _icons_as_chips(cfg) is False
 
 

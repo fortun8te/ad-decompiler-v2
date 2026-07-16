@@ -225,6 +225,22 @@ def test_proofread_rejects_wholesale_rewrite(tmp_path, monkeypatch):
     assert out["vlm_ocr_judge"]["notes"][0]["note"] == "vlm_low_similarity"
 
 
+def test_proofread_rejects_syllable_stutter_expansion(tmp_path, monkeypatch):
+    """002: brand proofread must not expand ESSENTIALS → ESSENTIALSENTIALS."""
+    _mock_multi(monkeypatch, ["ALLE ESSENTIALSENTIALS"])
+    ocr_result = {"lines": [_line("ALLE ESSENTIALS", conf=0.76)]}
+    out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), ocr_result, _cfg_proofread())
+    assert out["lines"][0]["text"] == "ALLE ESSENTIALS"
+    assert out["vlm_ocr_judge"]["proofread_corrected"] == 0
+    assert any(
+        note.get("note") == "vlm_stutter_expansion"
+        for note in out["vlm_ocr_judge"]["notes"]
+    )
+    assert vlm_ocr_judge._is_stutter_expansion(
+        "ALLE ESSENTIALS", "ALLE ESSENTIALSENTIALS"
+    )
+
+
 def test_proofread_routes_low_confidence_line(tmp_path, monkeypatch):
     _mock_multi(monkeypatch, ["energie"])
     ocr_result = {"lines": [_line("energi", conf=0.55)]}

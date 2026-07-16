@@ -34,6 +34,7 @@ from typing import Optional
 from .wordmark import is_platform_lockup, semantic_text_role
 from .raster_clusters import is_intentional_raster_cluster
 from .raster_clusters import normalized_role as cluster_normalized_role
+from .routing import chrome_as_raster_enabled, is_chrome_as_raster_role
 from .diagram_editability import (
     is_chart_label_role,
     is_chart_primitive_role,
@@ -82,6 +83,9 @@ _PRODUCT_CUTOUT_ROLES = frozenset({
     "pouch", "sachet", "shaker", "box", "carton", "device", "sign", "label",
     "photo", "photo-fragment", "photo_fragment", "person", "people", "portrait",
     "hand", "product-cluster",
+    # Comparison eye/face panels (066) are avatar-tagged photo cutouts; labels like
+    # "OUR COMPETITOR" / "prime prometics" are printed on the raster, not overlays.
+    "avatar", "profile", "profile_photo", "profile-photo", "headshot",
     "logo",  # still a cutout owner for geometry; text-bearing shells extract OCR below
 })
 
@@ -124,7 +128,63 @@ _BAKE_CUTOUT_ROLES = _PRODUCT_CUTOUT_ROLES - {"logo"}
 # deliberately NOT here — printed-on-product stays baked (091/094/002 invariant).
 _PHOTOGRAPHIC_PANEL_ROLES = frozenset({
     "photo", "photo-fragment", "photo_fragment", "person", "people", "portrait",
+    "avatar", "profile", "profile_photo", "profile-photo", "headshot",
 })
+
+# List-row ✓ / ✗ / ? chips nested inside a chrome-baked checklist card. Extracting
+# them punches holes the later tree often drops, leaving mangled card rasters (066).
+_LIST_ROW_ICON_ROLES = frozenset({
+    "verified", "checkmark", "check", "check-mark", "check_mark", "tick",
+    "cross", "x", "question-mark", "question_mark",
+})
+
+
+def _bake_chrome_text_enabled(cfg: dict | None) -> bool:
+    """Bake badge/seal/chip OCR into the cutout (default ON with chrome_as_raster)."""
+    mcfg = (cfg or {}).get("merge") or {}
+    if "bake_chrome_text" in mcfg:
+        return bool(mcfg.get("bake_chrome_text"))
+    return chrome_as_raster_enabled(cfg)
+
+
+def _is_vs_chip_text(candidate: dict) -> bool:
+    """Comparison VS tokens stay editable; never bake them into a badge cutout."""
+    meta = candidate.get("meta") or {}
+    if str(meta.get("role") or "").lower() in {"vs", "vs_badge", "vs_chip"}:
+        return True
+    if str(meta.get("semantic_name") or "").strip().upper() == "VS":
+        return True
+    text = str(candidate.get("text") or meta.get("text") or "").strip()
+    return bool(re.match(r"^\s*(vs\.?|versus)\s*$", text, re.I))
+
+
+def _bake_text_into_chrome_host(text: dict, host: dict, diagnostics: dict, *, action: str) -> None:
+    """Mark OCR as kept_in_photo on a chrome-as-raster badge/seal host (no sibling TEXT)."""
+    meta = text.setdefault("meta", {})
+    host_meta = host.setdefault("meta", {})
+    text["kept_in_photo"] = True
+    text["target"] = "drop"
+    meta["kept_in_photo"] = True
+    meta["origin"] = "scene"
+    meta["role"] = "scene-text"
+    meta["baked_owner_id"] = host.get("id")
+    meta["baked_badge_text"] = True
+    meta["suppression_reason"] = "baked-chrome-text"
+    for tentative in (
+        "overlay_text", "removal_required", "shell_text_host", "parent_id",
+        "ownership_enforced", "scene_text_geometric",
+    ):
+        meta.pop(tentative, None)
+    host_meta["shell_raster_chip"] = True
+    host_meta["baked_badge_text"] = True
+    host_meta.pop("text_bearing_shell", None)
+    host_meta.pop("plate_shell", None)
+    diagnostics.setdefault("scene_text_contract", []).append({
+        "id": text.get("id"),
+        "host": host.get("id"),
+        "action": action,
+        "host_role": host_meta.get("role"),
+    })
 
 
 def _positive_scene_ink_evidence(meta: dict, ownership: dict | None) -> bool:
@@ -208,16 +268,55 @@ def _box_area_frac(box: dict, canvas: dict) -> float:
     return (w * h) / _canvas_area(canvas)
 
 
+def _is_packaging_shell_region(shell: dict, product: dict) -> bool:
+    """Wide/thin on-pack highlight (002 flavor bar) nested in a product — not a CTA."""
+    sbox = shell.get("box") or {}
+    pbox = product.get("box") or {}
+    sw = float(sbox.get("w", 0) or 0)
+    sh = float(sbox.get("h", 0) or 0)
+    pw = float(pbox.get("w", 0) or 0)
+    ph = float(pbox.get("h", 0) or 0)
+    if sw <= 0 or sh <= 0 or pw <= 0 or ph <= 0:
+        return False
+    if _inside_frac(sbox, pbox) < 0.90:
+        return False
+    aspect = max(sw, sh) / max(1.0, min(sw, sh))
+    area_ratio = (sw * sh) / max(1.0, pw * ph)
+    role = str(shell.get("role") or "").lower()
+    if area_ratio > 0.18:
+        return False
+    if role in {"badge", "chip", "pill", "sticker", "seal", "tag"}:
+        return True
+    return role in {"button", "shape"} and aspect >= 3.2
+
+
 def _scene_cutout_owner(box: dict, regions: list[dict], threshold: float):
     """Smallest discrete cutout region that ``box`` sits at least ``threshold`` inside.
 
     Prefer text-bearing shell chrome (badge/button/logo seal) over a larger product
     pouch that also contains the text — otherwise 016-style offer seals bake OCR into
-    the product raster. Among equal preference, smallest area wins.
+    the product raster. Exception: packaging highlight bars SAM mislabels as buttons
+    (002 VANILLE SMAAK) stay owned by the product so OCR is baked, not punched.
+    Among equal preference, smallest area wins.
     """
     matches = [r for r in regions if _inside_frac(box, r["box"]) >= threshold]
     if not matches:
         return None
+
+    products = [
+        r for r in matches
+        if str(r.get("role") or "").lower() in _BAKE_CUTOUT_ROLES
+    ]
+    preferred = []
+    for region in matches:
+        role = str(region.get("role") or "").lower()
+        if role in _TEXT_BEARING_SHELL_ROLES and any(
+            _is_packaging_shell_region(region, prod) for prod in products
+        ):
+            continue  # demote packaging false-positive shells
+        preferred.append(region)
+    if not preferred:
+        preferred = matches
 
     def _rank(region):
         role = str(region.get("role") or "").lower()
@@ -225,7 +324,7 @@ def _scene_cutout_owner(box: dict, regions: list[dict], threshold: float):
         area = float(region["box"].get("w", 0) or 0) * float(region["box"].get("h", 0) or 0)
         return (shell, area, str(region.get("id") or ""))
 
-    return min(matches, key=_rank)
+    return min(preferred, key=_rank)
 
 
 def _classify_shell_role(
@@ -248,6 +347,10 @@ def _classify_shell_role(
         return "callout"
     if role in {"chip", "pill"} and not stroke_outline:
         return role
+    # Comparison / content cards host multi-line editable checklists (066). Never
+    # collapse them to chrome badges — that bakes every row into the card raster.
+    if role in {"card", "panel", "frame", "container", "plate"}:
+        return "card" if role in {"panel", "frame", "container", "plate"} else role
     if role in {
         "starburst", "price_burst", "sale_burst", "burst", "splat", "sticker_burst", "seal",
     }:
@@ -388,14 +491,116 @@ def _promote_geometric_text_shells(candidates: list, canvas: dict, cfg: dict, di
         if role and role != new_role:
             meta.setdefault("reclassified_from", role)
         meta["role"] = new_role
+        if snippet:
+            meta["shell_text_snippet"] = snippet[:48]
+        # Badge/seal/starburst hosts: bake OCR into the cutout (no sibling TEXT).
+        # Buttons / banners / callout outlines / VS chips stay editable shell + TEXT.
+        vs_only = bool(hosts) and all(_is_vs_chip_text(t) for t in hosts)
+        # Multi-line checklist / card bodies (066 comparison columns) must stay
+        # editable TEXT on a plate shell — chrome bake drops every row from the
+        # scene graph even when the glyphs remain in the card raster.
+        multi_line_body = len(hosts) >= 3 or (
+            len(hosts) >= 2
+            and any("\n" in str(t.get("text") or "") for t in hosts)
+        )
+        archetype = str(((cfg or {}).get("scene") or {}).get("archetype") or "").lower()
+        comparison_card = archetype == "comparison_grid" and (
+            role in {"card", "panel", "frame", "container", "plate"}
+            or multi_line_body
+            or len(hosts) >= 3
+        )
+        # Comparison checklist cards (066) with ✓/✗ row icons: keep copy as native
+        # TEXT. Icons stay chrome_as_raster IMAGE chips. Baking the whole card used
+        # to "drop" every checklist line from the editable scene graph.
+        nested_list_icons = [
+            c for c in candidates
+            if c.get("target") != "drop"
+            and c.get("id") != shell.get("id")
+            and str((c.get("meta") or {}).get("role") or "").lower().replace("-", "_")
+            in _LIST_ROW_ICON_ROLES
+            and _inside_frac(c.get("box") or {}, shell_box) >= 0.85
+        ]
+        checklist_editable = (
+            bool(meta.get("checklist_editable") or meta.get("absorbed_list_icons"))
+            or (
+                len(hosts) >= 2
+                and len(nested_list_icons) >= 2
+                and (
+                    role in {"card", "panel", "frame", "container", "plate", "shape", "badge", ""}
+                    or new_role in {"card", "badge"}
+                    or archetype == "comparison_grid"
+                )
+            )
+        )
+        if checklist_editable or comparison_card or multi_line_body or new_role == "card":
+            # Keep a designer-facing plate role; never leave a false badge label that
+            # a later scene-text pass can chrome-bake.
+            if new_role in {"badge", "seal"} or checklist_editable:
+                new_role = "card" if role in {
+                    "card", "panel", "frame", "container", "plate", "", "shape", "badge",
+                } or checklist_editable else "callout"
+                meta["role"] = new_role
+            if checklist_editable:
+                meta["checklist_editable"] = True
+                meta.pop("checklist_raster_chip", None)
+        # Body/heading copy is never chrome ink: a wide callout pill behind a body
+        # line is a text plate, not a seal — its copy must stay editable even when
+        # the plate itself rasters. Offer/label/cta text on compact seals still bakes.
+        body_copy_host = any(
+            str((t.get("meta") or {}).get("role") or t.get("role") or "").lower()
+            in {"body", "heading", "title", "subtitle", "headline"}
+            for t in hosts
+        )
+        _sb = shell_box or {}
+        wide_plate = float(_sb.get("w") or 0) > 2.5 * max(float(_sb.get("h") or 0), 1.0)
+        if (
+            _bake_chrome_text_enabled(cfg)
+            and is_chrome_as_raster_role(new_role)
+            and not vs_only
+            and not multi_line_body
+            and not comparison_card
+            and not checklist_editable
+            and not body_copy_host
+            and not wide_plate
+            and new_role not in {"card"}
+        ):
+            meta["geometric_text_shell"] = True
+            if stroke_outline:
+                meta["stroke_outline_shell"] = True
+                meta["stroke_only"] = True
+            meta["shell_raster_chip"] = True
+            meta["baked_badge_text"] = True
+            shell["target"] = "image"
+            for t in hosts:
+                if _is_vs_chip_text(t):
+                    tm = t.setdefault("meta", {})
+                    tm["overlay_text"] = True
+                    tm["removal_required"] = True
+                    tm["parent_id"] = shell.get("id")
+                    tm["shell_text_host"] = shell.get("id")
+                    t["target"] = "text"
+                    continue
+                _bake_text_into_chrome_host(
+                    t, shell, diagnostics,
+                    action="bake-chrome-geometric-shell",
+                )
+            diagnostics.setdefault("scene_text_contract", []).append({
+                "id": shell.get("id"),
+                "action": "geometric-chrome-raster-bake",
+                "host_role": new_role,
+                "stroke_outline": bool(stroke_outline),
+                "text_ids": [t.get("id") for t in hosts],
+            })
+            promoted += 1
+            continue
+        if vs_only:
+            meta["semantic_name"] = meta.get("semantic_name") or "VS"
         meta["text_bearing_shell"] = True
         meta["plate_shell"] = True
         meta["geometric_text_shell"] = True
         if stroke_outline:
             meta["stroke_outline_shell"] = True
             meta["stroke_only"] = True
-        if snippet:
-            meta["shell_text_snippet"] = snippet[:48]
         shell["target"] = "shape"
         if new_role == "button":
             meta["button_shell"] = True
@@ -703,12 +908,15 @@ def _should_bake_in_cutout(
     canvas: dict,
     scene_text_inside: float,
     facts: dict | None = None,
+    owner_meta: dict | None = None,
 ) -> bool:
     """Decide whether geometric cutout containment should bake this OCR line.
 
     Marketing overlay roles require a *bounded* cutout so an oversized SAM merge of
     plate+product cannot swallow left-column copy. Body/caption/label text and
-    VLM-printed roles bake at the normal scene_text_inside threshold.
+    VLM-printed roles bake at the normal scene_text_inside threshold. A fusion
+    ``printed_lockup`` owner always bakes contained OCR (label ink already lives
+    in the product raster).
     """
     box = candidate.get("box") or {}
     owner_box = cutout_owner.get("box") or {}
@@ -719,6 +927,11 @@ def _should_bake_in_cutout(
     role = str(meta.get("role") or "").lower()
     scene_role = str(meta.get("scene_text_role") or "").lower()
     if scene_role == "printed_on_product" or role in {"body", "caption", "label", "ingredients"}:
+        return True
+    # Fusion absorbed on-pack artwork into this product — every contained OCR line
+    # is printed ink. Skip the oversized-overlayish escape that protects flat-plate
+    # left columns (007); a printed-lockup cutout is never that plate.
+    if (owner_meta or {}).get("printed_lockup"):
         return True
     owner_area = _box_area_frac(owner_box, canvas)
     if role in _OVERLAYISH_TEXT_ROLES:
@@ -748,6 +961,116 @@ def _raster_cluster_owner(box: dict, owners: list[dict], threshold: float):
     return min(matches, key=lambda owner: (
         owner["box"]["w"] * owner["box"]["h"], owner["id"],
     ))
+
+
+_CHROME_ICON_ROLES = frozenset({
+    "icon", "verified", "checkmark", "cross", "question-mark", "question_mark",
+    "emoji", "symbol", "pictogram", "badge", "logo",
+})
+_OFFER_BADGE_TEXT_RE = re.compile(
+    r"(?i)(\d+\s*%|\boff\b|\bfree\b|\bgift|\bsave\b|€|\$|£)",
+)
+
+
+def _clip_text_boxes_away_from_chrome_icons(candidates: list) -> int:
+    """Shrink editable text that horizontally overlaps a chrome icon (009 verified)."""
+    icons = [
+        c for c in candidates
+        if str((c.get("meta") or {}).get("role") or c.get("role") or "").lower()
+        in _CHROME_ICON_ROLES
+        and c.get("target") != "drop"
+        and not c.get("kept_in_photo")
+        and float((c.get("box") or {}).get("w", 0) or 0) > 0
+    ]
+    if not icons:
+        return 0
+    clipped = 0
+    for text in candidates:
+        if text.get("kept_in_photo") or text.get("target") == "drop":
+            continue
+        is_text = (
+            text.get("target") == "text"
+            or text.get("meta", {}).get("source") == "ocr"
+        )
+        if not is_text:
+            continue
+        tbox = text.get("box") or {}
+        tx = float(tbox.get("x", 0) or 0)
+        ty = float(tbox.get("y", 0) or 0)
+        tw = float(tbox.get("w", 0) or 0)
+        th = float(tbox.get("h", 0) or 0)
+        if tw <= 0 or th <= 0:
+            continue
+        for icon in icons:
+            if icon is text:
+                continue
+            ibox = icon.get("box") or {}
+            ix = float(ibox.get("x", 0) or 0)
+            iy = float(ibox.get("y", 0) or 0)
+            ih = float(ibox.get("h", 0) or 0)
+            # Same row, icon to the right of the text start, overlapping the text span.
+            if iy + ih < ty or iy > ty + th:
+                continue
+            if ix < tx or ix >= tx + tw:
+                continue
+            new_w = max(8.0, ix - tx - 2.0)
+            if new_w >= tw - 1:
+                continue
+            text["box"] = {**tbox, "w": new_w}
+            meta = text.setdefault("meta", {})
+            meta["clipped_for_chrome_icon"] = icon.get("id")
+            clipped += 1
+            break
+    return clipped
+
+
+def _promote_circular_offer_products_to_badges(candidates: list, canvas: dict) -> int:
+    """013: circular product fragments hosting % OFF copy become chrome badge cutouts."""
+    texts = [
+        c for c in candidates
+        if (c.get("target") == "text" or c.get("meta", {}).get("source") == "ocr")
+        and _OFFER_BADGE_TEXT_RE.search(str(c.get("text") or ""))
+    ]
+    if not texts:
+        return 0
+    promoted = 0
+    for el in candidates:
+        meta = el.setdefault("meta", {})
+        role = str(meta.get("role") or el.get("role") or "").lower()
+        if role not in _BAKE_CUTOUT_ROLES:
+            continue
+        box = el.get("box") or {}
+        w = float(box.get("w", 0) or 0)
+        h = float(box.get("h", 0) or 0)
+        if w < 40 or h < 40:
+            continue
+        aspect = max(w, h) / max(1.0, min(w, h))
+        if aspect > 1.35:
+            continue  # not near-circular / square seal
+        if _box_area_frac(box, canvas) > 0.12:
+            continue  # hero / pack face, not a seal
+        host_text = next(
+            (t for t in texts if _inside_frac(t.get("box") or {}, box) >= 0.55),
+            None,
+        )
+        if host_text is None:
+            continue
+        tm = host_text.get("meta") or {}
+        # Explicit overlay / recreate evidence wins — do not steal plate offer copy
+        # into a mis-roled product cutout (positive-overlay-beats-geometry contract).
+        if (
+            tm.get("external_overlay") or tm.get("promote_text") or tm.get("editable_text")
+            or tm.get("overlay_text")
+            or (tm.get("ownership_decision") or {}).get("action") == "recreate"
+        ):
+            continue
+        meta["reclassified_from"] = meta.get("reclassified_from") or role
+        meta["role"] = "badge"
+        meta["chrome_as_raster"] = True
+        meta["shell_raster_chip"] = True
+        el["kind"] = el.get("kind") or "icon"
+        promoted += 1
+    return promoted
 
 
 def _normalize_text_key(value):
@@ -2316,6 +2639,183 @@ def _promote_story_cta(candidates: list, canvas: dict | None = None) -> list:
     return candidates
 
 
+def _merge_comparison_photo_checklist_columns(
+    candidates: list, canvas: dict, cfg: dict | None = None, diagnostics: dict | None = None,
+) -> list:
+    """066: join eye photo + checklist card into one continuous column raster.
+
+    Mirrored comparison columns are authored as a single rounded rect (photo over
+    list). Shipping them as two stacked chips leaves a seam gap and double borders.
+    """
+    archetype = str(((cfg or {}).get("scene") or {}).get("archetype") or "").lower()
+    if archetype != "comparison_grid":
+        return candidates
+    photo_roles = {
+        "avatar", "photo", "photo-fragment", "photo_fragment", "person", "portrait",
+        "profile", "profile_photo", "headshot",
+    }
+    photos = [
+        c for c in candidates
+        if c.get("target") == "image"
+        and str((c.get("meta") or {}).get("role") or "").lower().replace("-", "_") in photo_roles
+    ]
+    cards = [
+        c for c in candidates
+        if c.get("target") == "image"
+        and (
+            (c.get("meta") or {}).get("checklist_raster_chip")
+            or (c.get("meta") or {}).get("baked_badge_text")
+        )
+    ]
+    if len(photos) < 1 or len(cards) < 1:
+        return candidates
+    drop_ids: set[str] = set()
+    merged_rows = []
+    for card in cards:
+        if card.get("id") in drop_ids:
+            continue
+        cbox = card.get("box") or {}
+        best = None
+        best_gap = 1e9
+        for photo in photos:
+            if photo.get("id") in drop_ids or photo.get("id") == card.get("id"):
+                continue
+            pbox = photo.get("box") or {}
+            # Photo must sit above the card and share a column.
+            gap = float(cbox.get("y", 0) or 0) - (
+                float(pbox.get("y", 0) or 0) + float(pbox.get("h", 0) or 0)
+            )
+            if gap < -8 or gap > 48:
+                continue
+            overlap_x = min(
+                float(pbox.get("x", 0) or 0) + float(pbox.get("w", 0) or 0),
+                float(cbox.get("x", 0) or 0) + float(cbox.get("w", 0) or 0),
+            ) - max(float(pbox.get("x", 0) or 0), float(cbox.get("x", 0) or 0))
+            min_w = min(float(pbox.get("w", 0) or 0), float(cbox.get("w", 0) or 0))
+            if min_w <= 0 or overlap_x / min_w < 0.55:
+                continue
+            if gap < best_gap:
+                best, best_gap = photo, gap
+        if best is None:
+            continue
+        pbox = best.get("box") or {}
+        x0 = min(float(pbox.get("x", 0) or 0), float(cbox.get("x", 0) or 0))
+        y0 = min(float(pbox.get("y", 0) or 0), float(cbox.get("y", 0) or 0))
+        x1 = max(
+            float(pbox.get("x", 0) or 0) + float(pbox.get("w", 0) or 0),
+            float(cbox.get("x", 0) or 0) + float(cbox.get("w", 0) or 0),
+        )
+        y1 = max(
+            float(pbox.get("y", 0) or 0) + float(pbox.get("h", 0) or 0),
+            float(cbox.get("y", 0) or 0) + float(cbox.get("h", 0) or 0),
+        )
+        union = {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+        col_id = f"{card.get('id')}__column"
+        column = {
+            "id": col_id,
+            "box": union,
+            "z": max(float(best.get("z") or 0), float(card.get("z") or 0)),
+            "kind": "shape",
+            "target": "image",
+            # Full authored crop of the continuous column — never a hole-punched peel.
+            "source_crop": {"box": dict(union)},
+            "mask": {"kind": "rrect"},
+            "meta": {
+                "role": "badge",
+                "kind": "shape",
+                "source": "comparison-column-merge",
+                "shell_raster_chip": True,
+                "baked_badge_text": True,
+                "checklist_raster_chip": True,
+                "comparison_column_chip": True,
+                "merged_from": [best.get("id"), card.get("id")],
+                "chrome_as_raster": True,
+            },
+        }
+        for part in (best, card):
+            drop_ids.add(part.get("id"))
+            pm = part.setdefault("meta", {})
+            pm["suppression_reason"] = "merged-into-comparison-column"
+            pm["absorbed_into"] = col_id
+            part["target"] = "drop"
+        merged_rows.append(column)
+        if diagnostics is not None:
+            diagnostics.setdefault("scene_text_contract", []).append({
+                "id": col_id,
+                "action": "merge-comparison-photo-checklist-column",
+                "parts": [best.get("id"), card.get("id")],
+                "gap": round(best_gap, 2),
+            })
+    if not merged_rows:
+        return candidates
+    # Keep absorbed photo/card rows as target=drop so QA/diagnostics can see them.
+    return list(candidates) + merged_rows
+
+
+def _absorb_list_icons_into_baked_shells(candidates: list, diagnostics: dict | None = None) -> int:
+    """Keep list-row ✓/✗ chips inside chrome-baked checklist cards (066).
+
+    Geometric shell bake turns comparison cards into ``baked_badge_text`` IMAGE
+    cutouts while icon_detect still emits per-row verified/cross chips. Peeling
+    those chips punches holes in the card; layout then drops the chips → mangled
+    icons/ghost text. Absorbing them leaves one intact card raster.
+    """
+    shells = [
+        c for c in candidates
+        if c.get("target") != "drop"
+        and (
+            (c.get("meta") or {}).get("baked_badge_text")
+            or (c.get("meta") or {}).get("shell_raster_chip")
+        )
+        and float((c.get("box") or {}).get("w", 0) or 0) > 0
+        and float((c.get("box") or {}).get("h", 0) or 0) > 0
+    ]
+    if not shells:
+        return 0
+    absorbed = 0
+    for icon in candidates:
+        if icon.get("target") == "drop" or icon.get("kept_in_photo"):
+            continue
+        meta = icon.setdefault("meta", {})
+        role = str(meta.get("role") or icon.get("role") or "").lower().replace("-", "_")
+        if role not in _LIST_ROW_ICON_ROLES:
+            continue
+        icon_box = icon.get("box") or {}
+        icon_area = float(icon_box.get("w", 0) or 0) * float(icon_box.get("h", 0) or 0)
+        if icon_area <= 0:
+            continue
+        best = None
+        best_frac = 0.0
+        for shell in shells:
+            if shell.get("id") == icon.get("id"):
+                continue
+            frac = _inside_frac(icon_box, shell.get("box") or {})
+            if frac >= 0.85 and frac > best_frac:
+                best, best_frac = shell, frac
+        if best is None:
+            continue
+        shell_box = best.get("box") or {}
+        shell_area = float(shell_box.get("w", 0) or 0) * float(shell_box.get("h", 0) or 0)
+        # Peer chrome (009 verified next to username) is not nested in a big card.
+        if shell_area <= 0 or icon_area / shell_area > 0.20 or shell_area < icon_area * 8:
+            continue
+        icon["target"] = "drop"
+        meta["keep_in_background"] = True
+        meta["baked_owner_id"] = best.get("id")
+        meta["absorbed_into"] = best.get("id")
+        meta["suppression_reason"] = "list-icon-absorbed-into-baked-shell"
+        best.setdefault("meta", {}).setdefault("absorbed_list_icons", []).append(icon.get("id"))
+        absorbed += 1
+        if diagnostics is not None:
+            diagnostics.setdefault("scene_text_contract", []).append({
+                "id": icon.get("id"),
+                "host": best.get("id"),
+                "action": "absorb-list-icon-into-baked-shell",
+                "inside_frac": round(best_frac, 4),
+            })
+    return absorbed
+
+
 def _collapse_near_duplicate_nests(candidates: list, iou_thresh: float = 0.85) -> list:
     """Drop a parent shell that occupies nearly the same box as its nested child.
 
@@ -2486,10 +2986,13 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
         c for c in elem_cands
         if is_intentional_raster_cluster(c.get("meta", {}).get("role"))
     ]
-    # Do not rebuild buttons, icons and other internal chrome detected *inside* a
+    # Do not rebuild buttons and other internal chrome detected *inside* a
     # screenshot/UI crop. The screenshot is the exact, swappable visual owner. Only a
     # separately corroborated external overlay may escape; a surrounding source-evidenced
     # card/shell remains eligible because it contains (rather than sits inside) the crop.
+    # chrome_as_raster icons/badges/logos (009 verified check, engagement glyphs) stay
+    # extractable IMAGE cutouts — baking them then dropping the layer punches a hole
+    # the editable username text paints over.
     for child in elem_cands:
         if child in raster_cluster_owners:
             child["meta"].setdefault("decomposition_policy", {
@@ -2502,16 +3005,31 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             continue
         meta = child.setdefault("meta", {})
         ownership = meta.get("ownership_decision") or {}
+        child_role = str(meta.get("role") or child.get("role") or "").lower()
+        # Arrows/callout leaders inside screenshots/charts are chrome cutouts too
+        # (107 price-chart arrow); buttons stay baked as internal chrome.
+        chrome_cutout = bool(
+            chrome_as_raster_enabled(cfg)
+            and (
+                is_chrome_as_raster_role(child_role)
+                or child_role in {"arrow", "chevron"}
+            )
+            and child.get("target") != "text"
+        )
         positive_external = bool(
             meta.get("external_overlay") or meta.get("extract_from_cluster")
             or meta.get("separate_layer") or ownership.get("action") == "recreate"
             # Decomposed chart/diagram marks tagged with chart_group_id must stay
             # selectable layers, not baked internal chrome of a whole-plot crop.
             or (meta.get("chart_group_id") and is_chart_primitive_role(meta.get("role")))
+            or chrome_cutout
         )
         if positive_external:
             meta["parent_id"] = owner["id"]
             meta["raster_cluster_owner"] = owner["id"]
+            if chrome_cutout:
+                meta["extract_from_cluster"] = True
+                meta["chrome_as_raster"] = True
             if meta.get("chart_group_id") and is_chart_primitive_role(meta.get("role")):
                 meta["extract_from_cluster"] = True
                 meta["diagram_member"] = True
@@ -2762,13 +3280,64 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                     (e for e in elem_cands if e.get("id") == cutout_owner["id"]),
                     None,
                 )
-                owner_role = str(
-                    ((owner_elem or {}).get("meta") or {}).get("role") or ""
-                ).lower()
-                # Text-bearing badge/button/logo chrome: recreate as editable TEXT and
-                # rebuild the plate underneath. Never bake readable OCR into the shell
-                # raster for fidelity (Codia contract / benchmark 016 green seal).
+                owner_meta = ((owner_elem or {}).get("meta") or {})
+                owner_role = str(owner_meta.get("role") or "").lower()
+                # Early printed-lockup bake: fusion folded on-pack artwork into this
+                # product. Contained OCR stays in the raster — never promote to overlay
+                # TEXT / removal. Runs before chrome-shell extract so a mis-roled host
+                # cannot steal packaging label ink (Agent A owns chrome; this is product).
+                if (
+                    owner_meta.get("printed_lockup")
+                    and owner_role in _BAKE_CUTOUT_ROLES
+                    and _inside_frac(c["box"], cutout_owner.get("box") or {})
+                    >= scene_text_inside
+                ):
+                    c["kept_in_photo"] = True
+                    c["meta"]["origin"] = "scene"
+                    c["meta"]["role"] = "scene-text"
+                    c["meta"]["baked_owner_id"] = cutout_owner["id"]
+                    c["meta"]["scene_text_geometric"] = True
+                    c["meta"]["suppression_reason"] = "printed-lockup-product-text"
+                    for tentative in ("overlay_text", "removal_required"):
+                        c["meta"].pop(tentative, None)
+                    diagnostics["scene_text_contract"].append({
+                        "id": c.get("id"),
+                        "host": cutout_owner["id"],
+                        "action": "printed-lockup-bake",
+                        "host_role": owner_role,
+                    })
+                    continue
+                # Badge/seal/chip/logo chrome: bake OCR into the cutout (chrome_as_raster).
+                # Buttons / callouts / banners still extract as editable TEXT + plate.
                 if owner_role in _TEXT_BEARING_SHELL_ROLES:
+                    bake_host_role = "badge" if owner_role in {
+                        "logo", "wordmark", "brand", "logotype",
+                    } else owner_role
+                    # Body/heading copy on a wide plate is a text plate, not seal
+                    # chrome — its copy stays editable (mirrors the geometric-shell
+                    # gate above). Compact seals with offer/label text still bake.
+                    _ob = (cutout_owner.get("box") or {}) if cutout_owner else {}
+                    _wide_plate = float(_ob.get("w") or 0) > 2.5 * max(float(_ob.get("h") or 0), 1.0)
+                    _body_copy = str((c.get("meta") or {}).get("role") or c.get("role") or "").lower() in {
+                        "body", "heading", "title", "subtitle", "headline",
+                    }
+                    if (
+                        _bake_chrome_text_enabled(cfg)
+                        and is_chrome_as_raster_role(bake_host_role)
+                        and owner_elem is not None
+                        and not _is_vs_chip_text(c)
+                        and not _body_copy
+                        and not _wide_plate
+                    ):
+                        om = owner_elem.setdefault("meta", {})
+                        if owner_role in {"logo", "wordmark", "brand", "logotype"}:
+                            om["reclassified_from"] = om.get("reclassified_from") or owner_role
+                            om["role"] = "badge"
+                        _bake_text_into_chrome_host(
+                            c, owner_elem, diagnostics,
+                            action="bake-chrome-text",
+                        )
+                        continue
                     c["meta"]["overlay_text"] = True
                     c["meta"]["removal_required"] = True
                     c["meta"]["parent_id"] = cutout_owner["id"]
@@ -2778,6 +3347,9 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                         om = owner_elem.setdefault("meta", {})
                         om["text_bearing_shell"] = True
                         om["plate_shell"] = True
+                        if _is_vs_chip_text(c):
+                            om["semantic_name"] = om.get("semantic_name") or "VS"
+                            om["shell_text_snippet"] = str(c.get("text") or "VS")
                         if owner_role == "logo":
                             om["reclassified_from"] = "logo"
                             om["role"] = "badge"
@@ -2825,6 +3397,7 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                     continue
                 if not _should_bake_in_cutout(
                     c, cutout_owner, canvas, scene_text_inside, scene_facts,
+                    owner_meta=owner_meta,
                 ):
                     # Oversized cutout + overlayish role on a flat plate: leave as
                     # candidate overlay copy (007 left column under a loose SAM box).
@@ -2853,6 +3426,12 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                 c["meta"]["role"] = "scene-text"
                 break
 
+    # 009: username OCR boxes often swallow the verified badge slot — clip text to
+    # the left of overlapping chrome icons so the cutout stays visible.
+    _clip_text_boxes_away_from_chrome_icons(candidates)
+    # 013: SAM labels circular offer seals as product fragments — promote to badge.
+    _promote_circular_offer_products_to_badges(candidates, canvas)
+
     # routing.route returns a NEW dict (shallow copy) — capture it.
     routed = []
     for c in candidates:
@@ -2869,6 +3448,12 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     # Geometry-only: irregular colored plates (brushstroke banner, starburst seal)
     # hosting OCR → TEXT + plate_shell. No VLM roundtrip.
     _promote_geometric_text_shells(candidates, canvas, cfg, diagnostics)
+    # 066: checklist ✓/✗ chips inside chrome-baked cards stay in the card raster.
+    _absorb_list_icons_into_baked_shells(candidates, diagnostics)
+    # 066: photo panel + checklist card → one continuous column chip (no seam gap).
+    candidates = _merge_comparison_photo_checklist_columns(
+        candidates, canvas, cfg, diagnostics,
+    )
     # Collapse button/shape shells that are near-identical to a nested icon so dense
     # UI chrome does not ship duplicate owners (run 009 engagement icons).
     candidates = _collapse_near_duplicate_nests(candidates)

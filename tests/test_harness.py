@@ -426,3 +426,98 @@ def test_execute_repairs_continues_when_qa_ok_but_repairs_remain(tmp_path):
     summary = harness.execute_repairs(str(run_dir), {}, max_iterations=2, run_one=runner)
     assert calls == ["ocr"]
     assert summary["stopped"] == "qa_ok"
+
+
+# ── Workstream E: admission for baked chrome / kept_in_photo / glyph residue ─────────
+
+def test_admission_rejects_baked_chrome_text_promote(tmp_path):
+    design = {"layers": [{
+        "id": "c_seal", "type": "image",
+        "meta": {"role": "badge", "shell_raster_chip": True, "baked_badge_text": True},
+    }]}
+    (tmp_path / "design.json").write_text(json.dumps(design), encoding="utf-8")
+    repair = {
+        "stage": "text-analysis", "action": "restore-editable-text",
+        "target_id": "c_seal", "severity": "high",
+    }
+    assert harness.admission_reject_reason(repair, run_dir=str(tmp_path), design=design)
+    assert "baked-chrome" in harness.admission_reject_reason(
+        repair, run_dir=str(tmp_path), design=design)
+
+
+def test_admission_rejects_already_sliced_and_kept_in_photo(tmp_path):
+    design = {"layers": [
+        {"id": "c_slice", "type": "image",
+         "meta": {"fallback": "raster-slice", "fallback_scores": {"region_ssim": 0.4}}},
+        {"id": "c_pack", "type": "text", "kept_in_photo": True,
+         "meta": {"kept_in_photo": True, "baked_owner_id": "c_product"}},
+    ]}
+    sliced = {"stage": "reconstruct", "action": "inspect-worst-regions",
+              "target_id": "c_slice",
+              "params": {"regions": [{"layer_id": "c_slice"}]}}
+    kip = {"stage": "ocr", "action": "rerun", "target_id": "c_pack",
+           "params": {"upscale": True}}
+    assert harness.admission_reject_reason(sliced, design=design).startswith("already-sliced")
+    assert harness.admission_reject_reason(kip, design=design).startswith("kept-in-photo")
+
+
+def test_execute_repairs_skips_baked_chrome_without_pipeline_rerun(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    repairs = [{
+        "stage": "reconstruct", "action": "inspect-worst-regions",
+        "target_id": "c_chip", "severity": "high",
+        "params": {"regions": [{"layer_id": "c_chip",
+                                "box": {"x": 0, "y": 0, "w": 10, "h": 10}}]},
+    }]
+    (run_dir / "runtime_report.json").write_text(
+        json.dumps({"input": str(input_path)}), encoding="utf-8")
+    (run_dir / "design.json").write_text(json.dumps({
+        "layers": [{"id": "c_chip", "type": "image",
+                    "meta": {"shell_raster_chip": True, "baked_badge_text": True}}],
+    }), encoding="utf-8")
+    (run_dir / "repairs.json").write_text(json.dumps(repairs), encoding="utf-8")
+    (run_dir / "qa.json").write_text(json.dumps({
+        "ok": False, "hard_fails": [], "ssim": 0.7, "repairs": repairs,
+    }), encoding="utf-8")
+    calls = []
+
+    def runner(*_a, **_k):
+        calls.append(1)
+        return {"ok": True}
+
+    summary = harness.execute_repairs(str(run_dir), {}, max_iterations=2, run_one=runner)
+    assert calls == []
+    assert any(a.get("admission_skipped") for a in summary["attempts"])
+    assert any(a.get("reason") == "baked-or-sliced-deficit" for a in summary["attempts"])
+
+
+def test_qa_accepts_never_true_over_glyph_residue():
+    qa = {
+        "ok": True, "ssim": 0.99, "hard_fails": [],
+        "contract": {"glyph_residue_clean": False, "pass": False},
+        "structural": {"glyph_residue_unresolved": 1},
+    }
+    assert harness._qa_accepts(qa) is False
+    assert harness._qa_accepts({
+        "ok": True, "ssim": 0.99,
+        "hard_fails": [{"rule": "glyph-residue", "detail": "c_ESSENTIALS"}],
+    }) is False
+
+
+def test_structure_plan_fingerprint_includes_scene_intent(tmp_path):
+    (tmp_path / "merged.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "scene_intent.json").write_text(
+        json.dumps({"planning_fingerprint": "abc123"}), encoding="utf-8")
+    (tmp_path / "reconstruction.json").write_text("{}", encoding="utf-8")
+    choice = {"stage": "layout", "action": "refit-geometry", "resume": "layout",
+              "params": {"tighten_containers": True},
+              "patches": {"layout": {"min_container_frac": 0.001}}}
+    fp1, payload = harness._repair_plan_fingerprint(str(tmp_path), choice)
+    assert payload.get("planning_fingerprint") == "abc123"
+    assert "scene_intent.json" in payload["inputs"]
+    # Unchanged inputs → identical fingerprint (skip structure/VLM resume).
+    fp2, _ = harness._repair_plan_fingerprint(str(tmp_path), choice)
+    assert fp1 == fp2

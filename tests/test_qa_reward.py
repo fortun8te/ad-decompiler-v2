@@ -162,11 +162,12 @@ def test_compute_reward_never_raises_on_garbage():
 
 def test_recalibrated_default_gate_rejects_002_class_but_accepts_good_runs():
     """Measured floors: known-BAD 002 = LPIPS-sim 0.732 / local 0.465; good runs
-    (009/013/052) = LPIPS >= 0.976 / local >= 0.60. The default floors (0.80 / 0.50) must
+    (009/013/052) = LPIPS >= 0.976 / local >= 0.60. The default floors (0.80 / 0.55)
     sit in that gap — reject the degraded numbers, accept the good ones."""
     floors = qa_reward.gate_thresholds({})
-    assert floors == {"lpips_similarity_min": 0.80, "local_ssim_min": 0.50,
+    assert floors == {"lpips_similarity_min": 0.80, "local_ssim_min": 0.55,
                       "worst_local_ssim_min": qa_reward._DEFAULT_WORST_LOCAL_SSIM_MIN}
+    assert qa_reward._DEFAULT_WORST_LOCAL_SSIM_MIN == 0.15
     bad = {"components": {"lpips": {"similarity": 0.732}, "local_ssim": {"score": 0.465}}}
     good = {"components": {"lpips": {"similarity": 0.981}, "local_ssim": {"score": 0.601}}}
     assert qa_reward.acceptance_gate("", {}, reward=bad)["ok"] is False
@@ -439,6 +440,57 @@ def test_critique_rasterized_headline_maps_to_restore_editable_text():
          "suggested_fix": "make it editable text"}])
     assert (repairs[0]["stage"], repairs[0]["action"]) == ("text-analysis", "restore-editable-text")
     assert repairs[0]["severity"] == "high"
+
+
+def test_critique_does_not_repromote_baked_chrome_ocr_to_text():
+    design = {"layers": [{
+        "id": "c_seal", "type": "image", "text": "50%",
+        "meta": {"role": "badge", "shell_raster_chip": True, "baked_badge_text": True},
+    }]}
+    repairs = qa_reward.critique_to_repairs([
+        {"element": "50%", "issue": "badge text is baked into an image / not editable",
+         "suggested_fix": "make it editable text", "layer_ids": ["c_seal"]},
+    ], design=design)
+    assert repairs == []
+
+
+def test_acceptance_gate_fails_closed_on_glyph_residue():
+    qa = {
+        "ok": True, "ssim": 0.99, "hard_fails": [],
+        "contract": {"pass": True, "glyph_residue_clean": False},
+        "structural": {"glyph_residue_unresolved": 1},
+        "per_layer": [{"id": "a", "region_ssim": 0.9, "region_px": 100}],
+    }
+    reward = {"components": {
+        "local_ssim": {"score": 0.9, "worst_local": 0.8},
+        "lpips": {"similarity": 0.95},
+    }, "hard_fails": 0}
+    gate = qa_reward.acceptance_gate("", {}, qa=qa, reward=reward)
+    assert gate["ok"] is False
+    assert gate["checks"]["glyph_residue"]["ok"] is False
+
+
+def test_run_critique_uses_worst_region_crop(tmp_path, monkeypatch):
+    _write_png(tmp_path / "normalized.png", (200, 40, 40), size=(64, 64))
+    _write_png(tmp_path / "preview.png", (40, 40, 200), size=(64, 64))
+    (tmp_path / "qa.json").write_text(json.dumps({
+        "local_ssim_worst_window": {
+            "ssim": 0.05,
+            "bbox": {"x": 8, "y": 8, "w": 16, "h": 16},
+        },
+    }), encoding="utf-8")
+    seen = {}
+
+    def fake_ask(source_bytes, preview_bytes, prompt, **kwargs):
+        seen["prompt"] = prompt
+        seen["source_len"] = len(source_bytes)
+        return json.dumps({"critique": []})
+
+    monkeypatch.setattr(qa_reward, "_ask_vlm_pair", fake_ask)
+    result = qa_reward.run_critique(str(tmp_path), _critique_cfg())
+    assert "crop" in result
+    assert result["crop"]["x"] == 8
+    assert "cropped region" in seen["prompt"].lower() or "NOTE" in seen["prompt"]
 
 
 def test_critique_severity_escalates_but_never_downgrades():
