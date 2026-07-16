@@ -605,12 +605,14 @@ def _photographic_scene_text_mode(
         return True
     if not text_cands:
         return False
-    # Screenshots are flat UI, not photographs: a tweet/DM/AMA capture reads to the
-    # geometric inference below as "one dominant photo surface with all OCR inside it"
-    # and baked ALL text (benchmark 009 shipped a 1-layer raster with kept_in_photo=16,
-    # native ratio 0.00). The archetype classifier already knows better — screenshot
-    # text is the contract's prime editable content (H14/H16), never scene texture.
-    if str(scene.get("archetype") or "") == "social_screenshot":
+    # The geometric inference below exists for ONE case: a photograph whose text is
+    # physically part of the scene (021 sticky-notes / printed packaging). Every other
+    # archetype that can trip its conditions has text the contract demands editable:
+    # social_screenshot (tweet body baked → 009 shipped 1 raster layer, native 0.00),
+    # comparison_grid (before/after plates baked → 025 native 0.00 over 15 leaves),
+    # lifestyle_overlay (H7: overlay copy on photos must peel, never bake). Allowlist
+    # the single archetype the heuristic was designed for instead of chasing exclusions.
+    if str(scene.get("archetype") or "") not in ("caption_over_photo", ""):
         return False
     # 007-style can + left column: product geometry decides. Tiny person/logo chips
     # inside a full-bleed photo must not block 021 photographic-scene mode.
