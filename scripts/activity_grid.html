@@ -25,7 +25,7 @@
     font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
     -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 14px 14px 28px; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 12px 12px 24px; }
   .row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
   .dim { color: var(--dim); }
   .faint { color: var(--faint); }
@@ -33,38 +33,42 @@
   .ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
 
-  header .path { flex: 1; min-width: 120px; }
-  #summary { margin-top: 2px; }
+  header .path { flex: 1; min-width: 100px; font-size: 11px; }
+  #summary { margin-top: 2px; font-size: 11px; }
 
-  /* matrix */
-  #grid { margin-top: 4px; }
-  .m {
-    display: grid;
-    grid-template-columns: minmax(70px, 120px) minmax(0, 1fr) 34px 44px 40px;
-    gap: 0 10px;
-    align-items: center;
-    padding: 3px 4px;
-    margin: 0 -4px;
-    cursor: pointer;
-    border-left: 2px solid transparent;
+  /* ad-dots overview: one dot per ad */
+  #dots { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .dot {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--cell); border: 1px solid var(--line);
+    cursor: pointer; flex: 0 0 auto; padding: 0;
+    -webkit-appearance: none; appearance: none;
   }
-  .m:hover { background: #121418; }
-  .m.sel { background: #14171b; border-left-color: var(--faint); }
-  .m.live { border-left-color: var(--run); }
-  .m .id { font-size: 11px; }
-  .m.st-pending .id { color: var(--faint); }
-  .m.st-failed .id { color: var(--err); }
-  .m.st-stalled .id { color: var(--stall); }
-  .num { text-align: right; font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .num.q { color: var(--faint); }
-  .track { display: grid; grid-template-columns: repeat(18, 1fr); gap: 2px; min-width: 0; }
-  .c { height: 9px; background: var(--cell); }
-  .c.done { background: var(--done); }
-  .c.active { background: var(--run); animation: pulse 1.4s ease-in-out infinite; }
-  .c.stalled { background: var(--stall); }
-  .c.failed { background: var(--err); }
-  @keyframes pulse { 50% { opacity: 0.35; } }
+  .dot:hover { border-color: var(--faint); }
+  .dot.sel { box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--ink); }
+  .dot.st-done { background: var(--done); border-color: var(--done); }
+  .dot.st-running { background: var(--run); border-color: var(--run); animation: pulse 1.4s ease-in-out infinite; }
+  .dot.st-stalled { background: var(--stall); border-color: var(--stall); }
+  .dot.st-failed { background: var(--err); border-color: var(--err); }
+  .dot.st-partial { background: var(--faint); border-color: var(--faint); }
+  @keyframes pulse { 50% { opacity: 0.4; } }
   #empty { color: var(--faint); padding: 12px 0; }
+
+  /* selected-ad detail */
+  #detail { margin-top: 4px; }
+  #detId { font-size: 13px; }
+  #detStage { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .sdot {
+    width: 15px; height: 15px; border-radius: 50%;
+    background: var(--cell); flex: 0 0 auto;
+    display: grid; place-items: center;
+    font-size: 8px; color: transparent;
+  }
+  .sdot.done { background: var(--done); }
+  .sdot.active { background: var(--run); animation: pulse 1.4s ease-in-out infinite; }
+  .sdot.stalled { background: var(--stall); }
+  .sdot.failed { background: var(--err); }
+  #stageLabel { font-size: 10px; color: var(--faint); margin-top: 4px; min-height: 14px; }
 
   /* live + feed */
   #live { margin-top: 2px; }
@@ -77,8 +81,8 @@
 
   /* inspect */
   #inspect { margin-top: 4px; }
-  .shots { display: flex; gap: 8px; margin-top: 6px; }
-  .shot { flex: 1; min-width: 0; }
+  .shots { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+  .shot { flex: 1 1 140px; min-width: 0; }
   .shot .box {
     aspect-ratio: 4 / 5;
     background: #101215;
@@ -106,17 +110,19 @@
   #lb {
     display: none; position: fixed; inset: 0; z-index: 10;
     background: rgba(8, 9, 11, 0.92);
-    align-items: center; justify-content: center; padding: 20px; cursor: zoom-out;
+    align-items: center; justify-content: center; padding: 16px; cursor: zoom-out;
   }
   #lb.open { display: flex; }
   #lb img { max-width: 96vw; max-height: 92vh; object-fit: contain; }
 
-  @media (max-width: 560px) {
-    .m { grid-template-columns: minmax(60px, 90px) minmax(0, 1fr) 40px; }
-    .m .time, .m .q { display: none; }
+  @media (max-width: 480px) {
+    .wrap { padding: 8px 8px 20px; }
+    .dot { width: 16px; height: 16px; }
+    .sdot { width: 17px; height: 17px; }
     .shots { flex-direction: column; }
-    .shot .box { aspect-ratio: auto; max-height: 46vh; min-height: 80px; }
-    .shot .box img { height: auto; max-height: 46vh; }
+    .shot { flex-basis: auto; }
+    .shot .box { aspect-ratio: auto; max-height: 42vh; min-height: 80px; }
+    .shot .box img { height: auto; max-height: 42vh; }
   }
 </style>
 </head>
@@ -129,10 +135,19 @@
     <span id="conn" class="faint">connecting</span>
   </header>
   <div id="summary" class="dim">—</div>
+
+  <div id="dots"></div>
+  <div id="empty" hidden>no runs — watching for pipeline.log files</div>
   <hr />
 
-  <div id="grid"></div>
-  <div id="empty" hidden>no runs — watching for pipeline.log files</div>
+  <div id="detail">
+    <div class="row">
+      <span id="detId" class="dim">select an ad</span>
+      <span id="detSub" class="faint"></span>
+    </div>
+    <div id="detStage"></div>
+    <div id="stageLabel"></div>
+  </div>
   <hr />
 
   <div id="live">
@@ -147,10 +162,6 @@
   <hr />
 
   <div id="inspect">
-    <div class="row">
-      <span id="cmpId" class="dim">select a run</span>
-      <span id="cmpSub" class="faint"></span>
-    </div>
     <div class="shots">
       <div class="shot"><div class="lbl">original</div><div class="box" id="shotO">—</div></div>
       <div class="shot"><div class="lbl">rebuild</div><div class="box" id="shotP">—</div></div>
@@ -179,10 +190,11 @@ const DEFAULT_STAGES = [
 const $ = (id) => document.getElementById(id);
 const els = {
   rootPath: $("rootPath"), phase: $("phase"), conn: $("conn"), summary: $("summary"),
-  grid: $("grid"), empty: $("empty"),
+  dots: $("dots"), empty: $("empty"),
+  detId: $("detId"), detSub: $("detSub"), detStage: $("detStage"), stageLabel: $("stageLabel"),
   lvId: $("lvId"), lvStage: $("lvStage"), lvMeta: $("lvMeta"), liveLine: $("liveLine"),
   feed: $("feed"),
-  cmpId: $("cmpId"), cmpSub: $("cmpSub"), shotO: $("shotO"), shotP: $("shotP"),
+  shotO: $("shotO"), shotP: $("shotP"),
   btnPrev: $("btnPrev"), btnNext: $("btnNext"), doneNav: $("doneNav"),
   footUpdated: $("footUpdated"),
   lb: $("lb"), lbImg: $("lbImg"),
@@ -196,7 +208,9 @@ let lastRev = -1;
 let lastGeneration = -1;
 let lastRecvAt = 0;
 let sseMode = "connecting";
-const rowSigs = new Map();
+const dotEls = new Map();   // run.id -> dot button element
+const dotSigs = new Map();  // run.id -> last-rendered signature
+const sdotEls = [];         // stage-dot elements for the detail bar (fixed length = stages.length)
 
 function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -223,6 +237,14 @@ function elapsedFor(run) {
 function runsList() { return (state && state.benchmark && state.benchmark.runs) || []; }
 function runById(id) { return runsList().find((r) => r.id === id) || null; }
 function doneRuns() { return runsList().filter((r) => r.complete); }
+function statusClass(run) {
+  if (run.complete) return "st-done";
+  if (run.status === "failed") return "st-failed";
+  if (run.status === "stalled") return "st-stalled";
+  if (run.status === "running") return "st-running";
+  if (run.status === "partial") return "st-partial";
+  return "";
+}
 
 function selectAd(id, fromUser) {
   if (!id) return;
@@ -270,11 +292,23 @@ function renderHeader() {
 }
 
 function renderConn() {
+  // Transport health != data freshness: an idle SSE socket during a genuinely
+  // quiet pipeline stretch (no new log line for a while) is NOT a dead connection.
+  // Trust the socket's own readyState when in SSE mode; only fall back to a
+  // staleness check in poll mode, where a fresh fetch really is expected every 2s.
+  if (sseMode === "live") {
+    const open = sseSocket && sseSocket.readyState === EventSource.OPEN;
+    if (open) { els.conn.textContent = "sse"; els.conn.className = "faint"; return; }
+    els.conn.textContent = "reconnecting"; els.conn.className = "faint";
+    return;
+  }
   const age = lastRecvAt ? (Date.now() - lastRecvAt) / 1000 : Infinity;
-  if (age > 15) { els.conn.textContent = "no data"; els.conn.className = "err"; }
-  else if (sseMode === "live") { els.conn.textContent = "sse"; els.conn.className = "faint"; }
-  else if (sseMode === "poll") { els.conn.textContent = "poll"; els.conn.className = "faint"; }
-  else { els.conn.textContent = "connecting"; els.conn.className = "faint"; }
+  if (sseMode === "poll") {
+    if (age > 15) { els.conn.textContent = "no data"; els.conn.className = "err"; }
+    else { els.conn.textContent = "poll"; els.conn.className = "faint"; }
+    return;
+  }
+  els.conn.textContent = "connecting"; els.conn.className = "faint";
 }
 
 function renderSummary() {
@@ -306,6 +340,48 @@ function renderSummary() {
   els.summary.innerHTML = parts.join('<span class="faint"> · </span>');
 }
 
+/* ---- ad-dots overview: one dot per ad, ID-keyed so unrelated reordering
+   never forces a full teardown/rebuild (the actual cause of prior flicker). ---- */
+function renderDots() {
+  const runs = runsList();
+  els.empty.hidden = runs.length > 0;
+  if (!runs.length) {
+    els.dots.innerHTML = "";
+    dotEls.clear();
+    dotSigs.clear();
+    return;
+  }
+
+  const liveId = state && state.live ? state.live.image_id : null;
+  const seen = new Set();
+  runs.forEach((run) => {
+    seen.add(run.id);
+    const isSel = run.id === selectedId;
+    const sig = [run.status, run.complete, Math.round(run.percent || 0), isSel, run.id === liveId].join("|");
+    let dot = dotEls.get(run.id);
+    if (!dot) {
+      dot = document.createElement("button");
+      dot.type = "button";
+      dot.className = "dot";
+      dot.addEventListener("click", () => selectAd(run.id, true));
+      dotEls.set(run.id, dot);
+      els.dots.appendChild(dot);
+    }
+    if (dotSigs.get(run.id) === sig) return;
+    dotSigs.set(run.id, sig);
+    dot.className = "dot " + statusClass(run) + (isSel ? " sel" : "");
+    const qa = run.qa && typeof run.qa.ssim === "number"
+      ? " · ssim " + run.qa.ssim.toFixed(2) + " · recall " + ((run.qa.text_recall || 0) * 100).toFixed(0) + "%"
+      : "";
+    dot.title = run.id + " · " + run.status + " · " + Number(run.percent || 0).toFixed(0) + "%" +
+      (run.id === liveId ? " · live" : "") + qa;
+  });
+  // Prune dots for runs no longer present (rare: root switch).
+  for (const [id, dot] of dotEls) {
+    if (!seen.has(id)) { dot.remove(); dotEls.delete(id); dotSigs.delete(id); }
+  }
+}
+
 function cellState(run, name) {
   if (run.complete || (run.done || []).includes(name)) return "done";
   if (run.active === name) {
@@ -316,55 +392,57 @@ function cellState(run, name) {
   return "";
 }
 
-function buildGrid() {
-  els.grid.innerHTML = "";
-  rowSigs.clear();
-  runsList().forEach((run) => {
-    const row = document.createElement("div");
-    row.className = "m";
-    row.dataset.id = run.id;
-    row.addEventListener("click", () => selectAd(run.id, true));
-    els.grid.appendChild(row);
+/* ---- selected-ad detail: id/status line + one dot per pipeline stage
+   ("the progress dot bar"), rebuilt only when the selected ad or stage list changes. ---- */
+let detailBuiltFor = null;
+function buildStageDots() {
+  els.detStage.innerHTML = "";
+  sdotEls.length = 0;
+  stages.forEach((name) => {
+    const d = document.createElement("span");
+    d.className = "sdot";
+    d.dataset.stage = name;
+    d.addEventListener("mouseenter", () => { els.stageLabel.textContent = name; });
+    sdotEls.push(d);
+    els.detStage.appendChild(d);
   });
+  els.detStage.addEventListener("mouseleave", () => { els.stageLabel.textContent = ""; }, { once: false });
 }
 
-function renderGrid() {
-  const runs = runsList();
-  els.empty.hidden = runs.length > 0;
-  if (!runs.length) { els.grid.innerHTML = ""; rowSigs.clear(); return; }
+function renderDetail() {
+  const id = selectedId || (state && state.live && state.live.image_id);
+  const run = id && id !== "runtime-smoke" ? runById(id) : null;
 
-  const liveId = state && state.live ? state.live.image_id : null;
-  const rows = els.grid.querySelectorAll(".m");
-  const idsMatch = rows.length === runs.length &&
-    [...rows].every((el, i) => el.dataset.id === runs[i].id);
-  if (!idsMatch) buildGrid();
+  if (detailBuiltFor !== stages.length) {
+    buildStageDots();
+    detailBuiltFor = stages.length;
+  }
 
-  const rows2 = els.grid.querySelectorAll(".m");
-  runs.forEach((run, i) => {
-    const row = rows2[i];
-    const isLive = run.id === liveId;
-    const isSel = run.id === selectedId;
-    const sig = [run.status, run.active, (run.done || []).length, run.complete,
-      run.failed, run.stalled, Math.round(run.percent || 0),
-      run.qa && run.qa.ssim, isSel, isLive].join("|");
-    if (rowSigs.get(run.id) === sig) return;
-    rowSigs.set(run.id, sig);
+  if (!run) {
+    els.detId.textContent = "select an ad";
+    els.detSub.textContent = "";
+    sdotEls.forEach((d) => { d.className = "sdot"; });
+    return;
+  }
 
-    row.className = "m st-" + run.status + (isLive ? " live" : "") + (isSel ? " sel" : "");
-    const secs = run.stage_secs || {};
-    const cells = stages.map((name) => {
-      const st = cellState(run, name);
-      let tip = name + " · " + (st || "pending");
-      if (st === "done" && secs[name] != null) tip += " · " + secs[name] + "s";
-      return '<div class="c ' + st + '" title="' + esc(tip) + '"></div>';
-    }).join("");
+  els.detId.textContent = shortId(run.id);
+  els.detId.title = run.id;
+  const qa = run.qa && typeof run.qa.ssim === "number"
+    ? " · ssim " + run.qa.ssim.toFixed(3) +
+      " · recall " + ((run.qa.text_recall || 0) * 100).toFixed(0) + "%" +
+      (run.qa.repairs != null ? " · repairs " + run.qa.repairs : "")
+    : "";
+  els.detSub.textContent = run.status + " · " + Number(run.percent || 0).toFixed(0) + "% · " +
+    fmtDur(elapsedFor(run)) + qa;
 
-    row.innerHTML =
-      '<div class="id ellip" title="' + esc(run.id + " · " + run.status) + '">' + esc(shortId(run.id)) + "</div>" +
-      '<div class="track">' + cells + "</div>" +
-      '<div class="num">' + Number(run.percent || 0).toFixed(0) + "%</div>" +
-      '<div class="num time" data-time-for="' + esc(run.id) + '">' + fmtDur(elapsedFor(run)) + "</div>" +
-      '<div class="num q">' + (run.qa && typeof run.qa.ssim === "number" ? run.qa.ssim.toFixed(2) : "·") + "</div>";
+  const secs = run.stage_secs || {};
+  stages.forEach((name, i) => {
+    const st = cellState(run, name);
+    const d = sdotEls[i];
+    d.className = "sdot " + st;
+    let tip = name + " · " + (st || "pending");
+    if (st === "done" && secs[name] != null) tip += " · " + secs[name] + "s";
+    d.title = tip;
   });
 }
 
@@ -456,22 +534,10 @@ function renderInspect() {
   els.btnNext.disabled = done.length < 2;
 
   if (!run) {
-    els.cmpId.textContent = "select a run";
-    els.cmpSub.textContent = "";
     setShot(els.shotO, null, null, "—", "o");
     setShot(els.shotP, null, null, "—", "p");
     return;
   }
-
-  els.cmpId.textContent = shortId(run.id);
-  els.cmpId.title = run.id;
-  const qa = run.qa && typeof run.qa.ssim === "number"
-    ? " · ssim " + run.qa.ssim.toFixed(3) +
-      " · recall " + ((run.qa.text_recall || 0) * 100).toFixed(0) + "%" +
-      (run.qa.repairs != null ? " · repairs " + run.qa.repairs : "")
-    : "";
-  els.cmpSub.textContent = run.status + " · " + Number(run.percent || 0).toFixed(0) + "% · " +
-    fmtDur(elapsedFor(run)) + qa;
 
   setShot(els.shotO, run, run.has_original ? "original.png" : null,
     run.status === "pending" ? "queued" : "waiting on normalize", "o");
@@ -507,7 +573,8 @@ function render(force) {
   followLiveIfNeeded();
   renderHeader();
   renderSummary();
-  renderGrid();
+  renderDots();
+  renderDetail();
   renderLive();
   renderInspect();
   const d = new Date((state.updated_at || Date.now() / 1000) * 1000);
@@ -530,15 +597,15 @@ setInterval(() => {
       Number(live.percent || 0).toFixed(0) + "%" +
       (live.image_id === "runtime-smoke" ? "" : " · " + idx + "/" + stages.length);
   }
-  document.querySelectorAll("[data-time-for]").forEach((el) => {
-    const run = runById(el.getAttribute("data-time-for"));
-    if (run && (run.status === "running" || run.status === "stalled")) {
-      el.textContent = fmtDur(elapsedFor(run));
-    }
-  });
+  const selRun = selectedId ? runById(selectedId) : null;
+  if (selRun && (selRun.status === "running" || selRun.status === "stalled")) {
+    els.detSub.textContent = selRun.status + " · " + Number(selRun.percent || 0).toFixed(0) + "% · " + fmtDur(elapsedFor(selRun));
+  }
   renderConn();
 }, 500);
 
+let pollTimer = null;
+let sseSocket = null;
 async function pollOnce() {
   try {
     const res = await fetch("/status.json?_=" + Date.now(), { cache: "no-store" });
@@ -550,15 +617,27 @@ async function pollOnce() {
 function connectSSE() {
   let es;
   try { es = new EventSource("/events"); } catch (_) { sseMode = "poll"; return; }
-  es.onopen = () => { sseMode = "live"; renderConn(); };
-  es.onerror = () => { sseMode = "poll"; renderConn(); };
+  sseSocket = es;
+  es.onopen = () => {
+    sseMode = "live";
+    renderConn();
+    // SSE is delivering pushes; stop the redundant 2s poll to avoid duplicate
+    // fetch/apply churn (a real source of visible jank with many ads live).
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  };
+  es.onerror = () => {
+    sseMode = "poll";
+    renderConn();
+    if (!pollTimer) pollTimer = setInterval(pollOnce, 2000);
+  };
   es.onmessage = (ev) => {
     sseMode = "live";
+    lastRecvAt = Date.now();
     try { applyStatus(JSON.parse(ev.data)); } catch (_) {}
   };
 }
 connectSSE();
-setInterval(pollOnce, 2000);
+pollTimer = setInterval(pollOnce, 2000);
 pollOnce();
 document.addEventListener("visibilitychange", () => { if (!document.hidden) pollOnce(); });
 </script>

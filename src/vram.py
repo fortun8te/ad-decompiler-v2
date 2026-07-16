@@ -189,6 +189,51 @@ def unload_sam_backend() -> None:
 
 
 # ── LM Studio VLM eviction ──────────────────────────────────────────────────────────
+_COMFY_FREED_AT: float = 0.0
+
+
+def free_comfy_vram(cfg: Optional[dict] = None, *,
+                    log_fn: Optional[Callable[[str], None]] = None,
+                    min_used_mib: float = 11000.0,
+                    throttle_s: float = 30.0) -> bool:
+    """Ask ComfyUI to unload its resident models (Flux stays loaded after an inpaint).
+
+    A resident Flux Fill (~6.4 GB + T5) alongside the LM Studio VLM (~6.3 GB) exhausts a
+    16 GB card, and a starved llama-server then times out EVERY VLM call at the full
+    timeout ceiling — measured live 2026-07-16: fixture 021 spent 8+ minutes in
+    ocr-judge/font-judge purely because Flux from the previous fixture's inpaint was
+    still resident.  Called when entering VLM-heavy boundaries; only fires when the
+    ComfyUI queue is idle (never interrupts a running job), GPU usage is actually high,
+    and not more than once per ``throttle_s``.  Best-effort, never raises.
+    """
+    global _COMFY_FREED_AT
+    import json as _json
+    import time as _time
+    import urllib.request as _rq
+    try:
+        if _time.monotonic() - _COMFY_FREED_AT < throttle_s:
+            return False
+        mem = nvidia_smi_mem()
+        if mem and float(mem.get("used_mib") or 0) < min_used_mib:
+            return False
+        icfg = ((cfg or {}).get("inpaint") or {}).get("comfy") or {}
+        base = str(icfg.get("base_url") or "http://127.0.0.1:8188").rstrip("/")
+        with _rq.urlopen(_rq.Request(base + "/queue"), timeout=2) as resp:
+            queue = _json.loads(resp.read().decode("utf-8", "replace"))
+        if (queue.get("queue_running") or []) or (queue.get("queue_pending") or []):
+            return False
+        body = _json.dumps({"unload_models": True, "free_memory": True}).encode()
+        req = _rq.Request(base + "/free", data=body,
+                          headers={"Content-Type": "application/json"}, method="POST")
+        with _rq.urlopen(req, timeout=5):
+            pass
+        _COMFY_FREED_AT = _time.monotonic()
+        _emit(log_fn, "vram: freed resident ComfyUI models (Flux) before VLM stage")
+        return True
+    except Exception:
+        return False
+
+
 def _lms_path(cfg: Optional[dict] = None) -> Optional[str]:
     """Locate the LM Studio CLI (`lms`) on PATH or at its default install location."""
     override = str(((cfg or {}).get("runtime") or {}).get("vram", {}).get("lms_path") or "").strip()
@@ -470,6 +515,11 @@ def stage_boundary(
         unload_ocr_engines()
     if to_stage in {"vlm-ocr-judge", "vlm-proofread", "vlm-font-judge", "vlm-scene-text"} and opts["unload_ocr_before_vlm"]:
         unload_ocr_engines()
+    if to_stage in {"vlm-ocr-judge", "vlm-proofread", "vlm-font-judge", "vlm-scene-text",
+                    "vlm-element-propose", "vlm-grouping"}:
+        # A Flux model left resident by the PREVIOUS fixture's inpaint starves the
+        # llama-server the VLM stages depend on (every call times out at the ceiling).
+        free_comfy_vram(cfg, log_fn=log_fn)
     if to_stage in {"reconstruct", "inpaint", "vlm-segment-filter", "peel"}:
         unload_sam_backend()
 

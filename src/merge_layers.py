@@ -605,6 +605,13 @@ def _photographic_scene_text_mode(
         return True
     if not text_cands:
         return False
+    # Screenshots are flat UI, not photographs: a tweet/DM/AMA capture reads to the
+    # geometric inference below as "one dominant photo surface with all OCR inside it"
+    # and baked ALL text (benchmark 009 shipped a 1-layer raster with kept_in_photo=16,
+    # native ratio 0.00). The archetype classifier already knows better — screenshot
+    # text is the contract's prime editable content (H14/H16), never scene texture.
+    if str(scene.get("archetype") or "") == "social_screenshot":
+        return False
     # 007-style can + left column: product geometry decides. Tiny person/logo chips
     # inside a full-bleed photo must not block 021 photographic-scene mode.
     if _has_product_vs_overlay_split(product_regions, canvas):
