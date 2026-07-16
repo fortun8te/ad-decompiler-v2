@@ -187,3 +187,30 @@ def test_multi_pass_consensus_canonicalizes_json_and_code_fences(monkeypatch):
     assert note is None
     assert json.loads(answer)["label"] == "keep"
     assert crops == [b"tight", b"wide"]
+
+
+def test_parallelism_from_cfg_defaults_and_clamps():
+    assert vlm_client.parallelism_from_cfg(None) == 4
+    assert vlm_client.parallelism_from_cfg({}) == 4
+    assert vlm_client.parallelism_from_cfg({"vlm": {"parallelism": 8}}) == 8
+    assert vlm_client.parallelism_from_cfg({"vlm": {"parallel": 3}}) == 3
+    assert vlm_client.parallelism_from_cfg({"vlm": {"parallelism": 0}}) == 1
+    assert vlm_client.parallelism_from_cfg({"vlm": {"parallelism": "nope"}}) == 4
+
+
+def test_map_parallel_preserves_order_and_uses_workers():
+    seen = []
+
+    def work(n):
+        seen.append(n)
+        return n * 10
+
+    assert vlm_client.map_parallel(work, [1, 2, 3], workers=1) == [10, 20, 30]
+    assert seen == [1, 2, 3]
+    seen.clear()
+    assert vlm_client.map_parallel(work, [1, 2, 3, 4], workers=4) == [10, 20, 30, 40]
+    assert sorted(seen) == [1, 2, 3, 4]
+
+
+def test_map_parallel_empty():
+    assert vlm_client.map_parallel(lambda x: x, [], workers=4) == []

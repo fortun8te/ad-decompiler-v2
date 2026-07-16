@@ -61,8 +61,21 @@ DEFAULT_PROMPTS = [
     # which an ``arrow``-only prompt does not reliably propose.  Routing already gives
     # this role the gated vector path with an exact alpha-raster fallback.
     {"prompt": "callout leader line", "role": "callout_leader", "kind": "icon"},
+    # Circular endpoint dots on leader lines (Wavy beach / 041 / 044).
+    {"prompt": "callout leader endpoint dot", "role": "leader_dot", "kind": "icon"},
+    # IM8 STRUGGLE→product string/thread leaders (same vector path as callout leaders).
+    {"prompt": "thin string leader line to product", "role": "string", "kind": "icon"},
+    {"prompt": "vertical divider line", "role": "divider", "kind": "shape"},
     {"prompt": "starburst price badge", "role": "price_burst", "kind": "icon"},
     {"prompt": "sale burst sticker", "role": "sale_burst", "kind": "icon"},
+    {"prompt": "sale circle badge", "role": "sale_burst", "kind": "icon"},
+    {"prompt": "starburst seal badge", "role": "starburst", "kind": "icon"},
+    {"prompt": "star rating row", "role": "rating", "kind": "icon"},
+    {"prompt": "trustpilot stars", "role": "rating", "kind": "icon"},
+    {"prompt": "as seen in logo strip", "role": "logo-strip", "kind": "photo-fragment"},
+    {"prompt": "painted brushstroke banner", "role": "banner", "kind": "shape"},
+    {"prompt": "irregular text banner", "role": "banner", "kind": "shape"},
+    {"prompt": "brush stroke offer banner", "role": "banner", "kind": "shape"},
     {"prompt": "badge", "role": "badge", "kind": "icon"},
     {"prompt": "verified badge", "role": "verified", "kind": "icon"},
     {"prompt": "verified checkmark", "role": "verified", "kind": "icon"},
@@ -88,6 +101,9 @@ DEFAULT_PROMPTS = [
     {"prompt": "table or nutrition facts panel", "role": "nutrition-panel", "kind": "photo-fragment"},
     {"prompt": "diagram or infographic", "role": "diagram", "kind": "photo-fragment"},
     {"prompt": "inseparable product cluster", "role": "product-cluster", "kind": "photo-fragment"},
+    # IM8 chaotic pill piles / photographic body-morph strips — honest single raster.
+    {"prompt": "chaotic pile of pills", "role": "pill-cloud", "kind": "photo-fragment"},
+    {"prompt": "body transformation progression strip", "role": "body-progression", "kind": "photo-fragment"},
 ]
 
 _BACKEND_CACHE = {}
@@ -748,6 +764,44 @@ def _fallback_elements(
     return out
 
 
+def _role_early_exit_cfg(scfg: dict) -> dict:
+    """Skip remaining synonym text-prompts for a role once enough hits exist.
+
+    Dense ads often list ``product`` then ``product package`` / ``product shot``.
+    Fusion collapses the duplicates, so extra synonym prompts mostly burn wall time.
+    Box-refine of residuals is unaffected.
+    """
+    raw = scfg.get("role_prompt_early_exit")
+    if isinstance(raw, bool):
+        out = {"enabled": raw}
+    elif isinstance(raw, dict):
+        out = dict(raw)
+    elif raw is None:
+        out = {}
+    else:
+        out = {"enabled": False}
+    out.setdefault("enabled", True)
+    out["min_hits"] = int(out.get("min_hits", 2))
+    out["min_score"] = float(out.get("min_score", 0.55))
+    return out
+
+
+def _role_hit_counts(elements: list, *, min_score: float) -> dict[str, int]:
+    """Count accepted text-prompt observations per role at/above ``min_score``."""
+    counts: dict[str, int] = {}
+    for element in elements or []:
+        prov = element.get("provenance") or {}
+        if prov.get("mode") != "text-prompt":
+            continue
+        if float(element.get("score", 0) or 0) < float(min_score):
+            continue
+        role = str(element.get("role") or "").strip().lower()
+        if not role:
+            continue
+        counts[role] = counts.get(role, 0) + 1
+    return counts
+
+
 def detect(
     img_path: str,
     residual: Optional[list] = None,
@@ -810,12 +864,21 @@ def detect(
     box_min_score = _box_refine_min_score(scfg, residual)
     text_prompt_successes = 0
     text_prompt_predictions = 0
+    text_prompts_skipped = 0
     box_prompt_successes = 0
     box_prompt_predictions = 0
+    role_exit = _role_early_exit_cfg(scfg)
 
     # Open-vocabulary sweep. Duplicates are intentionally retained as observations and
-    # resolved once, mask-aware, by element_fusion.fuse().
+    # resolved once, mask-aware, by element_fusion.fuse().  Synonym prompts for a role
+    # already covered by enough high-score hits are skipped (config-gated).
     for spec in prompts:
+        role_key = str(spec.get("role") or "").strip().lower()
+        if role_exit["enabled"] and role_key:
+            hits = _role_hit_counts(elements, min_score=role_exit["min_score"])
+            if hits.get(role_key, 0) >= role_exit["min_hits"]:
+                text_prompts_skipped += 1
+                continue
         try:
             preds = _prediction_dicts(backend.predict_text(spec["prompt"]), width, height)
             text_prompt_successes += 1
@@ -1011,6 +1074,7 @@ def detect(
         "diagnostics": {
             "text_prompts_attempted": len(prompts),
             "text_prompts_succeeded": text_prompt_successes,
+            "text_prompts_skipped_role_exit": text_prompts_skipped,
             "text_predictions": text_prompt_predictions,
             "box_prompts_attempted": sum(1 for item in residual if _valid_box(item.get("box"))),
             "box_prompts_succeeded": box_prompt_successes,

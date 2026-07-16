@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.1.0","build":56,"commit":"ba5b0cc","dirty":false,"built_at":"2026-07-15T23:20:16Z","label":"v2.1.0+b56.ba5b0cc","source":"git"};
+const PLUGIN_BUILD = {"version":"2.1.0","build":58,"commit":"local","dirty":true,"built_at":"2026-07-16T00:40:00Z","label":"v2.1.0+b58.local-dirty","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,
@@ -395,7 +395,12 @@ function applyStrokes(node, layer, context) {
   const first = typeof specs[0] === "object" ? specs[0] : {};
   const weight = finite(pick(first, "width", "weight", "strokeWeight", "stroke_weight"), finite(pick(layer, "stroke_width", "strokeWidth"), 1));
   safeSet(node, "strokeWeight", Math.max(0, weight), context);
-  const align = normalizedToken(pick(first, "align", "alignment", "strokeAlign", "stroke_align"));
+  // Text outlines must sit OUTSIDE the glyph fill. CENTER/INSIDE paints opaque
+  // stroke ink over the letters and is the usual "stroke covers the text" failure.
+  let align = normalizedToken(pick(first, "align", "alignment", "strokeAlign", "stroke_align"));
+  if (node.type === "TEXT") {
+    if (!align || align === "CENTER" || align === "INSIDE" || align === "CENTRE") align = "OUTSIDE";
+  }
   if (align) safeSet(node, "strokeAlign", align, context);
   const caps = normalizedToken(pick(first, "cap", "strokeCap", "stroke_cap"));
   if (caps) safeSet(node, "strokeCap", caps, context);

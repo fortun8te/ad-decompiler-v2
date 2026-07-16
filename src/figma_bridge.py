@@ -117,7 +117,7 @@ def _tail_stage(run_dir):
     return tail_running_stage(run_dir)
 
 
-_HISTORY_MAX = 10
+_HISTORY_MAX = 40
 _STAGE_PROGRESS_IN_STAGE = 0.35  # assume ~35% through the active stage for ETA/progress
 
 
@@ -309,6 +309,53 @@ def _record_history(inbox, duration_s, run_dir=None, *, job_id=None, filename=No
         _atomic_write(_history_path(inbox), json.dumps(payload).encode())
     except OSError:
         pass
+
+
+def _resolve_history_run_dir(inbox, *, job_id=None, doc_id=None):
+    """Map a history identity back to ``uploads/<job_id>/run`` when the folder still exists."""
+    want_job = str(job_id or "").strip()
+    want_doc = str(doc_id or "").strip()
+    if not want_job and not want_doc:
+        return None, None
+    rows = list(_read_history(inbox).get("runs") or [])
+    # Newest first — matches /history response order.
+    for row in reversed(rows):
+        row_job = str(row.get("job_id") or "").strip()
+        row_doc = str(row.get("doc_id") or "").strip()
+        if want_job and row_job != want_job:
+            continue
+        if want_doc and row_doc != want_doc:
+            continue
+        if not row_job:
+            continue
+        candidate = os.path.join(inbox, "uploads", row_job, "run")
+        if os.path.isdir(candidate):
+            return candidate, row
+    return None, None
+
+
+def _restage_history_run(inbox, cfg, *, job_id=None, doc_id=None):
+    """Re-stage a past conversion into the live inbox so the plugin can import it again."""
+    run_dir, row = _resolve_history_run_dir(inbox, job_id=job_id, doc_id=doc_id)
+    if not run_dir:
+        return {"ok": False, "error": "history run not found or upload folder was pruned"}
+    staged = _stage_job_output(inbox, run_dir, cfg or {})
+    if not staged.get("staged"):
+        return {
+            "ok": False,
+            "error": staged.get("staging_error") or "could not restage design.json",
+            "job_id": (row or {}).get("job_id"),
+            "doc_id": (row or {}).get("doc_id"),
+        }
+    return {
+        "ok": True,
+        "job_id": (row or {}).get("job_id"),
+        "doc_id": staged.get("doc_id") or (row or {}).get("doc_id"),
+        "layer_count": staged.get("layer_count"),
+        "design_url": "/design.json",
+        "filename": (row or {}).get("filename"),
+        "manifest": staged.get("manifest"),
+    }
 
 
 def _atomic_write(path, data: bytes):
@@ -1287,10 +1334,19 @@ def make_handler(inbox, config_path=None):
                 # endpoint omits local run paths; the plugin only needs enough
                 # context to distinguish an older conversion from the staged one.
                 history = _read_history(inbox)
+                runs = list(reversed(history.get("runs") or []))
+                query = parse_qs(u.query)
+                try:
+                    limit = int((query.get("limit") or [str(_HISTORY_MAX)])[0])
+                except (TypeError, ValueError):
+                    limit = _HISTORY_MAX
+                limit = max(1, min(_HISTORY_MAX, limit))
                 payload = {
                     "ok": True,
                     "version": history.get("version", 2),
-                    "runs": list(reversed(history.get("runs") or [])),
+                    "limit": limit,
+                    "max": _HISTORY_MAX,
+                    "runs": runs[:limit],
                 }
                 return self._send(200, json.dumps(payload).encode(), "application/json")
             if u.path == "/inbox.json":
@@ -1459,6 +1515,23 @@ def make_handler(inbox, config_path=None):
 
         def _route_post(self):
             route = urlparse(self.path).path
+            if route == "/history/restage":
+                n = self._content_length(max_bytes=16 * 1024)
+                if n is None:
+                    return self._send(400, b'{"ok":false,"error":"missing or invalid Content-Length"}',
+                                       "application/json")
+                try:
+                    body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+                except (UnicodeDecodeError, ValueError, TypeError):
+                    return self._send(400, b'{"ok":false,"error":"invalid JSON body"}', "application/json")
+                if not isinstance(body, dict):
+                    return self._send(400, b'{"ok":false,"error":"JSON object required"}', "application/json")
+                result = _restage_history_run(
+                    inbox, base_cfg,
+                    job_id=body.get("job_id"), doc_id=body.get("doc_id"),
+                )
+                status = 200 if result.get("ok") else 404
+                return self._send(status, json.dumps(result, default=str).encode(), "application/json")
             if route == "/repo/update":
                 query = parse_qs(urlparse(self.path).query)
                 remote = (query.get("remote") or ["newrepo"])[0] or "newrepo"

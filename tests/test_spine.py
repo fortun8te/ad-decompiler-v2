@@ -172,6 +172,7 @@ def test_build_design_json_wires_gradient_fill_and_stroke_for_text_layer():
         assert text_layer.fill["kind"] == "linear"
         assert text_layer.fill["stops"][0]["color"] == "#eb3c14"
         assert text_layer.stroke["color"] == "#0f0f0f"
+        assert text_layer.stroke.get("align") == "OUTSIDE"
         # the paint description is not duplicated inside the style dict
         assert "fill" not in text_layer.style
         assert "stroke" not in text_layer.style

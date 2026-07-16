@@ -38,9 +38,15 @@ PRESETS: dict[str, dict[str, Any]] = {
                           "default_mask": "rrect", "flatten_scene_artwork": False},
         "social_header": {"unreadable_identity": "masked_raster_cluster",
                           "avatar_mask": "ellipse"},
+        # CODIA-PARITY: platform UI copy is Inter at letterSpacing 0; never rasterize
+        # correct-class fits. Chat/header grouping stays conservative (strong evidence only).
         "text": {"editable_ui_copy": True, "emoji": "native_text_or_platform_raster",
-                 "single_line_auto_resize": "WIDTH", "preserve_timestamp_group": True},
-        "grouping": {"photo_frame": True, "header_cluster": True},
+                 "single_line_auto_resize": "WIDTH", "preserve_timestamp_group": True,
+                 "default_family": "Inter", "platform_ui_prior": True},
+        "grouping": {"photo_frame": True, "header_cluster": True,
+                     "message_bubbles": True, "engagement_row": True,
+                     "ama_sticker": True, "quote_frame": True,
+                     "circular_insets_use_ellipse_mask": True},
         "thresholds": {"text_recall_min": 0.90, "editable_text_recall_min": 0.86,
                        "min_text_fidelity": 0.40, "visual_pass_ssim_min": 0.55,
                        "edge_f1_min": 0.35, "native_text_ratio_min": 0.90,
@@ -52,7 +58,8 @@ PRESETS: dict[str, dict[str, Any]] = {
                           "default_mask": "rrect", "flatten_scene_artwork": False},
         "text": {"editable_ui_copy": True, "emoji": "native_text_or_platform_raster",
                  "single_line_auto_resize": "WIDTH"},
-        "grouping": {"pair_text_with_backplate": True, "preserve_line_backplates": True},
+        "grouping": {"pair_text_with_backplate": True, "preserve_line_backplates": True,
+                     "quote_frame": True, "circular_insets_use_ellipse_mask": True},
         "thresholds": {"text_recall_min": 0.92, "editable_text_recall_min": 0.88,
                        "min_text_fidelity": 0.40, "native_text_ratio_min": 0.90,
                        # SSIM is a FLOOR gate, not the objective (docs/CODIA-PARITY-SPEC.md):
@@ -79,7 +86,7 @@ PRESETS: dict[str, dict[str, Any]] = {
                           "full_bleed_is_background": True, "flatten_scene_artwork": False},
         "text": {"editable_ui_copy": True, "single_line_auto_resize": "WIDTH"},
         "grouping": {"preserve_callout_leaders": True, "pair_text_with_backplate": True,
-                     "circular_insets_use_ellipse_mask": True},
+                     "circular_insets_use_ellipse_mask": True, "quote_frame": True},
         "thresholds": {"text_recall_min": 0.90, "editable_text_recall_min": 0.85,
                        "min_text_fidelity": 0.40, "native_text_ratio_min": 0.90,
                        "visual_pass_ssim_min": 0.60,
@@ -137,16 +144,87 @@ def scene_facts(canvas: dict, ocr: dict | None = None, observations: dict | None
     w, h = max(1, int(canvas.get("w", 1))), max(1, int(canvas.get("h", 1)))
     has_before = bool(re.search(r"\bbefore\b", joined))
     has_after = bool(re.search(r"\bafter\b", joined))
+    # MONTE-style WITHOUT / WITH column tags. Bare "with" is too common in body copy,
+    # so only count a WITH label when the OCR line is essentially that single token.
+    has_without = bool(re.search(r"\bwithout\b", joined))
+    has_with_label = any(bool(re.fullmatch(r"with\.?", t, re.I)) for t in texts if t)
+    # IM8 problem-solution / VS column tags (STRUGGLE↔ANSWER, PATCHED↔DAILY).
+    has_struggle = any(bool(re.fullmatch(r"struggle\.?", t, re.I)) for t in texts if t)
+    has_answer = any(bool(re.fullmatch(r"answer\.?", t, re.I)) for t in texts if t)
+    has_problem = any(bool(re.fullmatch(r"problem\.?", t, re.I)) for t in texts if t)
+    has_solution = any(bool(re.fullmatch(r"solution\.?", t, re.I)) for t in texts if t)
+    has_patched = any(
+        bool(re.fullmatch(r"patched(?:\s+together)?\.?", t, re.I)) for t in texts if t
+    )
+    has_daily = any(
+        bool(re.fullmatch(r"daily(?:\s+im8)?\.?", t, re.I)) for t in texts if t
+    )
+    # IM8 three-stage body strip: BEFORE / RITUAL / RESET (not a classic 2-side pair alone).
+    has_ritual = any(bool(re.fullmatch(r"ritual\.?", t, re.I)) for t in texts if t)
+    has_reset = any(bool(re.fullmatch(r"reset\.?", t, re.I)) for t in texts if t)
+    has_before = (
+        has_before or has_without or has_struggle or has_problem or has_patched
+    )
+    has_after = (
+        has_after or has_with_label or has_answer or has_solution or has_daily or has_reset
+    )
+    stage_progression = bool(
+        (has_before and has_ritual and has_reset)
+        or (has_ritual and has_reset and (has_before or has_after))
+    )
+    # Photo-of-handwriting / in-image-only text: honor explicit observations. Geometric
+    # inference lives in merge_layers (no VLM); do not invent the flag from a lone
+    # script wordmark on an otherwise overlay-heavy ad.
+    photo_of_handwriting = bool(
+        observations.get("photo_of_handwriting")
+        or observations.get("handwriting_photo")
+    )
+    text_on_photo_only = bool(
+        observations.get("text_on_photographic_surfaces_only")
+        or observations.get("scene_text_only")
+        or photo_of_handwriting
+    )
     facts = {
         "aspect_ratio": w / h,
         "text_line_count": len([x for x in texts if x]),
-        "before_after_labels": bool(re.search(r"\b(before|after|others|versus|vs)\b", joined)),
+        "before_after_labels": bool(
+            re.search(
+                r"\b(before|after|without|others|versus|vs|struggle|answer|"
+                r"problem|solution|patched|daily|ritual|reset)\b",
+                joined,
+            )
+            or has_with_label
+            or has_patched
+            or has_daily
+        ),
         "before_after_pair": has_before and has_after,
-        "social_metadata": bool(re.search(r"\b(views?|reposts?|likes?|reply|am|pm)\b", joined)),
+        "stage_progression": stage_progression,
+        "social_metadata": bool(re.search(
+            r"\b(views?|reposts?|likes?|reply|am|pm|weergaven)\b", joined
+        )),
+        # IG/DM chrome without tweet-style view counts.
+        "chat_ui": bool(re.search(
+            r"\b(new messages?|active now|delivered|seen\b|typing|direct message|"
+            r"message requests?|online|yesterday|just now)\b",
+            joined,
+        )),
+        # IG Ask-me-anything / question sticker chrome (035-style UGC).
+        "ama_sticker": bool(re.search(
+            r"\b(ask\s*me\s*anything|ask\s*me\b|\bama\b|questions?\s*for\s*me|"
+            r"ask\s*me\s*anything\??)\b",
+            joined,
+        )),
         "caption_language": bool(re.search(r"\b(my|i\s|finally|why|started|wish)\b", joined)),
         "emoji_present": any(ord(ch) > 0xFFFF for text in texts for ch in text),
+        "photo_of_handwriting": photo_of_handwriting,
+        "text_on_photographic_surfaces_only": text_on_photo_only,
     }
     facts.update(observations)
+    if photo_of_handwriting:
+        facts["photo_of_handwriting"] = True
+        facts["text_on_photographic_surfaces_only"] = True
+    elif text_on_photo_only:
+        facts["text_on_photographic_surfaces_only"] = True
     return facts
 
 
@@ -170,8 +248,13 @@ def classify(facts: dict, configured: str = "auto") -> dict:
     if f.get("social_metadata"): add("social_screenshot", 8, "social metadata")
     if f.get("social_header"): add("social_screenshot", 4, "social header")
     if f.get("avatar_present"): add("social_screenshot", 1, "avatar")
+    if f.get("chat_ui"): add("social_screenshot", 7, "chat/DM chrome")
+    if f.get("ama_sticker"): add("social_screenshot", 7, "AMA/question sticker")
     # Dark UI chrome only counts alongside social evidence; a dark poster is not a tweet.
-    if f.get("dark_background") and (f.get("social_metadata") or f.get("social_header")):
+    if f.get("dark_background") and (
+        f.get("social_metadata") or f.get("social_header") or f.get("chat_ui")
+        or f.get("ama_sticker")
+    ):
         add("social_screenshot", 1, "dark UI chrome")
     if photo >= .55 and backplates >= 2: add("caption_over_photo", 5, "photo with repeated text backplates")
     if f.get("caption_language") and photo >= .5: add("caption_over_photo", 5, "testimonial/caption language")
@@ -181,11 +264,20 @@ def classify(facts: dict, configured: str = "auto") -> dict:
     # creative and previously won 5:4, which flattened one comparison column into the
     # photo plate and defeated the independently-swappable column contract.
     if f.get("before_after_labels"): add("comparison_grid", 7, "comparison labels")
+    if f.get("stage_progression"): add("comparison_grid", 5, "stage progression strip")
     if f.get("center_divider"): add("comparison_grid", 2, "center divider")
     if photo >= .65: add("lifestyle_overlay", 3, "dominant lifestyle photo")
     if f.get("leader_lines") or f.get("circular_inset"): add("lifestyle_overlay", 3, "annotation overlay")
-    if f.get("product_count", 0) and flat >= .45: add("product_on_flat", 5, "product on flat field")
+    products = int(f.get("product_count", 0) or 0)
+    if products and flat >= .45: add("product_on_flat", 5, "product on flat field")
     if flat >= .75: add("product_on_flat", 2, "dominant flat background")
+    # Dark gradient packshots (Hears-style): multi-product cutouts on a dark plate even
+    # when quantization under-counts flatness on a smooth gradient.
+    mean_luma = float(f.get("mean_luma", 255) or 255)
+    if products >= 2 and (f.get("dark_background") or mean_luma < 90):
+        add("product_on_flat", 4, "multi-product on dark field")
+    elif products >= 1 and f.get("dark_background") and flat >= .30:
+        add("product_on_flat", 3, "product on dark plate")
     # Social chrome is more specific than generic caption-over-photo.
     precedence = {name: i for i, name in enumerate(ARCHETYPES[::-1])}
     chosen = max(ARCHETYPES, key=lambda n: (score[n], precedence[n]))
@@ -204,6 +296,8 @@ def decision(name: str, scores: dict, reasons: list[str]) -> dict:
 
 def apply_preset(cfg: dict, result: dict) -> dict:
     """Expose the contract through real downstream config namespaces."""
+    from src import format_readiness
+
     out = copy.deepcopy(cfg or {})
     preset = copy.deepcopy(result["preset"])
     facts = copy.deepcopy(result.get("facts") or {})
@@ -212,12 +306,46 @@ def apply_preset(cfg: dict, result: dict) -> dict:
     # existing raster ownership policy.
     if result["archetype"] == "comparison_grid" and facts.get("before_after_pair"):
         preset["photo_regions"]["suppress_descendants"] = False
+    # Huel-style social chrome on a comparison: reuse social header clustering without
+    # inventing a new preset. Circular product insets on Wavy stories reuse lifestyle flag.
+    if result["archetype"] == "comparison_grid":
+        grouping = dict(preset.get("grouping") or {})
+        if facts.get("social_metadata") or facts.get("social_header") or facts.get("avatar_present"):
+            grouping["header_cluster"] = True
+        if facts.get("circular_inset"):
+            grouping["circular_insets_use_ellipse_mask"] = True
+        # IM8 STRUGGLE→product string leaders: reuse lifestyle callout preserve flag.
+        if facts.get("leader_lines") or facts.get("stage_progression"):
+            grouping["preserve_callout_leaders"] = True
+        preset["grouping"] = grouping
     out["scene"] = {"archetype": result["archetype"], "preset": preset, "facts": facts}
     routing = out.setdefault("routing", {})
     routing.setdefault("min_text_fidelity", preset["thresholds"]["min_text_fidelity"])
     routing["photo_regions"] = preset["photo_regions"]
     routing["text_policy"] = preset["text"]
+    # Photo-of-handwriting / in-image-only OCR: suppress editable text emission downstream.
+    if facts.get("photo_of_handwriting") or facts.get("text_on_photographic_surfaces_only"):
+        text_policy = dict(routing.get("text_policy") or {})
+        text_policy["scene_text_only"] = True
+        text_policy["suppress_editable_ocr"] = True
+        routing["text_policy"] = text_policy
     out.setdefault("layout", {})["scene_grouping"] = preset["grouping"]
+    # Platform-UI font prior (Inter on social screenshots) is consumed by text_analysis.
+    text_policy = preset.get("text") or {}
+    if text_policy.get("platform_ui_prior") or text_policy.get("default_family"):
+        ta = out.setdefault("text_analysis", {})
+        if text_policy.get("platform_ui_prior") is not None:
+            ta.setdefault("platform_ui_prior", bool(text_policy.get("platform_ui_prior")))
+        if text_policy.get("default_family"):
+            ta.setdefault("platform_ui_family", text_policy["default_family"])
+    # Avatar ellipse mask hint for routing/reconstruct (009 circular profile crop).
+    social_header = preset.get("social_header") or {}
+    if social_header.get("avatar_mask"):
+        routing.setdefault("avatar_mask", social_header["avatar_mask"])
+    grouping = preset.get("grouping") or {}
+    # Circular product insets (white ring over photo) → ellipse clip, not alpha matte.
+    if grouping.get("circular_insets_use_ellipse_mask") or facts.get("circular_inset"):
+        routing.setdefault("circular_inset_ellipse", True)
     out.setdefault("qa", {})["archetype_thresholds"] = preset["thresholds"]
     # F8: the preset's text-recall contract (0.90-0.93) was carried only inside
     # archetype_thresholds and enforced nowhere. Expose it at the flat ``qa.text_recall_min``
@@ -231,4 +359,28 @@ def apply_preset(cfg: dict, result: dict) -> dict:
     # overrides still win inside qa_reward.reward_weights.
     if preset.get("reward_weights"):
         out["qa"]["reward_weights"] = copy.deepcopy(preset["reward_weights"])
+    # Format readiness: aspect class + capabilities (not a new named preset). Prefer an
+    # already-attached decision.format (pipeline may pass tags/overrides); else build one.
+    format_cfg = (cfg or {}).get("format") or {}
+    profile = result.get("format")
+    if not isinstance(profile, dict):
+        canvas = {
+            "w": int(facts.get("width") or 0),
+            "h": int(facts.get("height") or 0),
+        }
+        if not canvas["w"] or not canvas["h"]:
+            # scene_facts stores aspect_ratio; synthesize when canvas dims absent.
+            canvas = None
+        profile = format_readiness.build_format_profile(
+            canvas,
+            facts,
+            archetype=result["archetype"],
+            preset=preset,
+            capability_overrides=format_cfg.get("capabilities"),
+            tags=format_cfg.get("tags") or result.get("format_tags"),
+        )
+    out = format_readiness.apply_format(out, profile)
+    out["scene"]["archetype"] = result["archetype"]
+    out["scene"]["preset"] = preset
+    out["scene"]["facts"] = facts
     return out

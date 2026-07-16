@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from typing import Optional
 
 from .schema import (
     DesignDoc, Layer, SCHEMA_VERSION, dump, validate_design, fallback_kind,
 )
-from .text_analysis import fit_text_box, _fit_font, _line_advance
+from .text_analysis import fit_text_box, _fit_font, _line_advance, _style_name, _weight_candidates
 from .raster_clusters import is_intentional_raster_cluster
 
 # Candidate keys that ``_compile`` already routes to a concrete Layer field.  Anything
@@ -22,6 +23,76 @@ _CONSUMED_CANDIDATE_KEYS = frozenset({
     "shape_kind", "path", "svg", "src", "radius", "paths", "mask", "name", "role",
     "sizing",
 })
+
+# Designer-facing role → layer label. Prefer meta.semantic_role / meta.role / style.role.
+_ROLE_LABELS = {
+    "headline": "Headline", "title": "Headline",
+    "subheadline": "Subheadline", "subtitle": "Subheadline",
+    "body": "Body", "body-copy": "Body", "body_copy": "Body", "copy": "Body",
+    "callout": "Callout", "callout-text": "Callout", "benefit": "Callout",
+    "caption": "Caption", "eyebrow": "Eyebrow", "offer": "Offer",
+    "cta": "CTA", "button": "Button",
+    "avatar": "Avatar", "profile": "Avatar", "profile_picture": "Avatar",
+    "profile_photo": "Avatar", "pfp": "Avatar",
+    "product": "Product", "photo": "Photo", "person": "Person", "people": "Person",
+    "icon": "Icon", "arrow": "Arrow",
+    "callout-leader": "Arrow", "callout_leader": "Arrow",
+    "leader": "Arrow", "leader-line": "Arrow", "leader_line": "Arrow",
+    "connector": "Arrow",
+    "logo": "Logo", "wordmark": "Logo",
+    "background": "Background", "plate": "Background", "clean-plate": "Background",
+    "badge": "Badge", "chip": "Chip", "emoji": "Emoji", "decoration": "Decoration",
+    "banner": "Banner", "ribbon": "Banner", "brushstroke": "Banner",
+    "stroke-banner": "Banner", "seal": "Badge",
+    "starburst": "Badge", "price-burst": "Badge", "sale-burst": "Badge", "burst": "Badge",
+    "shape": "Shape", "illustration": "Illustration", "image": "Photo",
+    "screenshot": "Screenshot", "ui-panel": "UI panel", "receipt": "Receipt",
+    "chart": "Chart", "graph": "Graph", "table": "Table",
+    "nutrition-panel": "Nutrition panel", "diagram": "Diagram",
+    "infographic": "Infographic", "product-cluster": "Product",
+    "text-stack": "Text Stack", "caption-stack": "Caption",
+    "caption-plate": "Caption", "card-grid": "Card Grid", "panel-set": "Panel Set",
+    "structural-grid": "Grid", "native-chart": "Chart", "card": "Card",
+    "header": "Header", "footer": "Footer",
+    "disclaimer": "Disclaimer", "legal": "Disclaimer", "fine-print": "Disclaimer",
+    "hero": "Hero", "band": "Group",
+    "asset-group": "Group", "text": "Text",
+    "message-bubble": "Message", "message": "Message", "bubble": "Message",
+    "message-row": "Message row", "reply-quote": "Reply", "quote": "Reply",
+    "header-cluster": "Header", "stat-pill": "Stat", "stat-stack": "Stats",
+    "stat-row": "Stats", "benefit-stack": "Benefits", "pill": "Stat",
+    "rating-strip": "Rating", "rating": "Rating", "logo-strip": "Logo strip",
+    "as-seen-in": "As seen in", "leader-dot": "Dot", "leader_dot": "Dot",
+    "story-cta": "CTA", "sale-burst": "Badge", "sale_burst": "Badge",
+    "comparison-set": "Comparison", "comparison-column": "Photo",
+    "comparison-panel": "Photo", "photo-panel": "Photo",
+    "vs": "VS", "versus": "VS", "vs-chip": "VS", "vs-badge": "VS",
+    "checklist": "Checklist", "text-row": "Row", "label": "Label",
+    "ama-sticker": "AMA sticker", "quote-frame": "Quote",
+    "circular-inset": "Circular inset", "engagement-row": "Engagement",
+    "timeline": "Timeline", "timeline-step": "Step", "review-bar": "Reviews",
+}
+
+_TARGET_FALLBACK = {
+    "text": "Text", "image": "Photo", "icon": "Icon", "group": "Group", "shape": "Shape",
+}
+
+# Machine / pipeline names that must never ship to Figma as layer labels.
+_MACHINE_NAME_RE = re.compile(
+    r"(?i)"
+    r"(?:^c_[a-z]?\d+\b)"
+    r"|(?:\braster\s*slice\b)"
+    r"|(?:\bswappable\b)"
+    r"|(?:[—\-]+\s*vector\b)"
+    r"|(?:\bclean\s*plate\b)"
+    r"|(?:\blow\s*confidence\b)"
+    r"|(?:\bpanel\s*raster\b)"
+    r"|(?:\basset\s*group\b)"
+    r"|(?:\braster\s*crop\b)"
+    r"|(?:^band-[0-9a-f]+$)"
+    r"|(?:^text-stack-)"
+)
+_QUOTE_STYLE_RE = re.compile(r'[—\-]\s*"')
 
 
 def _strip_edge_emoji(text: str) -> str:
@@ -62,33 +133,213 @@ def _truncate(value, length=28):
     return value if len(value) <= length else value[: length - 1] + "…"
 
 
-def _name(candidate):
+def _clean_snippet(value, length=28) -> str:
+    """Collapse whitespace/newlines and truncate for designer-facing layer suffixes."""
+    return _truncate(value, length)
+
+
+def _normalize_role_token(value) -> str:
+    token = str(value or "").strip().lower().replace("_", "-")
+    return "-".join(token.split())
+
+
+def _role_token(candidate) -> str:
     meta = candidate.get("meta") or {}
-    # Names are part of the deliverable, not cosmetic metadata.  When the scene/VLM
-    # knows an asset's identity, preserve it verbatim so a designer sees e.g. "X logo"
-    # rather than a pile of anonymous `Image — cutout` layers.  Fall back only when no
-    # semantic label survived detection.
-    explicit = (candidate.get("name") or meta.get("semantic_name") or
-                meta.get("layer_name") or meta.get("vlm_name") or meta.get("label"))
+    style = candidate.get("style") or {}
+    for raw in (
+        meta.get("semantic_role"), meta.get("role"), candidate.get("role"),
+        style.get("role"),
+    ):
+        token = _normalize_role_token(raw)
+        if token:
+            return token
+    return ""
+
+
+def _role_label(role: str, target: Optional[str] = None) -> str:
+    if role in _ROLE_LABELS:
+        return _ROLE_LABELS[role]
+    if role:
+        return role.replace("-", " ").strip().title() or _TARGET_FALLBACK.get(target or "", "Layer")
+    return _TARGET_FALLBACK.get(target or "", "Layer")
+
+
+def _is_machine_name(value, candidate_id: Optional[str] = None) -> bool:
+    name = " ".join(str(value or "").split()).strip()
+    if not name:
+        return True
+    if candidate_id and name == str(candidate_id).strip():
+        return True
+    if candidate_id and name.lower().startswith(str(candidate_id).strip().lower() + " "):
+        return True
+    if _MACHINE_NAME_RE.search(name):
+        return True
+    if _QUOTE_STYLE_RE.search(name):
+        return True
+    return False
+
+
+def _explicit_designer_name(candidate) -> Optional[str]:
+    """Return a pre-existing designer name, ignoring ids / VLM / pipeline leftovers.
+
+    ``vlm_name`` is intentionally omitted: naming is local and sync; VLM labels are
+    not consulted on the design-stage hot path.
+    """
+    meta = candidate.get("meta") or {}
+    cid = candidate.get("id")
+    for raw in (
+        candidate.get("name"), meta.get("semantic_name"),
+        meta.get("layer_name"), meta.get("label"),
+    ):
+        if raw is None:
+            continue
+        text = " ".join(str(raw).split()).strip()
+        if text and not _is_machine_name(text, cid):
+            return _truncate(text, 56)
+    return None
+
+
+def _with_snippet(label: str, text) -> str:
+    snippet = _clean_snippet(text, 28)
+    if not snippet:
+        return label
+    # Avoid "Headline / Headline" when copy equals the role word.
+    if snippet.casefold() == label.casefold():
+        return label
+    return f"{label} / {snippet}"
+
+
+def _name(candidate):
+    """Fast deterministic Figma layer name (no VLM / network)."""
+    explicit = _explicit_designer_name(candidate)
     if explicit:
-        return _truncate(explicit, 56)
-    role = str(meta.get("role") or "").strip()
+        return explicit
+
+    meta = candidate.get("meta") or {}
     target = candidate.get("target")
-    if target == "text":
-        return f'{(role or "Text").title()} — "{_truncate(candidate.get("text"))}"'
-    if target == "image":
-        if meta.get("wordmark"):
-            return f'Logo — {_truncate(candidate.get("text") or "wordmark")} (raster crop)'
-        if meta.get("substitution") or meta.get("low_fidelity"):
-            return f'Text (fallback) — "{_truncate(candidate.get("text"))}"'
-        # These are deliberately image-filled native nodes, so they remain trivially
-        # swappable in Figma even when a complex asset cannot safely be vectorized.
-        return f'{(role or "Image").title()} — swappable crop'
-    if target == "icon":
-        return f'{(role or "Icon").title()} — vector'
+    role = _role_token(candidate)
+    text = candidate.get("text") or meta.get("source_text")
+
+    # Comparison ads: Before / After / VS / Photo / Before — prefer short local names.
+    side = str(meta.get("comparison_side") or meta.get("before_after_side") or "").lower()
+    if side in {"before", "after", "without", "with", "mid"}:
+        side_label = {
+            "before": "Before", "without": "Before",
+            "after": "After", "with": "After",
+            "mid": "Ritual",
+        }[side]
+        # Prefer merge-assigned semantic names for IM8 Struggle/Answer/Daily/Reset.
+        if meta.get("semantic_name") and target == "text":
+            return str(meta["semantic_name"])
+        if target == "image":
+            return f"Photo / {side_label}"
+        if target == "text" or role in {"label", "eyebrow", "caption", "tag"}:
+            return side_label
+    vs_blob = str(text or meta.get("shell_text_snippet") or "").strip()
+    if role in {"vs", "versus", "vs-chip", "vs-badge"} or _normalize_role_token(role) in {
+        "vs", "versus", "vs-chip", "vs-badge",
+    }:
+        return "VS"
+    if re.fullmatch(r"vs\.?|versus", vs_blob, re.I):
+        return "VS"
+    if role == "stage-progression" or meta.get("stage_count"):
+        return "Progression"
+    if role == "checklist" or meta.get("checklist") or (
+        role == "text-row" and any(
+            _normalize_role_token((c.get("meta") or {}).get("role")) in {
+                "verified", "checkmark", "check", "check-mark", "tick",
+                "x", "close", "cross", "cancel",
+            }
+            for c in (candidate.get("children") or [])
+        )
+    ):
+        return "Checklist"
+
+    label = _role_label(role, target)
+
+    if target == "text" or (text and role in {
+        "headline", "title", "subheadline", "subtitle", "body", "body-copy",
+        "body_copy", "copy", "caption", "eyebrow", "offer", "cta", "button", "text",
+        "callout", "callout-text", "benefit", "disclaimer", "legal", "fine-print",
+        "footer", "label",
+    }):
+        # Bare Before/After/VS / IM8 stage labels: no "Label / Before" padding.
+        if re.fullmatch(
+            r"before|after|without|with|vs\.?|versus|struggle|answer|problem|solution|"
+            r"ritual|reset|patched(?:\s+together)?|daily(?:\s+im8)?",
+            str(text or "").strip(),
+            re.I,
+        ):
+            token = str(text).strip()
+            if re.fullmatch(r"vs\.?|versus", token, re.I):
+                return "VS"
+            if re.fullmatch(r"before|without", token, re.I):
+                return "Before"
+            if re.fullmatch(r"after|with", token, re.I):
+                return "After"
+            return token.title()
+        return _with_snippet(label if label != "Layer" else "Text", text)
+
     if target == "group":
-        return f'{(role or "Frame").title()}'
-    return (role or "Shape").title()
+        if role in {"button", "cta"}:
+            return _with_snippet(label, text)
+        return label if label != "Layer" else "Group"
+
+    if meta.get("wordmark"):
+        return _with_snippet("Logo", text or candidate.get("text"))
+
+    if meta.get("substitution") or meta.get("low_fidelity"):
+        return _with_snippet("Text", text)
+
+    # Text-bearing brushstroke / seal / outline-pill plates.
+    if meta.get("text_bearing_shell") or meta.get("plate_shell"):
+        if role in {"banner", "ribbon", "brushstroke", "stroke-banner", "stroke_banner"}:
+            shell_label = "Banner"
+        elif role in {"button"}:
+            shell_label = "Button"
+        elif role in {"cta"}:
+            shell_label = "CTA"
+        elif (
+            role in {"callout", "pill", "benefit"}
+            or meta.get("stroke_outline_shell")
+        ):
+            shell_label = "Callout"
+        else:
+            shell_label = "Badge"
+        snippet = meta.get("shell_text_snippet") or text
+        return _with_snippet(shell_label, snippet)
+
+    if target == "image":
+        if meta.get("shell_raster_chip"):
+            if meta.get("stroke_outline_shell") or role in {"callout", "pill"}:
+                chip_label = "Callout"
+            elif role in {"banner", "ribbon", "brushstroke"}:
+                chip_label = "Banner"
+            elif role:
+                chip_label = "Badge"
+            else:
+                chip_label = "Shape"
+            return _with_snippet(chip_label, meta.get("shell_text_snippet") or text)
+        return label if label not in {"Layer", "Shape"} else "Photo"
+
+    if target == "icon":
+        return label if label != "Layer" else "Icon"
+
+    return label if label != "Layer" else "Shape"
+
+
+def _dedupe_sibling_names(layers: list) -> None:
+    """Append ' / 2', ' / 3', … only when siblings share an identical name."""
+    seen: dict[str, int] = {}
+    for layer in layers or []:
+        children = getattr(layer, "children", None) or []
+        if children:
+            _dedupe_sibling_names(children)
+        base = str(getattr(layer, "name", "") or "Layer")
+        count = seen.get(base, 0) + 1
+        seen[base] = count
+        if count > 1:
+            layer.name = f"{base} / {count}"
 
 
 def _resolve(path: Optional[str], run_dir: str) -> Optional[str]:
@@ -161,6 +412,108 @@ def _surface_fill(candidate):
 # Only CONTRAST-VERIFIED weight runs split (upstream _enrich_word_styles gates on a
 # >=180 weight delta measured from word pixels); everything else stays one node.
 _WEIGHT_SPLIT_MIN_DELTA = 250
+# Candidates whose file weight is farther than this from the declared node weight are
+# not trusted as the renderable face (Regular.ttf must not stand in for Bold).
+_WEIGHT_CANDIDATE_MATCH_TOL = 150
+
+
+def _promote_weight_candidate(style: dict) -> None:
+    """Keep ``fontCandidates[0]`` consistent with the declared ``fontWeight``.
+
+    Weight-split siblings update ``fontWeight`` (e.g. 700 for "121K") while inheriting
+    the parent line's Regular candidates. Preview/`fit_text_box` then measure/draw the
+    wrong face, and Figma's candidate-path retries can pick Regular over the primary
+    Bold request. Promote the closest matching-weight candidate, or rewrite the top
+    entry's weight/style and drop a mismatched file path so resolvers fall through to
+    family+weight (Figma) / system bold (preview).
+    """
+    if not isinstance(style, dict):
+        return
+    try:
+        weight = int(round(float(style.get("fontWeight") or 400)))
+    except (TypeError, ValueError):
+        return
+    italic = "italic" in str(style.get("fontStyle") or "").lower()
+    style_label = _style_name(weight, italic=italic)
+    style["fontWeight"] = weight
+    style["fontStyle"] = style_label
+    style["fontWeightCandidates"] = _weight_candidates(weight)
+    cands = [dict(c) for c in (style.get("fontCandidates") or []) if isinstance(c, dict)]
+    if not cands:
+        return
+
+    def _cand_weight(candidate: dict) -> int:
+        try:
+            return int(round(float(candidate.get("weight") or 400)))
+        except (TypeError, ValueError):
+            return 400
+
+    ranked = sorted(
+        cands,
+        key=lambda c: (abs(_cand_weight(c) - weight), -float(c.get("score") or 0.0)),
+    )
+    top = dict(ranked[0])
+    if abs(_cand_weight(top) - weight) > _WEIGHT_CANDIDATE_MATCH_TOL:
+        top["weight"] = weight
+        top["style"] = style_label
+        top.pop("path", None)
+    else:
+        top["weight"] = _cand_weight(top)
+        top_style = str(top.get("style") or "")
+        if top_style and (("italic" in top_style.lower()) == italic):
+            style["fontStyle"] = top_style
+        else:
+            top["style"] = style_label
+    rest = [c for c in ranked[1:]]
+    style["fontCandidates"] = [top] + rest
+    if top.get("family"):
+        style["fontFamily"] = top["family"]
+
+
+def _normalize_text_stroke(stroke, style: dict, effects: list) -> tuple:
+    """Keep glyph fills readable: OUTSIDE strokes, capped width, fat outlines as effects.
+
+    Figma's default text stroke is CENTER/INSIDE, which paints opaque outline ink over
+    the fill and covers the letters. Authored marketing outlines sit outside the glyph.
+    Very thick detected bands are converted to a soft drop-shadow ring instead.
+    """
+    if not stroke:
+        return None, list(effects or [])
+    out = dict(stroke) if isinstance(stroke, dict) else {
+        "kind": "flat", "color": str(stroke), "width": 1.0,
+    }
+    try:
+        font_size = float((style or {}).get("fontSize") or 0) or 16.0
+    except (TypeError, ValueError):
+        font_size = 16.0
+    try:
+        width = float(out.get("width", out.get("weight", 1.0)) or 1.0)
+    except (TypeError, ValueError):
+        width = 1.0
+    width = max(0.5, width)
+    if width > max(3.0, font_size * 0.14):
+        color = out.get("color") or out.get("paint") or "#000000"
+        if isinstance(color, dict):
+            color = color.get("color") or "#000000"
+        ring = {
+            "type": "DROP_SHADOW",
+            "color": color,
+            "offset": {"x": 0, "y": 0},
+            "radius": round(min(width, font_size * 0.2), 2),
+            "spread": round(max(0.0, min(width * 0.35, font_size * 0.08)), 2),
+            "visible": True,
+        }
+        merged = list(effects or [])
+        merged.append(ring)
+        return None, merged
+    out["width"] = round(min(width, max(1.0, font_size * 0.08)), 2)
+    align = str(out.get("align") or out.get("alignment") or out.get("strokeAlign") or "").upper()
+    if align in ("", "CENTER", "INSIDE", "CENTRE"):
+        out["align"] = "OUTSIDE"
+    else:
+        out["align"] = align
+    out["strokeAlign"] = out["align"]
+    return out, list(effects or [])
 
 
 def _split_weight_run_siblings(candidate: dict) -> list[dict]:
@@ -240,6 +593,7 @@ def _split_weight_run_siblings_unsafe(candidate: dict) -> list[dict]:
         style = dict(base_style)
         if run_style:
             style.update({k: v for k, v in run_style.items() if v is not None})
+        _promote_weight_candidate(style)
         piece["style"] = style
         piece["box"] = {"x": float(box.get("x", 0) or 0) + float(box.get("w", 0) or 0) * frac_x,
                         "y": float(box.get("y", 0) or 0),
@@ -262,16 +616,17 @@ def _split_weight_run_siblings_unsafe(candidate: dict) -> list[dict]:
 # (~2x lineHeight), vertically centered. Tight OCR ink boxes are why our renders
 # clipped at box edges. 1.6x lineHeight per line is the floor the parity spec sets.
 _TEXT_BOX_HEIGHT_FACTOR = 1.6
-_TEXT_BOX_WIDTH_SLACK = 0.04
+_TEXT_BOX_WIDTH_SLACK = 0.06
 
 
-def _generous_text_box(box: dict, style: dict, text: str) -> dict:
+def _generous_text_box(box: dict, style: dict, text: str, stroke=None) -> dict:
     """Grow a fitted text box Codia-style without moving the visible text.
 
     Height grows symmetrically around the ink center to >= 1.6x lineHeight per line
     (vertical CENTER alignment absorbs the slop, so the baseline never moves).
-    Width gains ~4% slack away from the horizontal anchor (LEFT keeps the left edge,
+    Width gains ~6% slack away from the horizontal anchor (LEFT keeps the left edge,
     RIGHT the right edge, CENTER splits), so anchor-based placement is unchanged.
+    Outside strokes get extra padding so outline ink is not clipped by the text frame.
     """
     out = dict(box or {})
     try:
@@ -280,17 +635,32 @@ def _generous_text_box(box: dict, style: dict, text: str) -> dict:
         lines = max(1, str(text or "").count("\n") + 1)
         font_size = float(style.get("fontSize") or 0) or max(1.0, h / lines)
         line_height = float(style.get("lineHeight") or 0) or font_size * 1.2
-        min_h = _TEXT_BOX_HEIGHT_FACTOR * line_height * lines
+        # Cap-height-derived fontSize exceeds painted ink height; keep >=1.25x fontSize
+        # of vertical room so CAP_HEIGHT trim / descenders never clip.
+        min_h = max(
+            _TEXT_BOX_HEIGHT_FACTOR * line_height * lines,
+            font_size * 1.25 * lines,
+        )
+        stroke_pad = 0.0
+        if isinstance(stroke, dict):
+            try:
+                stroke_pad = max(0.0, float(stroke.get("width", stroke.get("weight", 0)) or 0))
+            except (TypeError, ValueError):
+                stroke_pad = 0.0
+        min_h += 2.0 * stroke_pad
         if h < min_h:
             out["y"] = float(out.get("y", 0) or 0) - (min_h - h) / 2.0
             out["h"] = min_h
         if w > 0:
-            extra = w * _TEXT_BOX_WIDTH_SLACK
+            extra = w * _TEXT_BOX_WIDTH_SLACK + 2.0 * stroke_pad
             align = str(style.get("align", "LEFT")).upper()
             if align == "RIGHT":
                 out["x"] = float(out.get("x", 0) or 0) - extra
             elif align in ("CENTER", "JUSTIFIED"):
                 out["x"] = float(out.get("x", 0) or 0) - extra / 2.0
+            elif stroke_pad:
+                out["x"] = float(out.get("x", 0) or 0) - stroke_pad
+                extra = w * _TEXT_BOX_WIDTH_SLACK + stroke_pad
             out["w"] = w + extra
         out["x"] = round(float(out.get("x", 0) or 0), 2)
         out["y"] = round(float(out.get("y", 0) or 0), 2)
@@ -412,7 +782,7 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
                 children.append(Layer(
                     id=f"{layer_id}__hostbg",
                     type="image",
-                    name=f"{_name(candidate)} — panel raster",
+                    name=_name(candidate),
                     box={"x": 0.0, "y": 0.0,
                          "w": box.get("w", 1), "h": box.get("h", 1)},
                     z_index=bg_z,
@@ -445,6 +815,9 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         emoji_shift = raw_text.find(text_value) if text_value != raw_text else 0
         if text_value != raw_text:
             common["meta"]["emoji_stripped"] = raw_text
+        _promote_weight_candidate(style)
+        stroke, common["effects"] = _normalize_text_stroke(
+            stroke, style, list(common.get("effects") or []))
         # Fit against ink/painted bounds when available so Python preview and the Figma
         # plugin agree on the same target box (plugin uses visible_box in fitTextToVisibleBox).
         fit_box = dict(
@@ -455,6 +828,14 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         # Tracking policy (Codia parity): emitted letterSpacing is always 0 —
         # fit_text_box measures untracked, and runs must agree with the base style.
         style["letterSpacing"] = 0.0
+        # Anti-clip: never ship lh < fs (display headlines / CTA labels).
+        try:
+            _fs = float(style.get("fontSize") or 0)
+            _lh = float(style.get("lineHeight") or 0)
+            if _fs > 0 and (_lh <= 0 or _lh < _fs * 1.05):
+                style["lineHeight"] = round(_fs * 1.12, 2)
+        except (TypeError, ValueError):
+            pass
         text_runs = []
         for run in list(candidate.get("text_runs") or []):
             if not isinstance(run, dict):
@@ -473,17 +854,19 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
                 if run.get("text") is not None:
                     run["text"] = text_value[start:end]
             run_style = run.get("style")
-            if isinstance(run_style, dict) and "letterSpacing" in run_style:
+            if isinstance(run_style, dict):
                 run_style = dict(run_style)
-                run_style["letterSpacing"] = 0.0
+                if "letterSpacing" in run_style:
+                    run_style["letterSpacing"] = 0.0
+                _promote_weight_candidate(run_style)
                 run["style"] = run_style
             text_runs.append(run)
         # Codia-style GENEROUS text boxes (anti-clipping): the tight ink box becomes a
         # loose box >= 1.6x lineHeight per line, grown symmetrically around the ink
-        # center (vertical CENTER alignment keeps the visual baseline put), with ~4%
+        # center (vertical CENTER alignment keeps the visual baseline put), with ~6%
         # width slack away from the horizontal anchor. Preview, plugin and QA all read
         # the same grown box; the pre-fit ink evidence survives in meta.
-        generous = _generous_text_box(fitted_box, style, text_value)
+        generous = _generous_text_box(fitted_box, style, text_value, stroke=stroke)
         common["box"] = generous
         common["visible_box"] = dict(generous)
         common["meta"]["prefit_ink_box"] = dict(fitted_box)
@@ -558,15 +941,25 @@ _SOLID_PLATE_MAX_BANDS = 4
 _SOLID_PLATE_MIN_BAND_ROWS = 8
 
 
-def _solid_plate_bands(plate_path, canvas) -> Optional[list]:
-    """Return [{y, h, color}] in canvas coords when the plate is flat/banded, else None."""
-    if not plate_path:
+def _solid_plate_bands(plate_path, canvas, plate_rgb=None) -> Optional[list]:
+    """Return [{y, h, color}] in canvas coords when the plate is flat/banded, else None.
+
+    ``plate_rgb`` may be a preloaded HxWx3 array (uint8 or float) to skip a duplicate decode.
+    """
+    if plate_rgb is None and not plate_path:
         return None
     try:
         import numpy as np
-        from PIL import Image
-        with Image.open(plate_path) as image:
-            plate = np.asarray(image.convert("RGB"), dtype=np.float32)
+        if plate_rgb is not None:
+            plate = np.asarray(plate_rgb, dtype=np.float32)
+            if plate.ndim != 3 or plate.shape[2] < 3:
+                return None
+            if plate.shape[2] > 3:
+                plate = plate[:, :, :3]
+        else:
+            from PIL import Image
+            with Image.open(plate_path) as image:
+                plate = np.asarray(image.convert("RGB"), dtype=np.float32)
     except Exception:
         return None
     h, w = plate.shape[:2]
@@ -615,18 +1008,25 @@ _GROUP_BG_COLOR_DELTA = 8.0
 _GROUP_BG_TEXTURE_STD = 10.0
 
 
-def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings) -> int:
+def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings, plate_rgb=None) -> int:
     try:
         import numpy as np
         from PIL import Image
     except Exception:
         return 0
     plate_path = _resolve(base_src, run_dir)
-    if not plate_path:
+    if not plate_path and plate_rgb is None:
         return 0
     try:
-        with Image.open(plate_path) as image:
-            plate = np.asarray(image.convert("RGB"), dtype=np.float32)
+        if plate_rgb is not None:
+            plate = np.asarray(plate_rgb, dtype=np.float32)
+            if plate.ndim != 3 or plate.shape[2] < 3:
+                return 0
+            if plate.shape[2] > 3:
+                plate = plate[:, :, :3]
+        else:
+            with Image.open(plate_path) as image:
+                plate = np.asarray(image.convert("RGB"), dtype=np.float32)
     except Exception as exc:
         warnings.append({"code": "group-background-error", "detail": str(exc)})
         return 0
@@ -1216,10 +1616,11 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
         raise ValueError("refusing untouched source as rebuilt background; run reconstruct/inpaint first")
 
     layers = []
+    plate_u8 = None
     if base_src:
         base_rel = _stage_asset(base_src, "background", run_dir, warnings)
         layers.append(Layer(
-            id="background", type="image", name="Background — clean plate",
+            id="background", type="image", name="Background",
             box={"x": 0, "y": 0, "w": canvas["w"], "h": canvas["h"]},
             z_index=-1_000_000, src=base_rel,
             constraints={"horizontal": "STRETCH", "vertical": "STRETCH"},
@@ -1229,10 +1630,20 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
         # ships solid rects for UI screenshots; the raster floor beneath keeps fidelity
         # guaranteed while the rects make the plate natively editable).
         resolved_base = _resolve(base_src, run_dir)
+        # Decode the clean plate once for solid-band / gradient / per-group background work.
+        plate_u8 = None
+        if resolved_base:
+            try:
+                import numpy as np
+                from PIL import Image
+                with Image.open(resolved_base) as image:
+                    plate_u8 = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            except Exception:
+                plate_u8 = None
         solid_bands = None
         if resolved_base and bool(((cfg or {}).get("background") or {}).get("solid_plate", True)):
             try:
-                solid_bands = _solid_plate_bands(resolved_base, canvas)
+                solid_bands = _solid_plate_bands(resolved_base, canvas, plate_rgb=plate_u8)
             except Exception as exc:
                 solid_bands = None
                 warnings.append({"code": "solid-plate-error", "detail": str(exc)})
@@ -1261,14 +1672,16 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
         if resolved_base and not solid_bands:
             try:
                 from . import reconstruct as _reconstruct  # lazy: heavy transitive deps
-                bg_gradient = _reconstruct.extract_background_gradient(resolved_base, cfg)
+                bg_gradient = _reconstruct.extract_background_gradient(
+                    resolved_base, cfg, rgb=plate_u8,
+                )
             except Exception as exc:  # detection must never break the compile
                 bg_gradient = None
                 warnings.append({"code": "background-gradient-error", "detail": str(exc)})
             if bg_gradient:
                 layers.append(Layer(
                     id="background-gradient", type="shape", shape_kind="rect",
-                    name="Background — gradient",
+                    name="Background",
                     box={"x": 0, "y": 0, "w": canvas["w"], "h": canvas["h"]},
                     z_index=-999_999, fill=bg_gradient,
                     constraints={"horizontal": "STRETCH", "vertical": "STRETCH"},
@@ -1298,7 +1711,9 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
     # Background-per-group (Codia region construction; config background.per_group).
     if base_src and bool(((cfg or {}).get("background") or {}).get("per_group", True)):
         try:
-            _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings)
+            _add_group_backgrounds(
+                layers, canvas, run_dir, base_src, warnings, plate_rgb=plate_u8,
+            )
         except Exception as exc:
             warnings.append({"code": "group-background-error", "detail": str(exc)})
     # Single-ownership enforcement (one owner per pixel): erase every native text layer's
@@ -1316,6 +1731,8 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
             _infer_sizing(layer)
     except Exception as exc:
         warnings.append({"code": "sizing-inference-error", "detail": str(exc)})
+    # Designer-facing uniqueness among siblings (local, O(n); no VLM).
+    _dedupe_sibling_names(layers)
     total = _count_layers(layers)
     editable = _count_editable(layers)
     leaf_accounting = _leaf_accounting(layers)

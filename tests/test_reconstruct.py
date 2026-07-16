@@ -3,7 +3,71 @@ import os
 
 import numpy as np
 
-from src.reconstruct import _is_background_plate, _inpaint_used_opencv
+from src.reconstruct import (
+    _is_background_plate, _inpaint_used_opencv, _promote_ocr_overlapping_shells,
+)
+
+
+def test_promote_ocr_overlapping_logo_shell_skips_vectorize_path():
+    """Reconstruct safety net: logo hosting OCR → shape plate, not icon vectorize."""
+    candidates = [
+        {
+            "id": "c_E014", "target": "icon",
+            "box": {"x": 774, "y": 540, "w": 256, "h": 254},
+            "meta": {"role": "logo"},
+        },
+        {
+            "id": "c_pct", "target": "text", "text": "45%",
+            "box": {"x": 792, "y": 646, "w": 187, "h": 60},
+            "meta": {"role": "offer"},
+        },
+    ]
+    n = _promote_ocr_overlapping_shells(candidates, {})
+    assert n == 1
+    assert candidates[0]["target"] == "shape"
+    assert candidates[0]["meta"]["text_bearing_shell"] is True
+    assert candidates[0]["meta"]["role"] == "badge"
+    assert candidates[1]["meta"]["removal_required"] is True
+    assert candidates[1]["meta"]["shell_text_host"] == "c_E014"
+
+
+def test_promote_does_not_steal_product_packaging_text():
+    candidates = [
+        {
+            "id": "c_E013", "target": "image",
+            "box": {"x": 40, "y": 420, "w": 1000, "h": 620},
+            "meta": {"role": "product"},
+        },
+        {
+            "id": "c_label", "target": "text", "text": "VANILLE",
+            "box": {"x": 200, "y": 700, "w": 200, "h": 40},
+            "meta": {"role": "label"},
+        },
+    ]
+    assert _promote_ocr_overlapping_shells(candidates, {}) == 0
+    assert candidates[0]["target"] == "image"
+    assert candidates[1].get("meta", {}).get("removal_required") is not True
+
+
+def test_promote_wide_shape_hosting_ocr_becomes_banner_shell():
+    """Reconstruct safety net: brushstroke-like shape + inset OCR → banner plate."""
+    candidates = [
+        {
+            "id": "c_E_banner", "target": "shape",
+            "box": {"x": 80, "y": 220, "w": 920, "h": 140},
+            "meta": {"role": "shape"},
+        },
+        {
+            "id": "c_sold", "target": "text", "text": "ALMOST SOLD OUT...",
+            "box": {"x": 160, "y": 255, "w": 760, "h": 70},
+            "meta": {"role": "offer"},
+        },
+    ]
+    assert _promote_ocr_overlapping_shells(candidates, {}) == 1
+    assert candidates[0]["meta"]["text_bearing_shell"] is True
+    assert candidates[0]["meta"]["role"] == "banner"
+    assert candidates[1]["meta"]["removal_required"] is True
+    assert candidates[1]["meta"]["shell_text_host"] == "c_E_banner"
 
 
 def test_inpaint_used_opencv_detects_regional_fallback():
@@ -1012,6 +1076,34 @@ def test_outline_only_ghost_button_is_not_solidified():
     assert np.array_equal(restored, ring)
 
 
+def test_biomel_stroke_outline_pill_extracts_stroke_without_opaque_fill():
+    """Hollow outline pill → native stroke + transparent fill (no photo blot)."""
+    image = Image.new("L", (220, 60), 0)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((0, 0, 219, 59), radius=29, fill=255)
+    draw.rounded_rectangle((3, 3, 216, 56), radius=26, fill=0)
+    ring = np.asarray(image) > 16
+    rgb = np.full((60, 220, 3), 40, dtype=np.uint8)  # photo-like dark field
+    rgb[ring] = (10, 10, 10)  # black stroke
+    canvas_mask = (ring.astype(np.uint8) * 255)
+    box = {"x": 0, "y": 0, "w": 220, "h": 60}
+
+    extracted = reconstruct._extract_shape_style(
+        rgb, canvas_mask, box, {}, role="callout", stroke_outline=True,
+    )
+    assert extracted is not None
+    assert extracted["fill"] is None
+    assert extracted["stroke"] is not None
+    assert extracted["stroke"]["width"] >= 1
+    assert extracted["meta"].get("stroke_outline_shell") is True
+    assert extracted["meta"].get("fill_transparent") is True
+    # Auto-detect hollow ring even without the flag.
+    auto = reconstruct._extract_shape_style(rgb, canvas_mask, box, {}, role="callout")
+    assert auto is not None
+    assert auto["fill"] is None
+    assert auto["stroke"] is not None
+
+
 def test_plate_boundary_fragments_fold_back_into_the_button():
     # SAM peeled both anti-aliased end caps of 009's pill into separate "icons";
     # rendered above the native plate they re-drew the source's dark background
@@ -1048,6 +1140,31 @@ def test_plate_boundary_fragments_fold_back_into_the_button():
         candidates(), {"reconstruct": {"suppress_plate_fragments": False}})
     assert count == 0
     assert all(c["target"] != "drop" for c in off)
+
+
+def test_engagement_underlay_shell_is_suppressed_on_social():
+    """CODIA 009: bogus dark ellipse 'Button' under a comment icon must drop."""
+    candidates = [
+        {"id": "comment", "target": "icon",
+         "box": {"x": 100, "y": 100, "w": 36, "h": 36},
+         "meta": {"role": "comment"}},
+        {"id": "bogus", "target": "shape",
+         "box": {"x": 102, "y": 102, "w": 32, "h": 32},
+         "fill": {"kind": "flat", "color": "#030506"},
+         "meta": {"role": "button", "button_shell": True}},
+        {"id": "real-pill", "target": "shape",
+         "box": {"x": 200, "y": 100, "w": 160, "h": 48},
+         "fill": {"kind": "flat", "color": "#eff3f4"},
+         "meta": {"role": "button"}},
+    ]
+    cfg = {"scene": {"archetype": "social_screenshot"}}
+    out, suppressed = reconstruct._suppress_engagement_underlay_shells(candidates, cfg)
+    by_id = {c["id"]: c for c in out}
+    assert suppressed == 1
+    assert by_id["bogus"]["target"] == "drop"
+    assert by_id["bogus"]["meta"]["suppression_reason"] == "engagement-icon-underlay"
+    assert by_id["comment"]["target"] == "icon"
+    assert by_id["real-pill"]["target"] == "shape"
 
 
 def test_f7_before_after_label_stays_editable_when_not_over_a_column():

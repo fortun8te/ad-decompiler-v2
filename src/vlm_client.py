@@ -6,6 +6,8 @@ import io
 import json
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Iterable, TypeVar
 
 _DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
 _DEFAULT_MODEL = "google/gemma-4-e4b"
@@ -18,10 +20,56 @@ _DEFAULT_MAX_TOKENS = 500
 # floor so callers that pass a small max_tokens don't silently get truncated
 # before any real answer is produced.
 _MIN_MAX_TOKENS = 500
+# LM Studio continuous batching is typically configured with parallel slots
+# (lms ps shows "parallel: 4"). Sequential for-loops leave those slots idle.
+_DEFAULT_PARALLELISM = 4
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 
 class VLMError(RuntimeError):
     """A useful, non-secret error from the local OpenAI-compatible endpoint."""
+
+
+def parallelism_from_cfg(cfg: dict | None = None, default: int = _DEFAULT_PARALLELISM) -> int:
+    """``vlm.parallelism`` — concurrent independent VLM requests (LM Studio slots)."""
+    vcfg = (cfg or {}).get("vlm") if isinstance(cfg, dict) else None
+    if not isinstance(vcfg, dict):
+        return max(1, int(default))
+    raw = vcfg.get("parallelism", vcfg.get("parallel", default))
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+def map_parallel(
+    fn: Callable[[T], R],
+    items: Iterable[T],
+    *,
+    workers: int = _DEFAULT_PARALLELISM,
+) -> list[R]:
+    """Run ``fn`` over ``items`` with a thread pool; preserve input order.
+
+    Independent VLM crop calls are I/O-bound on the LM Studio HTTP server, which
+    already continuous-batches concurrent requests (typically 4 slots). Workers=1
+    keeps the old sequential behaviour for tests / debugging.
+    """
+    sequence = list(items)
+    if not sequence:
+        return []
+    worker_count = max(1, int(workers))
+    if worker_count == 1 or len(sequence) == 1:
+        return [fn(item) for item in sequence]
+
+    results: list[R | None] = [None] * len(sequence)
+    with ThreadPoolExecutor(max_workers=min(worker_count, len(sequence))) as pool:
+        futures = {pool.submit(fn, item): index for index, item in enumerate(sequence)}
+        for future in as_completed(futures):
+            index = futures[future]
+            results[index] = future.result()
+    return results  # type: ignore[return-value]
 
 
 def consensus_key(answer) -> str:

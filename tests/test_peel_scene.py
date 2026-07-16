@@ -101,6 +101,10 @@ class SpyInpaint:
 
 def _cfg(**peel):
     peel.setdefault("hole_dilate_px", 0)   # synthetic masks are exact — no AA fringe
+    peel.setdefault("text_hole_dilate_px", 0)
+    peel.setdefault("inpaint_feather_px", 0)  # unit tests assert exact fill pixels
+    peel.setdefault("fail_closed_to_flat", False)
+    peel.setdefault("flat_fill_allow_background", False)  # keep recomposite exact
     return {"peel": peel}
 
 
@@ -507,21 +511,41 @@ def test_role_band_puts_product_cutout_above_the_card_it_sits_on():
 # ── flat-fill fast path ────────────────────────────────────────────────────────────
 
 def test_flat_fill_fills_solid_holes_exactly_without_calling_the_inpainter():
+    # Flat-fill is for card/shape surfaces — photo kinds are denied (real photos
+    # have textured margins that used to false-trigger a solid beige plate).
+    # Text on non-photo under-layers is also eligible (native text over a card).
     flat, elements, masks = _scene()
+    for el in elements:
+        if el.id in ("left", "right"):
+            el.kind = "shape"
     spy = SpyInpaint()
     result = peel_scene.peel_scene(flat, elements, inpaint=spy,
                                    cfg=_cfg(flat_fill_tol=6.0))
-    # Element-class holes are all flat here — only TEXT-class holes reach the
-    # inpainter (flat-fill is element-class only; text stays with the router).
-    assert all(c["meta"]["text_occluder"] for c in spy.calls)
+    # Element + text holes on the solid shapes are flat — only the background
+    # plate (which refuses flat-fill) reaches the inpainter.
+    assert not any(c["meta"]["under_id"] in ("left", "right") for c in spy.calls)
     left = result.layer("left")
     hole = masks["circle"] & masks["left"]
     assert np.all(left.rgba[:, :, :3][hole] == BLUE)       # exact, no Telea blur
+    text_left = masks["text"] & masks["left"]
+    assert np.all(left.rgba[:, :, :3][text_left] == BLUE)
     right = result.layer("right")
     assert np.all(right.rgba[:, :, :3][masks["circle"] & masks["right"]] == GREEN)
     backends = {b["text_occluder"]: b["backend"] for b in left.meta["fill_backends"]}
-    assert backends == {False: "solid", True: "inpaint"}
+    assert backends == {False: "solid", True: "solid"}
     assert result.meta["recomposite"]["exact"] is True
+
+
+def test_flat_fill_still_denies_text_holes_on_photo_under_layers():
+    """Text over a photo must not solid-fill; photo kinds always deny flat-fill."""
+    flat, elements, masks = _scene()  # left/right kind=photo
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(flat, elements, inpaint=spy, cfg=_cfg(flat_fill_tol=6.0))
+    left = result.layer("left")
+    text_backends = [b["backend"] for b in left.meta["fill_backends"] if b["text_occluder"]]
+    assert text_backends and all(b == "inpaint" for b in text_backends)
+    assert any(c["meta"]["under_id"] == "left" and c["meta"]["text_occluder"]
+               for c in spy.calls)
 
 
 def test_flat_fill_defers_to_the_inpainter_on_textured_context():
@@ -529,11 +553,299 @@ def test_flat_fill_defers_to_the_inpainter_on_textured_context():
     flat = rng.integers(0, 255, (H, W, 3), np.uint8)       # loud texture everywhere
     under = _rect_mask((20, 20, 220, 320))
     top = _circle_mask()
-    elements = [SceneElement(id="under", mask=under, z=0.0),
+    elements = [SceneElement(id="under", mask=under, z=0.0, kind="shape"),
                 SceneElement(id="top", mask=top, z=1.0)]
     spy = SpyInpaint()
     peel_scene.peel_scene(flat, elements, inpaint=spy, cfg=_cfg(flat_fill_tol=6.0))
     assert any(c["meta"]["under_id"] == "under" for c in spy.calls)
+
+
+def test_flat_fill_skips_thin_rim_oversized_holes():
+    """Thin flat margins must not paint a whole plate solid (benchmark 016)."""
+    flat = np.full((H, W, 3), BG, np.uint8)
+    # Almost-full under "card" with a tiny visible rim — thin-rim guard fires.
+    under = _rect_mask((10, 10, W - 10, H - 10))
+    top = _rect_mask((30, 30, W - 30, H - 30))
+    flat[under] = (250, 230, 160)
+    flat[top] = RED
+    elements = [SceneElement(id="card", mask=under, z=0.0, kind="shape"),
+                SceneElement(id="blob", mask=top, z=1.0, kind="product")]
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(flat_fill_tol=8.0, flat_fill_min_visible_frac=0.12,
+                 flat_fill_max_area=5000, flat_fill_max_frac=0.05))
+    assert not result.skipped
+    card = result.layer("card")
+    backends = [b["backend"] for b in card.meta["fill_backends"] if not b["text_occluder"]]
+    assert backends and all(b == "inpaint" for b in backends)
+    assert any(c["meta"]["under_id"] == "card" for c in spy.calls)
+
+
+def test_background_flat_fill_per_cc_on_uniform_plate():
+    """Peel background on solid chrome should solid-fill (002 orange/white plates)."""
+    flat = np.full((H, W, 3), BG, np.uint8)
+    under = _rect_mask((40, 40, 200, 200))
+    top = _rect_mask((80, 80, 160, 160))
+    flat[under] = (200, 40, 10)
+    flat[top] = RED
+    # Leave most of the canvas as BG so background flat-fill has a clean ring.
+    elements = [SceneElement(id="card", mask=under, z=0.0, kind="shape"),
+                SceneElement(id="blob", mask=top, z=1.0, kind="product")]
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(flat_fill_tol=8.0, flat_fill_allow_background=True,
+                 flat_fill_min_visible_frac=0.0, fill_cc_split=True))
+    assert not result.skipped
+    bg_backends = [b["backend"] for b in (result.meta.get("fill_backends") or [])
+                   if not b.get("text_occluder")]
+    assert bg_backends and "solid" in bg_backends
+
+    # product_on_flat archetype enables background solid without the explicit knob.
+    cfg2 = _cfg(flat_fill_tol=8.0, flat_fill_min_visible_frac=0.0)
+    cfg2["scene"] = {"archetype": "product_on_flat"}
+    result2 = peel_scene.peel_scene(flat, elements, inpaint=SpyInpaint(), cfg=cfg2)
+    bg2 = [b["backend"] for b in (result2.meta.get("fill_backends") or [])
+           if not b.get("text_occluder")]
+    assert bg2 and "solid" in bg2
+
+
+def test_wordmark_does_not_activate_peel_alone():
+    under = _rect_mask((40, 40, 200, 200))
+    logo = _rect_mask((80, 80, 140, 140))
+    elements = [
+        SceneElement(id="card", mask=under, z=0.0, kind="shape"),
+        SceneElement(id="logo", mask=logo, z=1.0, kind="icon", meta={"role": "logo"}),
+    ]
+    report = peel_scene.overlap_report(elements, _cfg(min_overlap_area=64))
+    assert report["eligibility"]["logo"]["reason"] == "artwork-wordmark"
+    assert report["needed"] is False
+
+
+def test_fail_closed_to_flat_when_generative_smears():
+    flat = np.full((H, W, 3), BG, np.uint8)
+    under = _rect_mask((20, 20, 220, 320))
+    top = _circle_mask()
+    flat[under] = BLUE
+    flat[top] = RED
+    elements = [SceneElement(id="card", mask=under, z=0.0, kind="shape"),
+                SceneElement(id="blob", mask=top, z=1.0, kind="product")]
+
+    class SmearInpaint:
+        def __call__(self, rgb, mask, meta=None):
+            out = rgb.copy()
+            noise = np.random.default_rng(0).integers(0, 255, rgb.shape, np.uint8)
+            out[mask] = noise[mask]
+            return out
+
+    # Deny first solid via area cap; fail-closed re-samples and keeps solid blue.
+    cfg = _cfg(flat_fill_tol=8.0, fail_closed_to_flat=True, fail_closed_residue=1.0,
+               flat_fill_max_area=1, flat_fill_min_visible_frac=0.0,
+               context_shadow_px=0, inpaint_feather_px=0)
+    result = peel_scene.peel_scene(flat, elements, inpaint=SmearInpaint(), cfg=cfg)
+    card = result.layer("card")
+    hole = top & under
+    assert np.all(card.rgba[:, :, :3][hole] == BLUE)
+    assert any(b.get("backend") == "solid" for b in card.meta["fill_backends"])
+
+
+def test_max_components_and_peel_inpaint_mode():
+    frag = _fragmented_mask((20, 20, 220, 220), step=4)
+    assert peel_scene.mask_integrity(frag)["components"] > 24
+    elig = peel_scene.element_eligibility(
+        SceneElement(id="panel", mask=frag, z=0.0, kind="photo-fragment"),
+        _cfg(max_components=24))
+    assert elig["eligible"] is False and "components" in elig["reason"]
+    assert peel_scene.peel_inpaint_mode(
+        {"inpaint": {"mode": "flux"}, "scene": {"archetype": "lifestyle_overlay"}},
+        {"under_kind": "photo"}) == "lama"
+
+
+def test_text_holes_on_shape_prefer_solid_fill():
+    flat = np.full((H, W, 3), BG, np.uint8)
+    under = _rect_mask((20, 20, 220, 320))
+    text = _rect_mask((60, 80, 180, 120))
+    flat[under] = BLUE
+    flat[text] = INK
+    elements = [SceneElement(id="card", mask=under, z=0.0, kind="shape"),
+                SceneElement(id="t", mask=text, z=1.0, kind="text", is_text=True),
+                # Need an object pair to activate peel.
+                SceneElement(id="icon", mask=_rect_mask((40, 200, 100, 260)), z=2.0, kind="icon")]
+    flat[elements[2].mask] = RED
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(flat_fill_tol=6.0, flat_fill_text=True, flat_fill_min_visible_frac=0.0))
+    card = result.layer("card")
+    text_backends = [b["backend"] for b in card.meta["fill_backends"] if b["text_occluder"]]
+    assert text_backends and all(b == "solid" for b in text_backends)
+    # Text on photo must not punch when punch_text_into_photos is false.
+    photo = SceneElement(id="photo", mask=under, z=0.0, kind="photo-fragment")
+    els2 = [photo,
+            SceneElement(id="t", mask=text, z=1.0, kind="text", is_text=True),
+            SceneElement(id="icon", mask=_rect_mask((40, 200, 100, 260)), z=2.0, kind="icon")]
+    flat2 = flat.copy()
+    spy2 = SpyInpaint()
+    result2 = peel_scene.peel_scene(
+        flat2, els2, inpaint=spy2,
+        cfg=_cfg(punch_text_into_photos=False, flat_fill_tol=6.0))
+    ph = result2.layer("photo")
+    assert not any(b.get("text_occluder") for b in (ph.meta.get("fill_backends") or []))
+
+
+def test_abandon_oversized_photo_holes_leaves_transparent():
+    """Half-covered photo under-layers: don't LaMa-haze — punch alpha when configured."""
+    flat = np.full((H, W, 3), BG, np.uint8)
+    under = _rect_mask((20, 20, 420, 320))
+    # Large occluder covering >30% of under.
+    top = _rect_mask((20, 100, 420, 320))
+    flat[under] = BLUE
+    flat[top] = RED
+    elements = [SceneElement(id="panel", mask=under, z=0.0, kind="photo-fragment"),
+                SceneElement(id="cover", mask=top, z=1.0, kind="product")]
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(abandon_hole_frac=0.30, per_occluder_area=1, large_photo_hole="abandon",
+                 allow_flux=False))
+    panel = result.layer("panel")
+    hole = top & under
+    assert np.all(panel.rgba[:, :, 3][hole] == 0)
+    assert panel.meta.get("abandoned_fill") is True
+    assert any(b["backend"] == "abandoned" for b in panel.meta["fill_backends"])
+    # No inpaint call for the abandoned element-class hole.
+    assert not any(c["meta"].get("under_id") == "panel"
+                   and not c["meta"].get("text_occluder") for c in spy.calls)
+
+
+def test_large_photo_holes_bake_by_default_instead_of_lama_haze():
+    """Past Flux max (or Flux off): bake original pixels, no generative fill."""
+    flat = np.full((H, W, 3), BG, np.uint8)
+    under = _rect_mask((10, 10, 450, 350))
+    top = _rect_mask((40, 40, 280, 280))  # ~57k px hole
+    flat[under] = BLUE
+    flat[top] = RED
+    elements = [SceneElement(id="panel", mask=under, z=0.0, kind="photo-fragment"),
+                SceneElement(id="cover", mask=top, z=1.0, kind="product")]
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(allow_flux=False, max_generative_photo_hole_px=8000,
+                 abandon_photo_min_area=12000, large_photo_hole="bake",
+                 per_occluder_area=1, flat_fill_tol=0.0))
+    panel = result.layer("panel")
+    hole = top & under
+    assert np.all(panel.rgba[:, :, 3][hole] == 255)
+    assert np.all(panel.rgba[:, :, :3][hole] == RED)
+    assert panel.meta.get("baked_large_photo_hole") is True
+    assert panel.meta.get("peel_quality") == "incomplete-photo"
+    assert any(b["backend"] == "baked" for b in panel.meta["fill_backends"])
+    assert not any(c["meta"].get("under_id") == "panel"
+                   and not c["meta"].get("text_occluder") for c in spy.calls)
+
+
+def test_flux_band_photo_holes_call_inpaint_not_bake():
+    """With allow_flux, mid-size photo holes stay generative (adapter may pick Flux)."""
+    flat = np.full((H, W, 3), BG, np.uint8)
+    under = _rect_mask((10, 10, 450, 350))
+    top = _rect_mask((40, 40, 280, 280))  # ~57k — inside default flux_max 220k
+    flat[under] = BLUE
+    flat[top] = RED
+    elements = [SceneElement(id="panel", mask=under, z=0.0, kind="photo-fragment"),
+                SceneElement(id="cover", mask=top, z=1.0, kind="product")]
+    spy = SpyInpaint()
+    result = peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(allow_flux=True, flux_min_hole_px=4000, flux_max_hole_px=220000,
+                 per_occluder_area=1, flat_fill_tol=0.0))
+    panel = result.layer("panel")
+    assert not panel.meta.get("baked_large_photo_hole")
+    assert any(c["meta"].get("under_id") == "panel"
+               and not c["meta"].get("text_occluder") for c in spy.calls)
+
+
+def test_peel_inpaint_mode_routes_photo_band_to_flux():
+    cfg = {"peel": {"allow_flux": True, "flux_min_hole_px": 4000, "flux_max_hole_px": 100000}}
+    assert peel_scene.peel_inpaint_mode(
+        cfg, {"under_kind": "photo-fragment", "hole_px": 20000}) == "flux_comfy"
+    assert peel_scene.peel_inpaint_mode(
+        cfg, {"under_kind": "photo-fragment", "hole_px": 500}) == "lama"
+    assert peel_scene.peel_inpaint_mode(
+        cfg, {"under_kind": "shape", "hole_px": 20000}) == "lama"
+    assert peel_scene.peel_inpaint_mode(
+        cfg, {"under_kind": "photo", "hole_px": 20000, "text_occluder": True}) == "lama"
+
+
+def test_small_photo_holes_still_call_inpaint():
+    """Tiny photo overlaps remain eligible for generative/Telea fill."""
+    flat = np.full((H, W, 3), BG, np.uint8)
+    under = _rect_mask((20, 20, 400, 300))
+    top = _rect_mask((100, 100, 130, 130))  # 900 px — under generative cap
+    flat[under] = BLUE
+    flat[top] = RED
+    elements = [SceneElement(id="panel", mask=under, z=0.0, kind="photo-fragment"),
+                SceneElement(id="cover", mask=top, z=1.0, kind="icon")]
+    spy = SpyInpaint()
+    peel_scene.peel_scene(
+        flat, elements, inpaint=spy,
+        cfg=_cfg(max_generative_photo_hole_px=8000, abandon_photo_min_area=12000,
+                 abandon_hole_frac=0.50, per_occluder_area=1, flat_fill_tol=0.0))
+    assert any(c["meta"].get("under_id") == "panel"
+               and not c["meta"].get("text_occluder") for c in spy.calls)
+
+
+def test_perforated_top_still_activates_peel_over_solid_under():
+    """Hollow occluder footprints must not block peel when the under-layer is solid
+    (benchmark 009 skipped the whole scene because E011 was perforated)."""
+    under = _rect_mask((40, 40, 200, 200))
+    # Donut top: solid ring with large interior hole → high hole_frac (>25%).
+    outer = _rect_mask((60, 60, 180, 180))
+    inner = _rect_mask((85, 85, 155, 155))
+    top = outer & ~inner
+    flat = np.full((H, W, 3), BG, np.uint8)
+    flat[under] = BLUE
+    flat[top] = RED
+    elements = [SceneElement(id="card", mask=under, z=0.0, kind="shape"),
+                SceneElement(id="ring", mask=top, z=1.0, kind="icon")]
+    report = peel_scene.overlap_report(elements, _cfg(min_overlap_area=64))
+    assert report["eligibility"]["ring"]["as_top"] is True
+    assert report["eligibility"]["ring"]["as_under"] is False
+    assert report["eligibility"]["ring"]["eligible"] is False
+    assert report["eligibility"]["card"]["eligible"] is True
+    assert report["needed"] is True
+    pair = next(p for p in report["pairs"] if p["qualifies"]
+                and p["top"] == "ring" and p["under"] == "card")
+    assert pair["eligible"] is True
+    result = peel_scene.peel_scene(flat, elements, inpaint=SpyInpaint(),
+                                   cfg=_cfg(min_overlap_area=64))
+    assert not result.skipped
+    assert result.layer("card") is not None
+
+
+def test_large_element_holes_are_filled_per_occluder():
+    flat = np.full((H, W, 3), BG, np.uint8)
+    under = _rect_mask((10, 10, 430, 330))
+    a = _rect_mask((20, 20, 120, 120))
+    b = _rect_mask((200, 20, 300, 120))
+    flat[under] = (200, 200, 200)
+    flat[a] = RED
+    flat[b] = GREEN
+    elements = [SceneElement(id="card", mask=under, z=0.0, kind="shape"),
+                SceneElement(id="A", mask=a, z=1.0, kind="icon"),
+                SceneElement(id="B", mask=b, z=2.0, kind="icon")]
+    spy = SpyInpaint()
+    peel_scene.peel_scene(flat, elements, inpaint=spy,
+                          cfg=_cfg(per_occluder_area=100, flat_fill_tol=0.0))
+    under_calls = [c for c in spy.calls
+                   if c["meta"].get("under_id") == "card"
+                   and not c["meta"].get("text_occluder")]
+    # Two separate element-class calls (one per large occluder), not one batch.
+    assert len(under_calls) >= 2
+    ids = {tuple(c["meta"].get("occluder_ids") or []) for c in under_calls}
+    assert ("A",) in ids or ["A"] in [list(x) for x in ids]
+    assert any(set(c["meta"].get("occluder_ids") or []) == {"A"} for c in under_calls)
+    assert any(set(c["meta"].get("occluder_ids") or []) == {"B"} for c in under_calls)
 
 
 # ── artifacts ──────────────────────────────────────────────────────────────────────

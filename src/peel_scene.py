@@ -81,6 +81,7 @@ SCENE_DEFAULTS = {
     "min_overlap_area": 64,      # px² — smaller intersections don't justify a peel run
     "min_overlap_frac": 0.02,    # fraction of the SMALLER element's area
     "hole_dilate_px": 2,         # widen holes past anti-aliased fringes (0 = exact masks)
+    "text_hole_dilate_px": 4,    # extra bleed for text-shaped holes (glyph AA / residue)
     "context_pad_px": 24,        # crop padding around a layer for inpaint context
     "min_context_frac": 0.05,    # below this visible/total ratio, isolation is hopeless
     "text_occluders": "box",     # box | off — see docs (ghost-text vs box overfill)
@@ -88,8 +89,9 @@ SCENE_DEFAULTS = {
     "refine_band_px": 3,         # width of the edge band the matting may adjust
     # ── detection-granularity guard (element eligibility for the gate) ──
     "require_eligible": True,    # gate needs BOTH pair members to be solid elements
-    "min_cc_frac": 0.80,         # largest connected component ≥ this fraction of mask
+    "min_cc_frac": 0.85,         # largest connected component ≥ this fraction of mask
     "max_hole_frac": 0.25,       # interior holes ≤ this fraction of (mask + holes)
+    "max_components": 24,        # > this many CCs → fragmented residual (swiss-cheese)
     # ── fill-quality knobs ──
     "context_shadow_px": 12,     # blind this band around the hole from the inpaint
                                  # context — occluder drop shadows / AA halos live just
@@ -103,7 +105,71 @@ SCENE_DEFAULTS = {
     "flat_fill_inlier_frac": 0.60,
     "flat_fill_ring_px": 16,     # ring width sampled beyond the shadow band
     "flat_fill_min_px": 40,      # minimum inlier samples required to trust the ring
+    # Thin-rim guard (016): refuse flat-fill when almost none of the under-layer is
+    # still visible — a thin flat margin falsely looks solid and paints the whole
+    # footprint one colour.  Area/frac caps are secondary; 0 disables each.
+    # Solid cards under large products (002) keep visible_frac high → still flat-fill.
+    "flat_fill_min_visible_frac": 0.12,
+    "flat_fill_max_area": 0,     # 0 = no area cap; set >0 to refuse oversized writes
+    "flat_fill_max_frac": 0.0,   # 0 = no frac cap; e.g. 0.95 refuses near-total coverage
+    # Background plate: LOCAL solid fill per CC when the ring agrees — only on
+    # flat-plate archetypes by default (002 orange chrome). Lifestyle keeps LaMa.
+    "flat_fill_allow_background": False,
+    "flat_fill_bg_max_area": 0,      # 0 = no cap when background flat is allowed
+    "flat_fill_bg_max_frac": 0.0,
+    # Text holes on flat cards: solid-fill when the ring agrees (LaMa left glyph haze).
+    "flat_fill_text": True,
+    # Split large write masks into connected components before fill.
+    "fill_cc_split": True,
+    "fill_cc_min_area": 64,
+    "inpaint_feather_px": 0,     # soft edge on generative write-back (config enables)
+    # Large occluders batched into ONE LaMa call with context isolation invent haze
+    # (benchmark 016 E000←E013). Split element-class holes at this area threshold.
+    "per_occluder_area": 6000,   # element-class hole ≥ this → own inpaint call
+    # Photo under-layers with a hole bigger than this fraction of their mask cannot
+    # be recovered by LaMa under isolation.  See large_photo_hole for what we do
+    # instead of generative fill (bake keeps original pixels; abandon punches alpha).
+    "abandon_hole_frac": 0.15,
+    # Absolute px gate for photo holes — used when Flux is off or the hole is past
+    # flux_max_hole_px (bake/abandon rather than LaMa haze).
+    "abandon_photo_min_area": 12000,
+    # Soft LaMa ceiling when Flux is unavailable. With allow_flux, Flux covers the
+    # mid/large band and this only kicks in above flux_max_hole_px.
+    "max_generative_photo_hole_px": 8000,
+    # Prefer Flux Fill for photo under-layer holes (VRAM-cleared at peel boundary).
+    # Flat plates still solid-fill upstream; text stays Telea/LaMa.
+    "allow_flux": True,
+    "flux_min_hole_px": 4000,     # below → Telea/LaMa (Flux overhead not worth it)
+    "flux_max_hole_px": 220000,   # above → bake (Flux hallucinates on giant masks)
+    # bake = leave flat pixels; abandon = transparent. Only for holes Flux won't touch.
+    "large_photo_hole": "bake",
+    # Extra context for large photo fills (gives Flux/LaMa more of the under-layer).
+    "context_pad_large_px": 64,
+    "photo_context_shadow_px": 4,  # less blinding than context_shadow_px on photos
+    # Regional peel ladder: after LaMa, if a solid ring candidate scores cleaner,
+    # fail closed to that flat fill instead of keeping generative smear.
+    "fail_closed_to_flat": True,
+    "fail_closed_residue": 8.0,
+    # Peel objects only: OCR text / logos punch plates, never photo cutouts
+    # (printed ink / wordmarks stay on the product raster).
+    "punch_text_into_photos": False,
+    "punch_artwork_into_photos": False,
 }
+
+#: Archetypes whose plates are Codia-style solid/banded chrome — peel holes prefer
+#: analytic flat fill; generative backends are last resort and never Flux at peel.
+_FLAT_PLATE_ARCHETYPES = frozenset({
+    "product_on_flat", "social_screenshot", "comparison_grid",
+})
+
+#: Under-kinds that are plate chrome (safe for large solid fills when the ring agrees).
+_PLATE_KINDS = frozenset({
+    "shape", "card", "panel", "button", "background", "plate", "element",
+})
+
+#: Brand lettering / logos — artwork, not peelable objects that activate the gate.
+_ARTWORK_ROLES = frozenset({"logo", "wordmark", "brand", "logotype"})
+_ARTWORK_KINDS = frozenset({"logo", "wordmark", "brand"})
 
 
 def _options(cfg: Optional[dict]) -> dict:
@@ -114,6 +180,107 @@ def _options(cfg: Optional[dict]) -> dict:
         if key in SCENE_DEFAULTS:
             opts[key] = value
     return opts
+
+
+def _archetype(cfg: Optional[dict]) -> str:
+    return str(((cfg or {}).get("scene") or {}).get("archetype") or "").lower()
+
+
+def _is_flat_plate_archetype(cfg: Optional[dict] = None, archetype: str = "") -> bool:
+    # Format capability wins when present — batch multi-format runs should not need a
+    # new named archetype just to prefer analytic plate fill.
+    from src import format_readiness
+    fmt = format_readiness.format_from_cfg(cfg)
+    if fmt.get("capabilities"):
+        return format_readiness.prefers_solid_flat(cfg)
+    name = (archetype or _archetype(cfg)).lower()
+    extra = set((((cfg or {}).get("peel") or {}).get("flat_plate_archetypes")) or ())
+    return name in (_FLAT_PLATE_ARCHETYPES | {str(x).lower() for x in extra})
+
+
+def _element_role(element: SceneElement) -> str:
+    return str((element.meta or {}).get("role") or "").lower()
+
+
+def is_artwork_element(element: SceneElement) -> bool:
+    """Logo / wordmark / brand lettering — artwork, not a peelable object."""
+    if element.is_text:
+        return False
+    kind = str(element.kind or "").lower()
+    role = _element_role(element)
+    return kind in _ARTWORK_KINDS or role in _ARTWORK_ROLES
+
+
+def is_peel_object(element: SceneElement) -> bool:
+    """True when ``element`` is an object that may activate peel (not text/artwork)."""
+    if element.is_text or is_artwork_element(element):
+        return False
+    kind = str(element.kind or "").lower()
+    role = _element_role(element)
+    if kind in ("background", "plate"):
+        return False
+    if role in _ARTWORK_ROLES:
+        return False
+    return True
+
+
+def resolve_peel_fill_policy(cfg: Optional[dict] = None, *, under_kind: str = "",
+                             text_occluder: bool = False) -> dict:
+    """Archetype-aware peel hole policy: when to prefer flat vs LaMa (never Flux).
+
+    Returns ``{"prefer_flat": bool, "allow_background_flat": bool,
+    "backend": "flat"|"lama"|"abandon_photo", "archetype": str}``.
+    """
+    opts = _options(cfg)
+    archetype = _archetype(cfg)
+    flat_scene = _is_flat_plate_archetype(cfg, archetype)
+    kind = str(under_kind or "").lower()
+    photo = kind in _PHOTO_KINDS
+    plate = kind in _PLATE_KINDS
+    allow_bg = bool(opts.get("flat_fill_allow_background")) or flat_scene
+    # Text holes on flat chrome: prefer solid (LaMa left glyph haze on 002/016).
+    # On textured/photo unders, keep LaMa (or skip via punch_text_into_photos).
+    if text_occluder:
+        prefer = bool(opts.get("flat_fill_text", True)) and (flat_scene or plate) and not photo
+        return {"prefer_flat": prefer, "allow_background_flat": allow_bg,
+                "backend": "flat" if prefer else "lama",
+                "archetype": archetype, "flat_scene": flat_scene}
+    if photo:
+        # Lifestyle / photo plates: never solid-paint. Large holes bake/abandon
+        # upstream; small holes may still hit LaMa/Telea.
+        return {"prefer_flat": False, "allow_background_flat": False,
+                "backend": "lama", "archetype": archetype, "flat_scene": flat_scene}
+    # Shape/card/panel/background on flat archetypes → Codia solid plates.
+    if flat_scene and plate:
+        return {"prefer_flat": True, "allow_background_flat": True,
+                "backend": "flat", "archetype": archetype, "flat_scene": flat_scene}
+    if plate:
+        return {"prefer_flat": True, "allow_background_flat": allow_bg,
+                "backend": "flat", "archetype": archetype, "flat_scene": flat_scene}
+    return {"prefer_flat": flat_scene, "allow_background_flat": allow_bg,
+            "backend": "lama" if not flat_scene else "flat",
+            "archetype": archetype, "flat_scene": flat_scene}
+
+
+def peel_inpaint_mode(cfg: Optional[dict] = None, meta: Optional[dict] = None) -> str:
+    """Backend mode for the pipeline peel adapter.
+
+    Flat/analytic fills happen upstream in ``_fill_region``. Text/tiny holes stay
+    Telea in the adapter. Photo holes in the Flux band use Flux Fill after SAM is
+    unloaded at the peel VRAM boundary; everything else stays LaMa.
+    """
+    meta = meta or {}
+    opts = _options(cfg)
+    if meta.get("text_occluder"):
+        return "lama"
+    under = str(meta.get("under_kind") or "")
+    hole_px = int(meta.get("hole_px") or 0)
+    if bool(opts.get("allow_flux")) and _is_photo_kind(under) and hole_px > 0:
+        lo = int(opts.get("flux_min_hole_px") or 0)
+        hi = int(opts.get("flux_max_hole_px") or 0) or 10**9
+        if lo <= hole_px <= hi:
+            return "flux_comfy"
+    return "lama"
 
 
 # ── inputs / results ───────────────────────────────────────────────────────────────
@@ -332,6 +499,17 @@ def mask_integrity(mask) -> dict:
             "hole_frac": round(holes / max(1, area + holes), 4)}
 
 
+#: Kinds whose visible pixels are photographic / textured — never flat-fill, and
+#: oversized holes under them are abandoned (transparent) rather than LaMa-hazed.
+_PHOTO_KINDS = frozenset({
+    "photo", "photo-fragment", "person", "product", "image", "cutout",
+})
+
+#: Product cutouts that carry printed label ink — OCR/wordmarks must not punch these
+#: (ghost-text still punches plates and overlay photo panels).
+_PRODUCT_INK_KINDS = frozenset({"product", "photo-fragment", "cutout"})
+
+
 def element_eligibility(element: SceneElement, cfg: Optional[dict] = None) -> dict:
     """Detection-granularity guard: is this element solid enough for peel to trust?
 
@@ -340,24 +518,44 @@ def element_eligibility(element: SceneElement, cfg: Optional[dict] = None) -> di
     neither be a trustworthy occluder footprint nor provide clean inpaint context — a
     pair involving one must not switch peel on.  Text and background/plate kinds are
     never eligible pair members (text stays native; the plate is the single-plate
-    path's job).
+    path's job).  Logos / wordmarks may punch holes (``as_top``) but never activate
+    peel by themselves and are not completed as under-layers.
+
+    Roles differ: a perforated TOP is still a usable hole-punch footprint
+    (``as_top=True``), but a perforated UNDER cannot provide clean fill context
+    (``as_under=False``).  Fragmented masks fail both roles.  ``eligible`` remains
+    ``as_top and as_under`` for backward-compatible summaries.
     """
     if element.is_text:
-        return {"eligible": False, "reason": "text"}
+        return {"eligible": False, "as_top": False, "as_under": False, "reason": "text"}
     if str(element.kind).lower() in ("background", "plate"):
-        return {"eligible": False, "reason": "background-plate"}
+        return {"eligible": False, "as_top": False, "as_under": False,
+                "reason": "background-plate"}
+    if is_artwork_element(element):
+        # Artwork punches plates when peel already runs, but never activates the gate
+        # and never hosts a fill (brand lettering stays a cutout, not a completed plate).
+        return {"eligible": False, "as_top": True, "as_under": False,
+                "reason": "artwork-wordmark"}
     opts = _options(cfg)
     info = mask_integrity(element.mask)
+    max_cc = int(opts.get("max_components") or 0)
+    if max_cc > 0 and int(info["components"]) > max_cc:
+        return {"eligible": False, "as_top": False, "as_under": False, "integrity": info,
+                "reason": (f"fragmented-mask ({info['components']} components > "
+                           f"{max_cc} max)")}
     if info["cc_frac"] < float(opts["min_cc_frac"]):
-        return {"eligible": False, "integrity": info,
+        return {"eligible": False, "as_top": False, "as_under": False, "integrity": info,
                 "reason": (f"fragmented-mask (largest component {info['cc_frac']:.0%} "
                            f"of {info['components']} pieces < "
                            f"{float(opts['min_cc_frac']):.0%})")}
     if info["hole_frac"] > float(opts["max_hole_frac"]):
-        return {"eligible": False, "integrity": info,
+        # Hollow / ring-like occluders still punch a useful hole; they just cannot
+        # host a fill.  Keep as_top so solid unders under perforated tops still peel.
+        return {"eligible": False, "as_top": True, "as_under": False, "integrity": info,
                 "reason": (f"perforated-mask (interior holes {info['hole_frac']:.0%} > "
                            f"{float(opts['max_hole_frac']):.0%})")}
-    return {"eligible": True, "reason": "ok", "integrity": info}
+    return {"eligible": True, "as_top": True, "as_under": True,
+            "reason": "ok", "integrity": info}
 
 
 def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
@@ -365,13 +563,12 @@ def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
 
     A pair qualifies when the intersection is at least ``peel.min_overlap_area`` px AND
     at least ``peel.min_overlap_frac`` of the smaller element's area.  Peel is *needed*
-    only when some qualifying pair covers a NON-TEXT under-layer — an element sitting
-    on nothing but background is already handled by the single-plate path, and text
-    under-layers stay native — AND (with ``peel.require_eligible``, the default) BOTH
-    pair members pass the detection-granularity guard (``element_eligibility``): two
-    distinct, solid, non-plate elements with a genuine overlap.  Qualifying pairs
-    blocked only by eligibility are counted in ``blocked_qualifying`` so the skip
-    reason can say exactly what detection failed to surface.
+    only when some qualifying pair covers a NON-TEXT under-layer with a peel *object*
+    on top (product / person / icon / … — not a logo/wordmark).  Text stays native;
+    artwork may punch holes once peel runs for a real object pair, but never activates
+    the stage alone.  With ``peel.require_eligible`` (default) the under must pass
+    ``as_under`` and the top ``as_top``.  Qualifying pairs blocked only by eligibility
+    are counted in ``blocked_qualifying``.
     """
     _, np, _ = _deps()
     opts = _options(cfg)
@@ -380,6 +577,7 @@ def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
     require_eligible = bool(opts.get("require_eligible", True))
     boxes = {e.id: _tight_bbox(e.mask) for e in elements}
     areas = {e.id: int(np.count_nonzero(e.mask)) for e in elements}
+    by_id = {e.id: e for e in elements}
     eligibility = {e.id: element_eligibility(e, cfg) for e in elements if not e.is_text}
     ordered = sorted(elements, key=lambda e: -e.z)
     pairs = []
@@ -396,16 +594,22 @@ def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
                 continue
             frac = inter / max(1, min(areas[top.id], areas[under.id]))
             qualifies = inter >= min_area and frac >= min_frac
-            eligible = (not top.is_text and not under.is_text
-                        and eligibility.get(top.id, {}).get("eligible", False)
-                        and eligibility.get(under.id, {}).get("eligible", False))
+            top_ok = bool(eligibility.get(top.id, {}).get("as_top", False))
+            under_ok = bool(eligibility.get(under.id, {}).get("as_under", False))
+            object_top = is_peel_object(top)
+            eligible = (not top.is_text and not under.is_text and top_ok and under_ok
+                        and object_top)
             pairs.append({"top": top.id, "under": under.id, "area": inter,
                           "frac": round(frac, 5), "top_is_text": top.is_text,
                           "under_is_text": under.is_text,
+                          "top_is_artwork": is_artwork_element(top),
+                          "top_is_object": object_top,
                           "qualifies": qualifies, "eligible": eligible})
     element_pairs = [p for p in pairs if p["qualifies"]
                      and not p["top_is_text"] and not p["under_is_text"]]
     activating = [p for p in element_pairs if p["eligible"] or not require_eligible]
+    if not require_eligible:
+        activating = [p for p in activating if is_peel_object(by_id[p["top"]])]
     blocked = [p for p in element_pairs if not p["eligible"]]
     return {"pairs": pairs, "needed": bool(activating),
             "blocked_qualifying": len(blocked),
@@ -414,6 +618,7 @@ def overlap_report(elements: list, cfg: Optional[dict] = None) -> dict:
             "thresholds": {"min_overlap_area": min_area, "min_overlap_frac": min_frac,
                            "min_cc_frac": float(opts["min_cc_frac"]),
                            "max_hole_frac": float(opts["max_hole_frac"]),
+                           "max_components": int(opts.get("max_components") or 0),
                            "require_eligible": require_eligible}}
 
 
@@ -525,36 +730,208 @@ def _dilate_px(mask, px: int):
     return peel_decompose._expand_mask(mask, (2 * px + 1, 2 * px + 1))
 
 
+def _is_photo_kind(kind) -> bool:
+    return str(kind or "").lower() in _PHOTO_KINDS
+
+
+def _is_plate_kind(kind) -> bool:
+    return str(kind or "").lower() in _PLATE_KINDS
+
+
+def _may_punch_into(occluder: SceneElement, under_kind: str, opts: dict) -> bool:
+    """Whether ``occluder`` should punch a hole into an under-layer of ``under_kind``.
+
+    Peel objects only: OCR text and logo/wordmark artwork still punch plates and
+    overlay photo panels (ghost-text invariant), but never product cutouts —
+    printed label ink stays on the product raster.
+    """
+    kind = str(under_kind or "").lower()
+    if occluder.is_text:
+        if kind in _PRODUCT_INK_KINDS and not opts.get("punch_text_into_photos"):
+            return False
+        return True
+    if is_artwork_element(occluder):
+        if kind in _PRODUCT_INK_KINDS and not opts.get("punch_artwork_into_photos"):
+            return False
+        return True
+    return True
+
+
+def _flat_fill_allowed(write, element_mask, visible, meta, opts,
+                       cfg=None) -> bool:
+    """Whether the solid-median fast path may run for this hole.
+
+    Photo kinds are always denied.  Background / text holes are allowed when policy
+    + caps say so (flat chrome ads).  Thin-rim guard (`flat_fill_min_visible_frac`)
+    blocks the 016 failure mode where a tiny flat margin painted a whole plate.
+    """
+    kind = str(meta.get("under_kind") or "").lower()
+    if _is_photo_kind(kind):
+        return False
+    write_area = int(write.sum()) if hasattr(write, "sum") else 0
+    if write_area <= 0:
+        return False
+    policy = resolve_peel_fill_policy(
+        cfg, under_kind=kind, text_occluder=bool(meta.get("text_occluder")))
+    if meta.get("text_occluder"):
+        if not bool(opts.get("flat_fill_text", True)):
+            return False
+        # Text solid-fill only on plate chrome (card/shape/bg), never photos.
+        if kind not in _PLATE_KINDS and kind not in ("background", "plate"):
+            return False
+    if kind in ("background", "plate"):
+        if not (policy.get("allow_background_flat")
+                or bool(opts.get("flat_fill_allow_background"))):
+            return False
+        max_area = int(opts.get("flat_fill_bg_max_area")
+                       or opts.get("flat_fill_max_area") or 0)
+        max_frac = float(opts.get("flat_fill_bg_max_frac")
+                         or opts.get("flat_fill_max_frac") or 0.0)
+    else:
+        max_area = int(opts.get("flat_fill_max_area") or 0)
+        max_frac = float(opts.get("flat_fill_max_frac") or 0.0)
+    min_vis = float(opts.get("flat_fill_min_visible_frac") or 0.0)
+    # Background plate: visible ≈ everything outside the union — skip thin-rim.
+    if min_vis > 0 and kind not in ("background", "plate"):
+        mask_area = max(1, int(element_mask.sum()))
+        vis_frac = float(int(visible.sum()) / mask_area) if hasattr(visible, "sum") else 0.0
+        if vis_frac < min_vis:
+            return False
+    if max_area > 0 and write_area > max_area:
+        return False
+    if max_frac > 0:
+        mask_area = max(1, int(element_mask.sum()))
+        if (write_area / mask_area) > max_frac:
+            return False
+    return True
+
+
+def _photo_hole_decision(write, element_mask, meta, opts) -> Optional[str]:
+    """Decide how to handle a photo under-layer hole that generative fill can't recover.
+
+    Returns:
+        ``None`` — try Telea/LaMa/Flux (size is in a recoverable band).
+        ``"bake"`` — leave original flat pixels (no fill write).
+        ``"abandon"`` — zero alpha in the hole.
+    """
+    if meta.get("text_occluder"):
+        return None
+    if not _is_photo_kind(meta.get("under_kind")):
+        return None
+    write_area = int(write.sum()) if hasattr(write, "sum") else 0
+    if write_area <= 0:
+        return None
+    mask_area = max(1, int(element_mask.sum()))
+    frac = float(opts.get("abandon_hole_frac") or 0.0)
+    min_area = int(opts.get("abandon_photo_min_area") or 0)
+    allow_flux = bool(opts.get("allow_flux"))
+    flux_max = int(opts.get("flux_max_hole_px") or 0)
+    # Flux band: let the adapter try real generative fill (VRAM-cleared).
+    if allow_flux and flux_max > 0 and write_area <= flux_max:
+        return None
+    max_gen = int(opts.get("max_generative_photo_hole_px") or 0)
+    oversized = (
+        (frac > 0 and (write_area / mask_area) >= frac)
+        or (min_area > 0 and write_area >= min_area)
+        or (max_gen > 0 and write_area >= max_gen)
+        or (allow_flux and flux_max > 0 and write_area > flux_max)
+    )
+    if not oversized:
+        return None
+    mode = str(opts.get("large_photo_hole") or "bake").strip().lower()
+    return "abandon" if mode == "abandon" else "bake"
+
+
+def _should_abandon_hole(write, element_mask, meta, opts) -> bool:
+    """Back-compat: True only when the photo-hole policy chooses transparent abandon."""
+    return _photo_hole_decision(write, element_mask, meta, opts) == "abandon"
+
+
+def _sample_flat_color(crop, write_crop, visible_crop, opts, flat_tol: float):
+    """Return uint8 RGB median when the ring beyond the hole is flat, else None."""
+    _, np, _ = _deps()
+    shadow_px = max(0, int(opts.get("context_shadow_px") or 0))
+    inner = _dilate_px(write_crop, shadow_px) if shadow_px else write_crop
+    ring = _dilate_px(write_crop, shadow_px + int(opts["flat_fill_ring_px"])) \
+           & ~inner & visible_crop
+    samples = crop[ring].astype(np.float64)
+    if samples.shape[0] < int(opts["flat_fill_min_px"]):
+        return None
+    med = np.median(samples, axis=0)
+    inlier = np.abs(samples - med).max(axis=1) <= flat_tol
+    if (float(inlier.mean()) < float(opts["flat_fill_inlier_frac"])
+            or int(inlier.sum()) < int(opts["flat_fill_min_px"])):
+        return None
+    return np.round(np.median(samples[inlier], axis=0)).astype(np.uint8)
+
+
+def _feather_copy(region, write_crop, filled, feather_px: int):
+    """Copy `filled` into `region` on `write_crop`, with a soft edge ring."""
+    _, np, _ = _deps()
+    if feather_px <= 0 or not write_crop.any() or write_crop.all():
+        region[write_crop] = filled[write_crop]
+        return
+    core = write_crop & ~_dilate_px(~write_crop, feather_px)
+    region[core] = filled[core]
+    edge = write_crop & ~core
+    if not edge.any():
+        return
+    weight = np.zeros(write_crop.shape, np.float64)
+    grown = ~write_crop
+    for step in range(1, feather_px + 1):
+        nxt = _dilate_px(grown, 1)
+        band = nxt & ~grown & write_crop
+        weight[band] = step / float(feather_px + 1)
+        grown = nxt
+    weight[core] = 1.0
+    w = weight[edge][:, None]
+    src = region[edge].astype(np.float64)
+    dst = filled[edge].astype(np.float64)
+    region[edge] = np.clip(np.round(src * (1.0 - w) + dst * w), 0, 255).astype(np.uint8)
+
+
+def _iter_write_regions(write, opts):
+    """Yield connected components of `write` when `fill_cc_split` is on."""
+    cv2, np, _ = _deps()
+    write = np.asarray(write, bool)
+    if not write.any():
+        return
+    if not bool(opts.get("fill_cc_split", True)):
+        yield write
+        return
+    min_area = int(opts.get("fill_cc_min_area") or 0)
+    ncc, labels = cv2.connectedComponents(write.astype(np.uint8), connectivity=8)
+    if ncc <= 2:
+        yield write
+        return
+    emitted = False
+    for lab in range(1, ncc):
+        cc = labels == lab
+        if min_area > 0 and int(cc.sum()) < min_area:
+            continue
+        emitted = True
+        yield cc
+    if not emitted:
+        yield write
+
+
 def _fill_region(flat, layer_rgb, element_mask, visible, write, inpaint,
-                 accepts_meta, meta, opts):
-    """Inpaint ``write`` pixels into ``layer_rgb`` using ONLY ``visible`` as context.
+                 accepts_meta, meta, opts, cfg=None):
+    """Inpaint `write` pixels into `layer_rgb` using ONLY `visible` as context.
 
-    Context isolation: within the padded crop, everything that is not a visible pixel
-    of this layer is part of the inpaint mask, so the filler cannot read neighbouring
-    layers (the seam-bleed failure).  Only ``write`` pixels are copied back.  When the
-    layer is almost fully covered there is no usable context; degrade honestly to an
-    unisolated fill and record it in the returned note.
-
-    Fill-quality passes (both isolation-preserving by construction — they only ever
-    consult ``visible`` pixels of THIS layer):
-
-    * **Shadow blinding** (``peel.context_shadow_px``): occluder drop shadows and
-      anti-aliased halos live just OUTSIDE the detection mask, so they survive in the
-      visible context ring and smear gray into the fill.  The band around the hole is
-      marked unknown for the inpaint call (but never written back), so the filler
-      reads clean context beyond it.
-    * **Flat-fill fast path** (``peel.flat_fill_tol`` > 0): sample a ring beyond the
-      shadow band; when most ring pixels agree with the ring median (inlier fraction),
-      the hole is a solid-color surface (card/plate/tube body) — fill with the inlier
-      median directly.  Crisper than any inpainter on flat surfaces, and robust to
-      minority contamination (shadows, seams) that inflate a naive std.
-
-    Returns ``{"isolated": bool, "backend": "solid" | "inpaint"}``.
+    Context isolation + flat-fill / fail-closed-to-flat / feathered generative copy.
+    Returns `{"isolated": bool, "backend": "solid" | "inpaint" | "abandoned" | "baked"}`.
     """
     _, np, _ = _deps()
     h, w = flat.shape[:2]
+    write_area = int(np.count_nonzero(write))
+    is_photo = _is_photo_kind(meta.get("under_kind"))
+    pad = int(opts["context_pad_px"])
+    large_pad = int(opts.get("context_pad_large_px") or 0)
+    if is_photo and large_pad > pad and write_area >= int(opts.get("flux_min_hole_px") or 4000):
+        pad = large_pad
     box = _tight_bbox(np.logical_or(element_mask, write))
-    x0, y0, x1, y1 = _pad_bbox(box, int(opts["context_pad_px"]), w, h)
+    x0, y0, x1, y1 = _pad_bbox(box, pad, w, h)
     crop = flat[y0:y1, x0:x1]
     visible_crop = visible[y0:y1, x0:x1]
     write_crop = write[y0:y1, x0:x1]
@@ -563,30 +940,31 @@ def _fill_region(flat, layer_rgb, element_mask, visible, write, inpaint,
     mask_area = max(1, int(np.count_nonzero(element_mask)))
     isolated = (int(np.count_nonzero(visible)) / mask_area) >= float(opts["min_context_frac"])
     shadow_px = max(0, int(opts.get("context_shadow_px") or 0))
+    if is_photo and opts.get("photo_context_shadow_px") is not None:
+        shadow_px = max(0, int(opts.get("photo_context_shadow_px") or 0))
 
-    # Flat-fill applies to ELEMENT-class holes only: text holes are small, local, and
-    # sit on gradients often enough that a global median leaves a tone-mismatched
-    # fringe — the router's LaMa preserves local shading there.
+    photo_decision = _photo_hole_decision(write, element_mask, meta, opts)
+    if photo_decision == "abandon":
+        return {"isolated": isolated, "backend": "abandoned"}
+    if photo_decision == "bake":
+        # Leave ``layer_rgb`` untouched — only for holes past flux_max (or Flux off).
+        return {"isolated": isolated, "backend": "baked"}
+
     flat_tol = float(opts.get("flat_fill_tol") or 0.0)
-    if flat_tol > 0 and isolated and not meta.get("text_occluder"):
-        inner = _dilate_px(write_crop, shadow_px) if shadow_px else write_crop
-        ring = _dilate_px(write_crop, shadow_px + int(opts["flat_fill_ring_px"])) \
-               & ~inner & visible_crop
-        samples = crop[ring].astype(np.float64)
-        if samples.shape[0] >= int(opts["flat_fill_min_px"]):
-            med = np.median(samples, axis=0)
-            inlier = np.abs(samples - med).max(axis=1) <= flat_tol
-            if (float(inlier.mean()) >= float(opts["flat_fill_inlier_frac"])
-                    and int(inlier.sum()) >= int(opts["flat_fill_min_px"])):
-                color = np.round(np.median(samples[inlier], axis=0)).astype(np.uint8)
-                region[write_crop] = color
-                return {"isolated": True, "backend": "solid"}
+    solid_color = None
+    if (flat_tol > 0 and isolated
+            and _flat_fill_allowed(write, element_mask, visible, meta, opts, cfg=cfg)):
+        solid_color = _sample_flat_color(
+            crop, write_crop, visible_crop, opts, flat_tol)
+        if solid_color is not None:
+            region[write_crop] = solid_color
+            return {"isolated": True, "backend": "solid"}
 
     if isolated:
         call_mask = np.logical_or(~visible_crop, write_crop)
         if shadow_px:
             blinded = call_mask | _dilate_px(write_crop, shadow_px)
-            if not blinded.all():        # keep SOME context; else stay unblinded
+            if not blinded.all():
                 call_mask = blinded
     else:
         call_mask = _dilate_px(write_crop, int(opts["hole_dilate_px"]))
@@ -598,7 +976,29 @@ def _fill_region(flat, layer_rgb, element_mask, visible, write, inpaint,
     filled = np.asarray(filled, dtype=np.uint8)
     if filled.shape != crop.shape:
         raise ValueError(f"inpaint returned {filled.shape}, expected {crop.shape}")
-    region[write_crop] = filled[write_crop]
+
+    # Fail-closed: if the ring is geometrically flat and generative smear is
+    # worse than solid, keep solid — even when area caps blocked the *primary*
+    # flat path (those caps exist to avoid painting busy plates without evidence;
+    # after a dirty LaMa pass the solid ring is the safer plate).
+    if (bool(opts.get("fail_closed_to_flat", True)) and flat_tol > 0 and isolated
+            and not _is_photo_kind(meta.get("under_kind"))):
+        if solid_color is None:
+            solid_color = _sample_flat_color(
+                crop, write_crop, visible_crop, opts, flat_tol)
+            if solid_color is None and int(opts.get("context_shadow_px") or 0) > 0:
+                bare = dict(opts, context_shadow_px=0)
+                solid_color = _sample_flat_color(
+                    crop, write_crop, visible_crop, bare, flat_tol)
+        if solid_color is not None and write_crop.any():
+            gen = filled[write_crop].astype(np.float64)
+            solid = solid_color.astype(np.float64)
+            residue = float(np.mean(np.abs(gen - solid).max(axis=1)))
+            if residue >= float(opts.get("fail_closed_residue") or 8.0):
+                region[write_crop] = solid_color
+                return {"isolated": True, "backend": "solid"}
+
+    _feather_copy(region, write_crop, filled, int(opts.get("inpaint_feather_px") or 0))
     return {"isolated": isolated, "backend": "inpaint"}
 
 
@@ -662,6 +1062,7 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
         inpaint = peel_decompose.opencv_inpaint
     accepts_meta = _accepts_meta(inpaint)
     dilate = int(opts["hole_dilate_px"])
+    text_dilate = max(dilate, int(opts.get("text_hole_dilate_px") or dilate))
 
     ordered = sorted([e for e in elements], key=lambda e: e.z)   # back-to-front
     non_text = [e for e in ordered if not e.is_text]
@@ -689,37 +1090,61 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
             occluded = occluder_map > 0
             visible = mask & ~occluded
             # Split by routing class so the injected router can keep text-shaped
-            # holes away from generative backends (glyph residue).
+            # holes away from generative backends (glyph residue).  Text stays
+            # batched (many small boxes).  Element-class holes at/above
+            # per_occluder_area get their own fill — batching a 500k photo hole
+            # with icon holes produced LaMa haze + rectangular smears (016).
+            per_area = int(opts.get("per_occluder_area") or 0)
             for is_text_class in (False, True):
-                class_mask = np.zeros((h, w), bool)
-                class_occluders = []
+                jobs = []  # list of (write_mask, [occluder_ids])
+                small_mask = np.zeros((h, w), bool)
+                small_ids = []
+                hole_px = text_dilate if is_text_class else dilate
                 for number, occluder in enumerate(occ_order, start=1):
                     if occluder.is_text != is_text_class:
+                        continue
+                    if not _may_punch_into(occluder, element.kind, opts):
                         continue
                     sub = occluder_map == number
                     if not sub.any():
                         continue
-                    class_mask |= sub
-                    class_occluders.append(occluder.id)
                     fills.append(OcclusionFill(occluder_id=occluder.id,
                                                area=int(np.count_nonzero(sub)),
                                                bbox=_tight_bbox(sub),
                                                text_occluder=occluder.is_text))
-                if not class_mask.any():
-                    continue
-                # Fringe ring: widen the write region past anti-aliased edges, but
-                # ONLY inside this layer's own mask — a pixel outside mask(L) was
-                # never L's to begin with, so it is never synthesized into L.
-                write = _dilate_px(class_mask, dilate) & mask if dilate else class_mask
-                fill_info = _fill_region(
-                    flat, rgb, mask, visible, write, inpaint, accepts_meta,
-                    {"under_id": element.id, "under_kind": element.kind,
-                     "occluder_ids": class_occluders, "text_occluder": is_text_class},
-                    opts)
-                if not fill_info["isolated"]:
-                    meta["low_context_fill"] = True
-                meta.setdefault("fill_backends", []).append(
-                    {"text_occluder": is_text_class, "backend": fill_info["backend"]})
+                    write_sub = (_dilate_px(sub, hole_px) & mask) if hole_px else sub
+                    if (not is_text_class and per_area > 0
+                            and int(np.count_nonzero(write_sub)) >= per_area):
+                        jobs.append((write_sub, [occluder.id]))
+                    else:
+                        small_mask |= write_sub
+                        small_ids.append(occluder.id)
+                if small_mask.any():
+                    jobs.append((small_mask, small_ids))
+                for write, occ_ids in jobs:
+                    for write_cc in _iter_write_regions(write, opts):
+                        if not write_cc.any():
+                            continue
+                        fill_info = _fill_region(
+                            flat, rgb, mask, visible, write_cc, inpaint, accepts_meta,
+                            {"under_id": element.id, "under_kind": element.kind,
+                             "occluder_ids": occ_ids, "text_occluder": is_text_class,
+                             "hole_px": int(np.count_nonzero(write_cc))},
+                            opts, cfg=cfg)
+                        if fill_info["backend"] == "abandoned":
+                            alpha[write_cc] = 0
+                            meta["abandoned_fill"] = True
+                        elif fill_info["backend"] == "baked":
+                            meta["baked_large_photo_hole"] = True
+                        if not fill_info["isolated"]:
+                            meta["low_context_fill"] = True
+                        meta.setdefault("fill_backends", []).append(
+                            {"text_occluder": is_text_class,
+                             "backend": fill_info["backend"],
+                             "area": int(np.count_nonzero(write_cc)),
+                             "occluder_ids": list(occ_ids)})
+        if meta.get("baked_large_photo_hole") or meta.get("abandoned_fill"):
+            meta["peel_quality"] = "incomplete-photo"
         # Visible pixels are flat-image originals by construction (rgb started as a
         # copy of flat and only `write ⊆ mask` pixels were rewritten).
         rgba = np.dstack([rgb, alpha])
@@ -747,9 +1172,11 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
         if union.any():
             pseudo = SceneElement(id="background", mask=np.ones((h, w), bool), z=-1.0)
             occluder_map, occ_order = _direct_occluder_map(pseudo, list(elements))
+            bg_visible = ~_dilate_px(union, dilate)
             for is_text_class in (False, True):
                 class_mask = np.zeros((h, w), bool)
                 class_occluders = []
+                hole_px = text_dilate if is_text_class else dilate
                 for number, occluder in enumerate(occ_order, start=1):
                     sub = occluder_map == number
                     if occluder.is_text != is_text_class or not sub.any():
@@ -761,15 +1188,19 @@ def peel_scene(image, elements: list, inpaint: Optional[Callable] = None,
                         bbox=_tight_bbox(sub), text_occluder=occluder.is_text))
                 if not class_mask.any():
                     continue
-                write = _dilate_px(class_mask, dilate)
-                fill_info = _fill_region(
-                    flat, plate, np.ones((h, w), bool), ~_dilate_px(union, dilate),
-                    write, inpaint, accepts_meta,
-                    {"under_id": "background", "under_kind": "background",
-                     "occluder_ids": class_occluders,
-                     "text_occluder": is_text_class}, opts)
-                bg_meta.setdefault("fill_backends", []).append(
-                    {"text_occluder": is_text_class, "backend": fill_info["backend"]})
+                write = _dilate_px(class_mask, hole_px)
+                for write_cc in _iter_write_regions(write, opts):
+                    fill_info = _fill_region(
+                        flat, plate, np.ones((h, w), bool), bg_visible,
+                        write_cc, inpaint, accepts_meta,
+                        {"under_id": "background", "under_kind": "background",
+                         "occluder_ids": class_occluders,
+                         "text_occluder": is_text_class,
+                         "hole_px": int(np.count_nonzero(write_cc))}, opts, cfg=cfg)
+                    bg_meta.setdefault("fill_backends", []).append(
+                        {"text_occluder": is_text_class,
+                         "backend": fill_info["backend"],
+                         "area": int(np.count_nonzero(write_cc))})
         bg_meta["background"] = "inpainted"
 
     result = ScenePeelResult(layers=layers, background=plate, canvas=canvas,

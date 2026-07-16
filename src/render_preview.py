@@ -133,7 +133,8 @@ def _radius_mask(size, radius=0, ellipse=False):
 def _multiply_alpha(image, mask):
     import numpy as np
     from PIL import Image
-    array = np.asarray(image.convert("RGBA"), dtype=np.uint16).copy()
+    # Single owned buffer (avoid asarray-view + .copy()).
+    array = np.array(image.convert("RGBA"), dtype=np.uint16, copy=True)
     alpha = np.asarray(mask.convert("L"), dtype=np.uint16)
     array[:, :, 3] = (array[:, :, 3] * alpha + 127) // 255
     return Image.fromarray(array.astype(np.uint8))
@@ -249,6 +250,9 @@ def _normalize_align(value, default="left"):
     return default
 
 
+_TEXT_FONT_CACHE = {}
+
+
 def _text_font(style, font_size):
     from PIL import ImageFont
     candidates = style.get("fontCandidates") or []
@@ -284,18 +288,35 @@ def _text_font(style, font_size):
         windir = os.environ.get("WINDIR", r"C:\\Windows")
         selected_paths.append(os.path.join(windir, "Fonts",
                                            "arialbd.ttf" if target_weight >= 600 else "arial.ttf"))
-    paths = selected_paths + [candidate["path"] for candidate in usable]
+    # Prefer weight-matched files; if every candidate is Regular for a Bold node,
+    # try a system bold face BEFORE loading the mismatched Regular path.
+    matched_paths = [
+        candidate["path"] for candidate in usable
+        if abs(_candidate_weight(candidate) - target_weight) <= 150
+    ]
+    mismatched_paths = [
+        candidate["path"] for candidate in usable
+        if candidate["path"] not in matched_paths
+    ]
+    paths = selected_paths + matched_paths
     if target_weight >= 600:
-        # Without any usable candidate, a bold run must still render bold.
         paths += ["arialbd.ttf"]
+    paths += mismatched_paths
     paths += ["arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
+    size_key = max(1, int(round(_number(font_size, 12))))
     for path in paths:
+        cache_key = (path, size_key)
+        cached = _TEXT_FONT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
         try:
-            return ImageFont.truetype(path, font_size)
+            font = ImageFont.truetype(path, size_key)
         except Exception:
             continue
+        _TEXT_FONT_CACHE[cache_key] = font
+        return font
     try:
-        return ImageFont.load_default(font_size)
+        return ImageFont.load_default(size_key)
     except Exception:
         return ImageFont.load_default()
 
@@ -362,18 +383,28 @@ def _line_advance(font, line, tracking):
     return width + tracking * max(0, drawn - 1)
 
 
-def _draw_tracked_line(draw, origin, line, font, fill, tracking, ascent):
+def _draw_tracked_line(draw, origin, line, font, fill, tracking, ascent,
+                       stroke_fill=None, stroke_width=0):
     x, baseline = origin
+    # Draw outline first (Pillow strokes under the fill when both are set), so a
+    # CENTER-style stroke never plates opaque ink over the glyph interior.
+    stroke_kwargs = {}
+    if stroke_fill is not None and stroke_width and stroke_width > 0:
+        stroke_kwargs = {
+            "stroke_width": max(1, int(round(stroke_width))),
+            "stroke_fill": stroke_fill,
+        }
     for char in line:
         if ord(char) in _ZERO_WIDTH:
             continue
         glyph_font, embedded = _char_font(char, font)
         try:
             draw.text((x, baseline), char, font=glyph_font, fill=fill, anchor="ls",
-                      embedded_color=embedded)
+                      embedded_color=embedded, **stroke_kwargs)
         except (ValueError, TypeError, OSError):
             try:
-                draw.text((x, baseline - ascent), char, font=glyph_font, fill=fill)
+                draw.text((x, baseline - ascent), char, font=glyph_font, fill=fill,
+                          **stroke_kwargs)
             except (ValueError, TypeError, OSError):
                 continue
         x += glyph_font.getlength(char) + tracking
@@ -460,6 +491,20 @@ def _text_tile(layer, size):
             fill = fill_spec.get("color", "#111111")
     colour = _color(fill or "#111111")
 
+    stroke_colour = None
+    stroke_width = 0.0
+    stroke_spec = layer.get("stroke") or style.get("stroke")
+    if isinstance(stroke_spec, str):
+        stroke_colour, stroke_width = _color(stroke_spec), max(1.0, font_size * 0.04)
+    elif isinstance(stroke_spec, dict):
+        raw = stroke_spec.get("color", stroke_spec.get("paint"))
+        if isinstance(raw, dict):
+            raw = raw.get("color")
+        if raw:
+            stroke_colour = _color(raw)
+            stroke_width = max(0.0, _number(
+                stroke_spec.get("width", stroke_spec.get("weight", 1)), 1))
+
     lines = text.split("\n")
     segments = _run_segments(layer, text)
     styled = bool(segments) and any(
@@ -508,9 +553,9 @@ def _text_tile(layer, size):
     max_descent = max([descent] + [seg[5] for spec in line_specs for seg in spec])
     content_h = (line_count - 1) * line_height + max_ascent + max_descent
 
-    # A small margin guards side bearings, negative-tracking overshoot and descenders
-    # so measured content never touches the tile edge (which would clip a glyph).
-    pad = max(2, int(math.ceil(font_size * 0.12)))
+    # A small margin guards side bearings, negative-tracking overshoot, descenders
+    # and outside strokes so measured content never touches the tile edge.
+    pad = max(2, int(math.ceil(font_size * 0.12 + stroke_width)))
     tile_w = max(1, int(math.ceil(content_w)) + 2 * pad)
     tile_h = max(1, int(math.ceil(content_h)) + 2 * pad)
     tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
@@ -527,7 +572,8 @@ def _text_tile(layer, size):
         baseline = y + max_ascent
         for seg_text, seg_font, seg_colour, seg_tracking, seg_ascent, _ in spec:
             _draw_tracked_line(draw, (x, baseline), seg_text, seg_font, seg_colour,
-                               seg_tracking, seg_ascent)
+                               seg_tracking, seg_ascent,
+                               stroke_fill=stroke_colour, stroke_width=stroke_width)
             x += _line_advance(seg_font, seg_text, seg_tracking)
         y += line_height
 
@@ -585,11 +631,15 @@ def _effect_padding(effects):
 
 def _with_effects(tile, effects):
     from PIL import Image, ImageFilter
-    left, top, right, bottom = _effect_padding(effects)
+    active = [
+        effect for effect in (effects or [])
+        if isinstance(effect, dict) and effect.get("visible") is not False
+    ]
+    if not active:
+        return tile, (0, 0)
+    left, top, right, bottom = _effect_padding(active)
     padded = Image.new("RGBA", (tile.width + left + right, tile.height + top + bottom), (0, 0, 0, 0))
-    for effect in effects or []:
-        if not isinstance(effect, dict) or effect.get("visible") is False:
-            continue
+    for effect in active:
         kind = str(effect.get("type", effect.get("kind", ""))).lower().replace("_", "-")
         if kind in ("blur", "layer-blur"):
             tile = tile.filter(ImageFilter.GaussianBlur(max(0, _number(effect.get("radius", effect.get("blur", 8))))))
@@ -715,7 +765,8 @@ def _blend(canvas, tile, point, mode, clip_rect=None):
     canvas.alpha_composite(mixed, (x0, y0))
 
 
-def _draw_layer(canvas, layer, run_dir, offset=(0, 0)):
+def _prepare_layer_draw(layer, run_dir, offset=(0, 0)):
+    """Rasterize a layer once (tile + pose). Caller may blend onto multiple canvases."""
     from PIL import Image
     box = layer.get("box", {}) or {}
     tile, local_offset = _render_tile(layer, run_dir)
@@ -731,8 +782,14 @@ def _draw_layer(canvas, layer, run_dir, offset=(0, 0)):
     if opacity < 1:
         alpha = tile.getchannel("A").point(lambda value: round(value * opacity))
         tile.putalpha(alpha)
-    _blend(canvas, tile, (x, y), layer.get("blend_mode", layer.get("blendMode", "NORMAL")),
-           _layer_paint_clip(layer, offset))
+    mode = layer.get("blend_mode", layer.get("blendMode", "NORMAL"))
+    clip = _layer_paint_clip(layer, offset)
+    return tile, x, y, mode, clip
+
+
+def _draw_layer(canvas, layer, run_dir, offset=(0, 0)):
+    tile, x, y, mode, clip = _prepare_layer_draw(layer, run_dir, offset)
+    _blend(canvas, tile, (x, y), mode, clip)
 
 
 def render(design_or_path, run_dir, out_name="preview.png"):
@@ -753,27 +810,54 @@ def render(design_or_path, run_dir, out_name="preview.png"):
             except OSError:
                 pass
     errors = []
+    swatches = []
     for index, layer in enumerate(sorted(doc.get("layers", []), key=lambda item: _number(item.get("z_index", item.get("z", 0))))):
+        prepared = None
         try:
-            _draw_layer(canvas, layer, run_dir)
+            prepared = _prepare_layer_draw(layer, run_dir)
         except Exception as exc:
             # Keep rendering independent layers, but make the omission explicit to the
             # orchestrator. The caller turns these diagnostics into a QA failure.
             errors.append({"layer_id": layer.get("id"), "detail": str(exc)})
+        if prepared is not None:
+            try:
+                _blend(canvas, prepared[0], (prepared[1], prepared[2]), prepared[3], prepared[4])
+            except Exception as exc:
+                errors.append({"layer_id": layer.get("id"), "detail": str(exc)})
         one = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        try:
-            _draw_layer(one, layer, run_dir)
-        except Exception:
-            pass
+        if prepared is not None:
+            try:
+                # Same prepared tile as the preview composite — avoids a second full
+                # rasterize (image decode / text / shape) per root layer.
+                _blend(one, prepared[0], (prepared[1], prepared[2]), prepared[3], prepared[4])
+            except Exception:
+                pass
         safe = "".join(char if char.isalnum() or char in "-_" else "_" for char in (layer.get("name") or layer.get("id")))[:40]
         one.save(os.path.join(layers_dir, f"{index:02d}_{layer.get('type')}_{safe}.png"))
+        swatches.append(one)
     out = os.path.join(run_dir, out_name)
     canvas.convert("RGB").save(out)
-    _contact_sheet(layers_dir, os.path.join(run_dir, "layers_contact.png"))
+    _contact_sheet_images(swatches, os.path.join(run_dir, "layers_contact.png"))
     def count(items):
         return sum(1 + count(item.get("children") or []) for item in items)
     return {"preview": out, "layers_dir": layers_dir,
             "count": count(doc.get("layers", [])), "errors": errors}
+
+
+def _contact_sheet_images(images, out, cols=4, thumb=260):
+    """Build the contact sheet from in-memory swatches (no re-decode of layer PNGs)."""
+    from PIL import Image
+    if not images:
+        return
+    rows = (len(images) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * thumb, rows * thumb), (240, 240, 240))
+    for index, image in enumerate(images):
+        rgba = image.convert("RGBA") if image.mode != "RGBA" else image
+        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        background.alpha_composite(rgba)
+        background.thumbnail((thumb - 8, thumb - 8))
+        sheet.paste(background.convert("RGB"), ((index % cols) * thumb + 4, (index // cols) * thumb + 4))
+    sheet.save(out)
 
 
 def _contact_sheet(layers_dir, out, cols=4, thumb=260):
@@ -781,12 +865,5 @@ def _contact_sheet(layers_dir, out, cols=4, thumb=260):
     files = sorted(name for name in os.listdir(layers_dir) if name.endswith(".png"))
     if not files:
         return
-    rows = (len(files) + cols - 1) // cols
-    sheet = Image.new("RGB", (cols * thumb, rows * thumb), (240, 240, 240))
-    for index, name in enumerate(files):
-        image = Image.open(os.path.join(layers_dir, name)).convert("RGBA")
-        background = Image.new("RGBA", image.size, (255, 255, 255, 255))
-        background.alpha_composite(image)
-        background.thumbnail((thumb - 8, thumb - 8))
-        sheet.paste(background.convert("RGB"), ((index % cols) * thumb + 4, (index // cols) * thumb + 4))
-    sheet.save(out)
+    images = [Image.open(os.path.join(layers_dir, name)).convert("RGBA") for name in files]
+    _contact_sheet_images(images, out, cols=cols, thumb=thumb)

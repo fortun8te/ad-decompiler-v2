@@ -47,11 +47,12 @@ _MARKERS: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 _LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2})\]\s+(.*)$")
-_DONE_RE = re.compile(r"\bdone in\s+\d+(?:\.\d+)?s\b")
+_DONE_SECS_RE = re.compile(r"\bdone in\s+(\d+(?:\.\d+)?)s\b")
 _STALL_S = 90.0
 _POLL_S = 0.08
 _ROOT_RECHECK_S = 1.0
 _FEED_MAX = 14
+_ACTIVITY_POINTER = ".activity_current"
 # Artifact presence advances the stage cursor when pipeline.log lags (long peel/inpaint).
 _ARTIFACT_STAGE: list[tuple[str, tuple[str, ...]]] = [
     ("normalize", ("normalized.png", "original.png")),
@@ -97,22 +98,64 @@ _HTML_PATH = _HERE / "activity_grid.html"
 _REPO = _HERE.parent
 
 
+def read_activity_pointer(root: Path) -> Path | None:
+    """Return the bench path from ``.activity_current`` if valid.
+
+    benchmark.py writes this next to the output folder (usually ``runs/.activity_current``)
+    so a grid watching ``runs/`` or an old sibling bench can latch onto the new one.
+    """
+    root = root.resolve()
+    for base in (root, root.parent):
+        pointer = base / _ACTIVITY_POINTER
+        if not pointer.is_file():
+            continue
+        try:
+            raw = pointer.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        target = Path(raw)
+        if not target.is_absolute():
+            target = (pointer.parent / target).resolve()
+        else:
+            target = target.resolve()
+        if target.is_dir():
+            return target
+    return None
+
+
+def write_activity_pointer(output: Path) -> Path:
+    """Point the activity grid at ``output`` (called from benchmark.py)."""
+    output = output.resolve()
+    pointer = output.parent / _ACTIVITY_POINTER
+    pointer.write_text(str(output), encoding="utf-8")
+    return pointer
+
+
 def resolve_watch_root(root: Path) -> Path:
     """Latch onto the hottest active run folder under an umbrella like runs/.
 
-    Prefer whichever container has the newest pipeline.log write — including a
-    brand-new benchmark with only one ad so far. Never treat the umbrella itself
-    as a mega-batch of unrelated single-run folders.
+    Prefer ``.activity_current`` when it names a sibling/child bench, then the
+    container with the newest planned.json / smoke / pipeline.log activity —
+    including a brand-new benchmark that only has stubs so far. Never treat the
+    umbrella itself as a mega-batch of unrelated single-run folders.
     """
     root = root.resolve()
     if not root.is_dir():
         return root
+
+    ptr = read_activity_pointer(root)
+    if ptr is not None and (ptr == root or ptr.parent == root or ptr.parent == root.parent):
+        return ptr
 
     candidates: list[tuple[Path, float, int]] = []
 
     def consider(folder: Path) -> None:
         if folder.name in _SKIP_ROOT_NAMES or folder.name in _SKIP_DIRS:
             return
+        newest = 0.0
+        n_ads = 0
         try:
             logs = [
                 p for p in folder.glob("*/pipeline.log")
@@ -120,13 +163,44 @@ def resolve_watch_root(root: Path) -> Path:
             ]
         except OSError:
             return
-        if not logs:
+        if logs:
+            try:
+                newest = max(p.stat().st_mtime for p in logs)
+            except OSError:
+                newest = 0.0
+            n_ads = len(logs)
+
+        planned = folder / "planned.json"
+        if planned.is_file():
+            try:
+                newest = max(newest, planned.stat().st_mtime)
+            except OSError:
+                pass
+            planned_ids = load_planned(folder)
+            if planned_ids:
+                n_ads = max(n_ads, len(planned_ids))
+
+        smoke = folder / "runtime-smoke"
+        if smoke.is_dir():
+            try:
+                newest = max(newest, smoke.stat().st_mtime)
+                for f in smoke.rglob("*"):
+                    if f.is_file():
+                        try:
+                            newest = max(newest, f.stat().st_mtime)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
+        if newest <= 0.0 and not logs and not planned.is_file() and not smoke.is_dir():
             return
-        try:
-            newest = max(p.stat().st_mtime for p in logs)
-        except OSError:
-            return
-        candidates.append((folder, newest, len(logs)))
+        if newest <= 0.0:
+            try:
+                newest = folder.stat().st_mtime
+            except OSError:
+                return
+        candidates.append((folder, newest, n_ads))
 
     # Only consider children of an umbrella — not the umbrella's mixed leaf runs.
     nested = False
@@ -147,9 +221,48 @@ def resolve_watch_root(root: Path) -> Path:
     if not candidates:
         return root
 
-    # Hottest log wins. Tie-break: more ads (real batch) over a lone stale sibling.
+    # Hottest activity wins. Tie-break: more ads (real batch) over a lone sibling.
     candidates.sort(key=lambda c: (c[1], c[2]), reverse=True)
     return candidates[0][0]
+
+
+def _hms_to_secs(hms: str) -> int:
+    hh, mm, ss = hms.split(":")
+    return int(hh) * 3600 + int(mm) * 60 + int(ss)
+
+
+def parse_done_seconds(text: str) -> float | None:
+    """Last ``done in Xs`` value in the log, if any."""
+    last: float | None = None
+    for raw in text.splitlines():
+        m = _DONE_SECS_RE.search(raw)
+        if m:
+            last = float(m.group(1))
+    return last
+
+
+def estimate_log_span_s(text: str) -> float | None:
+    """Wall-clock seconds from first to last ``[HH:MM:SS]`` (handles midnight wrap)."""
+    stamps: list[int] = []
+    for raw in text.splitlines():
+        m = _LINE_RE.match(raw.strip())
+        if m:
+            stamps.append(_hms_to_secs(m.group(1)))
+    if len(stamps) < 2:
+        return None
+    delta = stamps[-1] - stamps[0]
+    if delta < 0:
+        delta += 86400
+    return float(delta)
+
+
+def estimate_started_at(text: str, log_mtime: float, now: float) -> float:
+    """Infer wall-clock start from first/last ``[HH:MM:SS]`` vs log mtime."""
+    anchor = min(log_mtime, now)
+    span = estimate_log_span_s(text)
+    if span is not None:
+        return anchor - span
+    return anchor
 
 
 def parse_log(text: str) -> tuple[list[str], str | None, bool, bool]:
@@ -169,7 +282,7 @@ def parse_log(text: str) -> tuple[list[str], str | None, bool, bool]:
         body = m.group(2) if m else line
         if "ERROR:" in body:
             failed = True
-        if _DONE_RE.search(body):
+        if _DONE_SECS_RE.search(body):
             complete = True
             last_idx = len(STAGES) - 1
             continue
@@ -353,7 +466,7 @@ def extract_feed(text: str, *, image_id: str = "", limit: int = _FEED_MAX) -> li
         if _FEED_NOISE.search(body):
             continue
         is_stage = any(any(m in body for m in markers) for _, markers in _MARKERS)
-        is_done = bool(_DONE_RE.search(body))
+        is_done = bool(_DONE_SECS_RE.search(body))
         if not (is_stage or is_done or "peel" in body.lower() or "harness" in body.lower()):
             continue
         cleaned = clean_line(body)
@@ -543,6 +656,8 @@ class Tracker:
         self.rev = 0
         self._live_id: str | None = None
         self._started: dict[str, float] = {}
+        self._frozen_elapsed: dict[str, float] = {}
+        self._smoke_started: float | None = None
         self._cache: dict[str, dict[str, Any]] = {}  # id -> disk cache
         self._lock = threading.Lock()
         self._status: dict[str, Any] = self._empty()
@@ -701,6 +816,7 @@ class Tracker:
         truncated = bool(prev and size < prev.get("size", 0))
         if truncated:
             self._started[image_id] = now
+            self._frozen_elapsed.pop(image_id, None)
             self.generation += 1
 
         unchanged = (
@@ -718,6 +834,11 @@ class Tracker:
             text = self._read_text_cached(image_id, log_path, size, mtime)
             done, active, complete, failed = parse_log(text)
 
+        # Harness / resume reopened a previously finished log — unfreeze the clock.
+        prev_complete = bool(prev and prev.get("parsed") and prev["parsed"][2])
+        if prev_complete and not complete:
+            self._frozen_elapsed.pop(image_id, None)
+
         art_idx, activity_mtime = artifact_progress(run_dir)
         activity_mtime = max(activity_mtime, mtime)
         done, active, complete = merge_progress(done, active, complete, art_idx)
@@ -725,12 +846,41 @@ class Tracker:
         has_original = (run_dir / "original.png").is_file()
         has_preview = (run_dir / "preview.png").is_file()
 
-        # Start clock on first real stage line (not stub "waiting").
+        done_secs = parse_done_seconds(text) if (text and complete) else None
+        log_span = estimate_log_span_s(text) if text else None
+
+        # Start clock once we see real stage work (not empty stubs).
         if image_id not in self._started and (done or active or complete):
-            self._started[image_id] = now if truncated else min(mtime, now)
+            if truncated:
+                self._started[image_id] = now
+            else:
+                self._started[image_id] = estimate_started_at(text, mtime, now)
 
         started_at = self._started.get(image_id)
-        elapsed = max(0.0, now - started_at) if started_at else 0.0
+
+        if image_id in self._frozen_elapsed:
+            elapsed = self._frozen_elapsed[image_id]
+        elif complete and log_span is not None and log_span > 0:
+            # Prefer log wall-clock over the last harness ``done in`` (often a tiny re-run).
+            elapsed = log_span
+            self._frozen_elapsed[image_id] = elapsed
+            if started_at is None:
+                started_at = activity_mtime - elapsed
+                self._started[image_id] = started_at
+        elif complete and done_secs is not None:
+            elapsed = done_secs
+            self._frozen_elapsed[image_id] = elapsed
+            if started_at is None:
+                started_at = activity_mtime - elapsed
+                self._started[image_id] = started_at
+        elif started_at is not None:
+            elapsed = max(0.0, now - started_at)
+            if complete or failed:
+                # Freeze so done/failed ads stop ticking.
+                self._frozen_elapsed[image_id] = elapsed
+        else:
+            elapsed = 0.0
+
         # Stall off artifact activity, not just pipeline.log — peel/inpaint are quiet.
         stalled = (
             not complete
@@ -797,6 +947,8 @@ class Tracker:
                 self.root = nxt
                 self._cache.clear()
                 self._started.clear()
+                self._frozen_elapsed.clear()
+                self._smoke_started = None
                 self._live_id = None
                 self.generation += 1
 
@@ -809,6 +961,7 @@ class Tracker:
             if key not in alive:
                 self._cache.pop(key, None)
                 self._started.pop(key, None)
+                self._frozen_elapsed.pop(key, None)
 
         # Benchmarks run ONE ad at a time. The live ad is the incomplete run with
         # the newest pipeline.log mtime (or the newest overall if all are done).
@@ -849,6 +1002,14 @@ class Tracker:
                     # Finished earlier stages, batch moved on — not "running".
                     r["status"] = "partial"
                     r["active"] = None  # don't pulse a stage on a non-live ad
+                    # Freeze wall clock at last activity so abandoned ads stop ticking.
+                    if r["id"] not in self._frozen_elapsed and r.get("started_at"):
+                        am = float(r.get("activity_mtime") or r.get("mtime") or now)
+                        self._frozen_elapsed[r["id"]] = max(
+                            0.0, am - float(r["started_at"])
+                        )
+                    if r["id"] in self._frozen_elapsed:
+                        r["elapsed_s"] = round(self._frozen_elapsed[r["id"]], 1)
                 else:
                     r["status"] = "pending"
 
@@ -907,13 +1068,20 @@ class Tracker:
             probes = smoke.get("probes") or list(_SMOKE_PROBES)
             n_done = len(smoke.get("done") or [])
             pct = round(100.0 * n_done / max(1, len(probes)), 1)
+            if self._smoke_started is None:
+                # Anchor to smoke folder birth, not the latest probe write (that resets).
+                smoke_dir = self.root / "runtime-smoke"
+                try:
+                    self._smoke_started = float(smoke_dir.stat().st_mtime)
+                except OSError:
+                    self._smoke_started = float(smoke.get("mtime") or now)
             live_payload = {
                 "image_id": "runtime-smoke",
                 "active": smoke.get("active") or "smoke",
                 "done": list(smoke.get("done") or []),
                 "percent": pct,
-                "elapsed_s": round(max(0.0, now - float(smoke.get("mtime") or now)), 1),
-                "started_at": None,
+                "elapsed_s": round(max(0.0, now - self._smoke_started), 1),
+                "started_at": self._smoke_started,
                 "stalled": bool(smoke.get("stalled")),
                 "complete": False,
                 "failed": smoke.get("status") == "failed",
@@ -1084,9 +1252,14 @@ def make_handler(tracker: Tracker):
 def main() -> None:
     ap = argparse.ArgumentParser(description="Live activity grid for pipeline.log")
     ap.add_argument("--root", default=str(_REPO / "runs"),
-                    help="benchmark/run root containing <image_id>/pipeline.log")
+                    help="benchmark umbrella (runs/) or a specific bench folder")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument(
+        "--no-auto-root",
+        action="store_true",
+        help="pin --root exactly; do not follow .activity_current / hottest bench",
+    )
     args = ap.parse_args()
 
     root = Path(args.root).expanduser()
@@ -1095,7 +1268,7 @@ def main() -> None:
     if not _HTML_PATH.is_file():
         raise SystemExit(f"missing {_HTML_PATH}")
 
-    tracker = Tracker(root, auto_root=True)
+    tracker = Tracker(root, auto_root=not args.no_auto_root)
     tracker.refresh()
     tracker.start()
     server = ThreadingHTTPServer((args.host, args.port), make_handler(tracker))

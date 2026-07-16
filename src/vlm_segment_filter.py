@@ -209,25 +209,20 @@ def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[di
         return elements
 
     candidate_ids = {id(el) for el in candidates}
-    results: list[dict] = []
+    workers = vlm_client.parallelism_from_cfg(cfg)
 
-    for element in elements:
-        if id(element) not in candidate_ids:
-            results.append(element)
-            continue
-
+    def _classify_one(element: dict) -> dict | None:
+        """Return annotated element, or None to drop (reject_mode=remove)."""
         try:
             crop = vlm_client.crop_box_bytes(image, element["box"], padding)
         except (KeyError, TypeError, ValueError, OverflowError):
-            results.append(_annotate(
+            return _annotate(
                 element, decision="review", label="unknown", note="invalid_crop_geometry"
-            ))
-            continue
+            )
         if crop is None:
-            results.append(_annotate(
+            return _annotate(
                 element, decision="review", label="unknown", note="invalid_crop_geometry"
-            ))
-            continue
+            )
 
         answer, note = vlm_client.multi_pass_answer(
             crop,
@@ -241,30 +236,22 @@ def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[di
         )
 
         if note == "vlm_error":
-            results.append(_annotate(
-                element, decision="review", label="unknown", note="vlm_error"
-            ))
-            continue
+            return _annotate(element, decision="review", label="unknown", note="vlm_error")
         if note == "vlm_disagreement":
-            results.append(_annotate(element, decision="review", label="junk", note="vlm_disagreement"))
-            continue
+            return _annotate(element, decision="review", label="junk", note="vlm_disagreement")
 
         parsed = _parse_classification(answer or "")
         if parsed is None:
-            results.append(_annotate(
-                element, decision="review", label="unknown", note="vlm_parse_error"
-            ))
-            continue
+            return _annotate(element, decision="review", label="unknown", note="vlm_parse_error")
 
         decision = parsed["decision"]
         label = parsed["label"]
         if decision == "drop":
             if reject_mode == "mark":
-                results.append(_annotate(element, decision=decision, label=label))
-            continue
+                return _annotate(element, decision=decision, label=label)
+            return None
         if decision == "review":
-            results.append(_annotate(element, decision=decision, label=label))
-            continue
+            return _annotate(element, decision=decision, label=label)
 
         kept = _annotate(element, decision=decision, label=label)
         if refine_enabled:
@@ -281,6 +268,24 @@ def filter_elements(image_path: str, elements: list[dict], cfg: dict) -> list[di
                 kept["meta"].setdefault("vlm_segment", {})["refined_role"] = refined
             elif refine_note == "vlm_disagreement":
                 kept["meta"].setdefault("vlm_segment", {})["refine_note"] = "vlm_disagreement"
-        results.append(kept)
+        return kept
 
+    # Preserve original order: non-candidates pass through; candidates classified
+    # in parallel then re-merged by index.
+    classify_jobs = [el for el in elements if id(el) in candidate_ids]
+    classified = {
+        id(el): result
+        for el, result in zip(
+            classify_jobs,
+            vlm_client.map_parallel(_classify_one, classify_jobs, workers=workers),
+        )
+    }
+    results: list[dict] = []
+    for element in elements:
+        if id(element) not in candidate_ids:
+            results.append(element)
+            continue
+        kept = classified.get(id(element))
+        if kept is not None:
+            results.append(kept)
     return results

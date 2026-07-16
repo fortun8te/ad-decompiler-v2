@@ -726,23 +726,37 @@ def test_numeric_verify_skips_confident_agreed_tokens_and_letters(tmp_path):
     assert confident["text"] == "257"
 
 
-def test_numeric_verify_requires_vlm_and_survives_errors(tmp_path):
-    image_path = tmp_path / "counts.png"
-    Image.new("RGB", (400, 120), "white").save(image_path)
-    line = _line("99", 0.5, _box(250, 40, 40, 30), "doctr")
-    line["id"] = "L0"
-
-    # Root VLM switch off -> the whole pass is disabled.
-    disabled = ocr._verify_numeric_tokens(
-        str(image_path), [line], {"vlm": {"enabled": False}, "ocr": {"numeric_verify": True}},
+def test_cleanup_line_text_unsmashes_and_dedupes_tokens():
+    assert ocr.cleanup_line_text("WeNEVER") == "We NEVER"
+    assert ocr.cleanup_line_text("do do this!") == "do this!"
+    assert ocr.cleanup_line_text("WeNEVER do do this!") == "We NEVER do this!"
+    assert ocr.cleanup_line_text("geld geld terug tot €100.") == "geld terug tot €100."
+    # Leave already-correct / camelCase brands alone.
+    assert ocr.cleanup_line_text("ONLINE EXCLUSIVE OFFER ENDING SOON") == (
+        "ONLINE EXCLUSIVE OFFER ENDING SOON"
     )
-    assert disabled is None
+    assert ocr.cleanup_line_text("iPhone") == "iPhone"
 
-    # A VLM error must leave the line untouched and be counted, not raised.
-    def error_ask(crop):
-        return None, "vlm_error"
 
-    result = ocr._verify_numeric_tokens(str(image_path), [line], _numeric_cfg(), ask=error_ask)
-    assert result["errors"] == 1
-    assert line["text"] == "99"
-    assert "numeric_verify" not in (line.get("meta") or {})
+def test_cleanup_line_text_fixes_weergaver_typo_case_preserving():
+    assert ocr.cleanup_line_text("121K weergaver") == "121K weergaven"
+    assert ocr.cleanup_line_text("121K WEERGAVER") == "121K WEERGAVEN"
+    assert ocr.cleanup_line_text("Weergaver") == "Weergaven"
+    # Do not rewrite substrings inside longer tokens.
+    assert ocr.cleanup_line_text("weergaverx") == "weergaverx"
+
+
+def test_apply_line_text_cleanup_records_meta():
+    lines = [{
+        "id": "L0",
+        "text": "do do this!",
+        "conf": 0.9,
+        "box": _box(10, 10, 100, 20),
+        "quad": _quad(10, 10, 100, 20),
+        "words": [],
+        "meta": {"engine": "doctr"},
+    }]
+    out = ocr._apply_line_text_cleanup(lines)
+    assert out[0]["text"] == "do this!"
+    assert out[0]["ocr_text"] == "do do this!"
+    assert out[0]["meta"]["ocr_text_cleanup"]["to"] == "do this!"

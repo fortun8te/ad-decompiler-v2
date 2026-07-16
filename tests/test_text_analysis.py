@@ -67,6 +67,19 @@ def test_fit_text_box_scales_multiline_line_height_with_font(monkeypatch):
     assert patch["lineHeight"] < 52
 
 
+def test_fit_text_box_never_emits_line_height_below_font_size(monkeypatch):
+    """Ad 013: dense display OCR measured lh 195 < fs 230 and clipped glyph tops."""
+    monkeypatch.setattr(text_analysis, "_fit_font", lambda style, size: _font(max(1, int(size))))
+    _, _, patch = text_analysis.fit_text_box(
+        "We NEVER\ndo this!",
+        {"fontSize": 230, "lineHeight": 195, "letterSpacing": 0},
+        {"x": 0, "y": 0, "w": 1000, "h": 500},
+    )
+    fs = patch.get("fontSize", 230)
+    lh = patch.get("lineHeight", 195)
+    assert lh >= fs * 1.05
+
+
 def test_enriches_painted_geometry_colour_baseline_and_style(tmp_path):
     image = Image.new("RGB", (640, 260), "white")
     draw = ImageDraw.Draw(image)
@@ -596,6 +609,36 @@ def test_meta_alignment_prefers_matching_weight():
         text_analysis._meta_alignment_adjustment(light_meta, profile)
 
 
+def test_floating_side_callouts_align_toward_center():
+    """014: left floating callouts RIGHT-align; right floating callouts LEFT-align."""
+    left = [{"box": {"x": 120, "y": 500, "w": 240, "h": 60}}]
+    right = [{"box": {"x": 720, "y": 500, "w": 240, "h": 60}}]
+    edge_left = [{"box": {"x": 40, "y": 500, "w": 240, "h": 60}}]
+    edge_right = [{"box": {"x": 800, "y": 500, "w": 240, "h": 60}}]
+    assert text_analysis._infer_alignment(left, 1080) == "RIGHT"
+    assert text_analysis._infer_alignment(right, 1080) == "LEFT"
+    assert text_analysis._infer_alignment(edge_left, 1080) == "LEFT"
+    assert text_analysis._infer_alignment(edge_right, 1080) == "RIGHT"
+
+
+def test_disclaimer_role_for_bottom_fda_copy():
+    lines = [{
+        "text": "*These statements have not been evaluated by the FDA.",
+        "box": {"x": 80, "y": 1780, "w": 920, "h": 36},
+        "style": {"fontSize": 14, "color": "#888888"},
+        "baseline": {"y0": 1805},
+    }, {
+        "text": "NUTRITIONAL SUPPORT",
+        "box": {"x": 120, "y": 80, "w": 840, "h": 90},
+        "style": {"fontSize": 48, "color": "#FFFFFF"},
+        "baseline": {"y0": 150},
+    }]
+    text_analysis._assign_roles(lines, {"w": 1080, "h": 1920})
+    by_text = {line["text"][:20]: line["role"] for line in lines}
+    assert by_text["*These statements ha"] == "disclaimer"
+    assert by_text["NUTRITIONAL SUPPORT"] == "headline"
+
+
 def test_fallback_chain_uses_weight_and_italic(tmp_path):
     path = tmp_path / "plain.png"
     Image.new("RGB", (200, 80), "white").save(path)
@@ -995,7 +1038,7 @@ def test_render_fit_corrects_cap_height_size_overestimate(tmp_path):
 
     assert meta_fit["applied"] is True
     assert abs(style["fontSize"] - true_size) <= true_size * 0.10
-    assert abs(style["letterSpacing"]) <= 1.2  # not the tracked-out heuristic value
+    assert float(style["letterSpacing"]) == 0.0  # Codia parity: never emit fitted tracking
     assert style["fontSizeCandidates"][0]["value"] == style["fontSize"]
 
 
@@ -1123,6 +1166,51 @@ def test_unknown_local_font_maps_to_same_class_google_default():
     assert text_analysis._norm_family(family) in text_analysis._GOOGLE_FONTS_NORM
 
 
+def test_platform_ui_prior_forces_inter_on_social_screenshot():
+    """CODIA-PARITY: social UI copy defaults to Inter, not Carlito/Arimo scatter."""
+    prepared = [
+        {"line": {
+            "id": "L0",
+            "style": {"fontFamily": "Carlito", "fontWeight": 400, "fontSize": 34,
+                      "fontCandidates": [
+                          {"family": "Carlito", "path": "/tmp/c.ttf", "score": 0.4,
+                           "source": "local-render"},
+                      ]},
+            "meta": {"render_fit": {"score": 0.42}},
+        }},
+        {"line": {
+            "id": "L1",
+            "style": {"fontFamily": "Playfair Display", "fontWeight": 700, "fontSize": 72,
+                      "fontCandidates": []},
+            # Strong serif display fit must NOT be overwritten.
+            "meta": {"render_fit": {"score": 0.85}},
+        }},
+    ]
+    # Force serif class for L1 by monkeypatching family class.
+    original = text_analysis._family_class
+
+    def _class(family, path=None):
+        if "playfair" in str(family).lower():
+            return "serif"
+        if "carlito" in str(family).lower():
+            return "sans"
+        return original(family, path)
+
+    text_analysis._family_class = _class
+    try:
+        evidence = text_analysis._apply_platform_ui_font_prior(
+            prepared,
+            {"scene": {"archetype": "social_screenshot"}},
+            {},
+        )
+    finally:
+        text_analysis._family_class = original
+    assert evidence is not None
+    assert prepared[0]["line"]["style"]["fontFamily"] == "Inter"
+    assert "L0" in evidence["applied_lines"]
+    assert prepared[1]["line"]["style"]["fontFamily"] == "Playfair Display"
+
+
 def test_mapping_targets_are_all_license_clean_google_families():
     # Internal consistency of the OFL corpus path: every mapping target is a
     # curated Google family, and none of it depends on the (non-commercial) Lens
@@ -1226,3 +1314,180 @@ def test_curated_corpus_is_bounded_to_common_families(monkeypatch, tmp_path):
     all_families = {text_analysis._norm_family(m["family"]) for m in
                     text_analysis._discover_google_fonts({**options, "google_fonts_curated": False})}
     assert "obscuredisplayxyz" in all_families
+
+
+# ---------------------------------------------------------------------------
+# Codia-parity: letterSpacing=0 + platform-UI Inter prior + stroke/shadow gates
+# ---------------------------------------------------------------------------
+
+
+def test_emit_letter_spacing_always_zero_even_after_render_fit(tmp_path, monkeypatch):
+    """Fitted tracking is measurement noise; emitted letterSpacing must stay 0."""
+    font_path = _font_path()
+    if not font_path:
+        pytest.skip("no TrueType font")
+    true_size = 40
+    font = ImageFont.truetype(font_path, true_size)
+    image = Image.new("RGB", (900, 160), "white")
+    draw = ImageDraw.Draw(image)
+    text = "korting krijgt op het volledige"
+    ocr_box = _draw_text(draw, (40, 40), text, font, (10, 10, 10))
+    path = tmp_path / "ls0.png"
+    image.save(path)
+    ocr = {
+        "source": {"path": str(path), "w": 900, "h": 160},
+        "lines": [_line("L0", text, ocr_box)],
+    }
+    cfg = {
+        "text_analysis": {
+            "font_matching": {
+                "enabled": True,
+                "font_files": [font_path],
+                "font_dirs": ["__none__"],
+                "max_fonts": 1, "max_lines": 2, "top_k": 1,
+            },
+        }
+    }
+    # Force a non-zero fitted tracking so the policy must actively suppress it.
+    from src import font_fit
+
+    real_fit = font_fit.fit_line
+
+    def noisy_fit(text_s, path_s, mask, size, options):
+        fit = real_fit(text_s, path_s, mask, size, options)
+        if fit is not None:
+            fit = dict(fit)
+            fit["letterSpacing"] = 3.5
+        return fit
+
+    monkeypatch.setattr(font_fit, "fit_line", noisy_fit)
+    result = text_analysis.analyze_text(str(path), ocr, cfg)
+    style = result["lines"][0]["style"]
+    assert float(style.get("letterSpacing") or 0) == 0.0
+    # Diagnostic only — fitted tracking may still be recorded on meta.
+    meta_fit = (result["lines"][0].get("meta") or {}).get("render_fit") or {}
+    assert meta_fit.get("letterSpacing") in (None, 0.0, 3.5) or True
+
+
+def test_platform_ui_prior_forces_inter_for_sans_ui_lines():
+    prepared = [{
+        "line": {
+            "id": "L0",
+            "text": "Post",
+            "style": {
+                "fontFamily": "Lato",
+                "fontWeight": 700,
+                "fontStyle": "Bold",
+                "letterSpacing": 1.2,
+                "fontCandidates": [
+                    {"family": "Lato", "style": "Bold", "weight": 700,
+                     "source": "local-render", "path": "lato.ttf", "score": 0.48},
+                ],
+            },
+            "meta": {"render_fit": {"score": 0.48, "letterSpacing": 1.2}},
+        },
+        "painted": {"w": 120, "h": 40},
+        "font_mask": None,
+    }]
+    evidence = text_analysis._apply_platform_ui_font_prior(
+        prepared,
+        {"text_analysis": {"platform_ui_prior": True, "platform_ui_family": "Inter"}},
+        {},
+    )
+    assert evidence and evidence["applied"] is True
+    style = prepared[0]["line"]["style"]
+    assert style["fontFamily"] == "Inter"
+    assert style["fontCandidates"][0]["family"] == "Inter"
+    assert float(style.get("letterSpacing") or 0) == 0.0
+    assert style["fontWeight"] == 700
+
+
+def test_platform_ui_prior_keeps_strong_serif_display():
+    prepared = [{
+        "line": {
+            "id": "L0",
+            "text": "Everyday",
+            "style": {
+                "fontFamily": "Playfair Display",
+                "fontWeight": 700,
+                "fontStyle": "Bold",
+                "letterSpacing": 0.0,
+                "fontCandidates": [
+                    {"family": "Playfair Display", "style": "Bold", "weight": 700,
+                     "source": "google-cache", "path": "playfair.ttf", "score": 0.85,
+                     "fit": {"score": 0.85}},
+                ],
+            },
+            "meta": {"render_fit": {"score": 0.85}},
+        },
+        "painted": {"w": 400, "h": 90},
+        "font_mask": None,
+    }]
+    text_analysis._apply_platform_ui_font_prior(
+        prepared,
+        {"text_analysis": {"platform_ui_prior": True, "platform_ui_family": "Inter"}},
+        {},
+    )
+    assert prepared[0]["line"]["style"]["fontFamily"] == "Playfair Display"
+
+
+def test_aa_edge_is_not_emitted_as_text_stroke(tmp_path):
+    """Anti-aliased plain ink must not invent a Figma outline stroke."""
+    font = _font(72)
+    image = Image.new("RGB", (420, 200), (240, 245, 230))
+    draw = ImageDraw.Draw(image)
+    pos = (40, 50)
+    draw.text(pos, "fiber", font=font, fill=(20, 30, 0))
+    bbox = draw.textbbox(pos, "fiber", font=font)
+    ocr_box = (max(0, bbox[0] - 6), max(0, bbox[1] - 6), bbox[2] + 6, bbox[3] + 6)
+    path = tmp_path / "aa.png"
+    image.save(path)
+    ocr = {
+        "source": {"path": str(path), "w": image.width, "h": image.height},
+        "lines": [_line("L0", "fiber", ocr_box)],
+    }
+    result = text_analysis.analyze_text(
+        str(path), ocr, {"text_analysis": {"font_matching": {"enabled": False}}}
+    )
+    assert result["lines"][0]["style"].get("stroke") is None
+
+
+def test_offset_text_shadow_emits_drop_shadow_effect(tmp_path):
+    """A soft offset halo (not a concentric outline) becomes a DROP_SHADOW effect."""
+    font = _font(80)
+    image = Image.new("RGB", (480, 220), (30, 90, 200))
+    draw = ImageDraw.Draw(image)
+    # Soft multi-offset shadow satellite, then bright fill on top.
+    for ox, oy in ((5, 5), (6, 6), (7, 7)):
+        draw.text((48 + ox, 58 + oy), "OFF", font=font, fill=(0, 0, 0))
+    draw.text((48, 58), "OFF", font=font, fill=(250, 250, 250))
+    bbox = draw.textbbox((48, 58), "OFF", font=font)
+    ocr_box = (max(0, bbox[0] - 20), max(0, bbox[1] - 20), bbox[2] + 24, bbox[3] + 24)
+    path = tmp_path / "shadow.png"
+    image.save(path)
+    ocr = {
+        "source": {"path": str(path), "w": image.width, "h": image.height},
+        "lines": [_line("L0", "OFF", ocr_box)],
+    }
+    result = text_analysis.analyze_text(
+        str(path), ocr, {"text_analysis": {"font_matching": {"enabled": False}}}
+    )
+    style = result["lines"][0]["style"]
+    effects = style.get("effects") or []
+    assert effects, "expected a detected text drop-shadow"
+    assert effects[0]["type"] in ("DROP_SHADOW", "drop-shadow")
+    assert abs(float(effects[0].get("offset", {}).get("x", effects[0].get("x", 0)))) + abs(
+        float(effects[0].get("offset", {}).get("y", effects[0].get("y", 0)))
+    ) > 0
+    # Shadow must not be mis-read as a concentric stroke.
+    assert style.get("stroke") is None
+
+
+def test_estimate_weight_emits_extra_bold_for_dense_ink():
+    dense = np.ones((40, 120), dtype=bool)
+    dense[::3, :] = False  # still very dense
+    assert text_analysis._estimate_weight(dense, {"h": 40, "w": 120}) >= 700
+    # Near-solid ink → ExtraBold bucket
+    solid = np.ones((40, 120), dtype=bool)
+    assert text_analysis._estimate_weight(solid, {"h": 40, "w": 120}) == 800
+    assert "Extra" in text_analysis._style_name(800)

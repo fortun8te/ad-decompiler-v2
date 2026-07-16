@@ -246,6 +246,76 @@ def test_prepare_inpaint_vram_evicts_vlm_when_enabled(monkeypatch):
     assert record["vlm_evicted"] is True
 
 
+def test_lazy_flux_prep_defers_at_reconstruct_boundary(monkeypatch):
+    """Regional + force_flux=false must not unload the VLM before reconstruct."""
+    events = []
+    monkeypatch.setattr(vram, "unload_ocr_engines", lambda: None)
+    monkeypatch.setattr(vram, "unload_sam_backend", lambda: events.append("sam"))
+    monkeypatch.setattr(vram, "optional_torch_cuda_empty_cache", lambda: None)
+    monkeypatch.setattr(vram, "log_vram", lambda label, log_fn=None: None)
+    monkeypatch.setattr(
+        vram, "prepare_inpaint_vram",
+        lambda *a, **k: events.append("prep") or {"vlm_evicted": True})
+    logs = []
+    vram.reset_telemetry()
+    cfg = {
+        "device": "cuda",
+        "inpaint": {
+            "mode": "flux_comfy",
+            "comfy": {"enabled": True},
+            "regional": {"enabled": True, "force_flux": False},
+        },
+        "runtime": {"vram": {"evict_vlm_for_inpaint": True, "lazy_flux_prep": True,
+                             "empty_cache_between_stages": False}},
+    }
+    vram.stage_boundary("merge", "reconstruct", cfg, "/tmp/run", log_fn=logs.append)
+    assert "prep" not in events
+    assert any("deferring Flux prep" in line for line in logs)
+    tel = vram.telemetry()
+    assert tel and tel[-1]["inpaint_prep"].get("deferred") is True
+
+
+def test_ensure_flux_vram_runs_once(monkeypatch):
+    monkeypatch.setattr(vram, "free_vram_mib", lambda: 15000.0)
+    monkeypatch.setattr(vram, "optional_torch_cuda_empty_cache", lambda: None)
+    calls = []
+    monkeypatch.setattr(vram, "evict_vlm", lambda cfg, log_fn=None: calls.append("evict") or True)
+    cfg = _flux_cfg()
+    cfg["vlm"] = {"enabled": True, "model": "m"}
+    cfg["runtime"] = {"vram": {"evict_vlm_for_inpaint": True}}
+    vram.reset_telemetry()
+    first = vram.ensure_flux_vram(cfg)
+    second = vram.ensure_flux_vram(cfg)
+    assert calls == ["evict"]
+    assert first["vlm_evicted"] is True
+    assert first["already_prepared"] is False
+    assert second["already_prepared"] is True
+    assert second["vlm_evicted"] is False
+
+
+def test_eager_flux_prep_when_force_flux(monkeypatch):
+    events = []
+    monkeypatch.setattr(vram, "unload_ocr_engines", lambda: None)
+    monkeypatch.setattr(vram, "unload_sam_backend", lambda: None)
+    monkeypatch.setattr(vram, "optional_torch_cuda_empty_cache", lambda: None)
+    monkeypatch.setattr(vram, "log_vram", lambda label, log_fn=None: None)
+    monkeypatch.setattr(
+        vram, "prepare_inpaint_vram",
+        lambda *a, **k: events.append("prep") or {"vlm_evicted": True, "flux_quant": "Q.gguf"})
+    vram.reset_telemetry()
+    cfg = {
+        "device": "cuda",
+        "inpaint": {
+            "mode": "flux_comfy",
+            "comfy": {"enabled": True},
+            "regional": {"enabled": True, "force_flux": True},
+        },
+        "runtime": {"vram": {"lazy_flux_prep": True, "empty_cache_between_stages": False}},
+    }
+    vram.stage_boundary("merge", "reconstruct", cfg, "/tmp/run")
+    assert events == ["prep"]
+
+
 def test_evict_vlm_shells_out_to_lms(monkeypatch):
     monkeypatch.setattr(vram, "_lms_path", lambda cfg=None: "/fake/lms")
     seen = {}

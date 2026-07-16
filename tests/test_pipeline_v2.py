@@ -58,7 +58,7 @@ def test_end_to_end_cpu_vertical_slice_uses_clean_plate(monkeypatch, tmp_path):
     assert (run_dir / "input_manifest.json").exists()
     design = json.loads((run_dir / "design.json").read_text(encoding="utf-8"))
     assert design["schema_version"] == 2
-    assert design["layers"][0]["name"] == "Background — clean plate"
+    assert design["layers"][0]["name"] == "Background"
     assert design["layers"][0]["meta"]["source"] == "inpaint"
     assert (run_dir / "background_clean.png").exists()
     assert (run_dir / "ownership.png").exists()

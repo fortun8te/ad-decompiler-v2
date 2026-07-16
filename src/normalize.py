@@ -273,7 +273,8 @@ def load_normalize(
 
             # verbatim (post-transpose) provenance copy — naive RGB, pre colour-management
             original_path = os.path.join(run_dir, "original.png")
-            im.convert("RGB").save(original_path, format="PNG")
+            # Avoid an extra full-frame buffer when the decoded source is already RGB.
+            (im if im.mode == "RGB" else im.convert("RGB")).save(original_path, format="PNG")
 
             # sRGB RGB, alpha flattened over an estimated neutral field
             im, cm = _colour_manage(im, icc, Image, ImageCms)

@@ -309,8 +309,8 @@ def test_fallback_disabled_by_config_is_a_noop(tmp_path):
 
 
 def test_forced_slice_ids_from_repair_patch_are_honored(tmp_path):
-    # With fully permissive thresholds nothing fails on its own, but the harness
-    # repair patch (reconstruct.focus_regions with layer_id) must still force the slice.
+    # Readable TEXT cannot be force-sliced by focus_regions alone (Codia). The harness
+    # must also opt into the forensic text_slice_gate_enabled flag.
     source, _ = _build_failed_text_run(tmp_path)
     permissive = {"region_ssim_min": 0.0, "region_color_min": 0.0,
                   "text_ink_iou_min": 0.0, "text_ink_excess_max": 1e9}
@@ -321,9 +321,20 @@ def test_forced_slice_ids_from_repair_patch_are_honored(tmp_path):
     )
     assert unforced["slices"] == []  # permissive gate really passes everything
 
-    report = reconstruct.apply_raster_slice_fallback(
+    blocked = reconstruct.apply_raster_slice_fallback(
         str(tmp_path), str(source),
         {"inpaint": {"mode": "opencv"}, "fallback": dict(permissive),
+         "reconstruct": {"focus_regions": [{"layer_id": "c_B0", "region_ssim": 0.2}]}},
+    )
+    assert blocked["slices"] == []
+    assert any(s.get("reason") == "codia-never-slice-readable-text"
+               for s in blocked.get("skipped") or [])
+
+    forensic = dict(permissive)
+    forensic["text_slice_gate_enabled"] = True
+    report = reconstruct.apply_raster_slice_fallback(
+        str(tmp_path), str(source),
+        {"inpaint": {"mode": "opencv"}, "fallback": forensic,
          "reconstruct": {"focus_regions": [{"layer_id": "c_B0", "region_ssim": 0.2}]}},
     )
 

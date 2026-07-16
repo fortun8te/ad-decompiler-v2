@@ -228,19 +228,24 @@ def _normalize_word(word: dict, engine: str) -> Optional[dict]:
     return out
 
 
+# OCR sometimes emits a bullet/mid-dot glyph that is already close to ·.
+_INTERPUNCT_BULLET = re.compile(r"[•∙⋅‧]")
 _INTERPUNCT_SEP = re.compile(r"(?<=[\w%€$£)\]]) [.\-] (?=[\w(€$£])")
 _INTERPUNCT_TAIL = re.compile(r"(?<=[\w%€$£)\]]) [.\-]$")
 
 
 def _restore_interpuncts(text: str) -> str:
-    """Restore interpunct separators ('·') that OCR reads as '.'/'-'.
+    """Restore interpunct separators ('·') that OCR reads as '.'/'-'/bullets.
 
     UI metadata lines separate tokens with a centered dot ("05:00 PM · 12-05-2026 ·
     121K weergaven"); OCR engines emit '.' or '-' for that glyph. Only a SEPARATOR
     pattern is rewritten — a space-surrounded lone '.'/'-' between word characters,
     or trailing after a token — and only on lines that contain a digit (UI/meta
     lines), so prose punctuation and real hyphenated words are never touched.
+    Decimals like ``1.2M`` stay intact because their '.' has no surrounding spaces.
     """
+    if _INTERPUNCT_BULLET.search(text):
+        text = _INTERPUNCT_BULLET.sub("·", text)
     if not any(ch.isdigit() for ch in text):
         return text
     text = _INTERPUNCT_SEP.sub(" · ", text)
@@ -1414,6 +1419,23 @@ def _reconcile(primary_lines, challenger_sets, iou_thresh=0.42, cfg=None):
         winner_index = max(range(len(members)), key=lambda index: (scores[index],
                                                                     _calibrated_confidence(members[index], cfg)))
         winner = copy.deepcopy(members[winner_index])
+        # Prefer an already-spaced case-split reading (``We NEVER``) over a smashed
+        # primary (``WeNEVER``) when both engines saw the same tokens.
+        winner_text = str(winner.get("text") or "")
+        cleaned_winner = cleanup_line_text(winner_text)
+        if cleaned_winner != winner_text:
+            for index, member in enumerate(members):
+                member_text = str(member.get("text") or "")
+                if member_text == cleaned_winner or (
+                    " " in member_text
+                    and " " not in winner_text
+                    and cleanup_line_text(member_text) == cleaned_winner
+                ):
+                    winner = copy.deepcopy(member)
+                    winner_index = index
+                    break
+            else:
+                winner["text"] = cleaned_winner
         agreeing_indices = [
             index for index, member in enumerate(members)
             if _text_similarity(winner.get("text"), member.get("text")) >= agreement_threshold
@@ -1650,6 +1672,115 @@ def _recombine_fragments(lines: list[dict], cfg: Optional[dict] = None) -> list[
 
 
 _PUNCT_TOKEN_RE = re.compile(r"^\W+$")
+# lower→ALLCAPS smash only: "WeNEVER" → "We NEVER". Requires 2+ capitals so
+# camelCase brands like "iPhone" are left alone.
+_CASE_SMASH_RE = re.compile(r"(?<=[a-z])(?=[A-Z]{2,})")
+
+# High-confidence UI OCR typos only (Dutch social chrome, etc.). Keys are casefold.
+_OCR_TYPO_MAP = {
+    "weergaver": "weergaven",  # X/Twitter "views" — final n misread as r
+}
+_OCR_TYPO_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(_OCR_TYPO_MAP, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _preserve_word_case(original: str, replacement: str) -> str:
+    """Apply ``replacement`` while roughly preserving ALLCAPS / Title / lower casing."""
+    if not original:
+        return replacement
+    if original.isupper():
+        return replacement.upper()
+    if original.islower():
+        return replacement.lower()
+    if original[:1].isupper() and original[1:].islower():
+        return replacement[:1].upper() + replacement[1:].lower()
+    if original[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def _apply_ocr_typos(text: str) -> str:
+    """Word-boundary typo fixes from ``_OCR_TYPO_MAP`` (case-preserving)."""
+    raw = str(text or "")
+    if not raw or not _OCR_TYPO_MAP:
+        return raw
+
+    def _repl(match: re.Match) -> str:
+        word = match.group(0)
+        fix = _OCR_TYPO_MAP.get(word.casefold())
+        return _preserve_word_case(word, fix) if fix else word
+
+    return _OCR_TYPO_RE.sub(_repl, raw)
+
+
+def _collapse_repeated_tokens(text: str) -> str:
+    """Collapse consecutive duplicate tokens: ``do do this!`` → ``do this!``.
+
+    OCR on dense display type sometimes emits the same word twice in one line.
+    That ships as editable text and paints as a clear copy error (ad 013).
+    Only collapses tokens that were already whitespace-separated.
+    """
+    parts = re.split(r"(\s+)", str(text or ""))
+    if len(parts) <= 1:
+        return str(text or "")
+    out: list[str] = []
+    prev_token = None
+    for part in parts:
+        if not part:
+            continue
+        if part.isspace():
+            out.append(part)
+            continue
+        # Compare alnum core so "do" / "do!" still collapse, keeping the latter's punct.
+        core = re.sub(r"^\W+|\W+$", "", part)
+        prev_core = re.sub(r"^\W+|\W+$", "", prev_token) if prev_token else ""
+        if core and prev_core and core.casefold() == prev_core.casefold():
+            while out and out[-1].isspace():
+                out.pop()
+            if out:
+                out.pop()
+        out.append(part)
+        prev_token = part
+    return "".join(out)
+
+
+def _split_case_smash(text: str) -> str:
+    """Insert spaces at lower→Upper boundaries (``WeNEVER`` → ``We NEVER``)."""
+    raw = str(text or "")
+    if not raw:
+        return raw
+    tokens = re.split(r"(\s+)", raw)
+    return "".join(
+        _CASE_SMASH_RE.sub(" ", tok) if tok and not tok.isspace() else tok
+        for tok in tokens
+    )
+
+
+def cleanup_line_text(text: str) -> str:
+    """Deterministic OCR text hygiene: un-smash case merges, drop repeated tokens, safe typos."""
+    cleaned = _split_case_smash(str(text or ""))
+    cleaned = _collapse_repeated_tokens(cleaned)
+    cleaned = _apply_ocr_typos(cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _apply_line_text_cleanup(lines: list[dict]) -> list[dict]:
+    output = []
+    for line in lines:
+        item = copy.deepcopy(line)
+        original = str(item.get("text") or "")
+        cleaned = cleanup_line_text(original)
+        if cleaned != original:
+            item["text"] = cleaned
+            meta = item.setdefault("meta", {})
+            meta["ocr_text_cleanup"] = {"from": original, "to": cleaned}
+            if item.get("ocr_text") is None:
+                item["ocr_text"] = original
+        output.append(item)
+    return output
 
 
 def _dedup_options(cfg: Optional[dict]) -> dict:
@@ -2057,6 +2188,7 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
     )
     merged = _suppress_contained_duplicates(merged, cfg=cfg)
     repaired = _recombine_fragments(merged, cfg=cfg)
+    repaired = _apply_line_text_cleanup(repaired)
     ordered = _order_lines(repaired)
     lines_out = []
     for line in ordered:

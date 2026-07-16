@@ -66,6 +66,12 @@ def test_preset_is_wired_to_downstream_namespaces_without_overwriting_user_gate(
     assert cfg["routing"]["min_text_fidelity"] == .51
     assert cfg["routing"]["photo_regions"]["default_mask"] == "rrect"
     assert cfg["layout"]["scene_grouping"]["header_cluster"] is True
+    assert cfg["layout"]["scene_grouping"]["message_bubbles"] is True
+    assert cfg["routing"]["text_policy"]["default_family"] == "Inter"
+    assert cfg["routing"]["text_policy"]["platform_ui_prior"] is True
+    assert cfg["text_analysis"]["platform_ui_prior"] is True
+    assert cfg["text_analysis"]["platform_ui_family"] == "Inter"
+    assert cfg["routing"]["avatar_mask"] == "ellipse"
     assert cfg["qa"]["archetype_thresholds"]["text_recall_min"] == .90
 
 
@@ -172,3 +178,47 @@ def test_dark_chrome_only_boosts_social_alongside_social_evidence():
     # A dark poster with no social evidence must not become a tweet.
     alone = classify({"dark_background": True, "flat_background_fraction": .8})
     assert alone["archetype"] != "social_screenshot"
+
+
+def test_photo_of_handwriting_fact_sets_scene_text_only_policy():
+    facts = scene_facts(
+        {"w": 338, "h": 600},
+        {"lines": [{"text": "BUY TWO"}, {"text": "FREE"}]},
+        {"photo_of_handwriting": True, "photo_coverage": .7, "flat_background_fraction": .3},
+    )
+    assert facts["photo_of_handwriting"] is True
+    assert facts["text_on_photographic_surfaces_only"] is True
+    result = classify(facts)
+    result["facts"] = facts
+    cfg = apply_preset({}, result)
+    assert cfg["routing"]["text_policy"]["scene_text_only"] is True
+    assert cfg["routing"]["text_policy"]["suppress_editable_ocr"] is True
+
+
+def test_chat_ui_ocr_selects_social_screenshot():
+    facts = scene_facts(
+        {"w": 1080, "h": 1920},
+        {"lines": [
+            {"text": "New Messages"},
+            {"text": "Active now"},
+            {"text": "omw"},
+        ]},
+        {"dark_background": True, "flat_background_fraction": 0.55},
+    )
+    assert facts["chat_ui"] is True
+    result = classify(facts)
+    assert result["archetype"] == "social_screenshot"
+    assert "chat/DM chrome" in result["reasons"]
+
+
+def test_dark_multi_product_packshot_prefers_product_on_flat():
+    """Hears-style: dark field + 2 products even when flat fraction is middling."""
+    result = classify({
+        "product_count": 2,
+        "dark_background": True,
+        "mean_luma": 42,
+        "flat_background_fraction": 0.40,
+        "photo_coverage": 0.45,
+    })
+    assert result["archetype"] == "product_on_flat"
+    assert "multi-product on dark field" in result["reasons"]

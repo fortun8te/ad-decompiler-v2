@@ -10,6 +10,7 @@ from pathlib import Path
 from doctor import inspect as inspect_machine
 from run_pipeline import STAGES, load_cfg, run_one
 from src.harness import harness_enabled
+from src import format_readiness
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -335,6 +336,17 @@ def _entry(run_dir: Path, result: dict) -> dict:
                                         structure.get("rasterized_text_ratio")),
         "archetype": archetype,
         "preset": preset,
+        "aspect_class": (
+            (qa.get("aspect_class") or meta.get("aspect_class")
+             or (_read(run_dir / "format.json", {}) or {}).get("aspect_class")
+             or (_read(run_dir / "archetype.json", {}) or {}).get("format", {}).get("aspect_class"))
+        ),
+        "enabled_capabilities": (
+            qa.get("enabled_capabilities")
+            or meta.get("enabled_capabilities")
+            or (_read(run_dir / "format.json", {}) or {}).get("enabled_capabilities")
+            or (_read(run_dir / "archetype.json", {}) or {}).get("format", {}).get("enabled_capabilities")
+        ),
         "edge_f1": qa.get("edge_f1"),
         "color_similarity": qa.get("color_similarity"),
         "hard_fails": merged_hard_fails,
@@ -496,23 +508,39 @@ def main():
         raise SystemExit(str(exc)) from exc
     if not images:
         raise SystemExit(f"No images found in {source_dir}")
+    # Format readiness metadata for activity-grid / batch slicing: aspect class +
+    # optional tags from <input_dir>/format_index.json (not new named presets).
+    format_index = format_readiness.resolve_format_index(source_dir)
+    planned_images = [
+        format_readiness.planned_image_entry(
+            path,
+            fixture_id=_file_fixture_id(path),
+            format_index=format_index,
+        )
+        for path in images
+    ]
+    aspect_counts: dict[str, int] = {}
+    for row in planned_images:
+        key = str(row.get("aspect_class") or "unknown")
+        aspect_counts[key] = aspect_counts.get(key, 0) + 1
     planned = {
-        "version": 1,
+        "version": 2,
         "input_dir": str(source_dir.resolve()),
         "output": str(output.resolve()),
-        "images": [
-            {
-                "id": path.stem,
-                "fixture_id": _file_fixture_id(path),
-                "filename": path.name,
-                "path": str(path.resolve()),
-            }
-            for path in images
-        ],
+        "format_index_entries": len(format_index),
+        "aspect_class_counts": aspect_counts,
+        "images": planned_images,
     }
     (output / "planned.json").write_text(json.dumps(planned, indent=2), encoding="utf-8")
     for path in images:
         (output / path.stem).mkdir(parents=True, exist_ok=True)
+    # Point activity grid at this bench (scripts/activity_grid.py follows .activity_current).
+    pointer = output.resolve().parent / ".activity_current"
+    try:
+        pointer.write_text(str(output.resolve()), encoding="utf-8")
+        print(f"Activity grid pointer -> {pointer} ({output.name})", flush=True)
+    except OSError as exc:
+        print(f"Activity grid pointer skipped: {exc}", flush=True)
     print(f"Planned {len(images)} ads -> {output / 'planned.json'}", flush=True)
 
     from src.runtime_bootstrap import ensure_services

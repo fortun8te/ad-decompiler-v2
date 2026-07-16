@@ -89,6 +89,18 @@ const design = {
         '<path d="M0 20 L200 20" fill="none" stroke="#e01b1b" stroke-width="5" stroke-linecap="round"/></svg>',
       src: null,
     },
+    {
+      // Outlined marketing text — stroke must be OUTSIDE so fill stays readable
+      id: "outlined-text",
+      type: "text",
+      name: "outlined-text",
+      text: "OFF",
+      box: { x: 40, y: 200, w: 160, h: 60 },
+      z_index: 40,
+      style: { fontFamily: "Inter", fontSize: 48, fontWeight: 700, color: "#ffffff" },
+      fill: { kind: "flat", color: "#ffffff" },
+      stroke: { kind: "flat", color: "#101010", width: 3, align: "CENTER" },
+    },
   ],
 };
 
@@ -189,12 +201,22 @@ function walk(node, cb) {
     check(!!svgImport, "createNodeFromSvg was never used for a stroked path");
   }
 
+  // Outlined text — CENTER/INSIDE must be coerced to OUTSIDE so fill stays readable
+  const outlined = one("outlined-text");
+  check(!!outlined, "outlined-text node was not created");
+  if (outlined) {
+    check(outlined.type === "TEXT", "outlined-text should be TEXT, got " + outlined.type);
+    check(outlined.strokeAlign === "OUTSIDE",
+      "outlined-text strokeAlign should be OUTSIDE, got " + outlined.strokeAlign);
+    check((outlined.strokes || []).length >= 1, "outlined-text should keep a stroke paint");
+  }
+
   if (failures.length) {
     console.log("\n FAIL — paint/effects render assertions");
     failures.forEach((f) => console.log("   ✗ " + f));
     console.log("\n " + failures.length + " assertion(s) failed\n");
     process.exit(1);
   }
-  console.log("\n PASS — annotation vector stroke + multi-stop and radial gradients all rendered\n");
+  console.log("\n PASS — annotation vector stroke + outlined text OUTSIDE + multi-stop and radial gradients all rendered\n");
   process.exit(0);
 })();

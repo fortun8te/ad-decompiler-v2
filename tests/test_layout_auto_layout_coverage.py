@@ -195,3 +195,188 @@ def test_tiny_label_on_a_large_plate_does_not_hug():
     tree = layout.infer(candidates, {"w": 800, "h": 800}, {})
     frame = tree[0]
     assert frame["layout"]["mode"] == "NONE"
+
+
+# --------------------------------------------------------------------------- #
+# IG Caption pills (Figma 15510: coral plate + two centered caption-paragraphs)
+# --------------------------------------------------------------------------- #
+
+_FIGMA_15510_CFG = {
+    "layout": {"scene_grouping": {"pair_text_with_backplate": True}},
+}
+
+
+def _figma_15510_caption_candidates(*, shell_role="card"):
+    """Exact local geometry from work/_figma_15510.json (frame origin subtracted)."""
+    return [
+        {
+            "id": "shell0",
+            "target": "shape",
+            "box": {"x": 19.0, "y": 672.0, "w": 1041.6, "h": 116.4},
+            "fill": {"kind": "flat", "color": "#ffffff"},
+            "radius": 58.2,
+            "meta": {"role": shell_role},
+        },
+        {
+            "id": "text0",
+            "target": "text",
+            "text": "Didn't know I needed this",
+            "box": {"x": 69.2, "y": 684.0, "w": 942.0, "h": 93.0},
+            "style": {
+                "fontFamily": "Inter",
+                "fontSize": 76.8,
+                "fontWeight": 700,
+                "letterSpacing": 0.0,
+                "align": "CENTER",
+            },
+            "meta": {"role": "headline"},
+        },
+        {
+            "id": "shell1",
+            "target": "shape",
+            "box": {"x": 208.6, "y": 843.6, "w": 662.4, "h": 116.4},
+            "fill": {"kind": "flat", "color": "#000000"},
+            "radius": 58.2,
+            "meta": {"role": shell_role},
+        },
+        {
+            "id": "text1",
+            "target": "text",
+            "text": "...Until I ran out",
+            "box": {"x": 256.8, "y": 855.6, "w": 567.0, "h": 93.0},
+            "style": {
+                "fontFamily": "Inter",
+                "fontSize": 76.8,
+                "fontWeight": 700,
+                "letterSpacing": 0.0,
+                "align": "CENTER",
+            },
+            "meta": {"role": "body"},
+        },
+    ]
+
+
+def test_centered_caption_plate_hugs_with_center_align():
+    """Centered text on a pill plate must HUG with CENTER/CENTER (not padded-card MIN)."""
+    candidates = [
+        {
+            "id": "plate",
+            "target": "shape",
+            "box": {"x": 19.0, "y": 672.0, "w": 1041.6, "h": 116.4},
+            "fill": {"kind": "flat", "color": "#ffffff"},
+            "meta": {"role": "card"},
+        },
+        {
+            "id": "copy",
+            "target": "text",
+            "text": "Didn't know I needed this",
+            "box": {"x": 69.2, "y": 684.0, "w": 942.0, "h": 93.0},
+            "style": {"align": "CENTER", "fontFamily": "Inter", "fontWeight": 700,
+                      "fontSize": 76.8, "letterSpacing": 0.0},
+            "meta": {"role": "headline"},
+        },
+    ]
+    tree = layout.infer(candidates, {"w": 1080, "h": 1920}, _FIGMA_15510_CFG)
+    assert len(tree) == 1
+    frame = tree[0]
+    assert frame["layout"]["mode"] in ("HORIZONTAL", "VERTICAL")
+    assert frame["layout"]["align"] == "CENTER"
+    assert frame["layout"]["counterAlign"] == "CENTER"
+    assert frame["layout"]["primarySizing"] == "HUG"
+    assert frame["layout"]["counterSizing"] == "HUG"
+    pad = frame["layout"]["padding"]
+    assert abs(pad["left"] - 50.2) < 0.5
+    assert abs(pad["right"] - 49.4) < 0.5
+    assert abs(pad["top"] - 12.0) < 0.5
+    assert abs(pad["bottom"] - 11.4) < 0.5
+
+
+def test_figma_15510_caption_pills_stack_as_ig_caption():
+    """Two sibling caption-paragraph plates become one VERTICAL IG Caption frame.
+
+    Ground truth (Figma 15510): layoutMode=VERTICAL, itemSpacing≈55.2,
+    counterAxisAlignItems=CENTER, HUG×HUG; second pill narrower and centered.
+    """
+    tree = layout.infer(
+        _figma_15510_caption_candidates(shell_role="card"),
+        {"w": 1080, "h": 1920},
+        _FIGMA_15510_CFG,
+    )
+    assert len(tree) == 1
+    stack = tree[0]
+    assert stack["meta"]["role"] == "caption-stack"
+    assert stack["layout"]["mode"] == "VERTICAL"
+    assert abs(stack["layout"]["gap"] - 55.2) < 0.5
+    assert stack["layout"]["itemSpacing"] == stack["layout"]["gap"]
+    assert stack["layout"]["counterAlign"] == "CENTER"
+    assert stack["layout"]["primarySizing"] == "HUG"
+    assert stack["layout"]["counterSizing"] == "HUG"
+    assert len(stack["children"]) == 2
+    for pill in stack["children"]:
+        assert pill["layout"]["align"] == "CENTER"
+        assert pill["layout"]["counterAlign"] == "CENTER"
+        assert pill["layout"]["primarySizing"] == "HUG"
+    # Narrower second pill stays centered under the first (relative x > 0).
+    wide, narrow = stack["children"]
+    assert narrow["box"]["w"] < wide["box"]["w"]
+    assert narrow["box"]["x"] > 0
+
+
+def test_figma_15510_shape_shells_pair_when_backplate_flag_set():
+    """SAM often labels pill chrome as role=shape; pair_text_with_backplate must still fire."""
+    tree = layout.infer(
+        _figma_15510_caption_candidates(shell_role="shape"),
+        {"w": 1080, "h": 1920},
+        _FIGMA_15510_CFG,
+    )
+    assert len(tree) == 1
+    stack = tree[0]
+    assert stack["meta"]["role"] == "caption-stack"
+    assert stack["layout"]["counterAlign"] == "CENTER"
+    assert abs(stack["layout"]["gap"] - 55.2) < 0.5
+
+
+def test_left_aligned_padded_card_keeps_min_align():
+    """A left-biased label on a plate must not be forced into CENTER caption treatment."""
+    candidates = [
+        {"id": "plate", "target": "shape", "box": {"x": 40, "y": 60, "w": 320, "h": 140},
+         "fill": {"kind": "flat", "color": "#101010"}, "meta": {"role": "card"}},
+        _text_node("copy", "Limited time only", {"x": 56, "y": 84, "w": 256, "h": 92}, "body"),
+    ]
+    candidates[1]["style"] = {"align": "LEFT"}
+    tree = layout.infer(candidates, {"w": 600, "h": 400}, _FIGMA_15510_CFG)
+    frame = tree[0]
+    assert frame["layout"]["primarySizing"] == "HUG"
+    assert frame["layout"]["align"] == "MIN"
+    assert frame["layout"]["counterAlign"] == "MIN"
+
+
+def test_left_column_stat_pills_pair_and_stack():
+    """Hears-style left-column stats: each plate+text becomes a stat-pill; siblings stack."""
+    candidates = [
+        {"id": "p1", "target": "shape", "box": {"x": 40, "y": 200, "w": 220, "h": 72},
+         "fill": {"kind": "flat", "color": "#ffffff40"}, "radius": 16,
+         "meta": {"role": "shape"}},
+        {"id": "t1", "target": "text", "text": "200%",
+         "box": {"x": 56, "y": 216, "w": 160, "h": 40},
+         "style": {"align": "LEFT", "fontSize": 28}, "meta": {"role": "offer"}},
+        {"id": "p2", "target": "shape", "box": {"x": 40, "y": 292, "w": 220, "h": 72},
+         "fill": {"kind": "flat", "color": "#ffffff40"}, "radius": 16,
+         "meta": {"role": "shape"}},
+        {"id": "t2", "target": "text", "text": "Noise reduction",
+         "box": {"x": 56, "y": 308, "w": 180, "h": 40},
+         "style": {"align": "LEFT", "fontSize": 22}, "meta": {"role": "body"}},
+    ]
+    # offer is in _BUTTON_TEXT_ROLES — use label/body for stats
+    candidates[1]["meta"]["role"] = "label"
+    tree = layout.infer(candidates, {"w": 1080, "h": 1350}, _FIGMA_15510_CFG)
+    assert len(tree) == 1
+    stack = tree[0]
+    assert stack["meta"]["role"] == "stat-stack"
+    assert stack["layout"]["mode"] == "VERTICAL"
+    assert stack["layout"]["counterAlign"] == "MIN"
+    assert len(stack["children"]) == 2
+    for pill in stack["children"]:
+        assert pill["meta"]["role"] == "stat-pill"
+        assert pill["layout"]["align"] == "MIN"
+        assert pill["layout"]["primarySizing"] == "HUG"

@@ -881,9 +881,70 @@ def test_history_endpoint_exposes_recent_conversion_identity_without_run_paths(t
     try:
         payload = json.loads(urlopen(base + "/history", timeout=2).read())
         assert payload["ok"] is True
+        assert payload["max"] >= 40
         assert [row["job_id"] for row in payload["runs"]] == ["job-old", "job-new"]
         assert payload["runs"][0]["filename"] == "old-ad.png"
         assert "run_dir" not in payload["runs"][0]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_history_keeps_forty_runs(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    for i in range(45):
+        _record_history(
+            str(inbox), 10.0 + i,
+            job_id=f"job-{i}", filename=f"ad-{i}.png", doc_id=f"doc-{i}",
+            finished_at=1000.0 + i, qa_ok=True, layer_count=i,
+        )
+    history = _read_history(str(inbox))
+    assert len(history["runs"]) == 40
+    assert history["runs"][0]["job_id"] == "job-5"
+    assert history["runs"][-1]["job_id"] == "job-44"
+
+
+def test_history_restage_promotes_past_run_into_inbox(tmp_path, monkeypatch):
+    from pathlib import Path
+    from src import figma_bridge as fb
+
+    inbox = tmp_path / "inbox"
+    upload = inbox / "uploads" / "job-past" / "run"
+    upload.mkdir(parents=True)
+    (upload / "design.json").write_text('{"schema_version":2,"id":"past-doc","layers":[]}', encoding="utf-8")
+    _record_history(
+        str(inbox), 12.0,
+        job_id="job-past", filename="past.png", doc_id="past-doc",
+        finished_at=50.0, qa_ok=True, layer_count=3,
+    )
+
+    def fake_stage(inbox_path, run_dir, cfg):
+        assert Path(run_dir) == upload
+        manifest = {
+            "doc_id": "past-doc", "run_dir": str(upload), "design": "design.json",
+            "summary": {"layers": 3},
+        }
+        (Path(inbox_path) / "inbox.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return {"staged": True, "doc_id": "past-doc", "layer_count": 3,
+                "staging_error": None, "design_url": "/design.json", "manifest": manifest}
+
+    monkeypatch.setattr(fb, "_stage_job_output", fake_stage)
+    server = _start_server(inbox)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        req = Request(
+            base + "/history/restage",
+            data=json.dumps({"job_id": "job-past"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        payload = json.loads(urlopen(req, timeout=2).read())
+        assert payload["ok"] is True
+        assert payload["doc_id"] == "past-doc"
+        assert payload["job_id"] == "job-past"
+        staged = json.loads((inbox / "inbox.json").read_text(encoding="utf-8"))
+        assert staged["doc_id"] == "past-doc"
     finally:
         server.shutdown()
         server.server_close()

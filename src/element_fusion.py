@@ -83,6 +83,24 @@ _RASTER_ROLES = {
     "illustration",
     "package",
 } | set(INTENTIONAL_RASTER_CLUSTER_ROLES)
+# Distinct product cutouts (box vs earplugs) — merge only near-identical masks.
+_PRODUCT_INSTANCE_ROLES = frozenset({
+    "product", "package", "packaging", "object", "bottle", "box", "jar", "can",
+    "pouch", "carton", "product-cluster", "packshot", "tube", "canister", "device",
+    "sachet", "pill-cloud", "body-progression", "body-morph",
+})
+# Side-by-side comparison portraits / panels (Huel, MONTE, HiStrips, Wavy) must stay
+# two separate frames — same-family raster agreement alone must not fuse them.
+_COMPARISON_PANEL_ROLES = frozenset({
+    "photo", "person", "people", "portrait", "face", "panel", "comparison-panel",
+    "comparison-column", "photo-panel", "image-panel", "photo-fragment", "photo_fragment",
+})
+# Photo/portrait panels a seam-straddling product may overlap — never absorb/nest the
+# product under these (Wavy tube across Before/After sections).
+_PHOTO_PANEL_ROLES = frozenset({
+    "photo", "image", "background", "panel", "portrait", "lifestyle",
+    "comparison-panel", "comparison-column", "photo-panel", "image-panel",
+})
 _SHAPE_ROLES = {"shape", "button", "card", "container", "background", "frame"}
 _CONTAINER_ROLES = {"shape", "button", "card", "container", "badge", "frame", "background"}
 _STRUCTURAL_FIELDS = (
@@ -216,6 +234,30 @@ def _heuristic_label(obs: dict) -> bool:
 
 def _semantic_compatible(a: dict, b: dict, mask_iou: float, opts: Optional[dict] = None) -> bool:
     fa, fb = _family(a["role"]), _family(b["role"])
+    ra = str(a.get("role") or "").lower().replace("_", "-")
+    rb = str(b.get("role") or "").lower().replace("_", "-")
+    # Sibling product cutouts (box + earplugs) must stay separate unless masks agree
+    # almost completely — same-family alone is not enough to collapse them.
+    if (
+        ra in _PRODUCT_INSTANCE_ROLES
+        and rb in _PRODUCT_INSTANCE_ROLES
+        and mask_iou < 0.85
+    ):
+        return False
+    # Two comparison photo panels / portraits: keep separate unless nearly identical.
+    if (
+        ra in _COMPARISON_PANEL_ROLES
+        and rb in _COMPARISON_PANEL_ROLES
+        and mask_iou < 0.85
+    ):
+        return False
+    # Product/package over a photo panel (Wavy tube across section seams) must never
+    # collapse into the panel raster — keep a discrete high-z cutout.
+    if (
+        (ra in _PRODUCT_INSTANCE_ROLES and rb in _PHOTO_PANEL_ROLES)
+        or (rb in _PRODUCT_INSTANCE_ROLES and ra in _PHOTO_PANEL_ROLES)
+    ):
+        return False
     if fa == fb or "unknown" in (fa, fb):
         return True
     # Residual-CC kinds are solidity/edge-density guesses, not semantics; when one side of
@@ -607,6 +649,15 @@ def _meaningful_parent(parent: dict, child: dict) -> bool:
     # shipping as two unrelated overlapping top-level elements.
     parent_role = normalized_role(parent["role"])
     child_role = normalized_role(child["role"])
+    # Seam-straddling product tubes (Wavy across Before/After) stay top-level vs photo
+    # panels. Fully inset products inside a photo may still nest for ownership.
+    if child_role in _PRODUCT_INSTANCE_ROLES and parent["kind"] in {
+        "photo-fragment", "photo", "image",
+    }:
+        if parent_role not in _CONTAINER_ROLES:
+            metrics = _mask_metrics(child["mask"], parent["mask"])
+            if metrics["containment"] < 0.85:
+                return False
     if parent_role in _CONTAINER_ROLES or parent_role in _RASTER_ROLES or parent["kind"] == "photo-fragment":
         return parent_role != child_role or parent["kind"] != child["kind"]
     return parent["kind"] == "shape" and child["kind"] != "shape"

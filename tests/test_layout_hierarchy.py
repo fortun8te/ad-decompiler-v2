@@ -45,9 +45,9 @@ def test_xycut_wraps_whitespace_separated_bands():
     bands = [node for node in tree if (node.get("meta") or {}).get("role") == "band"]
     assert len(bands) == 2
     by_name = {node["meta"]["semantic_name"]: node for node in bands}
-    assert set(by_name) == {"Header", "CTA cluster"}
+    assert set(by_name) == {"Header", "CTA"}
     assert [child["id"] for child in by_name["Header"]["children"]] == ["badge", "logo"]
-    cta = by_name["CTA cluster"]
+    cta = by_name["CTA"]
     assert [child["id"] for child in cta["children"]] == ["btn-a", "btn-b", "btn-c"]
     assert cta["meta"]["deterministic_geometry"] is True
     # The lone hero image between the bands stays a bare root layer.
@@ -57,7 +57,7 @@ def test_xycut_wraps_whitespace_separated_bands():
 def test_xycut_band_gets_precise_auto_layout():
     tree = layout.infer(_banded_candidates(), CANVAS, {})
     cta = next(node for node in tree
-               if (node.get("meta") or {}).get("semantic_name") == "CTA cluster")
+               if (node.get("meta") or {}).get("semantic_name") == "CTA")
     assert cta["layout"]["mode"] == "HORIZONTAL"
     assert cta["layout"]["itemSpacing"] == 40
     assert cta["layout"]["padding"] == {"left": 0, "right": 0, "top": 0, "bottom": 0}
@@ -199,9 +199,9 @@ def test_button_and_text_stack_frames_get_semantic_names():
     ]
     tree = layout.infer(candidates, {"w": 400, "h": 300}, {})
     button = next(node for node in tree if (node.get("meta") or {}).get("role") == "button")
-    assert button["meta"]["semantic_name"] == 'CTA Button — "Buy now"'
+    assert button["meta"]["semantic_name"] == "Button / Buy now"
     stack = next(node for node in tree if (node.get("meta") or {}).get("role") == "text-stack")
-    assert stack["meta"]["semantic_name"] == 'Copy — "NEW"'
+    assert stack["meta"]["semantic_name"] == "Text Stack"
 
 
 def test_explicit_names_survive_the_naming_pass():
@@ -212,7 +212,7 @@ def test_explicit_names_survive_the_naming_pass():
          "meta": {"role": "icon", "parent_id": "avatar"}},
     ]
     tree = layout.infer(candidates, {"w": 300, "h": 250}, {})
-    assert tree[0]["name"] == "Creator avatar — asset group"
+    assert tree[0]["name"] == "Creator avatar"
 
 
 def test_band_tree_compiles_through_the_design_schema(tmp_path):
@@ -227,7 +227,7 @@ def test_band_tree_compiles_through_the_design_schema(tmp_path):
     assert doc.meta["warnings"] == []
     names = {layer.name for layer in doc.layers}
     assert "Header" in names
-    assert "CTA cluster" in names
+    assert "CTA" in names
     groups = [layer for layer in doc.layers if layer.type == "group"]
     assert all(layer.children for layer in groups)
 

@@ -17,6 +17,7 @@ from .schema import (
     dump, load, raster_slice_failures, raster_slice_thresholds, is_raster_slice,
 )
 from .raster_clusters import INTENTIONAL_RASTER_CLUSTER_ROLES, is_intentional_raster_cluster
+from .diagram_editability import prefer_decomposed_charts
 
 
 def _deps():
@@ -65,6 +66,118 @@ def _iou(a, b):
     inter = ix * iy
     union = a.get("w", 0) * a.get("h", 0) + b.get("w", 0) * b.get("h", 0) - inter
     return inter / union if union > 0 else 0.0
+
+
+def _inside_frac(inner, outer):
+    """Fraction of ``inner`` box area that lies inside ``outer``."""
+    ix0 = max(float(inner.get("x", 0) or 0), float(outer.get("x", 0) or 0))
+    iy0 = max(float(inner.get("y", 0) or 0), float(outer.get("y", 0) or 0))
+    ix1 = min(float(inner.get("x", 0) or 0) + float(inner.get("w", 0) or 0),
+              float(outer.get("x", 0) or 0) + float(outer.get("w", 0) or 0))
+    iy1 = min(float(inner.get("y", 0) or 0) + float(inner.get("h", 0) or 0),
+              float(outer.get("y", 0) or 0) + float(outer.get("h", 0) or 0))
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    area = max(1e-6, float(inner.get("w", 0) or 0) * float(inner.get("h", 0) or 0))
+    return inter / area
+
+
+_SHELL_VECTORIZE_ROLES = frozenset({
+    "badge", "button", "chip", "pill", "cta", "callout", "logo", "sticker",
+    "price_burst", "sale_burst", "starburst", "burst",
+    "banner", "ribbon", "brushstroke", "seal", "shape",
+})
+
+
+def _classify_shell_role_from_box(shell_box: dict, current_role: str) -> str:
+    """Wide plates → banner; square seals → badge. Preserves button/starburst labels."""
+    role = str(current_role or "").lower().replace("-", "_")
+    if role in {"button", "cta", "chip", "pill", "callout"}:
+        return "button" if role == "cta" else role
+    if role in {
+        "starburst", "price_burst", "sale_burst", "burst", "splat", "sticker_burst", "seal",
+    }:
+        return role
+    if role in {"banner", "ribbon", "brushstroke", "stroke_banner"}:
+        return "banner"
+    if role == "badge":
+        return "badge"
+    w = float((shell_box or {}).get("w", 0) or 0)
+    h = float((shell_box or {}).get("h", 0) or 0)
+    if h > 0 and w / h >= 2.2:
+        return "banner"
+    return "badge"
+
+
+def _promote_ocr_overlapping_shells(candidates: list, cfg: Optional[dict] = None) -> int:
+    """Skip vectorize/raster-chip paths for shells that clearly host OCR text.
+
+    Merge normally flags ``text_bearing_shell``; this is a reconstruct-time safety net so
+    a missed flag cannot spend VTracer time then bake the seal (016 green badge).
+    Contained OCR stays TEXT with removal; the shell becomes a SHAPE plate.
+    """
+    rcfg = (cfg or {}).get("reconstruct") or {}
+    if not bool(rcfg.get("promote_text_shells", True)):
+        return 0
+    threshold = float(rcfg.get("text_shell_inside", 0.55))
+    texts = [
+        c for c in candidates
+        if c.get("target") == "text" and (c.get("text") or (c.get("meta") or {}).get("text"))
+    ]
+    if not texts:
+        return 0
+    promoted = 0
+    for shell in candidates:
+        meta = shell.setdefault("meta", {})
+        if meta.get("text_bearing_shell") or meta.get("plate_shell"):
+            continue
+        if shell.get("target") not in {"icon", "shape", "image"}:
+            continue
+        role = str(meta.get("role") or "").lower()
+        # Packaging / photo cutouts keep baked scene text; only chrome hosts promote.
+        if role in {
+            "product", "person", "photo", "photo-fragment", "photo_fragment",
+            "cutout", "package", "packaging", "pouch", "bottle", "jar",
+        }:
+            continue
+        if role not in _SHELL_VECTORIZE_ROLES and shell.get("target") not in {"icon", "shape"}:
+            continue
+        hosts = [
+            t for t in texts
+            if _inside_frac(t.get("box") or {}, shell.get("box") or {}) >= threshold
+        ]
+        if not hosts:
+            continue
+        shell_box = shell.get("box") or {}
+        # Near-coincident OCR boxes are not chrome plates.
+        if any(
+            _inside_frac(shell_box, t.get("box") or {}) >= 0.85
+            for t in hosts
+        ):
+            continue
+        new_role = _classify_shell_role_from_box(shell_box, role)
+        if role and role != new_role:
+            meta["reclassified_from"] = meta.get("reclassified_from") or role
+        meta["role"] = new_role
+        meta["text_bearing_shell"] = True
+        meta["plate_shell"] = True
+        meta["shell_text_promoted"] = True
+        snippet = " ".join(
+            str(t.get("text") or (t.get("meta") or {}).get("text") or "").strip()
+            for t in hosts
+        ).strip()
+        if snippet:
+            meta["shell_text_snippet"] = snippet[:48]
+        shell["target"] = "shape"
+        for t in hosts:
+            tm = t.setdefault("meta", {})
+            tm["overlay_text"] = True
+            tm["removal_required"] = True
+            tm.setdefault("shell_text_host", shell.get("id"))
+            tm.setdefault("parent_id", shell.get("id"))
+            t["target"] = "text"
+            t.pop("kept_in_photo", None)
+        promoted += 1
+    return promoted
 
 
 def _confidence(candidate):
@@ -304,6 +417,7 @@ def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
         "product", "person", "foreground", "cutout", "avatar", "profile",
         "profile_photo", "card", "thumbnail", "photo_card", "logo", "brand",
         "wordmark", "platform-logo", "icon", "badge", "button", "chip", "callout_leader",
+        "arrow", "leader", "leader_line", "connector",
         "text_backplate", "panel", "image-panel", "photo-panel", "triptych-panel",
         "comparison-panel", "comparison-column",
     } | set(INTENTIONAL_RASTER_CLUSTER_ROLES)
@@ -619,10 +733,12 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
     growing dilation, so thin residue that only needs cleaner context resolves.
     "Resolved" is an ABSOLUTE bar (remaining px / ratio), not a fraction of the original
     residue — a catastrophic ghost can no longer pass just because it shrank 30%.  Any
-    EMITTED native-text layer still ghosting after the passes is handed to the
-    raster-slice floor via ``force_raster_ids`` (apply_raster_slice_fallback reads it),
-    so a double-render is never shipped.  This module only *calls* inpaint; it does not
-    modify the backends.  Config-gated, default ON (``reconstruct.text_residual``).
+    EMITTED native-text layer still ghosting after the passes is cleaned with a
+    deterministic local plate-colour fill (Codia: keep native TEXT; never bake OCR into
+    a raster slice for SSIM). ``force_raster_ids`` is opt-in only
+    (``reconstruct.text_residual.force_raster``, default OFF). This module only *calls*
+    inpaint; it does not modify the backends. Config-gated, default ON
+    (``reconstruct.text_residual``).
     """
     cv2, np, Image = _deps()
     rcfg = (cfg or {}).get("reconstruct") or {}
@@ -636,27 +752,103 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
     if plate.shape != rgb.shape:
         return {"enabled": True, "checked": 0, "flagged": [], "note": "plate-shape-mismatch"}
     source = rgb.astype(np.int16)
+    # Reused across residue checks / solid-fill (invalidated after reinpaint rewrites disk).
+    plate_f32 = None
+    plate_u8 = None
     tolerance = float(audit_cfg.get("tolerance", 12.0))
     ink_tolerance = float(audit_cfg.get("ink_tolerance", 40.0))
     min_px = int(audit_cfg.get("min_px", 24))
     min_ratio = float(audit_cfg.get("min_ratio", 0.30))
     grow = max(1, int(audit_cfg.get("reinpaint_dilate", 3)))
-    max_passes = max(1, int(audit_cfg.get("reinpaint_max_passes", 3)))
     resolved_ratio = float(audit_cfg.get("resolved_ratio", 0.15))
     # Residue below the raster-slice minimum region size is considered resolved: it is
     # both visually negligible and too small for the looks-right floor to even act on
     # (schema.RASTER_SLICE_FALLBACK_DEFAULTS["min_region_px"] == 120). A genuine ghost
     # (009 c_B1 ~1729px, 067, 101 c_B0 ~5146px) sits far above this and still fails.
     resolved_abs_px = int(audit_cfg.get("resolved_abs_px", 120))
-    force_raster = bool(audit_cfg.get("force_raster", True))
+    # Default OFF — Codia: never bake readable OCR into a raster slice for fidelity.
+    force_raster = bool(audit_cfg.get("force_raster", False))
+    solid_fill = bool(audit_cfg.get("solid_fill_residue", True))
+    ring_radius = max(4, int(audit_cfg.get("solid_fill_ring", 10)))
+    # Flat/UI plates: skip wasted generative reinpaint and go straight to local plate
+    # fill (009 dark chrome, caption plates). Photo archetypes keep a short reinpaint
+    # ladder first. When solid fill is on, default to 1 reinpaint pass (not 3) — the
+    # fill is the real closer and extra passes mostly burn time on smears.
+    archetype = str(((cfg or {}).get("scene") or {}).get("archetype") or "").lower()
+    flat_residual_archetypes = frozenset({
+        "social_screenshot", "caption_over_photo", "comparison_grid", "product_on_flat",
+    }) | {
+        str(a).lower() for a in (audit_cfg.get("solid_fill_first_archetypes") or [])
+    }
+    from src import format_readiness
+    fmt = format_readiness.format_from_cfg(cfg)
+    capability_flat = bool(fmt.get("capabilities")) and format_readiness.prefers_solid_flat(cfg)
+    default_solid_first = capability_flat or archetype in flat_residual_archetypes
+    solid_first = bool(audit_cfg.get("solid_fill_first", default_solid_first))
+    if "solid_fill_first" in audit_cfg and audit_cfg.get("solid_fill_first") is None:
+        solid_first = default_solid_first
+    default_passes = 0 if solid_first else (1 if solid_fill else 3)
+    max_passes = max(0, int(audit_cfg.get("reinpaint_max_passes", default_passes)))
 
     def _residue(plate_arr, ink, ink_color):
+        nonlocal plate_f32
         d_src = np.abs(plate_arr - source).mean(axis=2)
         res = ink & (d_src <= tolerance)
         if ink_color is not None:
-            d_ink = np.abs(plate_arr.astype(np.float32) - ink_color).mean(axis=2)
+            if plate_f32 is None or plate_f32.shape != plate_arr.shape:
+                plate_f32 = plate_arr.astype(np.float32)
+            d_ink = np.abs(plate_f32 - ink_color).mean(axis=2)
             res = res | (ink & (d_ink <= ink_tolerance))
         return res
+
+    def _solid_fill_unresolved(tracked_rows, unresolved_rows, report_dict):
+        """Paint local plate colour under leftover glyph ink; keep native TEXT."""
+        nonlocal plate, plate_u8, plate_f32
+        if not unresolved_rows or not solid_fill:
+            return unresolved_rows
+        try:
+            if plate_u8 is None:
+                # Same pixels as the already-loaded int16 plate — avoid a second PNG decode.
+                plate_u8 = np.clip(plate, 0, 255).astype(np.uint8)
+        except Exception:
+            return unresolved_rows
+        filled_ids = []
+        ring_k = np.ones((2 * ring_radius + 1, 2 * ring_radius + 1), np.uint8)
+        max_ring = max(ring_radius * 3, ring_radius + 12)
+        for t in unresolved_rows:
+            residue = t["residue"]
+            if not np.any(residue):
+                continue
+            binary = residue.astype(np.uint8)
+            ring = (cv2.dilate(binary * 255, ring_k) > 0) & (binary == 0)
+            exterior = plate_u8[ring]
+            # Glyph residue near edges / crowded ink can leave <8 ring samples at the
+            # default radius (009 "krijgen"); expand sampling before giving up.
+            expand_r = ring_radius
+            while exterior.shape[0] < 8 and expand_r < max_ring:
+                expand_r = min(max_ring, expand_r + max(2, ring_radius // 2))
+                ring_k_exp = np.ones((2 * expand_r + 1, 2 * expand_r + 1), np.uint8)
+                ring = (cv2.dilate(binary * 255, ring_k_exp) > 0) & (binary == 0)
+                exterior = plate_u8[ring]
+            if exterior.shape[0] < 8:
+                continue
+            fill = np.median(exterior.astype(np.float32), axis=0).astype(np.uint8)
+            plate_u8[binary > 0] = fill
+            t["resolved"] = True
+            t["flag"]["resolved"] = True
+            t["flag"]["resolved_by"] = "solid-plate-fill"
+            t["flag"]["hard_fail"] = False
+            t["flag"]["residual_px_after"] = 0
+            filled_ids.append(str(t["item"].get("id")))
+        if filled_ids:
+            Image.fromarray(plate_u8).save(background_path)
+            plate = plate_u8.astype(np.int16)
+            plate_f32 = None
+            report_dict["solid_filled_ids"] = list(dict.fromkeys(
+                list(report_dict.get("solid_filled_ids") or []) + filled_ids
+            ))
+            report_dict["solid_fill_first"] = bool(solid_first and max_passes == 0)
+        return [t for t in tracked_rows if not t["resolved"]]
 
     checked = 0
     tracked = []
@@ -693,57 +885,67 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         "enabled": True, "checked": checked,
         "flagged": [t["flag"] for t in tracked],
         "expanded_px": 0, "reinpainted": False, "passes": 0,
+        "solid_filled_ids": [],
     }
-    if not tracked or not bool(audit_cfg.get("reinpaint", True)):
+    if not tracked:
         report["expanded_px"] = int(np.count_nonzero(expand_total))
         return report
 
+    # Flat/UI: solid-fill FIRST so we never spend 1–3 role-aware reinpaint calls on a
+    # plate that analytic fill already owns. Photo scenes keep a short reinpaint ladder.
+    unresolved = [t for t in tracked if not t["resolved"]]
+    if solid_first and solid_fill and unresolved:
+        unresolved = _solid_fill_unresolved(tracked, unresolved, report)
+
     passes_done = 0
     backend = None
-    for pass_index in range(max_passes):
-        pending = [t for t in tracked if not t["resolved"]]
-        if not pending:
-            break
-        dilate_px = grow * (pass_index + 1)
-        kernel = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), np.uint8)
-        expand = np.zeros(union.shape, dtype=np.uint8)
-        for t in pending:
-            grown = cv2.dilate(t["residue"].astype(np.uint8) * 255, kernel)
-            owner = int(t["item"].get("removal_owner") or 0)
-            if owner:
-                ledger[(grown > 0) & (ledger == 0)] = owner
-            np.maximum(union, grown, out=union)
-            np.maximum(expand, grown, out=expand)
-            np.maximum(expand_total, grown, out=expand_total)
-        if not np.any(expand):
-            break
-        try:
-            second = inpaint.inpaint_role_aware(
-                background_path, {"text": expand}, background_path, cfg,
-            )
-            report["reinpainted"] = bool(second.get("ok", True))
-            backend = second.get("backend")
-        except Exception as exc:  # a failed repair pass is evidence, never a crash
-            report["reinpaint_error"] = str(exc)
-            break
-        passes_done = pass_index + 1
-        plate_after = np.asarray(Image.open(background_path).convert("RGB"), dtype=np.int16)
-        for t in pending:
-            residue = _residue(plate_after, t["ink"], t["ink_color"])
-            remaining = int(residue.sum())
-            t["residue"] = residue
-            t["flag"]["residual_px_after"] = remaining
-            rem_ratio = remaining / max(1, t["total"])
-            if remaining < resolved_abs_px or rem_ratio < resolved_ratio:
-                t["resolved"] = True
-                t["flag"]["resolved"] = True
+    if unresolved and bool(audit_cfg.get("reinpaint", True)) and max_passes > 0:
+        for pass_index in range(max_passes):
+            pending = [t for t in tracked if not t["resolved"]]
+            if not pending:
+                break
+            dilate_px = grow * (pass_index + 1)
+            kernel = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), np.uint8)
+            expand = np.zeros(union.shape, dtype=np.uint8)
+            for t in pending:
+                grown = cv2.dilate(t["residue"].astype(np.uint8) * 255, kernel)
+                owner = int(t["item"].get("removal_owner") or 0)
+                if owner:
+                    ledger[(grown > 0) & (ledger == 0)] = owner
+                np.maximum(union, grown, out=union)
+                np.maximum(expand, grown, out=expand)
+                np.maximum(expand_total, grown, out=expand_total)
+            if not np.any(expand):
+                break
+            try:
+                second = inpaint.inpaint_role_aware(
+                    background_path, {"text": expand}, background_path, cfg,
+                )
+                report["reinpainted"] = bool(second.get("ok", True))
+                backend = second.get("backend")
+            except Exception as exc:  # a failed repair pass is evidence, never a crash
+                report["reinpaint_error"] = str(exc)
+                break
+            passes_done = pass_index + 1
+            plate = np.asarray(Image.open(background_path).convert("RGB"), dtype=np.int16)
+            plate_u8 = None
+            plate_f32 = None
+            for t in pending:
+                residue = _residue(plate, t["ink"], t["ink_color"])
+                remaining = int(residue.sum())
+                t["residue"] = residue
+                t["flag"]["residual_px_after"] = remaining
+                rem_ratio = remaining / max(1, t["total"])
+                if remaining < resolved_abs_px or rem_ratio < resolved_ratio:
+                    t["resolved"] = True
+                    t["flag"]["resolved"] = True
     report["passes"] = passes_done
     report["reinpaint_backend"] = backend
     report["expanded_px"] = int(np.count_nonzero(expand_total))
-    # Genuine residue that survived every pass under an EMITTED native-text layer would
-    # double-render (native text stamped over leftover ink). Hand those ids to the
-    # raster-slice floor so the layer ships as a pixel-exact slice of the ORIGINAL text.
+    # Genuine residue under an EMITTED native-text layer would double-render. Prefer a
+    # deterministic local plate fill (keep editable TEXT) over baking OCR into a slice.
     unresolved = [t for t in tracked if not t["resolved"]]
+    unresolved = _solid_fill_unresolved(tracked, unresolved, report)
     for t in unresolved:
         t["flag"]["hard_fail"] = True
     if force_raster:
@@ -1019,7 +1221,100 @@ def _comparison_plate_columns(background_path, assets_dir, width, height, cfg, c
     return out
 
 
-_PLATE_SHELL_ROLES = {"button", "badge", "chip", "pill"}
+_PLATE_SHELL_ROLES = {"button", "badge", "chip", "pill", "message-bubble", "message", "bubble"}
+_ENGAGEMENT_ICON_ROLES = {
+    "icon", "engagement", "like", "reply", "repost", "share", "comment", "views",
+}
+
+
+def _fill_luma(fill) -> Optional[float]:
+    """Approximate luma of a flat fill; None when not a flat hex colour."""
+    if not isinstance(fill, dict):
+        return None
+    if str(fill.get("kind") or "flat").lower() not in {"flat", "solid", ""}:
+        return None
+    color = str(fill.get("color") or "")
+    if not color.startswith("#") or len(color) < 7:
+        return None
+    try:
+        r = int(color[1:3], 16)
+        g = int(color[3:5], 16)
+        b = int(color[5:7], 16)
+    except ValueError:
+        return None
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _suppress_engagement_underlay_shells(candidates, cfg=None):
+    """Drop tiny dark button/ellipse plates that sit under engagement icons.
+
+    CODIA-PARITY (009): a bogus near-black ellipse tagged ``Button`` under the
+    comment icon. Real engagement chrome is the icon cutout; the underlay is a
+    plate fragment, not an editable control. Gated to social_screenshot by
+    default (``reconstruct.suppress_engagement_underlays``).
+    """
+    rcfg = (cfg or {}).get("reconstruct") or {}
+    archetype = str(((cfg or {}).get("scene") or {}).get("archetype") or "")
+    enabled = rcfg.get("suppress_engagement_underlays")
+    if enabled is None:
+        enabled = archetype == "social_screenshot"
+    if not enabled:
+        return candidates, 0
+    icons = [
+        item for item in candidates
+        if item.get("target") in {"icon", "image"}
+        and str((item.get("meta") or {}).get("role") or "").lower() in _ENGAGEMENT_ICON_ROLES
+    ]
+    if not icons:
+        return candidates, 0
+    suppressed = 0
+    for item in candidates:
+        if item.get("target") != "shape" or item.get("text"):
+            continue
+        meta = item.get("meta") or {}
+        role = str(meta.get("role") or "").lower()
+        if role not in {"button", "badge", "chip", "shape", ""} and not meta.get("button_shell"):
+            continue
+        box = item.get("box") or {}
+        fw, fh = float(box.get("w") or 0), float(box.get("h") or 0)
+        if fw <= 0 or fh <= 0 or max(fw, fh) > 64 or min(fw, fh) < 6:
+            continue
+        # Near-square / circular underlays only (the bogus 009 ellipse).
+        aspect = max(fw, fh) / max(1.0, min(fw, fh))
+        if aspect > 1.45:
+            continue
+        luma = _fill_luma(item.get("fill") or (item.get("style") or {}).get("fill"))
+        if luma is None or luma > 40.0:
+            continue
+        for icon in icons:
+            if _overlap_frac(box, icon.get("box") or {}) < 0.45:
+                continue
+            # Underlay should be comparable to or smaller than the icon.
+            ib = icon.get("box") or {}
+            if fw * fh > 1.35 * max(1.0, float(ib.get("w") or 0) * float(ib.get("h") or 0)):
+                continue
+            meta = item.setdefault("meta", {})
+            item["target"] = "drop"
+            meta["keep_in_background"] = True
+            meta["removal_required"] = True
+            meta["suppression_reason"] = "engagement-icon-underlay"
+            meta["underlay_of"] = icon.get("id")
+            suppressed += 1
+            break
+    return candidates, suppressed
+
+
+def _overlap_frac(a, b) -> float:
+    """Intersection over the smaller box area (0..1)."""
+    ax0, ay0 = float(a.get("x") or 0), float(a.get("y") or 0)
+    ax1, ay1 = ax0 + float(a.get("w") or 0), ay0 + float(a.get("h") or 0)
+    bx0, by0 = float(b.get("x") or 0), float(b.get("y") or 0)
+    bx1, by1 = bx0 + float(b.get("w") or 0), by0 + float(b.get("h") or 0)
+    ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    iy = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = ix * iy
+    smaller = min(max(1.0, (ax1 - ax0) * (ay1 - ay0)), max(1.0, (bx1 - bx0) * (by1 - by0)))
+    return inter / smaller
 
 
 def _suppress_plate_boundary_fragments(candidates, cfg=None):
@@ -1482,7 +1777,7 @@ def _gradient_reconstruction_error(rgb, gradient):
     return float(np.abs(rgb.astype(np.float32) - pred).mean())
 
 
-def extract_background_gradient(image_path, cfg=None):
+def extract_background_gradient(image_path, cfg=None, rgb=None):
     """Fit an editable native radial / multi-stop-linear gradient over a full clean plate.
 
     Radial-glow and smooth-gradient ad backgrounds are flattened to a raster today (item 2
@@ -1492,6 +1787,9 @@ def extract_background_gradient(image_path, cfg=None):
     high R² analytic fit AND a render-back mean-absolute-error check on the reconstructed
     gradient. Anything textured/photographic fails and stays raster. Returns None otherwise.
     Config: ``reconstruct.background_gradient`` (defaults ON).
+
+    ``rgb`` may be a preloaded HxWx3 uint8 array (same pixels as ``image_path``) so callers
+    that already decoded the plate avoid a duplicate PNG read.
     """
     cv2, np, Image = _deps()
     bg = ((cfg or {}).get("reconstruct") or {}).get("background_gradient")
@@ -1499,7 +1797,14 @@ def extract_background_gradient(image_path, cfg=None):
     if bg.get("enabled", True) is False:
         return None
     try:
-        rgb_full = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+        if rgb is not None:
+            rgb_full = np.asarray(rgb, dtype=np.uint8)
+            if rgb_full.ndim != 3 or rgb_full.shape[2] < 3:
+                return None
+            if rgb_full.shape[2] > 3:
+                rgb_full = rgb_full[:, :, :3]
+        else:
+            rgb_full = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
     except Exception:
         return None
     height, width = rgb_full.shape[:2]
@@ -1635,7 +1940,77 @@ def _shadow_effect(rgb, mask, box, geometry):
     }
 
 
-_PLATE_RESTORE_ROLES = {"button", "badge", "chip", "pill", "cta"}
+_PLATE_RESTORE_ROLES = {
+    "button", "badge", "chip", "pill", "cta", "callout", "logo",
+    "message-bubble", "message", "bubble",
+    "banner", "ribbon", "brushstroke", "seal",
+    "starburst", "price_burst", "sale_burst", "burst", "sticker",
+}
+
+
+def _mask_fill_fraction(local_mask) -> float:
+    _, np, _ = _deps()
+    if local_mask is None or local_mask.size == 0:
+        return 0.0
+    return float(np.mean(local_mask > 0))
+
+
+def _is_hollow_stroke_ring(local_mask, max_fill: float = 0.34) -> bool:
+    """True when the matte is mostly perimeter ink (outline pill / ghost button)."""
+    fill = _mask_fill_fraction(local_mask)
+    return 0.02 <= fill <= max_fill
+
+
+def _stroke_from_ring_mask(local_rgb, local_mask, max_width: int = 8):
+    """Sample stroke paint from a hollow ring matte (no solid interior required)."""
+    cv2, np, _ = _deps()
+    if local_mask is None or local_mask.size == 0 or not np.any(local_mask):
+        return None
+    ring = local_mask > 0
+    if int(ring.sum()) < 24:
+        return None
+    distance = cv2.distanceTransform(ring.astype(np.uint8), cv2.DIST_L2, 3)
+    # Width ≈ max distance from exterior through the ring band.
+    width = int(max(1, min(max_width, round(float(distance.max()) * 2.0))))
+    color = _robust_color(local_rgb[ring])
+    return {"color": _hex(color), "width": width, "align": "CENTER"}
+
+
+def _outline_shell_style(rgb, mask, box, cfg, role=None):
+    """Native stroke-only plate for Biomel-style outline pills (no invented opaque fill)."""
+    _, np, _ = _deps()
+    local_rgb, local_mask = _local_shape_pixels(rgb, mask, box)
+    if local_mask.size == 0 or not np.any(local_mask):
+        return None
+    style_cfg = ((cfg.get("reconstruct") or {}).get("style_extraction") or {})
+    stroke = _stroke_from_ring_mask(
+        local_rgb, local_mask, int(style_cfg.get("max_stroke_width", 8)),
+    )
+    if stroke is None:
+        return None
+    w = max(1, int(round(float((box or {}).get("w", 0) or 0))))
+    h = max(1, int(round(float((box or {}).get("h", 0) or 0))))
+    aspect = w / max(1, h)
+    role_l = str(role or "").lower().replace("-", "_")
+    if 0.75 <= aspect <= 1.35 or role_l in {"badge", "seal", "starburst", "price_burst"}:
+        geometry = "ellipse"
+        radius = None
+    else:
+        geometry = "rect"
+        radius = round(min(w, h) * 0.5, 2)
+    return {
+        "shape_kind": geometry,
+        "fill": None,
+        "stroke": stroke,
+        "radius": radius,
+        "effects": [],
+        "meta": {
+            "geometry": geometry,
+            "stroke_outline_shell": True,
+            "stroke_detected": True,
+            "fill_transparent": True,
+        },
+    }
 
 
 def _fill_plate_holes(local_mask):
@@ -1661,13 +2036,44 @@ def _fill_plate_holes(local_mask):
     return filled, restored - original
 
 
-def _extract_shape_style(rgb, mask, box, cfg, role=None):
+def _fill_shell_text_holes(image, rgb, box):
+    """Paint enclosed transparent holes in a shell crop with the plate fill colour.
+
+    Used when a text-bearing badge falls back to IMAGE (complex scalloped seal) so the
+    exported chrome is a solid plate under native TEXT, not a matte with glyph cutouts.
+    Returns ``(image, filled_pixel_count)``.
+    """
+    _, np, Image = _deps()
+    arr = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+    alpha = arr[:, :, 3] > 0
+    if not alpha.any():
+        return image, 0
+    filled_mask, n = _fill_plate_holes(alpha)
+    if n <= 0:
+        return image, 0
+    holes = filled_mask & ~alpha
+    if not holes.any():
+        return image, 0
+    # Sample plate colour from remaining opaque shell pixels (prefer interior).
+    opaque = arr[alpha]
+    fill = np.median(opaque[:, :3].astype(np.float32), axis=0).astype(np.uint8)
+    arr[holes, 0:3] = fill
+    arr[holes, 3] = 255
+    return Image.fromarray(arr, mode="RGBA"), int(np.count_nonzero(holes))
+
+
+def _extract_shape_style(rgb, mask, box, cfg, role=None, restore_plate=False,
+                         stroke_outline=False):
     """Conservative native-style extraction for semantic primitive candidates."""
     _, np, _ = _deps()
     local_rgb, local_mask = _local_shape_pixels(rgb, mask, box)
+    if stroke_outline or _is_hollow_stroke_ring(local_mask):
+        outline = _outline_shell_style(rgb, mask, box, cfg, role=role)
+        if outline is not None:
+            return outline
     style_cfg = ((cfg.get("reconstruct") or {}).get("style_extraction") or {})
     plate_holes = 0
-    if (str(role or "").lower() in _PLATE_RESTORE_ROLES
+    if ((restore_plate or str(role or "").lower() in _PLATE_RESTORE_ROLES)
             and style_cfg.get("restore_plate_mask", True) is not False):
         local_mask, plate_holes = _fill_plate_holes(local_mask)
     geometry = _simple_shape_geometry(local_mask)
@@ -1835,6 +2241,13 @@ def _image_mask_spec(candidate, mask, box):
         return {"kind": "path", "path": path} if path else {"kind": "alpha"}
 
     # No shape requested: infer a swappable primitive from the actual alpha coverage.
+    # Circular product insets (white-ring crops) honor explicit circular roles/meta.
+    if (
+        meta.get("circular_inset")
+        or role in {"circular_inset", "inset", "product_inset", "round_inset", "circle_crop"}
+        or meta.get("circular")
+    ):
+        return {"kind": "ellipse"}
     local = _local_alpha(mask, box)
     if local.size and min(local.shape) >= 8:
         if _simple_shape_geometry(local) == "ellipse":
@@ -1858,7 +2271,8 @@ def _photo_shape_override(rgb, mask, box, extracted, candidate):
     meta = candidate.get("meta") or {}
     role = str(meta.get("role") or "").lower()
     # Interactive / line chrome is always a primitive, regardless of any texture.
-    if role in ("button", "cta", "chip", "divider", "bar"):
+    if role in ("button", "cta", "chip", "divider", "bar", "chart-bar", "axis", "axis-line",
+                "gridline"):
         return None
     local_rgb, local_mask = _local_shape_pixels(rgb, mask, box)
     if local_mask.size == 0 or min(local_mask.shape) < 8:
@@ -1916,7 +2330,12 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     rgb = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
     h, w = rgb.shape[:2]
 
+    # Safety net: if merge skipped demotion, drop whole-plot rasters that the same
+    # chart_group already covers with native primitives (see docs/DIAGRAM-EDITABILITY.md).
+    candidates = prefer_decomposed_charts(candidates)
+
     canonical = deduplicate(candidates, float(rcfg.get("dedup_iou", 0.86)))
+    text_shells_promoted = _promote_ocr_overlapping_shells(canonical, cfg)
     photo_policy = (((cfg.get("scene") or {}).get("preset") or {}).get("photo_regions") or {})
     if photo_policy.get("suppress_descendants", True):
         canonical = _suppress_baked_raster_text(
@@ -1925,6 +2344,7 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     canonical = _suppress_comparison_column_labels(canonical, cfg)
     canonical, flattened_scene_artwork = _flatten_photo_scene(canonical, cfg)
     canonical, plate_fragments_suppressed = _suppress_plate_boundary_fragments(canonical, cfg)
+    canonical, engagement_underlays_suppressed = _suppress_engagement_underlay_shells(canonical, cfg)
     ocr_lines = {line.get("id"): line for line in (ocr.get("lines") or [])}
     masks = {}
     for candidate in canonical:
@@ -1964,7 +2384,9 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         # runs, so relying on z alone silently reverses ownership.
         if target == "text":
             return 4
-        if target == "icon":
+        if target == "icon" or role in {
+            "arrow", "callout_leader", "leader", "leader_line", "connector",
+        }:
             return 3
         if target in ("shape", "image") and role in ("product", "person", "foreground", "cutout"):
             return 2
@@ -2014,20 +2436,87 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         if target == "shape":
             # Do not overwrite upstream paint facts.  This fills only the gaps left by
             # segmentation/Qwen and tags every inference for later QA/debugging.
-            extracted = _extract_shape_style(
-                rgb, mask, c.get("box", {}), cfg, role=(c.get("meta") or {}).get("role")
+            is_text_shell = bool(
+                (c.get("meta") or {}).get("text_bearing_shell")
+                or (c.get("meta") or {}).get("plate_shell")
             )
-            photo_mask = _photo_shape_override(rgb, mask, c.get("box", {}), extracted, c)
+            stroke_outline = bool(
+                (c.get("meta") or {}).get("stroke_outline_shell")
+                or (c.get("meta") or {}).get("stroke_only")
+            )
+            extracted = _extract_shape_style(
+                rgb, mask, c.get("box", {}), cfg,
+                role=(c.get("meta") or {}).get("role"),
+                restore_plate=is_text_shell and not stroke_outline,
+                stroke_outline=stroke_outline or (
+                    is_text_shell and _is_hollow_stroke_ring(
+                        _local_shape_pixels(rgb, mask, c.get("box", {}))[1]
+                    )
+                ),
+            )
+            # Text-bearing chrome is never a photo avatar — skip photo reclass so a
+            # textured olive brushstroke cannot flatten to a wrong ellipse/rect.
+            photo_mask = None if is_text_shell else _photo_shape_override(
+                rgb, mask, c.get("box", {}), extracted, c
+            )
             if photo_mask is None:
                 if extracted:
                     c["shape_kind"] = c.get("shape_kind") or extracted["shape_kind"]
-                    c["fill"] = c.get("fill") or extracted["fill"]
+                    if extracted.get("fill") is not None:
+                        c["fill"] = c.get("fill") or extracted["fill"]
+                    elif extracted.get("meta", {}).get("fill_transparent"):
+                        c["fill"] = None
+                        c["meta"]["stroke_outline_shell"] = True
                     c["stroke"] = c.get("stroke") or extracted["stroke"]
                     if not c.get("effects") and extracted["effects"]:
                         c["effects"] = extracted["effects"]
                     if c.get("radius") is None and extracted["radius"] not in (None, 0):
                         c["radius"] = extracted["radius"]
                     c["meta"]["style_extraction"] = extracted["meta"]
+                    updated.append(c)
+                    continue
+                if is_text_shell and not stroke_outline:
+                    # Irregular brushstroke / starburst: prefer a solid-fill path silhouette;
+                    # if contour fidelity fails, honest alpha CHIP of the stroke only
+                    # (never a full-ad slice, never a bounding rect that invents area).
+                    path_d = _alpha_silhouette_path(mask, c.get("box", {}))
+                    fill_color = _dominant_fill(rgb, mask, c.get("box", {}))
+                    if path_d:
+                        c["shape_kind"] = "path"
+                        c["path"] = path_d
+                        c["fill"] = c.get("fill") or {"kind": "flat", "color": fill_color}
+                        c["meta"]["irregular_shell_path"] = True
+                        updated.append(c)
+                        continue
+                    c["meta"]["shell_raster_chip"] = True
+                    c["meta"]["vector_fallback"] = True
+                    c["meta"]["reclassified"] = "shape->shell-chip"
+                    c["mask"] = {"kind": "alpha"}
+                    target = c["target"] = "image"
+                    # fall through to image materialization (holes filled below)
+                elif is_text_shell and stroke_outline:
+                    # Hollow outline plate: never invent an opaque fill over the photo.
+                    outline = _outline_shell_style(
+                        rgb, mask, c.get("box", {}), cfg,
+                        role=(c.get("meta") or {}).get("role"),
+                    )
+                    if outline:
+                        c["shape_kind"] = outline["shape_kind"]
+                        c["fill"] = None
+                        c["stroke"] = c.get("stroke") or outline["stroke"]
+                        if c.get("radius") is None and outline.get("radius") not in (None, 0):
+                            c["radius"] = outline["radius"]
+                        c["meta"]["stroke_outline_shell"] = True
+                        c["meta"]["style_extraction"] = outline["meta"]
+                        updated.append(c)
+                        continue
+                    # Last resort: alpha chip of the stroke ring only (no plate fill).
+                    c["meta"]["shell_raster_chip"] = True
+                    c["meta"]["stroke_outline_shell"] = True
+                    c["meta"]["vector_fallback"] = True
+                    c["meta"]["reclassified"] = "shape->outline-chip"
+                    c["mask"] = {"kind": "alpha"}
+                    target = c["target"] = "image"
                 else:
                     kind, radius = _infer_shape(mask, c.get("box", {}))
                     c["shape_kind"] = c.get("shape_kind") or kind
@@ -2036,21 +2525,22 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                     }
                     if radius and kind == "rect" and c.get("radius") is None:
                         c["radius"] = radius
-                updated.append(c)
-                continue
-            # Photographic region (e.g. the ad9 circular avatar): deliver the real pixels as
-            # a swappable IMAGE clipped by the detected primitive, not a flattened solid fill.
-            if extracted and extracted.get("effects") and not c.get("effects"):
-                c["effects"] = extracted["effects"]
-            if extracted and extracted.get("stroke") and not c.get("stroke"):
-                c["stroke"] = extracted["stroke"]
-            if extracted:
-                c["meta"]["style_extraction"] = extracted["meta"]
-            c["meta"]["reclassified"] = "shape->image"
-            c["meta"]["photo_shape"] = True
-            c["mask"] = photo_mask
-            target = c["target"] = "image"
-            # fall through to the image materialization below
+                    updated.append(c)
+                    continue
+            else:
+                # Photographic region (e.g. the ad9 circular avatar): deliver the real pixels as
+                # a swappable IMAGE clipped by the detected primitive, not a flattened solid fill.
+                if extracted and extracted.get("effects") and not c.get("effects"):
+                    c["effects"] = extracted["effects"]
+                if extracted and extracted.get("stroke") and not c.get("stroke"):
+                    c["stroke"] = extracted["stroke"]
+                if extracted:
+                    c["meta"]["style_extraction"] = extracted["meta"]
+                c["meta"]["reclassified"] = "shape->image"
+                c["meta"]["photo_shape"] = True
+                c["mask"] = photo_mask
+                target = c["target"] = "image"
+                # fall through to the image materialization below
 
         owned = (ownership == owner_number.get(cid, 0)).astype(np.uint8) * 255
         # Holes introduced by front-to-back ownership are intentional: a child
@@ -2102,6 +2592,17 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             continue
         image = _source_rgba(c, rgb, mask, run_dir)
         image = _apply_owned_alpha(image, owned, c.get("box", {}))
+        # Text-bearing badge/button shells: ownership punches glyph holes into the
+        # chrome matte. Fill those enclosed holes with the shell's plate colour so
+        # native TEXT paints over a solid plate (not a donut that leaks the plate).
+        # Only shells flagged by merge (never ordinary logos — counters must survive).
+        if (
+            (c["meta"].get("text_bearing_shell") or c["meta"].get("plate_shell"))
+            and not c["meta"].get("stroke_outline_shell")
+        ):
+            image, filled_px = _fill_shell_text_holes(image, rgb, c.get("box") or {})
+            if filled_px:
+                c["meta"]["shell_text_holes_filled_px"] = filled_px
         comparison_columns = _split_comparison_frame(c, image, assets_dir, cfg)
         if comparison_columns:
             # Keep the broad source owner only as the inpaint/removal observation.  The
@@ -2380,6 +2881,8 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             "vector_fallback": vector_fallback,
             "flattened_scene_artwork": flattened_scene_artwork,
             "plate_fragments_suppressed": plate_fragments_suppressed,
+            "engagement_underlays_suppressed": engagement_underlays_suppressed,
+            "text_shells_promoted": text_shells_promoted,
             "mask_rejected": mask_rejected,
             "removal_capped": removal_capped,
             "kept_footprints_covered": footprints_covered,
@@ -2562,9 +3065,9 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
     for entry in ((cfg.get("reconstruct") or {}).get("focus_regions") or []):
         if isinstance(entry, dict) and entry.get("layer_id"):
             forced.add(str(entry["layer_id"]))
-    # Ghost-text layers the post-inpaint residual audit could not clean (glyph residue
-    # survived every re-inpaint pass) would otherwise stamp native text over leftover
-    # ink. Force them to a pixel-exact source slice here (the looks-right floor).
+    # Legacy / forensic: residual audit may still emit force_raster_ids when
+    # reconstruct.text_residual.force_raster is explicitly enabled. Readable TEXT is
+    # still refused below unless text_slice_gate_enabled is on.
     audit_forced = set()
     try:
         _audit = ((load(recon_path).get("stats") or {}).get("text_residual") or {})
@@ -2572,6 +3075,7 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
     except Exception:
         audit_forced = set()
     forced |= audit_forced
+    text_slice_ok = bool(thresholds.get("text_slice_gate_enabled", False))
 
     canvas = design.get("canvas") or {}
     canvas_area = max(1.0, float(canvas.get("w") or 1) * float(canvas.get("h") or 1))
@@ -2588,6 +3092,15 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
         if rid in forced and not reasons:
             reasons = ["forced by repair (reconstruct.focus_regions)"]
         if not reasons:
+            continue
+        # Codia: never raster-slice readable OCR/native TEXT to boost fidelity.
+        is_text_layer = str(row.get("type") or "") == "text"
+        if is_text_layer and not text_slice_ok:
+            report["skipped"].append({
+                "id": rid,
+                "reason": "codia-never-slice-readable-text",
+                "failing_reasons": list(reasons),
+            })
             continue
         if int(row.get("region_px") or 0) < int(thresholds["min_region_px"]):
             report["skipped"].append({"id": rid, "reason": "region-too-small"})

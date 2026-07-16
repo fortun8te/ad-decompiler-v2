@@ -84,11 +84,11 @@ def raster_slice_failures(row, thresholds=None) -> list:
     # CODIA-PARITY POLICY (authoritative construction brief): readable text is NEVER
     # raster-sliced to protect a pixel metric — "wrong Inter beats baked pixels".
     # Native TEXT always ships; the raster-slice fallback applies only to non-text
-    # regions (icons/chrome/pills/cards). The single remaining text-slicing path is
-    # the post-inpaint residue audit's force_raster_ids (a plate that could NOT be
-    # cleaned under the text), which reconstruct.apply_raster_slice_fallback honors
-    # via ``forced`` — it does not pass through this gate. The legacy ink gates below
-    # are kept behind ``text_slice_gate_enabled`` purely for forensic tooling.
+    # regions (icons/chrome/pills/cards). Ghost ink under native text is resolved by
+    # reconstruct's solid plate-fill residue path, NOT by baking OCR into a slice.
+    # ``force_raster_ids`` / focus-region forcing also cannot slice TEXT unless the
+    # forensic ``text_slice_gate_enabled`` flag is on (apply_raster_slice_fallback).
+    # Legacy ink gates below stay behind that flag for tooling only.
     if is_text and not bool(t.get("text_slice_gate_enabled", False)):
         return []
     iou = row.get("ink_iou") if is_text else None

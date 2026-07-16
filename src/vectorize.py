@@ -386,13 +386,19 @@ _DEFAULT_SCORE_MIN = {
     "default": 0.85, "icon": 0.82, "logo": 0.82, "badge": 0.80,
     "arrow": 0.82, "mask": 0.78, "chip": 0.80, "shape": 0.88,
     # Hand-drawn annotation strokes (marker underlines, strikethroughs, connector/leader
-    # lines) trace as thin flat marks; a headline-strict 0.85 gate over-rejects a couple
-    # of aliased edge pixels and forces a raster slice. The audit's YELLOW→GREEN win needs
-    # these to stay editable vectors, so they sit at the arrow tier. The render-back gate
-    # still arbitrates: a genuinely failed trace falls back to raster honestly.
-    "underline": 0.80, "strikethrough": 0.80, "strike_through": 0.80,
-    "connector": 0.80, "leader": 0.80, "callout_leader": 0.80, "leader_line": 0.80,
+    # arrows). Slightly looser than filled icons so thin white 014-style leaders survive
+    # the render-back gate; a genuinely failed trace still falls back to raster honestly.
+    "underline": 0.78, "strikethrough": 0.78, "strike_through": 0.78, "annotation": 0.78,
+    "connector": 0.78, "leader": 0.78, "callout_leader": 0.78, "leader_line": 0.78,
+    "string": 0.78, "thread": 0.78, "string_leader": 0.78, "leader_string": 0.78,
+    "callout_string": 0.78,
     "line": 0.80, "divider": 0.80,
+    # Chart/diagram strokes and markers: same tier as connectors — prefer editable
+    # vectors when the render-back gate passes; never force a photo-style reject bar.
+    "axis": 0.80, "axis_line": 0.80, "axis-line": 0.80, "gridline": 0.80,
+    "plot_line": 0.80, "plot-line": 0.80, "data_line": 0.80, "data-line": 0.80,
+    "data_point": 0.80, "data-point": 0.80, "marker": 0.80,
+    "chart_bar": 0.82, "chart-bar": 0.82, "bar": 0.82,
 }
 _DEFAULT_MAX_PATHS = {
     "default": 40, "icon": 60, "logo": 50, "badge": 35,
@@ -400,7 +406,13 @@ _DEFAULT_MAX_PATHS = {
     # A single authored annotation stroke is one or two paths; a scribble a handful more.
     "underline": 14, "strikethrough": 14, "strike_through": 14,
     "connector": 24, "leader": 24, "callout_leader": 24, "leader_line": 24,
+    "string": 24, "thread": 24, "string_leader": 24, "leader_string": 24,
+    "callout_string": 24,
     "line": 14, "divider": 14,
+    "axis": 8, "axis_line": 8, "axis-line": 8, "gridline": 8,
+    "plot_line": 16, "plot-line": 16, "data_line": 16, "data-line": 16,
+    "data_point": 12, "data-point": 12, "marker": 12,
+    "chart_bar": 8, "chart-bar": 8, "bar": 8,
 }
 
 
@@ -649,6 +661,8 @@ def _analytic_straight_line_svg(png_path, role):
     if role_key not in {
         "line", "divider", "rule", "separator", "underline", "strikethrough",
         "strike_through", "callout_leader", "leader", "leader_line", "connector",
+        "string", "thread", "string_leader", "leader_string", "callout_string",
+        "axis", "axis_line", "gridline", "plot_line", "data_line",
     }:
         return None
     try:
@@ -681,7 +695,10 @@ def _analytic_straight_line_svg(png_path, role):
         visible = rgba[mask]
         colour = np.median(visible[:, :3], axis=0).astype(int)
         alpha = float(np.median(visible[:, 3])) / 255.0
-        cap = "round" if role_key in {"callout_leader", "leader", "leader_line", "connector"} else "butt"
+        cap = "round" if role_key in {
+            "callout_leader", "leader", "leader_line", "connector",
+            "string", "thread", "string_leader", "leader_string", "callout_string",
+        } else "butt"
         return (
             f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">'
             f'<path d="M{p0[0]:.3f} {p0[1]:.3f} L{p1[0]:.3f} {p1[1]:.3f}" '

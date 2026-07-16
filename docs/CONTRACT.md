@@ -34,6 +34,10 @@ run_pipeline.py --input ad.png --output ./runs/run_001
 - **icon/badge/logo/arrow/simple graphic** → vectorize (VTracer color / Potrace binary),
   gated by a re-render fidelity check; fail → keep raster crop.
 - **emoji** → keep as text character (platform font) or platform PNG; NEVER vectorize.
+- **chart/diagram (default)** → one intentional raster cluster (exact swappable crop).
+  Semi-editable upgrade only when primitives are positively tagged with `chart_group_id`
+  (labels → TEXT, bars/axes → SHAPE, plot lines/connectors → gated VECTOR). See
+  `docs/DIAGRAM-EDITABILITY.md`.
 
 ## Hard rules (do not violate)
 1. Do NOT vectorize the whole ad. Only cropped simple elements.

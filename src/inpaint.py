@@ -873,6 +873,12 @@ def _solid_flat_enabled(cfg: Optional[dict]) -> bool:
     icfg = (cfg or {}).get("inpaint") or {}
     if "solid_flat_regions" in icfg:
         return bool(icfg.get("solid_flat_regions"))
+    from src import format_readiness
+
+    # Prefer format capability (flat_plate / ui_chrome) so new formats need no preset.
+    fmt = format_readiness.format_from_cfg(cfg)
+    if fmt.get("capabilities"):
+        return format_readiness.prefers_solid_flat(cfg)
     # Default ON for flat/UI archetypes only; genuine-photo archetypes keep pure inpaint.
     archetype = str(((cfg or {}).get("scene") or {}).get("archetype") or "").lower()
     extra = set(icfg.get("solid_flat_archetypes") or ())
@@ -1258,6 +1264,29 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             region_targets & {"image"}
             or region_roles & {"photo", "product", "person", "cutout"}
         )
+        ui_chrome_hole = bool(
+            not photo_hole
+            and (
+                region_targets <= {"text", "shape", "icon"}
+                or region_roles & {
+                    "badge", "button", "chip", "pill", "cta", "icon", "chrome",
+                    "divider", "bar", "ui-label", "label",
+                    "banner", "ribbon", "brushstroke", "seal",
+                    "starburst", "price_burst", "sale_burst", "burst",
+                }
+            )
+        )
+        archetype = str(((cfg.get("scene") or {}).get("archetype") or "")).lower()
+        extra_flat = {
+            str(a).lower()
+            for a in ((cfg.get("inpaint") or {}).get("solid_flat_archetypes") or ())
+        }
+        from src import format_readiness
+        fmt = format_readiness.format_from_cfg(cfg)
+        if fmt.get("capabilities"):
+            flat_ui_archetype = format_readiness.prefers_solid_flat(cfg)
+        else:
+            flat_ui_archetype = archetype in (_FLAT_PLATE_ARCHETYPES | extra_flat)
         crop_spec = _regional_crop(mask, cfg)
         if crop_spec is None:
             continue
@@ -1283,6 +1312,17 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
         if (coeff is not None and complexity.get("model") == "dominant-flat-rgb"
                 and complexity["residual_p90"] <= flat_residual):
             analytic = True
+        # Flat/UI chrome (text, badge, chip, icon on social/product-on-flat plates): prefer
+        # analytic even when the ring is slightly noisier. Generative backends invent
+        # glyph residue / smear into these holes and cost seconds for worse quality.
+        if (not analytic and coeff is not None and flat_ui_archetype and ui_chrome_hole
+                and float(complexity.get("dominant_fraction") or 0) >= float(
+                    regional_cfg.get("ui_analytic_dominant_fraction", 0.40))
+                and float(complexity.get("residual_p90") or 1e9) <= float(
+                    regional_cfg.get("ui_analytic_residual_p90", flat_residual * 2.5))):
+            analytic = True
+            complexity = dict(complexity)
+            complexity["ui_chrome_analytic"] = True
         # Analytic plates are safe (non-hallucinating) but can wipe subtle photographic
         # texture inside a removed product/person/photo region even when the exterior ring
         # looks flat. Prefer an active inpaint model for those holes unless the plate is
@@ -1291,7 +1331,14 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             analytic = False
         # Guardrail: analytic fills are great for small UI cutouts, but they destroy large
         # regions (e.g. a photo that was masked) by collapsing them to a single plate.
-        if region_fraction >= analytic_max_fraction:
+        # Flat/UI text+chrome holes get a higher ceiling — they are plates, not photos.
+        analytic_cap = analytic_max_fraction
+        if flat_ui_archetype and ui_chrome_hole:
+            analytic_cap = float(regional_cfg.get(
+                "ui_analytic_max_canvas_fraction",
+                max(analytic_max_fraction, 0.35),
+            ))
+        if region_fraction >= analytic_cap:
             analytic = False
         complex_background = bool(
             coeff is not None and (
@@ -1301,8 +1348,18 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
         )
         force_flux = bool(regional_cfg.get("force_flux", False))
         requested = "analytic-affine" if analytic and not force_flux else "big-lama"
+        # Never spend Flux on text / badge / chip chrome — it regenerates glyph residue
+        # and doubles wall time for a hole analytic/LaMa already owns better.
+        flux_blocked = bool(
+            "text" in region_targets
+            or ui_chrome_hole
+            or region_roles & {
+                "badge", "button", "chip", "pill", "cta",
+                "banner", "ribbon", "seal", "starburst", "burst",
+            }
+        )
         if not analytic or force_flux:
-            if force_flux and flux_allowed and "text" not in set(region["targets"]):
+            if force_flux and flux_allowed and not flux_blocked:
                 requested = "flux-comfy"
             elif base_mode == "opencv":
                 requested = "opencv"
@@ -1316,14 +1373,14 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
             # icon, creating a duplicate behind the new native Figma text.
             elif (flux_allowed and complex_background
                   and region_fraction <= flux_max_fraction
-                  and "text" not in set(region["targets"])):
+                  and not flux_blocked):
                 requested = "flux-comfy"
             # If we removed a huge fraction of the canvas, avoid analytic and prefer an
             # active model when possible; otherwise the plate will flatten/hallucinate.
             if (region_fraction >= force_active_for_large
                     and requested == "big-lama"
                     and flux_allowed
-                    and "text" not in set(region["targets"])):
+                    and not flux_blocked):
                 requested = "flux-comfy"
 
         started = time.monotonic()
@@ -1339,6 +1396,15 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
                 "opencv_fallback_used": False, "fallback_reason": None,
             }
         else:
+            # Lazy Flux VRAM: unload VLM / pick GGUF only when a region actually needs Flux.
+            # Analytic/LaMa-only runs (common under regional routing) skip the ~8–12 s churn.
+            flux_vram_prep = None
+            if requested == "flux-comfy":
+                try:
+                    from src import vram as _vram
+                except ImportError:  # pragma: no cover
+                    import vram as _vram  # type: ignore
+                flux_vram_prep = _vram.ensure_flux_vram(cfg)
             region_cfg = dict(cfg)
             region_cfg["inpaint"] = dict(cfg.get("inpaint") or {})
             region_cfg["inpaint"]["mode"] = requested
@@ -1389,6 +1455,14 @@ def inpaint_regional(image_path: str, observations: Iterable[dict], union_mask,
                 candidates, key=lambda row: row[0]["total"]
             )
             backend_diagnostics = dict(backend_diagnostics)
+            if flux_vram_prep and (
+                    flux_vram_prep.get("vlm_evicted") or flux_vram_prep.get("flux_quant")
+                    or not flux_vram_prep.get("already_prepared")):
+                backend_diagnostics["flux_vram_prep"] = {
+                    k: flux_vram_prep.get(k)
+                    for k in ("vlm_evicted", "flux_quant", "already_prepared",
+                              "free_mib_after")
+                }
             backend_diagnostics.update({
                 "attempts": attempts,
                 "chosen_seed": chosen_seed,

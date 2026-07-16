@@ -11,6 +11,13 @@ from __future__ import annotations
 INTENTIONAL_RASTER_CLUSTER_ROLES = frozenset({
     "screenshot", "ui-panel", "receipt", "chart", "graph", "table",
     "nutrition-panel", "diagram", "infographic", "product-cluster",
+    # Press / trust chrome: brand marks in an AS SEEN IN band are not worth
+    # inventing as native vectors — keep one honest swappable strip (or chips).
+    "logo-strip", "as-seen-in", "press-logos",
+    # Atomic rating fallback when individual stars cannot be separated cleanly.
+    "rating-strip",
+    # IM8: chaotic pill clouds and photographic body-morph strips stay one crop.
+    "pill-cloud", "body-progression", "body-morph",
 })
 
 _ALIASES = {
@@ -26,6 +33,27 @@ _ALIASES = {
     "info-graphic": "infographic",
     "inseparable-product-cluster": "product-cluster",
     "product-scene": "product-cluster",
+    "pill-cloud": "pill-cloud",
+    "pill_cloud": "pill-cloud",
+    "chaotic-pill-cluster": "pill-cloud",
+    "pill-cluster": "pill-cloud",
+    "body-progression": "body-progression",
+    "body_progression": "body-progression",
+    "body-morph": "body-morph",
+    "body_morph": "body-morph",
+    "body-stage-strip": "body-progression",
+    "logo-strip": "logo-strip",
+    "logo_strip": "logo-strip",
+    "as-seen-in": "as-seen-in",
+    "as_seen_in": "as-seen-in",
+    "asseenin": "as-seen-in",
+    "press-logos": "press-logos",
+    "press_logos": "press-logos",
+    "press-strip": "logo-strip",
+    "rating-strip": "rating-strip",
+    "rating_strip": "rating-strip",
+    "star-rating": "rating-strip",
+    "trustpilot": "rating-strip",
 }
 
 _LABELS = {
@@ -39,6 +67,13 @@ _LABELS = {
     "diagram": "Diagram",
     "infographic": "Infographic",
     "product-cluster": "Product cluster",
+    "pill-cloud": "Pill cloud",
+    "body-progression": "Body progression",
+    "body-morph": "Body morph",
+    "logo-strip": "Logo strip",
+    "as-seen-in": "As seen in",
+    "press-logos": "Press logos",
+    "rating-strip": "Rating",
 }
 
 

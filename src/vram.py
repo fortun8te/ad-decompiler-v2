@@ -2,9 +2,14 @@
 
 Heavy stages (OCR, SAM, inpaint) each cache GPU models.  ``stage_boundary`` unloads
 the prior stage's caches between transitions so the next stage has headroom.  It also
-records free/used telemetry per boundary and, before the ComfyUI Flux inpaint, can
+records free/used telemetry per boundary and, before a *real* ComfyUI Flux inpaint, can
 (config-gated) evict the persistent LM Studio VLM and pick a Flux GGUF quant that fits
 the free VRAM measured after eviction.
+
+With regional routing (``inpaint.regional.enabled`` + ``force_flux: false``), most holes
+go analytic / Big-LaMa and never touch Flux.  Eager VLM unload+reload then costs ~8–12 s
+for nothing.  ``lazy_flux_prep: true`` (default) defers eviction/quant until the first
+region actually routes to ``flux-comfy`` via ``ensure_flux_vram``.
 
 16 GB cannot hold gemma-4-e4b (~6.3 GB, resident in LM Studio) + SAM3 (~3 GB) + Flux Fill
 Q6 GGUF (9.2 GB) + t5xxl fp8 (4.5 GB) at once.  The knobs live under ``runtime.vram``:
@@ -14,6 +19,7 @@ Q6 GGUF (9.2 GB) + t5xxl fp8 (4.5 GB) at once.  The knobs live under ``runtime.v
         empty_cache_between_stages: true   # gc + torch.cuda.empty_cache() at boundaries
         evict_vlm_for_inpaint: true        # `lms unload` the VLM before Flux inpaint
         reload_vlm_after_inpaint: true      # `lms load` it back once inpaint is done
+        lazy_flux_prep: true               # defer unload/quant until a Flux region runs
 
 Every hook is best-effort and never raises: a missing ``lms`` CLI or ``nvidia-smi`` only
 means the corresponding optimisation is skipped, recorded honestly in telemetry.
@@ -33,12 +39,19 @@ _MiB = 1024 * 1024
 _TELEMETRY: list[dict] = []
 
 # Boundaries that immediately precede the heavy ComfyUI Flux inpaint.
-_INPAINT_BOUNDARIES = {"reconstruct", "inpaint"}
+# ``peel`` is included so SAM is unloaded and Flux prep can run for large photo holes
+# (peel previously banned Flux because SAM was still resident → ~25 min/call).
+_INPAINT_BOUNDARIES = {"reconstruct", "inpaint", "peel"}
+
+# Idempotency for lazy Flux prep within a single pipeline run.
+_FLUX_PREP_DONE: bool = False
 
 
 def reset_telemetry() -> None:
     """Clear accumulated per-boundary VRAM telemetry (call once per run)."""
+    global _FLUX_PREP_DONE
     _TELEMETRY.clear()
+    _FLUX_PREP_DONE = False
 
 
 def telemetry() -> list[dict]:
@@ -326,6 +339,27 @@ def _flux_inpaint_active(cfg: Optional[dict]) -> bool:
     )
 
 
+def _should_eager_flux_prep(cfg: Optional[dict], opts: Optional[dict] = None) -> bool:
+    """Whether merge→reconstruct should unload the VLM / pick a Flux quant immediately.
+
+    When regional routing can still send every hole to analytic/LaMa, eager prep wastes
+    ~8–12 s of unload+reload.  Eager only when Flux is certain to run (force_flux, or
+    Flux mode with regional disabled) or when ``lazy_flux_prep`` is off.
+    """
+    if not _flux_inpaint_active(cfg):
+        return False
+    opts = opts or _vram_cfg(cfg)
+    if not opts.get("lazy_flux_prep", True):
+        return True
+    regional = ((cfg or {}).get("inpaint") or {}).get("regional") or {}
+    if bool(regional.get("force_flux")):
+        return True
+    mode = str(((cfg or {}).get("inpaint") or {}).get("mode", "auto")).lower()
+    if mode in ("flux", "flux-comfy", "flux_comfy") and not bool(regional.get("enabled", True)):
+        return True
+    return False
+
+
 def prepare_inpaint_vram(cfg: Optional[dict], opts: Optional[dict] = None, *,
                          log_fn: Optional[Callable[[str], None]] = None) -> dict:
     """Evict the VLM and select a fitting Flux quant just before the heavy inpaint.
@@ -363,6 +397,26 @@ def prepare_inpaint_vram(cfg: Optional[dict], opts: Optional[dict] = None, *,
     return record
 
 
+def ensure_flux_vram(cfg: Optional[dict], opts: Optional[dict] = None, *,
+                     log_fn: Optional[Callable[[str], None]] = None) -> dict:
+    """Run Flux VRAM prep at most once per pipeline run (lazy regional path).
+
+    Call immediately before the first region that routes to ``flux-comfy``.  Subsequent
+    calls are no-ops so multi-region Flux fills do not re-evict the VLM.
+    """
+    global _FLUX_PREP_DONE
+    if _FLUX_PREP_DONE:
+        return {
+            "vlm_evicted": False, "flux_quant": None, "flux_quant_prev": None,
+            "free_mib_before": None, "free_mib_after": None,
+            "already_prepared": True,
+        }
+    record = prepare_inpaint_vram(cfg, opts, log_fn=log_fn)
+    _FLUX_PREP_DONE = True
+    record["already_prepared"] = False
+    return record
+
+
 def _vlm_feature_enabled(cfg: Optional[dict]) -> bool:
     """Mirror doctor's VLM-feature gate: any enabled VLM sub-feature keeps gemma resident."""
     vlm = (cfg or {}).get("vlm") or {}
@@ -382,12 +436,16 @@ def _vram_cfg(cfg: Optional[dict]) -> dict:
     if empty_cache is None:
         empty_cache = device == "cuda"
     evict = bool(vram.get("evict_vlm_for_inpaint", False))
+    lazy = vram.get("lazy_flux_prep")
+    if lazy is None:
+        lazy = True
     return {
         "unload_ocr_before_sam": bool(vram.get("unload_ocr_before_sam", True)),
         "unload_ocr_before_vlm": bool(vram.get("unload_ocr_before_vlm", vram.get("unload_ocr_before_sam", True))),
         "empty_cache_between_stages": bool(empty_cache),
         "evict_vlm_for_inpaint": evict,
         "reload_vlm_after_inpaint": bool(vram.get("reload_vlm_after_inpaint", evict)),
+        "lazy_flux_prep": bool(lazy),
         "device": device,
     }
 
@@ -401,6 +459,7 @@ def stage_boundary(
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Free GPU memory between heavy pipeline stages and record VRAM telemetry."""
+    global _FLUX_PREP_DONE
     del run_dir  # reserved for future per-run diagnostics
     opts = _vram_cfg(cfg)
     label = f"{from_stage}->{to_stage}"
@@ -411,12 +470,17 @@ def stage_boundary(
         unload_ocr_engines()
     if to_stage in {"vlm-ocr-judge", "vlm-proofread", "vlm-font-judge", "vlm-scene-text"} and opts["unload_ocr_before_vlm"]:
         unload_ocr_engines()
-    if to_stage in {"reconstruct", "inpaint", "vlm-segment-filter"}:
+    if to_stage in {"reconstruct", "inpaint", "vlm-segment-filter", "peel"}:
         unload_sam_backend()
 
     inpaint_prep: dict = {}
     if to_stage in _INPAINT_BOUNDARIES:
-        inpaint_prep = prepare_inpaint_vram(cfg, opts, log_fn=log_fn)
+        if _should_eager_flux_prep(cfg, opts):
+            inpaint_prep = prepare_inpaint_vram(cfg, opts, log_fn=log_fn)
+            _FLUX_PREP_DONE = True
+        elif _flux_inpaint_active(cfg) and opts.get("lazy_flux_prep", True):
+            _emit(log_fn, "vram: deferring Flux prep until a region routes to flux-comfy")
+            inpaint_prep = {"deferred": True, "vlm_evicted": False, "flux_quant": None}
 
     if opts["empty_cache_between_stages"]:
         optional_torch_cuda_empty_cache()
@@ -424,7 +488,7 @@ def stage_boundary(
     after = _snapshot()
     log_vram(f"after-{label}", log_fn)
 
-    if before or after or inpaint_prep.get("vlm_evicted") or inpaint_prep.get("flux_quant"):
+    if before or after or inpaint_prep.get("vlm_evicted") or inpaint_prep.get("flux_quant") or inpaint_prep.get("deferred"):
         entry = {"boundary": label, "before": before, "after": after}
         if inpaint_prep:
             entry["inpaint_prep"] = inpaint_prep

@@ -6,9 +6,9 @@ Covers the three mechanisms the benchmark forensics exposed:
     (067 "WE'RE SAYING GOODBYE" stayed red, 021 sticky-note copy) shifts the pixel
     value out of source-match range but is visibly still inky; the old source-match
     metric read that as "resolved" and shipped a double render;
-  * iterate-then-honestly-fail — the audit now runs several re-inpaint passes and, if
-    residue survives, hands the layer to the raster-slice floor via force_raster_ids
-    instead of stamping native text over the ghost;
+  * iterate-then-solid-fill — the audit runs several re-inpaint passes and, if
+    residue survives, paints a deterministic local plate colour under the glyphs
+    (Codia: keep native TEXT; never bake OCR into a raster slice for SSIM);
   * per-candidate removal cap — one low-confidence backdrop blob (002 c_E003 claimed
     34.5% of the canvas) must not inpaint most of the plate.
 
@@ -51,9 +51,10 @@ def _text_candidate(**overrides):
 # ── smear-aware residue detection + iterate-then-force-raster ────────────────────────
 
 
-def test_smeared_ghost_is_flagged_and_forced_to_raster(tmp_path, monkeypatch):
+def test_smeared_ghost_is_flagged_then_solid_filled(tmp_path, monkeypatch):
     """A smear that the OLD source-match metric would miss must (a) be flagged, and
-    (b) after every re-inpaint pass fails, be handed to the raster-slice floor."""
+    (b) after a short re-inpaint ladder fails, be cleared with a plate-colour fill while
+    the layer stays native TEXT (never force-rasterized by default)."""
     source = tmp_path / "source.png"
     _source(source)
     # 38 is 18 away from the ink colour (20): outside the source-match tolerance (12)
@@ -81,20 +82,56 @@ def test_smeared_ghost_is_flagged_and_forced_to_raster(tmp_path, monkeypatch):
 
     result = reconstruct.reconstruct(
         str(source), {"lines": []}, [_text_candidate()], str(tmp_path),
-        {"inpaint": {"mode": "opencv"}},
+        # Non-flat archetype + explicit reinpaint budget so we exercise the ladder,
+        # then solid-fill closer (Codia: keep native TEXT).
+        {"inpaint": {"mode": "opencv"},
+         "scene": {"archetype": "lifestyle_overlay"},
+         "reconstruct": {"text_residual": {"reinpaint_max_passes": 1}}},
     )
 
     residual = result["stats"]["text_residual"]
     assert residual["checked"] == 1
     assert residual["flagged"] and residual["flagged"][0]["id"] == "c_B0"
-    # Ink-colour proximity caught it even though it never matches source.
-    assert residual["flagged"][0]["resolved"] is False
-    assert residual["flagged"][0]["hard_fail"] is True
-    # It iterated (default 3 passes) instead of giving up after one.
-    assert residual["passes"] == 3
-    assert calls["repair"] == 3
-    # …and the unresolved editable text layer is queued for the raster-slice floor.
-    assert residual["force_raster_ids"] == ["c_B0"]
+    assert residual["passes"] == 1
+    assert calls["repair"] == 1
+    # Codia: solid plate fill clears the ghost; native TEXT stays (no force_raster).
+    assert residual["flagged"][0]["resolved"] is True
+    assert residual["flagged"][0].get("resolved_by") == "solid-plate-fill"
+    assert "c_B0" in (residual.get("solid_filled_ids") or [])
+    assert residual.get("force_raster_ids", []) == []
+
+
+def test_flat_ui_ghost_skips_reinpaint_and_solid_fills(tmp_path, monkeypatch):
+    """social_screenshot / product_on_flat: no generative reinpaint — solid fill first."""
+    source = tmp_path / "source.png"
+    _source(source)
+    calls = {"repair": 0}
+
+    def fake_once(image_path, mask, output_path, cfg=None):
+        Image.open(image_path).save(output_path)  # leave full residue
+        return {"ok": True, "path": output_path, "backend": "fake-noop",
+                "backend_class": "active"}
+
+    def fake_role_aware(image_path, masks, output_path, cfg=None):
+        calls["repair"] += 1
+        Image.open(image_path).save(output_path)
+        return {"ok": True, "backend": "fake-repair"}
+
+    monkeypatch.setattr(reconstruct.inpaint, "inpaint_once", fake_once)
+    monkeypatch.setattr(reconstruct.inpaint, "inpaint_role_aware", fake_role_aware)
+
+    result = reconstruct.reconstruct(
+        str(source), {"lines": []}, [_text_candidate()], str(tmp_path),
+        {"inpaint": {"mode": "opencv"},
+         "scene": {"archetype": "social_screenshot"}},
+    )
+    residual = result["stats"]["text_residual"]
+    assert residual["passes"] == 0
+    assert calls["repair"] == 0
+    assert residual.get("solid_fill_first") is True
+    assert residual["flagged"][0]["resolved"] is True
+    assert residual["flagged"][0].get("resolved_by") == "solid-plate-fill"
+    assert residual.get("force_raster_ids", []) == []
 
 
 def test_residue_resolved_on_a_later_pass_is_not_forced(tmp_path, monkeypatch):
@@ -121,7 +158,13 @@ def test_residue_resolved_on_a_later_pass_is_not_forced(tmp_path, monkeypatch):
 
     result = reconstruct.reconstruct(
         str(source), {"lines": []}, [_text_candidate()], str(tmp_path),
-        {"inpaint": {"mode": "opencv"}},
+        {"inpaint": {"mode": "opencv"},
+         "scene": {"archetype": "lifestyle_overlay"},
+         "reconstruct": {"text_residual": {
+             "solid_fill_first": False,
+             "reinpaint_max_passes": 3,
+             "solid_fill_residue": False,
+         }}},
     )
 
     residual = result["stats"]["text_residual"]
@@ -146,7 +189,9 @@ def test_reinpaint_can_be_disabled(tmp_path, monkeypatch):
     result = reconstruct.reconstruct(
         str(source), {"lines": []}, [_text_candidate()], str(tmp_path),
         {"inpaint": {"mode": "opencv"},
-         "reconstruct": {"text_residual": {"reinpaint": False}}},
+         "reconstruct": {"text_residual": {
+             "reinpaint": False, "solid_fill_residue": False,
+         }}},
     )
     residual = result["stats"]["text_residual"]
     assert residual["flagged"] and residual["flagged"][0]["resolved"] is False
@@ -154,7 +199,7 @@ def test_reinpaint_can_be_disabled(tmp_path, monkeypatch):
     assert residual["passes"] == 0
 
 
-# ── end-to-end: force_raster_ids drives the raster-slice floor ────────────────────────
+# ── end-to-end: readable TEXT is never force-sliced (Codia) ──────────────────────────
 
 
 def _build_text_run(tmp_path):
@@ -175,9 +220,9 @@ def _build_text_run(tmp_path):
     return source
 
 
-def test_audit_force_raster_ids_are_sliced_and_marked_resolved(tmp_path):
-    """The unresolved-ghost ids the audit persists must force a slice even when the
-    per-layer QA gate would otherwise pass, and the slice marks the flag resolved."""
+def test_force_raster_ids_cannot_slice_readable_text_by_default(tmp_path):
+    """Even a legacy force_raster_ids entry must NOT bake readable TEXT unless the
+    forensic text_slice_gate_enabled flag is on (wrong Inter beats baked pixels)."""
     source = _build_text_run(tmp_path)
     recon_path = os.path.join(str(tmp_path), "reconstruction.json")
     recon = load(recon_path)
@@ -189,7 +234,6 @@ def test_audit_force_raster_ids_are_sliced_and_marked_resolved(tmp_path):
     }
     dump(recon, recon_path)
 
-    # Fully permissive per-layer gate: nothing fails on its own merits.
     permissive = {"region_ssim_min": 0.0, "region_color_min": 0.0,
                   "text_ink_iou_min": 0.0, "text_ink_excess_max": 1e9}
     report = reconstruct.apply_raster_slice_fallback(
@@ -197,13 +241,18 @@ def test_audit_force_raster_ids_are_sliced_and_marked_resolved(tmp_path):
         {"inpaint": {"mode": "opencv"}, "fallback": dict(permissive)},
     )
 
-    assert [entry["id"] for entry in report["slices"]] == ["c_B0"]
-    assert report.get("residue_resolved_by_slice") == ["c_B0"]
-    # The persisted audit flag is now resolved (the slice IS the resolution), so QA's
-    # glyph-residue gate and repair's rebuild-clean-plate won't re-fire on it.
-    flag = load(recon_path)["stats"]["text_residual"]["flagged"][0]
-    assert flag["resolved"] is True
-    assert flag["resolved_by"] == "raster-slice"
+    assert report["slices"] == []
+    assert any(s.get("reason") == "codia-never-slice-readable-text"
+               for s in report.get("skipped") or [])
+    # Forensic opt-in still available for tooling.
+    forensic = dict(permissive)
+    forensic["text_slice_gate_enabled"] = True
+    report2 = reconstruct.apply_raster_slice_fallback(
+        str(tmp_path), str(source),
+        {"inpaint": {"mode": "opencv"}, "fallback": forensic},
+    )
+    assert [entry["id"] for entry in report2["slices"]] == ["c_B0"]
+    assert report2.get("residue_resolved_by_slice") == ["c_B0"]
 
 
 # ── per-candidate removal cap (plate over-destruction) ───────────────────────────────

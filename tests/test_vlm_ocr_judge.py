@@ -138,6 +138,27 @@ def test_passes_disagree_leaves_original(tmp_path, monkeypatch):
     assert out["vlm_ocr_judge"]["lines_disagreed"] == 1
 
 
+def test_passes_disagree_prefers_spaced_case_split(tmp_path, monkeypatch):
+    """Ad 013: VLM split on WeNEVER vs We NEVER — fall back to the spaced reading."""
+    monkeypatch.setattr(vlm_client, "multi_pass_answer", lambda *a, **k: (None, "vlm_disagreement"))
+    ocr_result = {
+        "lines": [_line("WeNEVER", meta={"disagreement": ["We NEVER", "WeNEVER"]})],
+    }
+    out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), ocr_result, _cfg())
+    assert out["lines"][0]["text"] == "We NEVER"
+    assert out["lines"][0]["meta"]["vlm_ocr_fallback"]["to"] == "We NEVER"
+
+
+def test_vlm_answer_collapses_repeated_tokens(tmp_path, monkeypatch):
+    """Ad 013: VLM invented ``do do this!`` from ``do1 this`` — hygiene collapses it."""
+    _mock_multi(monkeypatch, ["do do this!"])
+    ocr_result = {
+        "lines": [_line("do1 this", meta={"disagreement": ["do1 this", "do thisı"]})],
+    }
+    out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), ocr_result, _cfg())
+    assert out["lines"][0]["text"] == "do this!"
+
+
 def test_vlm_error_degrades_silently(tmp_path, monkeypatch):
     monkeypatch.setattr(vlm_client, "multi_pass_answer", lambda *a, **k: (None, "vlm_error"))
     ocr_result = {
@@ -285,3 +306,138 @@ def test_ocr_read_skips_regions_overlapping_existing_lines(tmp_path, monkeypatch
     }
     vlm_ocr_judge.judge_ocr_lines(img, ocr_result, _cfg(ocr_read=True))
     assert calls["n"] == 0
+
+
+def test_disagreement_max_lines_caps_vlm_calls(tmp_path, monkeypatch):
+    calls = []
+
+    def _capture(crop, prompt, **kwargs):
+        calls.append(prompt)
+        return "OK", None
+
+    monkeypatch.setattr(vlm_client, "multi_pass_answer", _capture)
+    lines = [
+        _line(
+            f"body {i}",
+            conf=0.9,
+            box={"x": i * 5, "y": 50, "w": 20, "h": 10},
+            meta={"disagreement": [f"body {i}", f"b0dy {i}"]},
+        )
+        for i in range(5)
+    ]
+    # Distinct ids so notes/assertions stay unambiguous.
+    for i, line in enumerate(lines):
+        line["id"] = f"B{i}"
+    out = vlm_ocr_judge.judge_ocr_lines(
+        _image(tmp_path),
+        {"lines": lines},
+        {"vlm": {"ocr_judge": {"enabled": True, "passes": 1, "max_lines": 2}}},
+    )
+    assert len(calls) == 2
+    assert out["vlm_ocr_judge"]["lines_checked"] == 2
+    assert out["vlm_ocr_judge"]["max_lines"] == 2
+
+
+def test_disagreement_priority_prefers_brand_price_cta(tmp_path, monkeypatch):
+    prompts = []
+
+    def _capture(crop, prompt, **kwargs):
+        prompts.append(prompt)
+        # Echo a reading that stays close enough to pass the novel-reading gate.
+        if "UPFRONT" in prompt:
+            return "UPFRONT", None
+        if "SAVE 30%" in prompt:
+            return "SAVE 30%", None
+        if "Shop now" in prompt:
+            return "Shop now", None
+        return "ingredients listed here", None
+
+    monkeypatch.setattr(vlm_client, "multi_pass_answer", _capture)
+    body = _line(
+        "ingredients listed here",
+        conf=0.5,
+        box={"x": 0, "y": 80, "w": 400, "h": 40},  # large but low-impact
+        meta={"disagreement": ["ingredients listed here", "ingredientz listed here"]},
+    )
+    body["id"] = "BODY"
+    brand = _line(
+        "UPFRONT",
+        conf=0.9,
+        box={"x": 10, "y": 10, "w": 80, "h": 24},
+        meta={"disagreement": ["UPFRONT", "UPFR0NT"]},
+    )
+    brand["id"] = "BRAND"
+    price = _line(
+        "SAVE 30%",
+        conf=0.9,
+        box={"x": 10, "y": 40, "w": 90, "h": 20},
+        meta={"disagreement": ["SAVE 30%", "SAVF 30%"]},
+    )
+    price["id"] = "PRICE"
+    cta = _line(
+        "Shop now",
+        conf=0.9,
+        box={"x": 10, "y": 60, "w": 70, "h": 18},
+        meta={"disagreement": ["Shop now", "Shop naw"]},
+    )
+    cta["id"] = "CTA"
+    # Body first in list order — without priority sort it would win the budget.
+    out = vlm_ocr_judge.judge_ocr_lines(
+        _image(tmp_path),
+        {"lines": [body, brand, price, cta]},
+        {"vlm": {"ocr_judge": {"enabled": True, "passes": 1, "max_lines": 3}}},
+    )
+    assert out["vlm_ocr_judge"]["lines_checked"] == 3
+    joined = "\n".join(prompts)
+    assert "UPFRONT" in joined
+    assert "SAVE 30%" in joined
+    assert "Shop now" in joined
+    assert "ingredients listed here" not in joined
+    by_id = {line["id"]: line for line in out["lines"]}
+    assert by_id["BODY"].get("vlm_ocr_judged") is not True
+    assert by_id["BRAND"].get("vlm_ocr_judged") is True
+    assert by_id["PRICE"].get("vlm_ocr_judged") is True
+    assert by_id["CTA"].get("vlm_ocr_judged") is True
+
+
+def test_disagreement_skips_already_numeric_verified(tmp_path, monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        vlm_client, "multi_pass_answer",
+        lambda *a, **k: called.append(1) or ("99", None),
+    )
+    line = _line(
+        "99",
+        meta={"disagreement": ["66", "99"]},
+    )
+    line["vlm_ocr_judged"] = True  # numeric_verify already settled this
+    out = vlm_ocr_judge.judge_ocr_lines(
+        _image(tmp_path),
+        {"lines": [line]},
+        _cfg(),
+    )
+    assert called == []
+    assert out["vlm_ocr_judge"]["lines_checked"] == 0
+
+
+def test_high_impact_heuristics():
+    assert vlm_ocr_judge._looks_like_price_or_offer("SAVE 30%")
+    assert vlm_ocr_judge._looks_like_price_or_offer("€49")
+    assert vlm_ocr_judge._looks_like_cta("Shop now")
+    assert vlm_ocr_judge._looks_like_cta("Get up to")
+    assert not vlm_ocr_judge._is_high_impact_text("ingredients listed here")
+    # Brand still wins via existing heuristic.
+    assert vlm_ocr_judge._is_high_impact_text("UPFRONT")
+
+
+def test_resolve_options_defaults_max_lines():
+    opts = vlm_ocr_judge._resolve_options({"vlm": {"ocr_judge": {"enabled": True}}})
+    assert opts["max_lines"] == vlm_ocr_judge._DEFAULT_MAX_DISAGREE_LINES
+    opts_null = vlm_ocr_judge._resolve_options(
+        {"vlm": {"ocr_judge": {"enabled": True, "max_lines": None}}},
+    )
+    assert opts_null["max_lines"] == vlm_ocr_judge._DEFAULT_MAX_DISAGREE_LINES
+    opts_zero = vlm_ocr_judge._resolve_options(
+        {"vlm": {"ocr_judge": {"enabled": True, "max_lines": 0}}},
+    )
+    assert opts_zero["max_lines"] == 0

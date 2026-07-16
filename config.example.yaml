@@ -10,6 +10,23 @@ archetype:
   # text_backplate_count, column_count, center_divider, leader_lines, product_count.
   observations: {}
 
+# Format readiness (docs/FORMAT-READINESS.md): aspect classes + capability flags.
+# Do NOT add dozens of named presets for stories/feed/UGC/testimonials — override
+# capabilities or tag fixtures in <input_dir>/format_index.json instead.
+format:
+  # Optional hard overrides (bool). Omitted keys keep inferred values.
+  # capabilities:
+  #   text_plates: true
+  #   ui_chrome: false
+  #   caption_stack: true
+  #   flat_plate: true
+  #   cutouts: true
+  #   diagrams: false
+  #   gradients: false
+  #   comparison_columns: false
+  #   icons_as_chips: true
+  tags: []            # soft boosts: ugc, testimonial, caption_pill, before_after, …
+
 # Gemma 4 e4b is part of the RTX quality path: proofread OCR, classify layout context,
 # arbitrate uncertain segments, and propose visual elements before geometric refinement.
 # misreads (stylized ad type, small/dense labels) that OCR confidence alone can't flag as
@@ -19,6 +36,9 @@ vlm:
   enabled: true
   base_url: http://127.0.0.1:1234/v1
   model: google/gemma-4-e4b
+  # Concurrent independent crop requests against LM Studio continuous batching
+  # (typically parallel: 4). Set to 1 to force sequential (debug / A/B).
+  parallelism: 4
   timeout_s: 30                        # bounded per request; stages fall back safely on a timeout
   max_tokens: 1024                     # enough room for Gemma reasoning + final structured output
   confidence_threshold: 0.85           # only lines below this OCR confidence get checked
@@ -36,7 +56,11 @@ vlm:
     enabled: true
     passes: 2                         # both passes must agree before text is replaced
     padding: 3
-    max_lines: null                     # cap disagreement judgements per run
+    # Cap disagreement judgements (mirrors proofread.max_regions). Dense ad 002
+    # spent ~223s VLM-judging 72 OCR lines; many never become editable layers.
+    # Lines are priority-sorted (brand / price / CTA / large area) before the
+    # cap. Does not weaken numeric_verify or font_judge. null → code default 12.
+    max_lines: 12
     allow_novel_reading: false          # reject unrelated crop text instead of inventing a third reading
     min_reading_similarity: 0.55        # permits likely OCR corrections but rejects unrelated answers
     ocr_read:                           # optional grid scan for text all engines missed
@@ -46,6 +70,15 @@ vlm:
       max_image_pixels: 4000000         # skip ocr_read when canvas exceeds this
       max_regions: 8
       passes: 2
+    # Optional single-engine / brand-token proofread (separate from disagreement).
+    # One pass: ensemble already reconciles; 2nd pass added ~15s/image for little gain.
+    # proofread:
+    #   enabled: true
+    #   max_conf: 0.80
+    #   brand_tokens: true
+    #   max_regions: 8
+    #   passes: 1
+    #   min_similarity: 0.6
   font_judge:                        # optional VLM re-rank after local font matching
     enabled: true
     score_threshold: 7                # 0-10; below this tries the next candidate (max 3)
@@ -104,6 +137,7 @@ runtime:
     empty_cache_between_stages: true  # gc + torch.cuda.empty_cache(); default true when device=cuda
     evict_vlm_for_inpaint: true       # unload the LM Studio VLM for the Flux inpaint stage
     reload_vlm_after_inpaint: true     # reload it once inpaint completes (default: = evict flag)
+    lazy_flux_prep: true              # defer unload/quant until a region routes to flux-comfy
     # vlm_reload_ttl_s: 0             # optional TTL passed to `lms load --ttl`
     # lms_path: ""                    # optional explicit path to the LM Studio `lms` CLI
 
@@ -146,6 +180,12 @@ sam3:
   box_refine_confidence: 0.32         # lower bar for geometric refine when residuals exist
   resolution: 1008
   compile: false
+  # Skip synonym text-prompts for a role once enough high-score hits exist
+  # (e.g. skip "product package" after "product" already found 2).
+  role_prompt_early_exit:
+    enabled: true
+    min_hits: 2
+    min_score: 0.55
   # Every residual proposal is also box-refined; prompts find missed semantic elements.
   prompts:
     - {prompt: person, role: person, kind: photo-fragment}
@@ -216,6 +256,12 @@ vectorize:
     chip: 0.80
     mask: 0.78
     shape: 0.88
+    # Chart/diagram marks (semi-editable path); fail → exact raster, never invent geometry
+    axis: 0.80
+    gridline: 0.80
+    plot-line: 0.80
+    data-point: 0.80
+    chart-bar: 0.82
   max_paths:                           # role-based complexity cap
     default: 40
     icon: 60
@@ -225,6 +271,11 @@ vectorize:
     chip: 35
     mask: 20
     shape: 45
+    axis: 8
+    gridline: 8
+    plot-line: 16
+    data-point: 12
+    chart-bar: 8
   vtracer_presets:                     # tried in order before potrace / contour fallback
     - {mode: spline, colormode: color, hierarchical: stacked, filter_speckle: 4}
     - {mode: spline, colormode: color, hierarchical: cutout, filter_speckle: 2}
@@ -268,8 +319,9 @@ inpaint:
     # Route by local background complexity. Flat/low-entropy holes -> analytic plate model
     # or Big-LaMa; only complex/photographic local backgrounds -> Flux Fill. Diffusion Fill
     # hallucinates objects into large plain-background holes (RePainter, OmniPaint 2025-26)
-    # while LaMa interpolates flat/gradient plates cleanly at ~50x the speed. Text holes
-    # always stay on Big-LaMa. Set true to force every non-text hole to Flux.
+    # while LaMa interpolates flat/gradient plates cleanly at ~50x the speed. Text / badge /
+    # chip / UI chrome holes stay off Flux. Flat archetypes get a looser analytic gate for
+    # UI chrome (ui_analytic_*). Set true to force every non-blocked hole to Flux.
     force_flux: false
     min_context: 64
     max_context: 96
@@ -286,9 +338,12 @@ inpaint:
     dominant_plate_tolerance: 12
     flat_residual_p90: 10
     flat_gradient_p90: 10
+    ui_analytic_residual_p90: 25
+    ui_analytic_dominant_fraction: 0.40
+    ui_analytic_max_canvas_fraction: 0.35
     flux_residual_p90: 18
     flux_gradient_p90: 18
-    flux_max_canvas_fraction: 0.025     # never ask Flux to invent a large product/text hole
+    flux_max_canvas_fraction: 0.045     # photo holes up to ~4.5% canvas may use Flux
     photo_prompt: ""                    # photo holes: let Fill dev inpaint from context
     plate_prompt: "clean plain seamless background, empty, no text, no objects"
     nested_containment: 0.88
@@ -397,3 +452,39 @@ peel:
   text_occluders: box
   refine_alpha: false
   refine_band_px: 3
+  require_eligible: true
+  min_cc_frac: 0.85
+  max_hole_frac: 0.25
+  max_components: 24
+  context_shadow_px: 12
+  flat_fill_tol: 8.0          # 0 disables; solid-median fast path for card/plate holes
+  flat_fill_inlier_frac: 0.60
+  flat_fill_ring_px: 16
+  flat_fill_min_px: 40
+  flat_fill_min_visible_frac: 0.12  # thin-rim guard (016); cards under products stay above
+  flat_fill_max_area: 0           # 0 = no cap; solid cards under large products may flat-fill
+  flat_fill_max_frac: 0.0         # 0 = no cap; photo kinds denied
+  flat_fill_allow_background: true
+  flat_fill_bg_max_area: 250000
+  flat_fill_bg_max_frac: 0.55
+  flat_fill_text: true
+  text_hole_dilate_px: 4
+  fill_cc_split: true
+  fill_cc_min_area: 64
+  inpaint_feather_px: 2
+  per_occluder_area: 6000     # element-class holes ≥ this get their own inpaint call
+  abandon_hole_frac: 0.15
+  abandon_photo_min_area: 12000
+  max_generative_photo_hole_px: 8000
+  allow_flux: true            # Flux Fill for mid/large photo holes (VRAM-cleared)
+  flux_min_hole_px: 4000
+  flux_max_hole_px: 220000
+  large_photo_hole: bake      # bake | abandon past flux_max
+  context_pad_large_px: 64
+  photo_context_shadow_px: 4
+  fail_closed_to_flat: true   # if LaMa smears worse than solid ring → keep solid
+  fail_closed_residue: 8.0
+  punch_text_into_photos: false
+  punch_artwork_into_photos: false
+  text_inpaint: telea         # telea | lama — text-occluder fills (never Flux)
+  telea_max_hole_px: 2500     # non-text holes below this use Telea too

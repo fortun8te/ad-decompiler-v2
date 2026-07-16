@@ -23,6 +23,22 @@ _DEFAULT_GRID_COLS = 4
 _DEFAULT_GRID_ROWS = 4
 _DEFAULT_MAX_IMAGE_PIXELS = 4_000_000
 _DEFAULT_MAX_OCR_READ_REGIONS = 8
+# Disagreement arbitration budget — mirrors proofread.max_regions. Dense ads
+# (session 002: 72 OCR lines, ~223s VLM) waste most of an uncapped pass on
+# body/microcopy; high-impact lines are sorted first, then this cap applies.
+_DEFAULT_MAX_DISAGREE_LINES = 12
+
+# High-impact copy heuristics (aligned with text_analysis CTA/price/offer cues).
+_CTA_RE = re.compile(
+    r"\b(shop|buy|order|get|try|learn|discover|download|book|join|start|sign up|"
+    r"subscribe|claim|apply|contact|swipe|tap|click)(\s+now|\s+today)?\b",
+    re.IGNORECASE,
+)
+_PRICE_OR_OFFER_RE = re.compile(
+    r"(?:[$€£¥]\s?\d|\d(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|dollars?|euros?)"
+    r"|\b\d{1,3}\s?%|\bsave\b|\boff\b|\bfree\b)",
+    re.IGNORECASE,
+)
 
 _DISAGREE_PROMPT_HEAD = (
     "This crop contains exactly ONE line of text from an ad. OCR engines read it "
@@ -101,6 +117,73 @@ def _looks_like_brand_token(text: str) -> bool:
         return False
     uppercase = sum(1 for char in letters if char.isupper())
     return uppercase / len(letters) >= 0.8
+
+
+def _looks_like_price_or_offer(text: str) -> bool:
+    """Currency, percent-off, or SAVE/OFF/FREE phrasing — high-impact marketing copy."""
+    return bool(_PRICE_OR_OFFER_RE.search(str(text or "")))
+
+
+def _looks_like_cta(text: str) -> bool:
+    """CTA verb phrases (Shop now / Get / Claim / …) worth prioritizing for arbitration."""
+    return bool(_CTA_RE.search(str(text or "")))
+
+
+def _is_high_impact_text(text: str) -> bool:
+    return (
+        _looks_like_brand_token(text)
+        or _looks_like_price_or_offer(text)
+        or _looks_like_cta(text)
+    )
+
+
+def _disagreement_priority(line: dict) -> tuple:
+    """Sort key for capped disagreement arbitration (lower = sooner).
+
+    Mirrors proofread's brand-then-area ordering, plus price/offer/CTA elevation.
+    Fused text *and* engine readings are scanned so a garbage primary reading
+    still ranks high when a challenger saw brand/price/CTA copy.
+    """
+    text = str(line.get("text") or "")
+    readings = _engine_readings(line)
+    impact = 0 if (
+        _is_high_impact_text(text)
+        or any(_is_high_impact_text(reading) for reading in readings)
+    ) else 1
+    box = line.get("box") or {}
+    visual_area = float(box.get("w", 0) or 0) * float(box.get("h", 0) or 0)
+    # Prefer larger (more prominent) lines and wider engine splits next.
+    return (impact, -visual_area, -len(readings), float(line.get("conf", 1.0) or 0.0))
+
+
+def _cleanup_text(text: str) -> str:
+    """Lazy OCR hygiene (case-smash + repeated tokens) without importing heavy OCR deps at module load."""
+    from src.ocr import cleanup_line_text
+
+    return cleanup_line_text(text)
+
+
+def _deterministic_reading_fallback(original: str, readings: list[str]) -> str | None:
+    """When VLM passes disagree, prefer a spaced/cleaned engine reading over a smashed primary.
+
+    Ad 013: doctr ``WeNEVER`` vs easyocr ``We NEVER`` — VLM split on the two forms and left
+    the smashed winner. Cleanup alone after a later stage is enough for smash, but preferring
+    the already-spaced reading keeps provenance honest when arbitration aborts.
+    """
+    original = str(original or "")
+    cleaned_original = _cleanup_text(original)
+    spaced = [
+        str(reading)
+        for reading in readings
+        if str(reading) and (" " in str(reading)) and (" " not in original)
+        and _cleanup_text(str(reading)) == cleaned_original
+    ]
+    if spaced:
+        # Prefer the spaced form that hygiene would emit.
+        return max(spaced, key=lambda value: (value == cleaned_original, len(value)))
+    if cleaned_original and cleaned_original != original:
+        return cleaned_original
+    return None
 
 
 def _engine_readings(line: dict) -> list[str]:
@@ -189,6 +272,10 @@ def _resolve_options(cfg: dict) -> dict:
     read = _ocr_read_cfg(cfg)
     proof = _proofread_cfg(cfg)
     passes = int(merged.get("passes") or _DEFAULT_PASSES)
+    # Cap disagreement judgements like proofread.max_regions. Explicit 0 disables
+    # the path; omit/null falls back to the session-tuned default (not unlimited).
+    raw_max_lines = merged.get("max_lines", _DEFAULT_MAX_DISAGREE_LINES)
+    max_lines = _DEFAULT_MAX_DISAGREE_LINES if raw_max_lines is None else int(raw_max_lines)
     return {
         "base_url": str(merged.get("base_url") or vlm_client._DEFAULT_BASE_URL),
         "model": str(merged.get("model") or vlm_client._DEFAULT_MODEL),
@@ -196,7 +283,8 @@ def _resolve_options(cfg: dict) -> dict:
         "max_tokens": int(merged.get("max_tokens") or _DEFAULT_MAX_TOKENS),
         "padding": int(merged.get("padding") if merged.get("padding") is not None else _DEFAULT_PADDING),
         "passes": passes,
-        "max_lines": merged.get("max_lines"),
+        "max_lines": max_lines,
+        "parallelism": vlm_client.parallelism_from_cfg(cfg),
         "allow_novel_reading": bool(merged.get("allow_novel_reading", False)),
         "min_reading_similarity": float(merged.get("min_reading_similarity", .55)),
         "ocr_read_enabled": bool(read.get("enabled", False)),
@@ -223,21 +311,28 @@ def _judge_disagreements(
     lines: list[dict],
     options: dict,
 ) -> tuple[int, int, int, int, list[dict]]:
-    candidates = [ln for ln in lines if ln.get("box") and _has_disagreement(ln)]
+    # Skip lines already settled by numeric_verify (or a prior judge pass).
+    candidates = [
+        ln for ln in lines
+        if ln.get("box") and _has_disagreement(ln) and not ln.get("vlm_ocr_judged")
+    ]
+    # Spend the bounded budget on brand / price / CTA / large lines first —
+    # same lesson as proofread.max_regions priority sorting.
+    candidates.sort(key=_disagreement_priority)
     max_lines = options["max_lines"]
-    if max_lines is not None:
+    if max_lines is not None and max_lines >= 0:
         candidates = candidates[: int(max_lines)]
 
     checked = corrected = disagreements = errors = 0
     notes: list[dict] = []
-    for line in candidates:
+
+    def _one(line: dict):
         readings = _engine_readings(line)
         crop = vlm_client.crop_box_bytes(image, line["box"], options["padding"])
         if crop is None:
-            continue
+            return None
         wider_crop = vlm_client.crop_box_bytes(image, line["box"], options["padding"] + 2)
         crop_variants = [crop] + ([wider_crop] if wider_crop and wider_crop != crop else [])
-        checked += 1
         answer, note = vlm_client.multi_pass_answer(
             crop,
             _disagreement_prompt(readings),
@@ -248,8 +343,50 @@ def _judge_disagreements(
             passes=options["passes"],
             crop_variants=crop_variants,
         )
-        original = str(line.get("text", ""))
+        return {
+            "line": line,
+            "readings": readings,
+            "crop_variants": len(crop_variants),
+            "answer": answer,
+            "note": note,
+            "original": str(line.get("text", "")),
+        }
+
+    for result in vlm_client.map_parallel(
+        _one, candidates, workers=options.get("parallelism", 1)
+    ):
+        if result is None:
+            continue
+        line = result["line"]
+        readings = result["readings"]
+        answer = result["answer"]
+        note = result["note"]
+        original = result["original"]
+        checked += 1
         if note == "vlm_disagreement":
+            fallback = _deterministic_reading_fallback(original, readings)
+            if fallback and fallback != original:
+                line["ocr_text"] = original
+                line["text"] = fallback
+                corrected += 1
+                meta = copy.deepcopy(line.get("meta") or {})
+                meta.pop("disagreement", None)
+                meta["vlm_ocr_fallback"] = {
+                    "reason": "vlm_disagreement_deterministic",
+                    "from": original,
+                    "to": fallback,
+                    "readings": readings,
+                }
+                line["meta"] = meta
+                line["vlm_ocr_judged"] = True
+                notes.append({
+                    "line_id": line.get("id"),
+                    "note": "vlm_disagreement_fallback",
+                    "readings": readings,
+                    "ocr_text": original,
+                    "fallback": fallback,
+                })
+                continue
             disagreements += 1
             notes.append({
                 "line_id": line.get("id"),
@@ -263,6 +400,8 @@ def _judge_disagreements(
             notes.append({"line_id": line.get("id"), "note": "vlm_error", "ocr_text": original})
             continue
         if answer is not None and _looks_plausible(original, answer):
+            # Hygiene after VLM: collapse ``do do this!`` and un-smash ``WeNEVER``.
+            answer = _cleanup_text(answer)
             normalized_answer = answer.casefold().strip()
             similarity = max((SequenceMatcher(None, normalized_answer, reading.casefold().strip()).ratio()
                               for reading in readings), default=0.0)
@@ -280,7 +419,7 @@ def _judge_disagreements(
             meta = copy.deepcopy(line.get("meta") or {})
             meta.pop("disagreement", None)
             meta["vlm_ocr_consensus"] = {"answer": answer, "passes": options["passes"],
-                                         "crop_variants": len(crop_variants),
+                                         "crop_variants": result["crop_variants"],
                                          "reading_similarity": round(similarity, 4)}
             line["meta"] = meta
     return checked, corrected, disagreements, errors, notes
@@ -326,13 +465,14 @@ def _judge_uncertain(
 
     checked = corrected = errors = 0
     notes: list[dict] = []
-    for line, brandish in candidates:
+
+    def _one(pair):
+        line, brandish = pair
         crop = vlm_client.crop_box_bytes(image, line["box"], options["padding"])
         if crop is None:
-            continue
+            return None
         wider_crop = vlm_client.crop_box_bytes(image, line["box"], options["padding"] + 2)
         crop_variants = [crop] + ([wider_crop] if wider_crop and wider_crop != crop else [])
-        checked += 1
         answer, note = vlm_client.multi_pass_answer(
             crop,
             _PROOFREAD_PROMPT,
@@ -343,7 +483,25 @@ def _judge_uncertain(
             passes=options["proofread_passes"],
             crop_variants=crop_variants,
         )
-        original = str(line.get("text", ""))
+        return {
+            "line": line,
+            "brandish": brandish,
+            "answer": answer,
+            "note": note,
+            "original": str(line.get("text", "")),
+        }
+
+    for result in vlm_client.map_parallel(
+        _one, candidates, workers=options.get("parallelism", 1)
+    ):
+        if result is None:
+            continue
+        line = result["line"]
+        brandish = result["brandish"]
+        answer = result["answer"]
+        note = result["note"]
+        original = result["original"]
+        checked += 1
         if note == "vlm_error":
             errors += 1
             notes.append({"line_id": line.get("id"), "note": "vlm_error", "ocr_text": original})
@@ -353,6 +511,7 @@ def _judge_uncertain(
             continue
         if answer is None or not _looks_plausible(original, answer):
             continue
+        answer = _cleanup_text(answer)
         similarity = SequenceMatcher(
             None, answer.casefold().strip(), original.casefold().strip()
         ).ratio()
@@ -392,11 +551,12 @@ def _ocr_read_missed(
 
     added = checked = errors = 0
     new_lines: list[dict] = []
-    for index, box in enumerate(missed):
+
+    def _one(pair):
+        index, box = pair
         crop = vlm_client.crop_box_bytes(image, box, 0)
         if crop is None:
-            continue
-        checked += 1
+            return None
         answer, note = vlm_client.multi_pass_answer(
             crop,
             _OCR_READ_PROMPT,
@@ -406,20 +566,30 @@ def _ocr_read_missed(
             max_tokens=options["max_tokens"],
             passes=options["ocr_read_passes"],
         )
+        return {"index": index, "box": box, "answer": answer, "note": note}
+
+    for result in vlm_client.map_parallel(
+        _one, list(enumerate(missed)), workers=options.get("parallelism", 1)
+    ):
+        if result is None:
+            continue
+        checked += 1
+        note = result["note"]
+        answer = result["answer"]
         if note:
             if note == "vlm_error":
                 errors += 1
             continue
         if not answer or not _looks_plausible("", answer, max_len_factor=6.0):
             continue
-        line_id = f"vlm-read-{index}"
+        line_id = f"vlm-read-{result['index']}"
         new_lines.append({
             "id": line_id,
             "text": answer,
             "conf": 0.55,
-            "box": copy.deepcopy(box),
-            "meta": {"source": "vlm_ocr_read", "vlm_ocr_read": True},
+            "box": result["box"],
             "vlm_ocr_read": True,
+            "meta": {"source": "vlm-ocr-read"},
         })
         added += 1
     return checked, added, errors, new_lines
@@ -463,11 +633,18 @@ def judge_ocr_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
         )
         lines.extend(new_lines)
 
+    # Final hygiene pass: VLM answers and untouched lines both get case-smash /
+    # repeated-token cleanup so ad-013 style ``WeNEVER`` / ``do do this!`` cannot ship.
+    from src.ocr import _apply_line_text_cleanup
+
+    lines = _apply_line_text_cleanup(lines)
+
     result = dict(ocr_result)
     result["lines"] = lines
     result["vlm_ocr_judge"] = {
         "model": options["model"],
         "passes": options["passes"],
+        "max_lines": options["max_lines"],
         "lines_checked": checked,
         "lines_corrected": corrected,
         "lines_disagreed": disagreements,

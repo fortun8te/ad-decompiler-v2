@@ -209,25 +209,39 @@ contract, but the win waits on panel-level detection).
 
 ### 4b. Fill quality (what makes the revealed hole clean)
 
+**Strategy ladder (archetype-aware — not just mask tweaks):**
+
+| Hole class | `product_on_flat` / UI / `social_screenshot` | `lifestyle_overlay` / photo |
+|---|---|---|
+| Shape/card/panel under objects | **Solid/analytic** ring median | Solid if ring flat, else LaMa |
+| Background plate | **Solid** per-CC when ring agrees (orange/white chrome) | LaMa (or abandon) |
+| Photo/product under | Abandon if hole ≫ mask; else LaMa | Same |
+| Text occluder on plate | Solid when ring flat | LaMa / Telea |
+| Text/logo on product cutout | **Do not punch** (printed ink stays) | Same |
+| Flux | **Never** at peel (VRAM + smear) | Never |
+
+Fail-closed: after LaMa/Telea, if the fill's mean deviation from the solid ring
+candidate exceeds `peel.fail_closed_residue`, keep the solid plate instead of smear.
+
 * **Shadow blinding** (`context_shadow_px`, 12): occluder drop shadows / AA halos live
   just OUTSIDE the detection mask, survive into the visible-context ring, and smear
   gray into any inpaint (the 002 gray-gradient ghosts). The band around the hole is
   masked unknown for the fill call — but never written back.
 * **Robust flat-fill** (`flat_fill_tol`, 8): sample a ring beyond the shadow band; if
   ≥ `flat_fill_inlier_frac` of ring pixels sit within ±tol of the ring median, the
-  surface is flat — fill with the inlier median. Crisper than any inpainter on
-  cards/plates, immune to minority contamination (shadows, seams, adjacent color
-  bands) that inflates a naive std. Element-class holes only: text holes are small and
-  often sit on gradients where a global median leaves a tone-mismatched fringe — the
-  router's LaMa preserves local shading there.
+  surface is flat — fill with the inlier median. Thin-rim guard
+  (`flat_fill_min_visible_frac`) blocks the 016 "paint whole plate beige" failure.
+  Background flat-fill is enabled for flat-plate archetypes (or
+  `flat_fill_allow_background: true`).
+* **Fragmentation guard**: `min_cc_frac` (0.85) + `max_components` (24) — residual
+  swiss-cheese masks cannot activate peel.
+* **Peel objects only**: logos/wordmarks do not activate the gate; OCR/artwork do not
+  punch product cutouts.
 * **z-order role bands** (`_band_of`): fusion tags product/person cutouts
   `kind="photo-fragment"` (band 5) while the detector role-tags them `product`/`person`
-  (band 20); the band is the MAX of both, otherwise the card an element sits ON is
-  treated as its occluder (inverted z — 002 originally "filled" every product fully
-  under its own card).
-* **LaMa over Telea**: `scripts/peel_scene_demo.py --inpaint auto` (default) uses
-  Big-LaMa (CPU) when importable; the pipeline adapter routes through the entropy
-  ladder with text pinned to LaMa. Telea remains the zero-dep test default.
+  (band 20); the band is the MAX of both.
+* **LaMa / Telea, never Flux**: pipeline `_peel_inpaint` pins large holes to LaMa and
+  tiny/text holes to Telea.
 
 Config (all optional; `enabled` gates the pipeline stage, the module itself ignores it):
 

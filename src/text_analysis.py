@@ -495,14 +495,95 @@ def _stroke_from_mask(crop, mask) -> Optional[tuple[dict, str]]:
     consistency = float(np.median(np.abs(rim_pixels - rim_rgb), axis=0).mean())
     if consistency > _STROKE_MAX_RIM_STD:
         return None
-    return {"kind": "flat", "color": _rgb_hex(rim_rgb), "width": round(float(boundary_depth), 1)}, _rgb_hex(interior_rgb)
+    # Cap outline width so a thick band cannot plate over the glyph fill in Figma.
+    # Authored outlines sit outside the fill; CENTER/INSIDE covers letters.
+    width = round(min(float(boundary_depth), 8.0), 1)
+    fill_hex = _rgb_hex(interior_rgb)
+    stroke_hex = _rgb_hex(rim_rgb)
+    # Thin bands need a stronger fill↔stroke split; weak jumps are almost always AA.
+    if width <= 2.0 and _colour_distance(stroke_hex, fill_hex) < _STROKE_COLOR_DISTANCE + 20:
+        return None
+    return {
+        "kind": "flat",
+        "color": stroke_hex,
+        "width": width,
+        "align": "OUTSIDE",
+        "strokeAlign": "OUTSIDE",
+    }, fill_hex
+
+
+def _shadow_from_mask(crop, mask) -> Optional[dict]:
+    """Detect an authored *offset* drop-shadow under glyph ink.
+
+    Ink isolation usually absorbs the dark satellite into the same mask as the
+    fill, so concentric outline logic cannot see it. Split ink by luminance into
+    a bright fill cluster and a darker satellite; when the dark centroid is
+    clearly shifted (and not a concentric outline ring), emit a DROP_SHADOW.
+    Fail closed on unimodal ink, busy plates, and near-zero offsets.
+    """
+    import numpy as np
+
+    m = np.asarray(mask).astype(bool)
+    total = int(m.sum())
+    if total < 80 or min(m.shape) < 12:
+        return None
+    outside = ~m
+    if int(outside.sum()) < 30:
+        return None
+    bg_samples = crop[outside].astype(np.float32)
+    if float(np.max(np.std(bg_samples, axis=0))) > 36.0:
+        return None
+    lum = crop.astype(np.float32).mean(axis=2)
+    ink_lum = lum[m]
+    if ink_lum.size < 80:
+        return None
+    p20, p50, p80 = np.percentile(ink_lum, [20, 50, 80])
+    # Need a real light/dark split inside the ink (fill vs shadow), not AA noise.
+    if float(p80 - p20) < 55.0:
+        return None
+    split = float((p20 + p80) / 2.0)
+    dark = m & (lum <= split)
+    bright = m & (lum >= max(split, p50))
+    dark_n, bright_n = int(dark.sum()), int(bright.sum())
+    if dark_n < max(24, int(total * 0.12)) or bright_n < max(24, int(total * 0.18)):
+        return None
+    # Shadow satellite should not dominate the glyph fill.
+    if dark_n > bright_n * 1.35:
+        return None
+    ys_d, xs_d = np.nonzero(dark)
+    ys_b, xs_b = np.nonzero(bright)
+    dx = float(xs_d.mean() - xs_b.mean())
+    dy = float(ys_d.mean() - ys_b.mean())
+    if abs(dx) < 2.0 and abs(dy) < 2.0:
+        return None
+    if abs(dx) > 24.0 or abs(dy) > 24.0:
+        return None
+    dark_rgb = np.median(crop[dark].astype(np.float32), axis=0)
+    bright_rgb = np.median(crop[bright].astype(np.float32), axis=0)
+    # Dark cluster must actually be darker / distinct from the fill.
+    if float(np.mean(dark_rgb)) >= float(np.mean(bright_rgb)) - 25.0:
+        return None
+    if float(np.linalg.norm(dark_rgb - bright_rgb)) < 40.0:
+        return None
+    opacity = max(0.22, min(0.72, (255.0 - float(np.mean(dark_rgb))) / 255.0 * 0.85))
+    radius = max(2.0, min(14.0, 0.55 * (abs(dx) + abs(dy)) + 1.5))
+    return {
+        "type": "DROP_SHADOW",
+        "color": _rgb_hex(dark_rgb),
+        "opacity": round(opacity, 3),
+        "offset": {"x": int(round(dx)), "y": int(round(dy))},
+        "radius": round(radius, 2),
+        "spread": 0.0,
+        "visible": True,
+    }
 
 
 def _paint_from_mask(crop, mask, fallback_hex: str) -> dict:
-    """Best-effort fill/stroke description for the painted ink, in addition to the
+    """Best-effort fill/stroke/effect description for the painted ink, in addition to the
     single flattened colour used elsewhere for backward compatibility."""
     fill = {"kind": "flat", "color": fallback_hex}
     stroke = None
+    effects: list[dict] = []
     gradient = _dominant_axis_gradient(crop, mask)
     if gradient is not None:
         fill = gradient
@@ -511,7 +592,27 @@ def _paint_from_mask(crop, mask, fallback_hex: str) -> dict:
         stroke, interior_hex = stroke_result
         if gradient is None:
             fill = {"kind": "flat", "color": interior_hex}
-    return {"fill": fill, "stroke": stroke}
+    else:
+        # Only hunt for offset shadows when there is no concentric outline band —
+        # outline + shadow double-counting invents noisy Figma effects.
+        shadow = _shadow_from_mask(crop, mask)
+        if shadow is not None:
+            effects.append(shadow)
+            # Shadow satellites pollute axis gradients; keep a flat fill from the
+            # bright ink cluster so the glyph colour stays readable.
+            try:
+                import numpy as np
+
+                lum = crop.astype(np.float32).mean(axis=2)
+                bright = mask & (lum >= float(np.percentile(lum[mask], 60)))
+                if bright.any():
+                    fill = {
+                        "kind": "flat",
+                        "color": _rgb_hex(np.median(crop[bright].astype(np.float32), axis=0)),
+                    }
+            except Exception:
+                pass
+    return {"fill": fill, "stroke": stroke, "effects": effects}
 
 
 def _measure_shear_angle(mask) -> Optional[float]:
@@ -706,7 +807,10 @@ def _estimate_weight(mask, painted_box: dict) -> int:
     except Exception:
         return 400
     # Density alone is intentionally conservative; exact weight is resolved by
-    # the later Figma render-fit loop.
+    # the later Figma render-fit loop. Near-solid ink maps to ExtraBold (800) so
+    # UI chrome like Codia's "Post" (Inter ExtraBold) is not stuck at Bold 700.
+    if density >= 0.58:
+        return 800
     if density >= 0.46:
         return 700
     if density >= 0.34:
@@ -717,7 +821,9 @@ def _estimate_weight(mask, painted_box: dict) -> int:
 
 
 def _style_name(weight: int, italic: bool = False) -> str:
-    if weight >= 700:
+    if weight >= 800:
+        base = "Extra Bold"
+    elif weight >= 700:
         base = "Bold"
     elif weight >= 600:
         base = "Semi Bold"
@@ -775,8 +881,31 @@ def _fit_font(style: dict, font_size: float):
     except Exception:
         return None
     candidates = style.get("fontCandidates") or []
-    paths = [c.get("path") for c in candidates
-             if isinstance(c, dict) and c.get("path") and os.path.exists(c["path"])]
+    try:
+        target_weight = float(style.get("fontWeight") or 400)
+    except (TypeError, ValueError):
+        target_weight = 400.0
+    usable = [
+        c for c in candidates
+        if isinstance(c, dict) and c.get("path") and os.path.exists(c["path"])
+    ]
+
+    def _cand_weight(candidate: dict) -> float:
+        try:
+            return float(candidate.get("weight") or 400)
+        except (TypeError, ValueError):
+            return 400.0
+
+    # Prefer a file whose weight matches the declared node weight; a Regular path
+    # must not measure Bold text (weight-split siblings inherit the parent list).
+    usable.sort(key=lambda c: abs(_cand_weight(c) - target_weight))
+    paths = []
+    for candidate in usable:
+        if abs(_cand_weight(candidate) - target_weight) <= 150:
+            paths.append(candidate["path"])
+    if target_weight >= 600:
+        paths += ["arialbd.ttf"]
+    paths += [c["path"] for c in usable if c["path"] not in paths]
     paths += ["arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
     size = max(1, int(round(font_size)))
     for path in paths:
@@ -872,7 +1001,7 @@ def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
         # Keeping that absolute value after shrinking a substitute font is a common
         # source of clipped final lines in both the preview and Figma.
         if line_count > 1:
-            patch["lineHeight"] = round(max(new_size, line_height * target_scale), 2)
+            patch["lineHeight"] = round(max(new_size * 1.12, line_height * target_scale), 2)
 
     # At very small sizes Pillow rounds to whole-pixel font sizes, so the linear estimate
     # can still overshoot by a pixel.  A short bounded refinement keeps the contract exact
@@ -886,6 +1015,12 @@ def fit_text_box(text: str, style: dict, box: dict) -> tuple[dict, str, dict]:
         ratio = max(0.5, min(0.99, avail_w / max(1.0, current)))
         new_size = max(1.0, effective_size * ratio)
         patch["fontSize"] = round(new_size, 2)
+
+    # Hard floor: lineHeight must never sit below fontSize (preview/Figma clip ascenders).
+    effective_size = float(patch.get("fontSize", font_size) or font_size)
+    effective_lh = float(patch.get("lineHeight", line_height) or line_height)
+    if effective_size > 0 and effective_lh < effective_size * 1.05:
+        patch["lineHeight"] = round(effective_size * 1.12, 2)
 
     # Emit the tracking policy explicitly so preview, plugin and parity all read 0.
     if _num(style.get("letterSpacing"), 0.0) != 0.0:
@@ -1764,10 +1899,13 @@ def _base_style(line: dict, painted: dict, colour: str, ink_confidence: float,
         "colorRGB": list(_hex_rgb(colour)),
         "align": "LEFT",
         "lineHeight": round(max(font_size * 1.15, painted["h"]), 2),
-        "letterSpacing": _estimate_tracking(line.get("text", ""), painted, font_size),
+        # Codia parity: emitted letterSpacing is always 0. Heuristic tracking is
+        # retained only as a diagnostic on meta when render-fit records it.
+        "letterSpacing": 0.0,
         "confidence": round(min(_num(line.get("conf"), 0.5), max(0.25, ink_confidence)), 4),
         "fill": (paint or {}).get("fill") or {"kind": "flat", "color": colour},
         "stroke": (paint or {}).get("stroke"),
+        "effects": list((paint or {}).get("effects") or []),
     }
     # The preview renderer draws candidates[0]; declared weight/style must match it
     # (also covers a google-cache top candidate whose weight differs from the coarse
@@ -1821,12 +1959,12 @@ def _render_fit_options(config: dict) -> dict:
 
 
 def _apply_line_render_fit(line: dict, mask, painted: dict, render_fit_options: dict) -> Optional[dict]:
-    """Refine one line's emitted size/tracking by fitting its chosen font to its
-    own ink mask (cluster representatives share matched candidates, but every
-    line has its own painted geometry).  Applies the fitted ``fontSize`` and
-    ``letterSpacing`` when the fit passes ``min_score``; always records the fit
-    evidence on ``meta.render_fit`` so downstream fidelity gating can see a bad
-    fit even when nothing was applied.  Returns the fit mapping or ``None``.
+    """Refine one line's emitted size by fitting its chosen font to its own ink
+    mask (cluster representatives share matched candidates, but every line has
+    its own painted geometry).  Applies the fitted ``fontSize`` when the fit
+    passes ``min_score``; ``letterSpacing`` stays 0 (Codia parity) while the
+    fitted tracking is recorded on ``meta.render_fit`` for diagnostics.
+    Returns the fit mapping or ``None``.
     """
     if not render_fit_options.get("enabled", True) or mask is None:
         return None
@@ -1851,7 +1989,7 @@ def _apply_line_render_fit(line: dict, mask, painted: dict, render_fit_options: 
     if applied:
         new_size = _num(fit.get("fontSize"), style.get("fontSize"))
         style["fontSize"] = round(new_size, 2)
-        style["letterSpacing"] = round(_num(fit.get("letterSpacing")), 3)
+        style["letterSpacing"] = 0.0
         style["lineHeight"] = round(max(new_size * 1.15, _num(painted.get("h"))), 2)
         style["fontSizeCandidates"] = _size_candidates(new_size)
     line.setdefault("meta", {})["render_fit"] = {
@@ -1862,6 +2000,126 @@ def _apply_line_render_fit(line: dict, mask, painted: dict, render_fit_options: 
         "applied": applied,
     }
     return fit
+
+
+def _platform_ui_cfg(cfg: Optional[dict]) -> dict:
+    """Resolve the text_analysis mapping, accepting a bare options dict in tests."""
+    tcfg = _text_cfg(cfg)
+    if tcfg:
+        return tcfg
+    if isinstance(cfg, dict) and (
+        "platform_ui_prior" in cfg or "platform_ui_family" in cfg or "platform_ui" in cfg
+    ):
+        return cfg
+    return {}
+
+
+def _platform_ui_prior_enabled(cfg: Optional[dict]) -> bool:
+    """Whether body/UI copy should default to Inter (social / platform screenshots)."""
+    tcfg = _platform_ui_cfg(cfg)
+    if "platform_ui_prior" in tcfg:
+        return bool(tcfg.get("platform_ui_prior"))
+    policy = ((cfg or {}).get("routing") or {}).get("text_policy") or {}
+    if policy.get("platform_ui_prior") is not None:
+        return bool(policy.get("platform_ui_prior"))
+    if str(policy.get("default_family") or "").lower() == "inter":
+        return True
+    archetype = str(((cfg or {}).get("scene") or {}).get("archetype") or "").lower()
+    return archetype == "social_screenshot"
+
+
+def _platform_ui_family(cfg: Optional[dict]) -> str:
+    tcfg = _platform_ui_cfg(cfg)
+    family = tcfg.get("platform_ui_family")
+    if not family:
+        policy = ((cfg or {}).get("routing") or {}).get("text_policy") or {}
+        family = policy.get("default_family")
+    return str(family or "Inter")
+
+
+def _apply_platform_ui_font_prior(prepared: list[dict], cfg: Optional[dict],
+                                  render_fit_options: dict) -> Optional[dict]:
+    """Force Inter (or configured family) on platform-UI sans lines.
+
+    Keeps a line's own family only when it is a confident non-sans (serif/script
+    display) match — body/meta/stat lines on social chrome always become Inter.
+    letterSpacing is forced to 0 (Codia parity).
+    """
+    if not _platform_ui_prior_enabled(cfg):
+        return None
+    family = _platform_ui_family(cfg)
+    tcfg = _platform_ui_cfg(cfg)
+    strong_keep = _num((tcfg.get("platform_ui") or {}).get("strong_keep"), 0.72)
+    applied = []
+    skipped = []
+    for item in prepared:
+        line = item.get("line") or {}
+        style = line.get("style") or {}
+        current = str(style.get("fontFamily") or "")
+        if not current:
+            continue
+        if _norm_family(current) == _norm_family(family):
+            style["letterSpacing"] = 0.0
+            continue
+        candidates = [c for c in (style.get("fontCandidates") or []) if isinstance(c, dict)]
+        top = candidates[0] if candidates else {}
+        line_class = _family_class(current, top.get("path"))
+        fit_meta = (line.get("meta") or {}).get("render_fit") or {}
+        score = _num(fit_meta.get("score"), 0.0)
+        if isinstance(top.get("fit"), dict):
+            score = max(score, _num(top["fit"].get("score"), 0.0))
+        score = max(score, _num(top.get("score"), 0.0))
+        # Distinctive display faces keep their match when the fit is strong.
+        if line_class in ("serif", "script") and score >= strong_keep:
+            skipped.append({"id": line.get("id"), "family": current, "class": line_class,
+                            "score": score, "reason": "strong-non-sans"})
+            continue
+        style["fontFamily"] = family
+        style["letterSpacing"] = 0.0
+        weight = int(round(_num(style.get("fontWeight"), 400)))
+        italic = "italic" in str(style.get("fontStyle") or "").lower()
+        style_label = _style_name(weight, italic=italic)
+        inter_cand = next(
+            (c for c in candidates
+             if _norm_family(c.get("family")) == _norm_family(family)),
+            None,
+        )
+        if inter_cand is not None:
+            promoted = dict(inter_cand)
+            promoted["weight"] = int(round(_num(promoted.get("weight"), weight)))
+            rest = [c for c in candidates if c is not inter_cand]
+            style["fontCandidates"] = [promoted] + rest
+        elif top:
+            # Relabel the best sans match to the platform family; keep path for preview.
+            promoted = dict(top)
+            promoted["family"] = family
+            promoted["local_family"] = current
+            promoted["weight"] = weight
+            promoted["style"] = style_label
+            promoted["source"] = promoted.get("source") or "platform-ui-prior"
+            promoted["figma_loadable"] = True
+            style["fontCandidates"] = [promoted] + candidates[1:]
+        else:
+            style["fontCandidates"] = [{
+                "family": family, "style": style_label, "weight": weight,
+                "score": max(score, 0.55), "source": "platform-ui-prior",
+                "figma_loadable": True,
+            }]
+        _reconcile_style_weight(style)
+        meta = line.setdefault("meta", {})
+        meta["platform_ui_prior"] = {
+            "from": current, "to": family, "previous_class": line_class,
+        }
+        applied.append(line.get("id"))
+    if not applied and not skipped:
+        return None
+    return {
+        "family": family,
+        "applied": bool(applied),
+        "applied_lines": applied,
+        "skipped": skipped,
+        "enabled": True,
+    }
 
 
 def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
@@ -2024,7 +2282,7 @@ def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
             new_size = _num(fit.get("fontSize"), _num(style.get("fontSize"), 16.0))
             style["fontFamily"] = family
             style["fontSize"] = round(new_size, 2)
-            style["letterSpacing"] = round(_num(fit.get("letterSpacing")), 3)
+            style["letterSpacing"] = 0.0
             style["lineHeight"] = round(
                 max(new_size * 1.15, _num((item.get("painted") or {}).get("h"))), 2)
             style["fontSizeCandidates"] = _size_candidates(new_size)
@@ -2199,6 +2457,14 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
 # Roles, paragraph grouping, alignment, hierarchy and repeated styles
 
 
+_LEGAL_DISCLAIMER = re.compile(
+    r"(?:fda|these statements|not intended to(?:\s+diagnose)?|consult your|"
+    r"results may vary|supplement facts|proprietary blend|"
+    r"\*\s*these|disclaimer)",
+    re.I,
+)
+
+
 def _assign_roles(lines: list[dict], canvas: dict) -> None:
     sizes = [line["style"]["fontSize"] for line in lines]
     median_size = _median(sizes, 16.0)
@@ -2222,6 +2488,11 @@ def _assign_roles(lines: list[dict], canvas: dict) -> None:
             role = "headline"
         elif size >= median_size * 1.18 and len(words) <= 24:
             role = "subheadline"
+        elif y_ratio >= 0.82 and (
+            _LEGAL_DISCLAIMER.search(text)
+            or (size <= median_size * 0.85 and len(words) >= 6)
+        ):
+            role = "disclaimer"
         elif len(text) >= 52 or len(words) >= 9:
             role = "body"
         elif y_ratio <= 0.13 and len(words) <= 5 and size <= median_size * 1.05:
@@ -2242,6 +2513,7 @@ def _assign_roles(lines: list[dict], canvas: dict) -> None:
             "cta": 3,
             "caption": 4,
             "footer": 4,
+            "disclaimer": 4,
         }.get(role, 3)
         line["role"] = role
         line["hierarchy"] = {"level": level, "parent_id": None}
@@ -2290,10 +2562,20 @@ def _infer_alignment(lines: list[dict], canvas_w: float) -> str:
     if len(lines) == 1:
         box = lines[0]["box"]
         center = _box_center(box)[0]
+        left = float(box.get("x", 0) or 0)
+        right = left + float(box.get("w", 0) or 0)
         if box["w"] < canvas_w * 0.88 and abs(center - canvas_w / 2.0) <= canvas_w * 0.055:
             return "CENTER"
-        if box["x"] >= canvas_w * 0.52 and abs((box["x"] + box["w"]) - canvas_w) <= canvas_w * 0.08:
+        # Edge-flush columns keep outward alignment (007 left rail, edge callouts).
+        if left <= canvas_w * 0.08:
+            return "LEFT"
+        if abs(right - canvas_w) <= canvas_w * 0.08:
             return "RIGHT"
+        # Floating side callouts (014): align toward the product / canvas center.
+        if center < canvas_w * 0.45:
+            return "RIGHT"
+        if center > canvas_w * 0.55:
+            return "LEFT"
         return "LEFT"
     lefts = [line["box"]["x"] for line in lines]
     rights = [line["box"]["x"] + line["box"]["w"] for line in lines]
@@ -2339,7 +2621,9 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
         baselines = [line["baseline"]["y0"] for line in group]
         deltas = [baselines[i + 1] - baselines[i] for i in range(len(baselines) - 1)]
         median_size = _median((line["style"]["fontSize"] for line in group), 16.0)
-        line_height = max(median_size * 0.92, _median(deltas, median_size * 1.15))
+        # Floor at 1.12× fontSize — never allow lh < fs. Dense display OCR baseline
+        # gaps under-measure (ad 013: lh 195 < fs 230 clipped glyph tops on "We NEVER").
+        line_height = max(median_size * 1.12, _median(deltas, median_size * 1.2))
         role_line = min(group, key=lambda line: line["hierarchy"]["level"])
         role = role_line["role"]
         level = role_line["hierarchy"]["level"]
@@ -2692,6 +2976,13 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
     if consensus_evidence:
         result["font_consensus"] = consensus_evidence
 
+    # Pass 3.55: platform-UI Inter prior (CODIA-PARITY for social screenshots).
+    # Chirp / system UI is visually Inter-like; per-line forensics scatter Carlito/
+    # Arimo/Caladea and then the slice gate rasterizes correct-class fits.
+    ui_prior = _apply_platform_ui_font_prior(prepared, cfg, render_fit_options)
+    if ui_prior:
+        result["platform_ui_font_prior"] = ui_prior
+
     # Pass 3.6: fidelity gating (after consensus so adopted re-fits count).
     for i, item in enumerate(prepared):
         line = item["line"]
@@ -2775,6 +3066,15 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
                 "from": "text", "to": "masked-pixel-fallback",
                 "reason": reason, "confidence": meta["fidelity_confidence"],
             }
+
+    # Belt-and-suspenders Codia tracking policy: no stage may emit fitted letterSpacing.
+    for line in enriched:
+        style = line.get("style")
+        if isinstance(style, dict):
+            style["letterSpacing"] = 0.0
+        for word in line.get("words") or []:
+            if isinstance(word, dict) and isinstance(word.get("style"), dict):
+                word["style"]["letterSpacing"] = 0.0
 
     _assign_roles(enriched, canvas)
     blocks = _make_blocks(enriched, canvas, config)

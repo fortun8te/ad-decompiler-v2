@@ -43,6 +43,24 @@ def test_inferred_cta_shell_becomes_button_frame():
     assert frame["children"][0]["id"] == "label"
 
 
+def test_button_layout_floors_padding_so_label_is_not_flush():
+    """Tight OCR label inside a badge must keep chrome padding (ad 013 CTA clip)."""
+    candidates = [
+        {"id": "shell", "target": "shape", "box": {"x": 20, "y": 30, "w": 160, "h": 52},
+         "fill": {"kind": "flat", "color": "#0c834f"}, "style": {"radius": 24},
+         "meta": {"role": "badge"}},
+        {"id": "label", "target": "text", "box": {"x": 22, "y": 32, "w": 156, "h": 48},
+         "text": "61% OFF", "style": {"fontSize": 28}, "meta": {"role": "offer"}},
+    ]
+    tree = layout.infer(candidates, {"w": 400, "h": 300}, {})
+    pad = tree[0]["layout"]["padding"]
+    # Measured insets are 2px; floor bumps to >=4 so chrome cannot clip the label.
+    assert pad["top"] >= 4
+    assert pad["bottom"] >= 4
+    assert pad["left"] >= 4
+    assert pad["right"] >= 4
+
+
 def test_vertical_pill_button_uses_vertical_centered_layout():
     candidates = [
         {"id": "pill", "target": "shape", "box": {"x": 40, "y": 20, "w": 48, "h": 120},
@@ -321,10 +339,47 @@ def test_semantic_image_owner_keeps_overlay_in_named_asset_group():
     assert len(tree) == 1
     group = tree[0]
     assert group["id"] == "asset-group-avatar"
-    assert group["name"] == "Creator avatar — asset group"
+    assert group["name"] == "Creator avatar"
     assert [child["id"] for child in group["children"]] == ["avatar", "online"]
     assert group["children"][0]["box"]["x"] == 0
     assert group["children"][1]["box"]["x"] == 92
+
+
+def test_semantic_asset_group_resolves_unprefixed_fusion_parent_id():
+    """Merge candidates use c_<id> but a stale fusion parent_id may still say E010.
+    Layout must resolve the alias so nested chrome stays under its owner."""
+    tree = layout.infer([
+        {"id": "c_E010", "target": "image", "box": {"x": 40, "y": 50, "w": 120, "h": 120},
+         "meta": {"role": "avatar", "semantic_name": "Creator avatar"}},
+        {"id": "c_E011", "target": "icon", "box": {"x": 132, "y": 142, "w": 22, "h": 22},
+         "meta": {"role": "icon", "parent_id": "E010"}},
+    ], {"w": 300, "h": 250})
+    assert len(tree) == 1
+    group = tree[0]
+    assert group["id"] == "asset-group-c_E010"
+    assert [child["id"] for child in group["children"]] == ["c_E010", "c_E011"]
+
+
+def test_single_child_none_band_is_unwrapped():
+    """Passthrough NONE bands with one child only inflate node count; unwrap them."""
+    band = {
+        "id": "band-lonely", "target": "group",
+        "box": {"x": 20, "y": 30, "w": 160, "h": 52},
+        "layout": {"mode": "NONE", "confidence": 0.2},
+        "meta": {"role": "band"},
+        "children": [{
+            "id": "btn", "target": "group",
+            "box": {"x": 20, "y": 30, "w": 160, "h": 52},
+            "layout": {"mode": "HORIZONTAL", "confidence": 0.9},
+            "meta": {"role": "button"},
+            "children": [{"id": "label", "target": "text",
+                          "box": {"x": 40, "y": 40, "w": 80, "h": 24}, "text": "Go"}],
+        }],
+    }
+    out = layout._unwrap_passthrough_bands([band])
+    assert len(out) == 1
+    assert out[0]["id"] == "btn"
+    assert out[0]["meta"]["role"] == "button"
 
 
 def test_intentional_raster_cluster_keeps_positive_overlay_in_named_asset_group():
@@ -365,3 +420,125 @@ def test_ui_label_in_pill_shell_groups_as_button_with_pill_radius():
     assert frame["layout"]["primaryAxisAlignItems"] == "CENTER"
     assert frame["layout"]["counterAxisAlignItems"] == "CENTER"
     assert frame["children"][0]["id"] == "c_B1"
+
+
+def test_social_header_cluster_groups_avatar_identity_and_follow():
+    """009-style header: avatar + name/handle + follow pill → one Auto Layout row."""
+    cfg = {
+        "scene": {"archetype": "social_screenshot"},
+        "layout": {"scene_grouping": {"header_cluster": True}},
+    }
+    candidates = [
+        {"id": "av", "target": "image", "box": {"x": 40, "y": 40, "w": 96, "h": 96},
+         "meta": {"role": "avatar"}},
+        {"id": "name", "target": "text", "box": {"x": 160, "y": 48, "w": 180, "h": 28},
+         "text": "UPFRONT", "meta": {"role": "name"}},
+        {"id": "handle", "target": "text", "box": {"x": 160, "y": 82, "w": 140, "h": 22},
+         "text": "@upfront", "meta": {"role": "handle"}},
+        {"id": "follow", "target": "shape", "box": {"x": 820, "y": 55, "w": 160, "h": 56},
+         "fill": {"kind": "flat", "color": "#eef2f3"}, "radius": 28,
+         "meta": {"role": "button"}},
+        {"id": "follow_label", "target": "text", "box": {"x": 850, "y": 68, "w": 100, "h": 30},
+         "text": "Volgend", "meta": {"role": "label"}},
+    ]
+    tree = layout.infer(candidates, {"w": 1080, "h": 400}, cfg)
+    headers = [n for n in tree if (n.get("meta") or {}).get("role") == "header-cluster"]
+    assert len(headers) == 1
+    header = headers[0]
+    child_ids = {c.get("id") for c in header["children"]}
+    assert "av" in child_ids
+    # Name/handle nest into a vertical identity sub-frame when stacked.
+    nested = [c for c in header["children"]
+              if (c.get("meta") or {}).get("role") == "header-identity"]
+    if nested:
+        assert {c["id"] for c in nested[0]["children"]} >= {"name", "handle"}
+        assert nested[0]["layout"]["mode"] == "VERTICAL"
+    else:
+        assert {"name", "handle"}.issubset(child_ids)
+    assert header["layout"]["mode"] == "HORIZONTAL"
+    assert header["layout"]["confidence"] >= 0.8
+
+
+def test_message_bubble_shell_gets_hug_auto_layout_not_centered_button():
+    """Chat bubble: rounded plate + left-padded body copy → message-bubble frame."""
+    cfg = {"layout": {"scene_grouping": {"message_bubbles": True}}}
+    candidates = [
+        {"id": "bubble", "target": "shape", "box": {"x": 40, "y": 80, "w": 280, "h": 96},
+         "fill": {"kind": "flat", "color": "#1d9bf0"}, "radius": 22,
+         "meta": {"role": "card"}},
+        {"id": "line1", "target": "text", "box": {"x": 56, "y": 92, "w": 240, "h": 28},
+         "text": "Hey — you free later?", "meta": {"role": "body"}},
+        {"id": "line2", "target": "text", "box": {"x": 56, "y": 128, "w": 200, "h": 28},
+         "text": "Coffee at 4?", "meta": {"role": "body"}},
+    ]
+    tree = layout.infer(candidates, {"w": 400, "h": 300}, cfg)
+    assert len(tree) == 1
+    frame = tree[0]
+    assert frame["meta"]["role"] == "message-bubble"
+    assert frame["layout"]["mode"] == "VERTICAL"
+    assert frame["layout"]["primaryAxisAlignItems"] == "MIN"
+    assert frame["layout"]["padding"]["left"] >= 6
+    assert {c["id"] for c in frame["children"]} == {"line1", "line2"}
+
+
+def test_dm_avatar_pairs_with_message_bubble_row():
+    """IG DM: avatar left of a bubble at mid-canvas becomes a message-row (not header)."""
+    cfg = {
+        "layout": {"scene_grouping": {"message_bubbles": True, "header_cluster": True}},
+        "scene": {"archetype": "social_screenshot"},
+    }
+    candidates = [
+        {"id": "av", "target": "image", "box": {"x": 24, "y": 420, "w": 56, "h": 56},
+         "meta": {"role": "avatar"}},
+        {"id": "bubble", "target": "shape", "box": {"x": 96, "y": 400, "w": 260, "h": 88},
+         "fill": {"kind": "flat", "color": "#efefef"}, "radius": 20,
+         "meta": {"role": "card"}},
+        {"id": "msg", "target": "text", "box": {"x": 112, "y": 420, "w": 220, "h": 48},
+         "text": "omw in 10", "style": {"align": "LEFT"}, "meta": {"role": "body"}},
+    ]
+    tree = layout.infer(candidates, {"w": 400, "h": 800}, cfg)
+    rows = [n for n in tree if (n.get("meta") or {}).get("role") == "message-row"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["layout"]["mode"] == "HORIZONTAL"
+    child_ids = {c["id"] for c in row["children"]}
+    assert "av" in child_ids
+    bubble = next(c for c in row["children"] if (c.get("meta") or {}).get("role") == "message-bubble")
+    assert bubble["id"] == "bubble"
+
+
+def test_message_bubble_nests_reply_quote_plate():
+    """Nested inset quote plate inside a bubble is tagged reply-quote, not a second bubble."""
+    cfg = {"layout": {"scene_grouping": {"message_bubbles": True}}}
+    candidates = [
+        {"id": "bubble", "target": "shape", "box": {"x": 40, "y": 80, "w": 300, "h": 160},
+         "fill": {"kind": "flat", "color": "#1d9bf0"}, "radius": 22,
+         "meta": {"role": "card"}},
+        {"id": "quote", "target": "shape", "box": {"x": 56, "y": 96, "w": 240, "h": 52},
+         "fill": {"kind": "flat", "color": "#0b6cb8"}, "radius": 10,
+         "meta": {"role": "card"}},
+        {"id": "quote_text", "target": "text", "box": {"x": 68, "y": 106, "w": 200, "h": 28},
+         "text": "you free later?", "style": {"align": "LEFT"}, "meta": {"role": "body"}},
+        {"id": "reply", "target": "text", "box": {"x": 56, "y": 164, "w": 220, "h": 28},
+         "text": "yeah 4pm works", "style": {"align": "LEFT"}, "meta": {"role": "body"}},
+    ]
+    tree = layout.infer(candidates, {"w": 400, "h": 320}, cfg)
+    assert len(tree) == 1
+    frame = tree[0]
+    assert frame["meta"]["role"] == "message-bubble"
+    quotes = [c for c in frame["children"] if (c.get("meta") or {}).get("role") == "reply-quote"]
+    assert len(quotes) == 1
+    assert quotes[0]["id"] == "quote"
+    assert any(c.get("id") == "reply" for c in frame["children"])
+
+
+def test_header_cluster_disabled_without_scene_grouping_flag():
+    """Without header_cluster evidence flag, avatar+name stay absolute siblings."""
+    candidates = [
+        {"id": "av", "target": "image", "box": {"x": 40, "y": 40, "w": 96, "h": 96},
+         "meta": {"role": "avatar"}},
+        {"id": "name", "target": "text", "box": {"x": 160, "y": 60, "w": 180, "h": 28},
+         "text": "UPFRONT", "meta": {"role": "name"}},
+    ]
+    tree = layout.infer(candidates, {"w": 1080, "h": 400}, {})
+    assert not any((n.get("meta") or {}).get("role") == "header-cluster" for n in tree)

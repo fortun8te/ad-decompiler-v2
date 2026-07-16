@@ -22,6 +22,17 @@ _ALLCAPS_SHORT = re.compile(r"^[A-ZÀ-ÖØ-Þ& ]+$")
 _LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
 _PLATFORM_WORDMARK = re.compile(r"^(?:x\.com|twitter\.com)$", re.I)
 _CTA = re.compile(r"^(?:buy|shop|learn|order|get|try|sign up|subscribe|download)(?:\s+\w+){0,3}$", re.I)
+# Sale / offer chrome ("45%", "Off", "Get up to") — overlay copy on badges, not packaging.
+_OFFER = re.compile(
+    r"^(?:"
+    r"\d+\s*%|"
+    r"(?:up\s+to|get\s+up\s+to|upto)\b.*|"
+    r"off|"
+    r"(?:save|upto)\s+\d+\s*%|"
+    r"\d+\s*%\s*off"
+    r")$",
+    re.I,
+)
 
 
 def _clean(t) -> str:
@@ -60,8 +71,18 @@ def semantic_text_role(line: dict, canvas: dict) -> str:
         return "ui-label"
     if _CTA.match(text) or GENERIC_SHORT_COPY.match(text):
         return "cta"
+    if _OFFER.match(text) or ("%" in text and len(text) <= 12):
+        return "offer"
     words = text.split()
-    if y <= H * .62 and h >= max(18.0, H * .028) and len(words) <= 12 and w <= W * .95:
+    # Primary display headline: large type in the upper band — not mid-canvas
+    # benefit callouts (014) which are shorter and sit beside a product.
+    if (
+        y <= H * .38
+        and h >= max(28.0, H * .035)
+        and len(words) <= 12
+        and w >= W * .40
+        and w <= W * .95
+    ):
         return "headline"
     if len(words) >= 9 or (h <= H * .03 and len(words) >= 4):
         return "body-copy"

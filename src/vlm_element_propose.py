@@ -456,13 +456,14 @@ def enrich_residual(
         tiles = tiles[:max_tiles]
 
     raw_proposals: list[dict] = []
-    stats = {"tiles": len(tiles), "accepted": 0, "skipped": 0, "notes": []}
+    stats = {"tiles": len(tiles), "accepted": 0, "skipped": 0, "notes": [],
+             "parallelism": vlm_client.parallelism_from_cfg(cfg)}
 
-    for tile_idx, tile in enumerate(tiles):
+    def _one(pair):
+        tile_idx, tile = pair
         crop = vlm_client.crop_box_bytes(image, tile, padding=0)
         if crop is None:
-            stats["skipped"] += 1
-            continue
+            return {"skipped": True, "note": None, "proposals": [], "tile_idx": tile_idx, "tile": tile}
         proposals, note = _two_pass_proposals(
             crop,
             base_url=base_url,
@@ -471,15 +472,27 @@ def enrich_residual(
             max_tokens=max_tokens,
             passes=passes,
         )
-        if note:
+        return {
+            "skipped": bool(note) or not proposals,
+            "note": note,
+            "proposals": proposals or [],
+            "tile_idx": tile_idx,
+            "tile": tile,
+        }
+
+    for result in vlm_client.map_parallel(
+        _one, list(enumerate(tiles)), workers=vlm_client.parallelism_from_cfg(cfg)
+    ):
+        if result["skipped"]:
             stats["skipped"] += 1
-            if note not in stats["notes"]:
+            note = result["note"]
+            if note and note not in stats["notes"]:
                 stats["notes"].append(note)
             continue
-        if not proposals:
-            continue
         stats["accepted"] += 1
-        for proposal in proposals:
+        tile = result["tile"]
+        tile_idx = result["tile_idx"]
+        for proposal in result["proposals"]:
             box = _fraction_to_pixel(proposal["approx_box_fraction"], tile, width, height)
             if box is None:
                 continue

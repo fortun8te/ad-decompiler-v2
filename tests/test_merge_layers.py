@@ -647,6 +647,151 @@ def test_positive_overlay_evidence_beats_product_geometry():
     assert not node.get("kept_in_photo")
 
 
+def test_text_bearing_logo_badge_extracts_ocr_as_native_text():
+    """Benchmark 016 green seal: a mislabeled 'logo' hosting 'Get up to' / '45%' / 'Off'
+    must become TEXT + plate shell, never bake OCR into the badge raster."""
+    canvas = {"w": 1080, "h": 1080}
+    elements = [{"id": "E014", "box": {"x": 774, "y": 540, "w": 256, "h": 254},
+                 "kind": "icon", "area": 65024, "coverage": .06, "role": "logo"}]
+    ocr = {"lines": [
+        {"id": "get", "text": "Get up to", "conf": .9,
+         "box": {"x": 820, "y": 602, "w": 162, "h": 38}},
+        {"id": "pct", "text": "45%", "conf": .95,
+         "box": {"x": 792, "y": 646, "w": 187, "h": 60}},
+        {"id": "off", "text": "Off", "conf": .9,
+         "box": {"x": 875, "y": 716, "w": 54, "h": 30}},
+    ]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    for cid in ("c_get", "c_pct", "c_off"):
+        node = m[cid]
+        assert node["target"] == "text", cid
+        assert not node.get("kept_in_photo"), cid
+        assert node["meta"].get("overlay_text") is True, cid
+        assert node["meta"].get("removal_required") is True, cid
+        assert node["meta"].get("shell_text_host") == "c_E014", cid
+        assert node["meta"].get("suppression_reason") != "text-inside-product-cutout", cid
+    shell = m["c_E014"]
+    assert shell["meta"].get("text_bearing_shell") is True
+    assert shell["meta"].get("plate_shell") is True
+    assert shell["meta"].get("role") == "badge"
+    assert shell["target"] == "shape"
+
+
+def test_ad013_circular_offer_badge_extracts_native_text():
+    """Ad 013: ``61% OFF`` / ``+ FREE GIFTS`` on a circular logo seal must stay editable."""
+    canvas = {"w": 1080, "h": 1920}
+    elements = [{"id": "E007", "box": {"x": 97, "y": 730, "w": 303, "h": 304},
+                 "kind": "icon", "area": 71757, "coverage": .03, "role": "logo"}]
+    ocr = {"lines": [
+        {"id": "off", "text": "61% OFF", "conf": .95,
+         "box": {"x": 97, "y": 807, "w": 284, "h": 105}},
+        {"id": "gifts", "text": "+ FREE GIFTS", "conf": .9,
+         "box": {"x": 117, "y": 873, "w": 268, "h": 88}},
+    ]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    for cid in ("c_off", "c_gifts"):
+        node = m[cid]
+        assert node["target"] == "text", cid
+        assert not node.get("kept_in_photo"), cid
+        assert node["meta"].get("shell_text_host") == "c_E007", cid
+    assert m["c_E007"]["meta"].get("role") == "badge"
+    assert m["c_E007"]["meta"].get("text_bearing_shell") is True
+
+
+def test_badge_shell_preferred_over_enclosing_product_for_ocr():
+    """When offer text sits inside both a product pouch and a badge seal, the seal wins."""
+    canvas = {"w": 1080, "h": 1080}
+    elements = [
+        {"id": "E013", "box": {"x": 40, "y": 420, "w": 1000, "h": 620},
+         "kind": "photo-fragment", "area": 620000, "coverage": .5, "role": "product"},
+        {"id": "E014", "box": {"x": 774, "y": 540, "w": 256, "h": 254},
+         "kind": "icon", "area": 65024, "coverage": .06, "role": "logo"},
+    ]
+    ocr = {"lines": [
+        {"id": "pct", "text": "45%", "conf": .95,
+         "box": {"x": 792, "y": 646, "w": 187, "h": 60}},
+    ]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    node = m["c_pct"]
+    assert node["target"] == "text"
+    assert node["meta"].get("shell_text_host") == "c_E014"
+    assert node["meta"].get("suppression_reason") != "text-inside-product-cutout"
+    assert m["c_E014"]["meta"].get("text_bearing_shell") is True
+    assert m["c_E014"]["target"] == "shape"
+
+
+def test_brushstroke_banner_shape_pairs_editable_text():
+    """028-style olive brushstroke: irregular shape + inset copy → shell + native TEXT.
+
+    Geometry only (no VLM): high inside_frac of OCR in a wide colored shape marks
+    text_bearing_shell / plate_shell and keeps the copy editable.
+    """
+    canvas = {"w": 1080, "h": 1350}
+    elements = [{
+        "id": "E_banner", "box": {"x": 80, "y": 220, "w": 920, "h": 140},
+        "kind": "shape", "area": 920 * 140, "coverage": 0.09, "role": "shape",
+        "source": "sam3",
+    }]
+    ocr = {"lines": [{
+        "id": "sold", "text": "ALMOST SOLD OUT...", "conf": 0.95, "role": "offer",
+        "box": {"x": 160, "y": 255, "w": 760, "h": 70},
+    }]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    text = m["c_sold"]
+    shell = m["c_E_banner"]
+    assert text["target"] == "text"
+    assert not text.get("kept_in_photo")
+    assert text["meta"].get("overlay_text") is True
+    assert text["meta"].get("removal_required") is True
+    assert text["meta"].get("shell_text_host") == "c_E_banner"
+    assert shell["target"] == "shape"
+    assert shell["meta"].get("text_bearing_shell") is True
+    assert shell["meta"].get("plate_shell") is True
+    assert shell["meta"].get("role") == "banner"
+    assert shell["meta"].get("geometric_text_shell") is True
+    assert "ALMOST SOLD OUT" in (shell["meta"].get("shell_text_snippet") or "")
+
+
+def test_starburst_seal_shape_pairs_editable_text():
+    """028-style starburst seal: square irregular badge + inset offer copy."""
+    canvas = {"w": 1080, "h": 1350}
+    elements = [{
+        "id": "E_seal", "box": {"x": 780, "y": 520, "w": 240, "h": 240},
+        "kind": "icon", "area": 57600, "coverage": 0.04, "role": "shape",
+        "source": "sam3",
+    }]
+    ocr = {"lines": [{
+        "id": "ltd", "text": "LIMITED TIME OFFER", "conf": 0.92, "role": "offer",
+        "box": {"x": 810, "y": 590, "w": 180, "h": 100},
+    }]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    assert m["c_ltd"]["target"] == "text"
+    assert m["c_ltd"]["meta"].get("shell_text_host") == "c_E_seal"
+    assert m["c_E_seal"]["meta"].get("text_bearing_shell") is True
+    assert m["c_E_seal"]["meta"].get("role") == "badge"
+    assert m["c_E_seal"]["target"] == "shape"
+
+
+def test_product_box_inset_text_stays_kept_in_photo():
+    """Embossed product/mask text must bake — geometric shell promotion must not steal it."""
+    canvas = {"w": 1080, "h": 1350}
+    elements = [{
+        "id": "E_mask", "box": {"x": 200, "y": 600, "w": 680, "h": 520},
+        "kind": "photo-fragment", "area": 680 * 520, "coverage": 0.24, "role": "product",
+        "source": "sam3",
+    }]
+    ocr = {"lines": [{
+        "id": "brand", "text": "DORE & ROSE", "conf": 0.9, "role": "label",
+        "box": {"x": 320, "y": 820, "w": 440, "h": 50},
+    }]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    node = m["c_brand"]
+    assert node.get("kept_in_photo") is True
+    assert node["target"] == "drop"
+    assert node["meta"].get("baked_owner_id") == "c_E_mask"
+    assert m["c_E_mask"]["meta"].get("text_bearing_shell") is not True
+
+
 def test_merge_report_records_dedup_reasons_when_run_dir_given(tmp_path):
     """Diagnostics counts/reasons are emitted as a sidecar report next to merged.json."""
     import json
@@ -664,3 +809,556 @@ def test_merge_report_records_dedup_reasons_when_run_dir_given(tmp_path):
     assert report["counts"]["text_dedup"] == 1
     assert report["text_dedup"][0]["dropped"] == "c_frag"
     assert report["text_dedup"][0]["kept"] == "c_full"
+
+
+def test_fusion_parent_id_rewritten_to_canonical_candidate_id():
+    """Fusion emits parent_id=E010; merge prefixes ids as c_E010. Layout nesting
+    keys on meta.parent_id ∈ candidate ids, so the link must be rewritten or the
+    nested icon ships as a duplicate top-level layer (benchmark-final4/009)."""
+    elements = [
+        {"id": "E010", "box": {"x": 26, "y": 1010, "w": 54, "h": 50},
+         "kind": "shape", "role": "button", "area": 1911, "coverage": 0.01,
+         "score": 0.5},
+        {"id": "E011", "box": {"x": 40, "y": 1020, "w": 24, "h": 24},
+         "kind": "icon", "role": "icon", "area": 400, "coverage": 0.002,
+         "score": 0.9, "parent_id": "E010"},
+    ]
+    merged = _by_id(merge_layers.merge({"lines": []}, elements, [], {"w": 1080, "h": 1080}, {}))
+    assert "c_E010" in merged and "c_E011" in merged
+    assert merged["c_E011"]["meta"]["parent_id"] == "c_E010"
+
+
+def test_near_duplicate_button_icon_nest_collapses_to_one_owner():
+    """Run 009 engagement chrome: button shell + icon share ~the same box (IoU≈0.98).
+    Keep the more specific icon; drop the redundant button shell so ownership stays
+    single and node count does not balloon."""
+    elements = [
+        {"id": "E010", "box": {"x": 23, "y": 1007, "w": 60, "h": 56},
+         "kind": "shape", "role": "button", "area": 1911, "coverage": 0.01,
+         "score": 0.5},
+        {"id": "E011", "box": {"x": 23, "y": 1007, "w": 59, "h": 56},
+         "kind": "icon", "role": "icon", "area": 1158, "coverage": 0.01,
+         "score": 0.98, "parent_id": "E010"},
+    ]
+    merged = _by_id(merge_layers.merge({"lines": []}, elements, [], {"w": 1080, "h": 1080}, {}))
+    assert merged["c_E010"]["target"] == "drop"
+    assert merged["c_E010"]["meta"]["suppression_reason"] == "near-duplicate-nested-shell"
+    assert merged["c_E011"]["target"] in {"icon", "image", "shape"}
+    assert merged["c_E011"]["meta"].get("parent_id") in (None, "")
+    assert merged["c_E011"]["meta"].get("absorbed_shell_id") == "c_E010"
+
+
+def test_redundant_arrow_icon_dropped_when_price_text_already_has_arrow():
+    """Bench 002: OCR reads ``€63 → €49`` and SAM also proposes an arrow icon over the
+    glyph — keep native text, drop the overlapping arrow vector."""
+    ocr = {"lines": [
+        {"id": "pr", "text": "€63 → €49", "conf": 0.95, "role": "price",
+         "box": {"x": 346, "y": 544, "w": 381, "h": 58}},
+    ]}
+    elements = [
+        {"id": "E004", "box": {"x": 506, "y": 545, "w": 57, "h": 57},
+         "kind": "icon", "role": "arrow", "area": 1133, "coverage": 0.001, "score": 0.9},
+        # Distant arrow must survive (not overlapping the price line).
+        {"id": "E099", "box": {"x": 40, "y": 40, "w": 40, "h": 40},
+         "kind": "icon", "role": "arrow", "area": 800, "coverage": 0.001, "score": 0.9},
+    ]
+    merged = _by_id(merge_layers.merge(ocr, elements, [], _C002, {}))
+    assert merged["c_pr"]["target"] == "text"
+    assert "→" in merged["c_pr"]["text"]
+    assert merged["c_E004"]["target"] == "drop"
+    assert merged["c_E004"]["meta"]["suppression_reason"] == "redundant-arrow-in-text"
+    assert merged["c_E099"]["target"] != "drop"
+
+
+def test_dashed_guide_rect_hugging_text_is_dropped_underline_kept():
+    """Sparse stroke-only rect matching a text box is layout-guide junk; a short
+    annotation underline under the same line must survive."""
+    ocr = {"lines": [
+        {"id": "hl", "text": "SALE", "conf": 0.95, "role": "headline",
+         "box": {"x": 100, "y": 200, "w": 220, "h": 48}},
+    ]}
+    elements = [
+        # Dashed guide: text-sized box, low fill fraction (perimeter ink only).
+        {"id": "G0", "box": {"x": 96, "y": 196, "w": 228, "h": 56},
+         "kind": "shape", "role": "shape", "area": 1800, "coverage": 0.002, "score": 0.4},
+        # Short underline bar under the text — keep.
+        {"id": "U0", "box": {"x": 110, "y": 250, "w": 160, "h": 6},
+         "kind": "shape", "role": "underline", "area": 900, "coverage": 0.0005, "score": 0.8},
+    ]
+    merged = _by_id(merge_layers.merge(ocr, elements, [], CANVAS, {}))
+    assert merged["c_hl"]["target"] == "text"
+    assert merged["c_G0"]["target"] == "drop"
+    assert merged["c_G0"]["meta"]["suppression_reason"] == "guide_artifact"
+    assert merged["c_G0"]["meta"].get("guide_artifact") is True
+    assert merged["c_U0"]["target"] != "drop"
+
+
+_C014 = {"w": 1080, "h": 1920}
+
+
+def test_014_callout_leaders_survive_guide_drop_and_stay_off_product():
+    """014-style explainer: 4 floating callouts + 4 thin leader strokes around a
+    center product. Leaders must not be guide-dropped, text stays TEXT, product
+    stays image, and preserve_callout_leaders tags grouping meta."""
+    ocr = {"lines": [
+        {"id": "hl", "text": "NUTRITIONAL SUPPORT FOR YOUR BODY", "conf": 0.96,
+         "role": "headline", "box": {"x": 120, "y": 80, "w": 840, "h": 90}},
+        {"id": "c1", "text": "Vitamin D3 for immune health", "conf": 0.92,
+         "role": "body", "box": {"x": 60, "y": 520, "w": 260, "h": 70}},
+        {"id": "c2", "text": "Zinc for cellular repair", "conf": 0.91,
+         "role": "body", "box": {"x": 760, "y": 500, "w": 250, "h": 70}},
+        {"id": "c3", "text": "B12 for energy metabolism", "conf": 0.90,
+         "role": "body", "box": {"x": 70, "y": 1100, "w": 250, "h": 70}},
+        {"id": "c4", "text": "Antioxidants for recovery", "conf": 0.90,
+         "role": "body", "box": {"x": 760, "y": 1120, "w": 250, "h": 70}},
+        {"id": "fda", "text": "*These statements have not been evaluated by the FDA.",
+         "conf": 0.85, "role": "disclaimer",
+         "box": {"x": 80, "y": 1780, "w": 920, "h": 36}},
+    ]}
+    # Center product (hand + gummy).
+    product = {
+        "id": "PROD", "box": {"x": 380, "y": 640, "w": 320, "h": 520},
+        "kind": "photo-fragment", "role": "product", "area": 140000,
+        "coverage": 0.07, "score": 0.95,
+    }
+    # Thin leader strokes from each callout toward the product. Two tagged as
+    # callout_leader/arrow; two as generic sparse shapes (the regression case).
+    leaders = [
+        {"id": "A1", "box": {"x": 300, "y": 560, "w": 90, "h": 28},
+         "kind": "icon", "role": "callout_leader", "area": 420, "coverage": 0.0002,
+         "score": 0.8, "stroke_only": True},
+        {"id": "A2", "box": {"x": 690, "y": 540, "w": 85, "h": 30},
+         "kind": "icon", "role": "arrow", "area": 400, "coverage": 0.0002,
+         "score": 0.8, "stroke_only": True},
+        {"id": "A3", "box": {"x": 300, "y": 1080, "w": 95, "h": 26},
+         "kind": "shape", "role": "shape", "area": 380, "coverage": 0.0002,
+         "score": 0.7},  # low fill → stroke-like; must NOT guide-drop
+        {"id": "A4", "box": {"x": 680, "y": 1100, "w": 90, "h": 28},
+         "kind": "shape", "role": "shape", "area": 360, "coverage": 0.0002,
+         "score": 0.7},
+    ]
+    # Poison: a true guide rect hugging the headline — must still drop.
+    guide = {
+        "id": "G1", "box": {"x": 110, "y": 70, "w": 860, "h": 110},
+        "kind": "shape", "role": "shape", "area": 2200, "coverage": 0.001, "score": 0.3,
+    }
+    cfg = {
+        "scene": {
+            "preset": {"grouping": {"preserve_callout_leaders": True}},
+            "facts": {"leader_lines": True, "photo_coverage": 0.85},
+        },
+    }
+    merged = _by_id(merge_layers.merge(
+        ocr, [product] + leaders + [guide], [], _C014, cfg,
+    ))
+
+    assert merged["c_hl"]["target"] == "text"
+    assert merged["c_fda"]["target"] == "text"
+    assert merged["c_PROD"]["target"] == "image"
+    assert merged["c_G1"]["target"] == "drop"
+    assert merged["c_G1"]["meta"].get("suppression_reason") == "guide_artifact"
+
+    for aid in ("c_A1", "c_A2", "c_A3", "c_A4"):
+        assert merged[aid]["target"] != "drop", aid
+        assert merged[aid]["meta"].get("guide_artifact") is not True, aid
+        assert merged[aid]["meta"].get("callout_leader") or merged[aid]["meta"].get("role") in {
+            "arrow", "callout_leader",
+        }, aid
+        # Never nested under the product photo.
+        assert merged[aid]["meta"].get("parent_id") != "c_PROD", aid
+        assert merged[aid]["meta"].get("callout_group_id"), aid
+
+    for cid in ("c_c1", "c_c2", "c_c3", "c_c4"):
+        assert merged[cid]["target"] == "text", cid
+        assert merged[cid]["meta"].get("role") == "callout", cid
+        assert merged[cid]["meta"].get("callout_group_id"), cid
+        assert merged[cid]["meta"].get("overlay_text") is True, cid
+
+
+def test_thin_leader_near_text_not_guide_dropped_without_role():
+    """Untagged thin stroke grazing callout text but pointing at product must survive."""
+    ocr = {"lines": [
+        {"id": "c1", "text": "Vitamin D3", "conf": 0.9, "role": "body",
+         "box": {"x": 40, "y": 200, "w": 180, "h": 40}},
+    ]}
+    elements = [
+        {"id": "P0", "box": {"x": 320, "y": 220, "w": 200, "h": 240},
+         "kind": "photo-fragment", "role": "product", "area": 48000, "coverage": 0.13,
+         "score": 0.9},
+        # Sparse stroke between text and product — would look guide-like without
+        # the callout-leader geometry gate.
+        {"id": "L0", "box": {"x": 200, "y": 210, "w": 110, "h": 18},
+         "kind": "shape", "role": "shape", "area": 280, "coverage": 0.0004, "score": 0.6},
+    ]
+    merged = _by_id(merge_layers.merge(ocr, elements, [], CANVAS, {
+        "scene": {"preset": {"grouping": {"preserve_callout_leaders": True}}},
+    }))
+    assert merged["c_L0"]["target"] != "drop"
+    assert merged["c_L0"]["meta"].get("suppression_reason") != "guide_artifact"
+    assert merged["c_c1"]["target"] == "text"
+    assert merged["c_P0"]["target"] == "image"
+
+
+# ── 007-like product label vs left-column overlay ─────────────────────────────────────
+_C007 = {"w": 1080, "h": 1920}
+
+
+def _can_007():
+    # Right-side silver can cutout (not full-bleed).
+    return {"id": "E_can", "box": {"x": 420, "y": 180, "w": 620, "h": 1600},
+            "kind": "photo-fragment", "area": 992000, "coverage": .48, "role": "product"}
+
+
+def _overlay_007():
+    return [
+        {"id": "date", "text": "20 MEI 20:00", "conf": .95, "role": "headline",
+         "box": {"x": 80, "y": 220, "w": 320, "h": 70}},
+        {"id": "cta", "text": "Schrijf je nu in, mis geen enkele update.", "conf": .9, "role": "cta",
+         "box": {"x": 90, "y": 330, "w": 300, "h": 50}},
+        {"id": "sale", "text": "Allerlaatste site-wide sale van 2026.", "conf": .9, "role": "offer",
+         "box": {"x": 70, "y": 520, "w": 340, "h": 80}},
+    ]
+
+
+def _on_can_007():
+    return [
+        {"id": "up", "text": "UPFRONT", "conf": .9, "role": "headline",
+         "box": {"x": 560, "y": 420, "w": 280, "h": 90}},
+        {"id": "caf", "text": "CAFFEINE 150mg", "conf": .85, "role": "offer",
+         "box": {"x": 600, "y": 520, "w": 200, "h": 50}},
+        {"id": "nut", "text": "ingredienten bruisend water 9 kJ", "conf": .7, "role": "body",
+         "box": {"x": 500, "y": 1100, "w": 400, "h": 200}},
+    ]
+
+
+def test_007_overlay_outside_product_stays_native_text():
+    """Left-column flat marketing copy is NOT inside the can → editable TEXT."""
+    chrome = [
+        {"id": "E_br", "box": {"x": 60, "y": 200, "w": 360, "h": 120},
+         "kind": "shape", "role": "shape", "area": 40000, "coverage": .02},
+        {"id": "E_cta", "box": {"x": 80, "y": 320, "w": 320, "h": 70},
+         "kind": "shape", "role": "button", "area": 22000, "coverage": .01},
+    ]
+    m = _by_id(merge_layers.merge(
+        {"lines": _overlay_007() + _on_can_007()},
+        [_can_007()] + chrome, [], _C007,
+        {"scene": {"facts": {"flat_background_fraction": 0.55, "photo_coverage": 0.45}}},
+    ))
+    for cid in ("c_date", "c_cta", "c_sale"):
+        node = m[cid]
+        assert node["target"] == "text", cid
+        assert not node.get("kept_in_photo"), cid
+        assert node["meta"].get("overlay_text") is True, cid
+
+
+def test_007_on_can_label_text_kept_in_photo():
+    """Warped on-can branding / nutrition stays baked into the product cutout."""
+    m = _by_id(merge_layers.merge(
+        {"lines": _overlay_007() + _on_can_007()},
+        [_can_007()], [], _C007,
+        {"scene": {"facts": {"flat_background_fraction": 0.55, "photo_coverage": 0.45}}},
+    ))
+    for cid in ("c_up", "c_caf", "c_nut"):
+        node = m[cid]
+        assert node.get("kept_in_photo") is True, cid
+        assert node["target"] == "drop", cid
+        assert node["meta"].get("baked_owner_id") == "c_E_can", cid
+        assert not node["meta"].get("overlay_text"), cid
+        assert not node["meta"].get("removal_required"), cid
+
+
+def test_oversized_product_box_does_not_swallow_flat_overlay():
+    """Loose SAM box covering plate+can must not bake left-column headline/CTA."""
+    giant = {"id": "E_big", "box": {"x": 40, "y": 80, "w": 1000, "h": 1750},
+             "kind": "photo-fragment", "area": 1_750_000, "coverage": .84, "role": "product"}
+    m = _by_id(merge_layers.merge(
+        {"lines": _overlay_007() + _on_can_007()},
+        [giant], [], _C007,
+        {"scene": {"facts": {"flat_background_fraction": 0.55, "photo_coverage": 0.45}}},
+    ))
+    assert m["c_date"]["target"] == "text"
+    assert not m["c_date"].get("kept_in_photo")
+    # Overlayish roles (incl. OCR that semantic_text_role promotes to headline) must
+    # not bake into the oversized merge — left column stays editable.
+    assert m["c_sale"]["target"] == "text"
+    assert not m["c_sale"].get("kept_in_photo")
+
+
+def test_021_handwriting_photo_facts_suppress_editable_ocr():
+    """Explicit photo-of-handwriting / scene-text-only facts bake all OCR."""
+    canvas = {"w": 338, "h": 600}
+    elements = [{"id": "E000", "box": {"x": 0, "y": 0, "w": 338, "h": 600},
+                 "kind": "photo-fragment", "area": 202800, "coverage": 1.0, "role": "photo"}]
+    ocr = {"lines": [
+        {"id": "buy", "text": "BUY TWO", "conf": .6, "role": "cta",
+         "box": {"x": 58, "y": 292, "w": 66, "h": 67}},
+        {"id": "free", "text": "FREE", "conf": .55, "role": "offer",
+         "box": {"x": 204, "y": 222, "w": 58, "h": 23}},
+    ]}
+    cfg = {"scene": {"facts": {
+        "photo_of_handwriting": True,
+        "text_on_photographic_surfaces_only": True,
+        "flat_background_fraction": 0.31,
+        "photo_coverage": 0.69,
+    }}}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, cfg))
+    for cid in ("c_buy", "c_free"):
+        assert m[cid].get("kept_in_photo") is True, cid
+        assert m[cid]["target"] == "drop", cid
+        assert m[cid]["meta"]["suppression_reason"] == "text-on-photographic-surface-only", cid
+
+
+def test_021_geometric_photo_of_text_without_special_case_id():
+    """Full-bleed photo + all OCR inside + no flat plate/backplates → bake (021-like).
+
+    Tiny person/logo chips inside the photo must not disable photographic-scene mode
+    (real 021 fused_elements has several person fragments + a 16px logo).
+    """
+    canvas = {"w": 338, "h": 600}
+    elements = [
+        {"id": "E000", "box": {"x": 0, "y": 0, "w": 338, "h": 600},
+         "kind": "photo-fragment", "area": 202800, "coverage": 1.0, "role": "photo"},
+        {"id": "E001", "box": {"x": 14, "y": 0, "w": 145, "h": 140},
+         "kind": "photo-fragment", "area": 20300, "coverage": .1, "role": "person"},
+        {"id": "E005", "box": {"x": 123, "y": 183, "w": 16, "h": 7},
+         "kind": "icon", "area": 112, "coverage": .001, "role": "logo"},
+    ]
+    ocr = {"lines": [
+        {"id": "buy", "text": "BUY TWO", "conf": .6, "role": "headline",
+         "box": {"x": 58, "y": 292, "w": 66, "h": 67}},
+        {"id": "dj", "text": "Pioneer DJ", "conf": .5, "role": "caption",
+         "box": {"x": 198, "y": 137, "w": 37, "h": 7}},
+    ]}
+    cfg = {"scene": {"facts": {
+        "flat_background_fraction": 0.31,
+        "photo_coverage": 0.69,
+        "text_backplate_count": 0,
+    }}}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, cfg))
+    for cid in ("c_buy", "c_dj"):
+        assert m[cid].get("kept_in_photo") is True, cid
+        assert m[cid]["meta"]["suppression_reason"] == "text-on-photographic-surface-only", cid
+
+
+def test_vector_chrome_button_shell_stays_shape_not_fake_text_plate():
+    """Outlined CTA rect routes as button/shape; label stays native TEXT."""
+    elements = [
+        _can_007(),
+        {"id": "E_cta", "box": {"x": 80, "y": 320, "w": 320, "h": 70},
+         "kind": "shape", "role": "button", "area": 22000, "coverage": .01},
+    ]
+    ocr = {"lines": [
+        {"id": "cta", "text": "Schrijf je nu in, mis geen enkele update.", "conf": .9, "role": "cta",
+         "box": {"x": 90, "y": 330, "w": 300, "h": 50}},
+    ]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], _C007, {
+        "scene": {"facts": {"flat_background_fraction": 0.55}},
+    }))
+    assert m["c_cta"]["target"] == "text"
+    assert not m["c_cta"].get("kept_in_photo")
+    assert m["c_E_cta"]["target"] in {"shape", "icon"}
+    assert m["c_E_cta"]["meta"].get("role") in {"button", "shape", "badge"}
+
+def test_biomel_stroke_outline_pill_shell_plus_text_not_guide_dropped():
+    """Biomel outlined benefit pill: sparse perimeter ink + inset copy → callout shell + TEXT.
+
+    Must not be mis-routed as a layout guide or left as empty chrome.
+    """
+    canvas = {"w": 1080, "h": 1350}
+    # Hollow outline pill: area << box (fill_frac ~0.18).
+    pill_box = {"x": 40, "y": 420, "w": 280, "h": 56}
+    elements = [
+        {"id": "E_pill", "box": pill_box, "kind": "shape", "role": "shape",
+         "area": int(280 * 56 * 0.18), "coverage": 0.002, "score": 0.7,
+         "source": "sam3"},
+        {"id": "PROD", "box": {"x": 400, "y": 500, "w": 320, "h": 520},
+         "kind": "photo-fragment", "role": "product", "area": 140000,
+         "coverage": 0.07, "score": 0.95},
+    ]
+    ocr = {"lines": [{
+        "id": "digest", "text": "Daily digestive support", "conf": 0.94, "role": "body",
+        "box": {"x": 55, "y": 430, "w": 250, "h": 36},
+    }]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    shell = m["c_E_pill"]
+    text = m["c_digest"]
+    assert shell["target"] == "shape"
+    assert shell["meta"].get("suppression_reason") != "guide_artifact"
+    assert shell["meta"].get("text_bearing_shell") is True
+    assert shell["meta"].get("plate_shell") is True
+    assert shell["meta"].get("stroke_outline_shell") is True
+    assert shell["meta"].get("role") == "callout"
+    assert text["target"] == "text"
+    assert not text.get("kept_in_photo")
+    assert text["meta"].get("shell_text_host") == "c_E_pill"
+    assert text["meta"].get("role") == "callout"
+
+
+def test_biomel_scalloped_save_badge_promotes_like_seal():
+    """Scalloped SAVE / price badge: near-square sparse chrome + offer copy → seal/badge shell."""
+    canvas = {"w": 1080, "h": 1350}
+    elements = [{
+        "id": "E_save", "box": {"x": 820, "y": 180, "w": 200, "h": 200},
+        "kind": "icon", "role": "shape", "area": int(200 * 200 * 0.28),
+        "coverage": 0.03, "score": 0.85, "source": "sam3",
+    }]
+    ocr = {"lines": [{
+        "id": "save", "text": "SAVE 10%", "conf": 0.95, "role": "offer",
+        "box": {"x": 850, "y": 250, "w": 140, "h": 60},
+    }]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    assert m["c_save"]["target"] == "text"
+    assert m["c_save"]["meta"].get("shell_text_host") == "c_E_save"
+    assert m["c_E_save"]["target"] == "shape"
+    assert m["c_E_save"]["meta"].get("text_bearing_shell") is True
+    assert m["c_E_save"]["meta"].get("role") in {"seal", "badge", "starburst", "price_burst"}
+
+
+def test_biomel_two_products_plus_vs_not_merged():
+    """VS comparison: coffee + bag stay two product cutouts; VS chip stays editable."""
+    canvas = {"w": 1080, "h": 1080}
+    elements = [
+        {"id": "P_coffee", "box": {"x": 80, "y": 280, "w": 360, "h": 520},
+         "kind": "photo-fragment", "role": "product", "area": 160000,
+         "coverage": 0.14, "score": 0.94},
+        {"id": "P_bag", "box": {"x": 640, "y": 260, "w": 360, "h": 540},
+         "kind": "photo-fragment", "role": "product", "area": 170000,
+         "coverage": 0.15, "score": 0.93},
+        {"id": "VS", "box": {"x": 500, "y": 480, "w": 80, "h": 80},
+         "kind": "shape", "role": "badge", "area": 5000, "coverage": 0.004, "score": 0.8},
+    ]
+    ocr = {"lines": [
+        {"id": "vs", "text": "VS", "conf": 0.97, "role": "label",
+         "box": {"x": 515, "y": 500, "w": 50, "h": 40}},
+        {"id": "left_price", "text": "£3.20", "conf": 0.94, "role": "offer",
+         "box": {"x": 160, "y": 200, "w": 120, "h": 48}},
+        {"id": "right_price", "text": "£1.00/day", "conf": 0.93, "role": "offer",
+         "box": {"x": 720, "y": 200, "w": 160, "h": 48}},
+    ]}
+    cfg = {"scene": {"archetype": "comparison_grid", "facts": {"before_after_labels": True}}}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, cfg))
+    assert m["c_P_coffee"]["target"] == "image"
+    assert m["c_P_bag"]["target"] == "image"
+    assert m["c_P_coffee"]["meta"].get("suppression_reason") != "near-duplicate-nested-shell"
+    assert m["c_P_bag"]["meta"].get("suppression_reason") != "near-duplicate-nested-shell"
+    assert m["c_vs"]["target"] == "text"
+    assert m["c_VS"]["target"] == "shape"
+    assert m["c_VS"]["meta"].get("text_bearing_shell") is True
+
+
+def test_biomel_callout_leader_near_outline_pill_kept():
+    """Leader stroke beside an outline pill must survive guide-drop (014 + Biomel)."""
+    canvas = {"w": 1080, "h": 1350}
+    elements = [
+        {"id": "E_pill", "box": {"x": 40, "y": 420, "w": 280, "h": 56},
+         "kind": "shape", "role": "shape", "area": int(280 * 56 * 0.18),
+         "coverage": 0.002, "score": 0.7},
+        {"id": "A1", "box": {"x": 310, "y": 430, "w": 90, "h": 28},
+         "kind": "shape", "role": "shape", "area": 380, "coverage": 0.0002, "score": 0.7},
+        {"id": "PROD", "box": {"x": 480, "y": 500, "w": 300, "h": 480},
+         "kind": "photo-fragment", "role": "product", "area": 120000,
+         "coverage": 0.08, "score": 0.95},
+    ]
+    ocr = {"lines": [{
+        "id": "digest", "text": "Daily digestive support", "conf": 0.94, "role": "body",
+        "box": {"x": 55, "y": 430, "w": 250, "h": 36},
+    }]}
+    cfg = {"scene": {"preset": {"grouping": {"preserve_callout_leaders": True}},
+                    "facts": {"leader_lines": True}}}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, cfg))
+    assert m["c_E_pill"]["target"] == "shape"
+    assert m["c_E_pill"]["meta"].get("stroke_outline_shell") is True
+    assert m["c_A1"]["target"] != "drop"
+    assert m["c_A1"]["meta"].get("callout_leader") or m["c_A1"]["meta"].get("role") in {
+        "arrow", "callout_leader",
+    }
+
+
+# ── MONTE / Wavy / Biomel product+copy DTC lock ───────────────────────────────────────
+
+_C_DTC = {"w": 1080, "h": 1350}
+
+
+def test_monte_black_plate_left_text_right_product_on_pack_baked():
+    """MONTE black: left marketing stack editable; on-tube label kept_in_photo."""
+    elements = [
+        {"id": "TUBE", "box": {"x": 520, "y": 280, "w": 420, "h": 900},
+         "kind": "photo-fragment", "role": "product", "area": 280000,
+         "coverage": 0.19, "score": 0.96},
+    ]
+    ocr = {"lines": [
+        {"id": "brand", "text": "MONTE", "conf": 0.97, "role": "headline",
+         "box": {"x": 70, "y": 160, "w": 320, "h": 90}},
+        {"id": "sub", "text": "Fuel your day", "conf": 0.92, "role": "subheadline",
+         "box": {"x": 70, "y": 270, "w": 300, "h": 48}},
+        {"id": "onpack", "text": "25g PROTEIN", "conf": 0.88, "role": "offer",
+         "box": {"x": 600, "y": 520, "w": 220, "h": 60}},
+    ]}
+    cfg = {"scene": {
+        "archetype": "product_on_flat",
+        "facts": {"flat_background_fraction": 0.78, "photo_coverage": 0.22,
+                  "dark_background": True},
+    }}
+    m = _by_id(merge_layers.merge(ocr, elements, [], _C_DTC, cfg))
+    assert m["c_brand"]["target"] == "text"
+    assert not m["c_brand"].get("kept_in_photo")
+    assert not m["c_brand"]["meta"].get("wordmark")
+    assert m["c_brand"]["meta"].get("overlay_text") is True
+    assert m["c_sub"]["target"] == "text"
+    assert not m["c_sub"].get("kept_in_photo")
+    assert m["c_onpack"].get("kept_in_photo") is True
+    assert m["c_onpack"]["target"] == "drop"
+    assert m["c_onpack"]["meta"].get("baked_owner_id") == "c_TUBE"
+    assert m["c_TUBE"]["target"] == "image"
+
+
+def test_wavy_cream_tube_wordmark_baked_brand_overlay_editable():
+    """Wavy cream: decorative on-tube script bakes; flat display brand stays TEXT."""
+    elements = [
+        {"id": "TUBE", "box": {"x": 480, "y": 360, "w": 300, "h": 760},
+         "kind": "photo-fragment", "role": "product", "area": 180000,
+         "coverage": 0.12, "score": 0.95},
+    ]
+    ocr = {"lines": [
+        {"id": "brand", "text": "WAVY", "conf": 0.96, "role": "headline",
+         "box": {"x": 80, "y": 100, "w": 280, "h": 80}},
+        {"id": "script", "text": "wavy", "conf": 0.9, "role": "logo",
+         "box": {"x": 520, "y": 620, "w": 200, "h": 90},
+         "scene_text_role": "wordmark"},
+    ]}
+    cfg = {"scene": {
+        "archetype": "product_on_flat",
+        "facts": {"flat_background_fraction": 0.74, "photo_coverage": 0.26},
+    }}
+    m = _by_id(merge_layers.merge(ocr, elements, [], _C_DTC, cfg))
+    assert m["c_brand"]["target"] == "text"
+    assert not m["c_brand"].get("kept_in_photo")
+    assert not m["c_brand"]["meta"].get("wordmark")
+    assert m["c_script"].get("kept_in_photo") is True
+    assert m["c_script"]["target"] == "drop"
+    assert m["c_script"]["meta"].get("baked_owner_id") == "c_TUBE"
+
+
+def test_biomel_outlined_pill_stroke_only_meta_without_area_still_shells():
+    """Stroke-only hollow pill (explicit stroke, no fill) shells even without area frac."""
+    canvas = {"w": 1080, "h": 1350}
+    pill_box = {"x": 40, "y": 420, "w": 280, "h": 56}
+    elements = [
+        {"id": "E_pill", "box": pill_box, "kind": "shape", "role": "shape",
+         "score": 0.7, "source": "sam3", "stroke": {"color": "#111111", "width": 2},
+         "fill": None},
+        {"id": "PROD", "box": {"x": 400, "y": 500, "w": 320, "h": 520},
+         "kind": "photo-fragment", "role": "product", "area": 140000,
+         "coverage": 0.07, "score": 0.95},
+    ]
+    ocr = {"lines": [{
+        "id": "digest", "text": "Daily digestive support", "conf": 0.94, "role": "body",
+        "box": {"x": 55, "y": 430, "w": 250, "h": 36},
+    }]}
+    m = _by_id(merge_layers.merge(ocr, elements, [], canvas, {}))
+    shell = m["c_E_pill"]
+    assert shell["target"] == "shape"
+    assert shell["meta"].get("text_bearing_shell") is True
+    assert shell["meta"].get("stroke_outline_shell") or shell["meta"].get("stroke_only")
+    assert m["c_digest"]["target"] == "text"
+    assert not m["c_digest"].get("kept_in_photo")

@@ -84,6 +84,47 @@ def test_prompt_sweep_and_box_refines_every_residual(tmp_path):
     assert os.path.exists(tmp_path / "sam3.json")
 
 
+def test_role_prompt_early_exit_skips_synonym_prompts(tmp_path):
+    """Once a role has enough high-score hits, later synonym prompts are skipped."""
+
+    class MultiProduct(FakeSam3):
+        def predict_text(self, prompt):
+            self.text_calls.append(prompt)
+            mask = np.zeros((100, 120), dtype=bool)
+            if prompt == "product":
+                mask[10:40, 10:50] = True
+                mask2 = np.zeros((100, 120), dtype=bool)
+                mask2[50:80, 60:100] = True
+                return [
+                    {"mask": mask, "box": [10, 10, 50, 40], "score": 0.91},
+                    {"mask": mask2, "box": [60, 50, 100, 80], "score": 0.88},
+                ]
+            if prompt == "product package":
+                mask[20:45, 20:55] = True
+                return [{"mask": mask, "box": [20, 20, 55, 45], "score": 0.80}]
+            return []
+
+    backend = MultiProduct()
+    cfg = {
+        "sam3": {
+            "prompts": [
+                {"prompt": "product", "role": "product", "kind": "photo-fragment"},
+                {"prompt": "product package", "role": "product", "kind": "photo-fragment"},
+                {"prompt": "logo", "role": "logo", "kind": "icon"},
+            ],
+            "confidence": 0.4,
+            "role_prompt_early_exit": {"enabled": True, "min_hits": 2, "min_score": 0.55},
+        }
+    }
+    result = sam3_detect.detect(
+        _image(tmp_path), [], cfg, run_dir=str(tmp_path), backend=backend
+    )
+    assert backend.text_calls == ["product", "logo"]  # package skipped
+    assert result["diagnostics"]["text_prompts_skipped_role_exit"] == 1
+    roles = [e["role"] for e in result["elements"] if e["provenance"]["mode"] == "text-prompt"]
+    assert roles.count("product") == 2
+
+
 def test_empty_backend_predictions_are_partial_not_false_success(tmp_path):
     class EmptySam3:
         name = "empty-sam3"
@@ -218,7 +259,7 @@ def test_default_prompts_include_ui_ad_roles():
 def test_default_prompts_include_intentional_raster_cluster_roles():
     roles = {spec["role"] for spec in sam3_detect._prompt_specs(None)}
     assert {"screenshot", "ui-panel", "receipt", "chart", "nutrition-panel",
-            "diagram", "product-cluster"} <= roles
+            "diagram", "product-cluster", "logo-strip"} <= roles
 
 
 def test_small_square_icon_accepted_below_generic_min_score(tmp_path):

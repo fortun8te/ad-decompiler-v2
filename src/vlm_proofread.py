@@ -136,7 +136,9 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     errors = 0
     ensemble_checked = 0
     notes: list[dict] = []
-    for line in candidates:
+    workers = vlm_client.parallelism_from_cfg(cfg)
+
+    def _one(line: dict):
         is_ensemble = (
             ensemble_enabled
             and float(line.get("conf", 0.0)) >= threshold
@@ -144,10 +146,7 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
         )
         crop = vlm_client.crop_box_bytes(image, line["box"], padding)
         if crop is None:
-            continue
-        checked += 1
-        if is_ensemble:
-            ensemble_checked += 1
+            return None
         answer, note = _multi_pass_answer(
             crop,
             base_url=base_url,
@@ -156,7 +155,24 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
             max_tokens=max_tokens,
             passes=passes,
         )
-        original = str(line.get("text", ""))
+        return {
+            "line": line,
+            "is_ensemble": is_ensemble,
+            "answer": answer,
+            "note": note,
+            "original": str(line.get("text", "")),
+        }
+
+    for result in vlm_client.map_parallel(_one, candidates, workers=workers):
+        if result is None:
+            continue
+        line = result["line"]
+        checked += 1
+        if result["is_ensemble"]:
+            ensemble_checked += 1
+        answer = result["answer"]
+        note = result["note"]
+        original = result["original"]
         if note == "vlm_disagreement":
             disagreements += 1
             notes.append({"line_id": line.get("id"), "note": "vlm_disagreement", "ocr_text": original})
@@ -175,6 +191,7 @@ def proofread_lines(image_path: str, ocr_result: dict, cfg: dict) -> dict:
         "model": model,
         "threshold": threshold,
         "passes": passes,
+        "parallelism": workers,
         "lines_checked": checked,
         "lines_corrected": corrected,
         "lines_disagreed": disagreements,

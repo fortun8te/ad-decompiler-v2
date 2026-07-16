@@ -15,7 +15,7 @@ from PIL import Image
 from src import build_design_json, render_preview, schema
 from src.build_design_json import (
     _generous_text_box, _split_weight_run_siblings, _strip_edge_emoji,
-    _solid_plate_bands,
+    _solid_plate_bands, _promote_weight_candidate, _normalize_text_stroke,
 )
 from src.ocr import _restore_interpuncts
 from src.text_analysis import fit_text_box
@@ -127,7 +127,14 @@ def test_weight_run_split_produces_siblings():
         "id": "c_footer", "target": "text",
         "text": "05:00 PM · 12-05-2026 · 121K weergaven",
         "box": {"x": 20, "y": 920, "w": 680, "h": 45},
-        "style": {"fontSize": 34.0, "fontWeight": 300, "color": "#626465"},
+        "style": {
+            "fontSize": 34.0, "fontWeight": 300, "color": "#626465",
+            "fontFamily": "Inter", "fontStyle": "Light",
+            "fontCandidates": [
+                {"family": "Inter", "style": "Light", "weight": 300,
+                 "source": "local-render", "path": "inter-light.ttf", "score": 0.9},
+            ],
+        },
         "text_runs": [{"start": 24, "end": 28,
                        "style": {"fontWeight": 700, "color": "#CCCCCC"}}],
         "meta": {},
@@ -138,9 +145,79 @@ def test_weight_run_split_produces_siblings():
     assert texts == ["05:00 PM · 12-05-2026 ·", "121K", "weergaven"]
     weights = [p["style"].get("fontWeight") for p in pieces]
     assert weights == [300, 700, 300]
+    bold = pieces[1]["style"]
+    # Bold sibling must not keep the Light file as candidates[0].path
+    assert bold["fontWeight"] == 700
+    assert bold["fontCandidates"][0]["weight"] == 700
+    assert "path" not in bold["fontCandidates"][0] or not bold["fontCandidates"][0].get("path")
     xs = [p["box"]["x"] for p in pieces]
     assert xs == sorted(xs)
     assert all(not p.get("text_runs") for p in pieces)
+
+
+def test_promote_weight_candidate_rewrites_mismatched_regular_file():
+    style = {
+        "fontFamily": "Inter", "fontWeight": 700, "fontStyle": "Bold",
+        "fontCandidates": [
+            {"family": "Inter", "style": "Regular", "weight": 400,
+             "source": "local-render", "path": "inter-regular.ttf", "score": 0.8},
+        ],
+    }
+    _promote_weight_candidate(style)
+    assert style["fontWeight"] == 700
+    assert style["fontCandidates"][0]["weight"] == 700
+    assert "path" not in style["fontCandidates"][0]
+
+
+def test_normalize_text_stroke_outside_and_fat_to_effect():
+    thin, effects = _normalize_text_stroke(
+        {"kind": "flat", "color": "#0f0f0f", "width": 2.0, "align": "CENTER"},
+        {"fontSize": 48.0}, [])
+    assert thin is not None
+    assert thin["align"] == "OUTSIDE"
+    assert thin["strokeAlign"] == "OUTSIDE"
+    assert thin["width"] <= 48.0 * 0.08 + 0.01
+    assert effects == []
+
+    fat, effects = _normalize_text_stroke(
+        {"kind": "flat", "color": "#ffffff", "width": 12.0},
+        {"fontSize": 40.0}, [])
+    assert fat is None
+    assert effects and effects[0]["type"] == "DROP_SHADOW"
+    assert effects[0]["offset"] == {"x": 0, "y": 0}
+
+
+def test_build_preserves_detected_text_shadow_effects(tmp_path):
+    run_dir = tmp_path / "run"
+    candidates = [{
+        "id": "t_shadow", "target": "text", "text": "SALE",
+        "box": {"x": 40, "y": 40, "w": 200, "h": 48},
+        "visible_box": {"x": 40, "y": 40, "w": 200, "h": 48},
+        "style": {
+            "fontSize": 40.0, "fontWeight": 700, "color": "#ffffff",
+            "lineHeight": 48.0, "align": "LEFT", "letterSpacing": 2.5,
+            "effects": [{
+                "type": "DROP_SHADOW", "color": "#00000099",
+                "offset": {"x": 2, "y": 3}, "radius": 4, "spread": 0,
+            }],
+        },
+        "meta": {"role": "headline"},
+    }]
+    doc = build_design_json.build(candidates, {"w": 400, "h": 200}, str(run_dir))
+    layer = next(l for l in doc.layers if l.type == "text")
+    assert float(layer.style.get("letterSpacing") or 0) == 0.0
+    assert layer.effects and layer.effects[0]["type"] == "DROP_SHADOW"
+    assert layer.effects[0]["offset"] == {"x": 2, "y": 3}
+
+
+def test_generous_box_pads_for_outside_stroke():
+    style = {"fontSize": 40.0, "lineHeight": 48.0, "align": "LEFT"}
+    box = {"x": 10.0, "y": 20.0, "w": 200.0, "h": 40.0}
+    stroke = {"width": 4.0, "align": "OUTSIDE", "color": "#000"}
+    out = _generous_text_box(box, style, "SALE", stroke=stroke)
+    assert out["h"] >= style["fontSize"] * 1.25 - 0.01
+    assert out["w"] > box["w"] + 3.0
+    assert out["x"] <= box["x"]
 
 
 def test_weight_run_split_ignores_small_delta_and_multiline():
@@ -282,6 +359,9 @@ def test_interpunct_restoration():
     assert _restore_interpuncts("well - known phrase") == "well - known phrase"
     assert _restore_interpuncts("Price 4.22 USD") == "Price 4.22 USD"
     assert _restore_interpuncts("12-05-2026") == "12-05-2026"
+    # Bullet glyphs + decimal view counts after a date separator.
+    assert _restore_interpuncts("9:41 AM • May 12 • 1.2M views") == "9:41 AM · May 12 · 1.2M views"
+    assert _restore_interpuncts("May 12 . 1.2M views") == "May 12 · 1.2M views"
 
 
 # ── routing: emoji + icon chips ─────────────────────────────────────────────────

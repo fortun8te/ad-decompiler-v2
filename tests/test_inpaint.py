@@ -491,6 +491,45 @@ def test_regional_flat_plate_uses_analytic_fill_and_keeps_exterior_exact(tmp_pat
     assert np.max(np.abs(output[mask > 0].astype(int) - np.array([18, 24, 30]))) <= 1
 
 
+def test_regional_ui_chrome_prefers_analytic_over_flux_on_flat_archetype(tmp_path, monkeypatch):
+    """009-style dark UI: text/badge holes must not spend Flux even with a noisier ring."""
+    from PIL import Image
+    source = np.full((120, 160, 3), 12, dtype=np.uint8)
+    source[40:70, 50:110] = (240, 240, 240)  # text ink
+    # Mild ring noise (panel edge) that used to push residual over the strict flat gate.
+    source[36:40, 48:112] = 28
+    mask = np.zeros((120, 160), dtype=np.uint8); mask[40:70, 50:110] = 255
+    Image.fromarray(source).save(tmp_path / "source.png")
+    calls = {"flux": 0}
+
+    def fake_single(rgb, inner_mask, cfg):
+        calls["flux"] += 1
+        return np.full_like(rgb, 7), "flux-comfy", {"backend_choice": "flux-comfy"}
+
+    monkeypatch.setattr(inpaint, "_inpaint_single_pass", fake_single)
+    cfg = {
+        "scene": {"archetype": "social_screenshot"},
+        "inpaint": {
+            "mode": "auto", "comfy": {"enabled": True},
+            "regional": {
+                "enabled": True, "min_context": 12, "max_context": 16, "min_crop": 64,
+                "flat_residual_p90": 4, "flat_gradient_p90": 4,
+                "ui_analytic_residual_p90": 40, "ui_analytic_dominant_fraction": 0.35,
+                "flux_residual_p90": -1, "flux_gradient_p90": -1,
+                "flux_max_canvas_fraction": 0.5,
+            },
+        },
+    }
+    result = inpaint.inpaint_regional(
+        str(tmp_path / "source.png"),
+        [{"id": "t0", "target": "text", "role": "headline", "mask_array": mask}],
+        mask, str(tmp_path / "out.png"), cfg,
+    )
+    assert calls["flux"] == 0
+    assert result["regions"][0]["route"] == "analytic-affine"
+    assert result["backend_counts"].get("analytic-affine") == 1
+
+
 def test_regional_dominant_flat_plate_ignores_foreground_ring_contamination(tmp_path):
     from PIL import Image
     source = np.full((100, 120, 3), 245, dtype=np.uint8)

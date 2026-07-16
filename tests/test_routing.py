@@ -57,6 +57,30 @@ def test_flat_button_stays_native_primitive_instead_of_being_traced():
     assert out["meta"]["button_shell"] is True
 
 
+def test_text_bearing_logo_shell_routes_to_shape_plate_not_icon():
+    """Sale seals mislabeled as logo/icon must become a SHAPE plate when they host OCR."""
+    out = routing.route(
+        {"id": "E014", "kind": "icon", "box": {"x": 774, "y": 540, "w": 256, "h": 254},
+         "meta": {"role": "logo", "text_bearing_shell": True, "plate_shell": True}},
+        CANVAS,
+    )
+    assert out["target"] == "shape"
+    assert out["meta"]["role"] == "badge"
+    assert out["meta"]["plate_shell"] is True
+    assert out["meta"].get("reclassified_from") == "logo"
+
+
+def test_text_bearing_wide_shape_routes_as_banner_plate():
+    out = routing.route(
+        {"id": "E_ban", "kind": "shape", "box": {"x": 80, "y": 220, "w": 920, "h": 140},
+         "meta": {"role": "shape", "text_bearing_shell": True, "plate_shell": True}},
+        {"w": 1080, "h": 1350},
+    )
+    assert out["target"] == "shape"
+    assert out["meta"]["role"] == "banner"
+    assert out["meta"]["plate_shell"] is True
+
+
 def test_thin_divider_stays_a_native_bar_instead_of_vector_tracing():
     out = routing.route(
         {"id": "rule", "kind": "divider", "box": {"x": 10, "y": 10, "w": 180, "h": 2},
@@ -220,3 +244,16 @@ def test_oversized_burst_uses_exact_raster_instead_of_rectangle():
     )
     assert out["target"] == "image"
     assert out["meta"]["vector_fallback"] is True
+
+
+def test_monte_flat_brand_headline_stays_editable_text_not_wordmark_raster():
+    """Short brand on cream/black plate with overlay flags → TEXT, not logo IMAGE."""
+    out = routing.route(
+        {"id": "brand", "text": "MONTE", "kind": "text",
+         "box": {"x": 70, "y": 120, "w": 300, "h": 80},
+         "meta": {"role": "headline", "overlay_text": True, "removal_required": True}},
+        CANVAS,
+    )
+    assert out["target"] == "text"
+    assert not out["meta"].get("wordmark")
+    assert out["meta"].get("overlay_text") is True

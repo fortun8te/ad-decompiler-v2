@@ -253,7 +253,9 @@ def classify_scene_text(image_path: str, ocr_result: dict, cfg: dict) -> dict:
     errors = 0
     notes: list[dict] = []
     role_counts = {role: 0 for role in _ROLES}
+    workers = vlm_client.parallelism_from_cfg(cfg)
 
+    pending: list[dict] = []
     for line in candidates:
         if time.monotonic() >= deadline:
             notes.append({"note": "vlm_budget_exhausted", "lines_remaining": len(candidates) - checked})
@@ -278,34 +280,55 @@ def classify_scene_text(image_path: str, ocr_result: dict, cfg: dict) -> dict:
         prior_decision = prior_decisions.get(observation_key)
         raw_answers = ([json.dumps(prior_decision)] if prior_decision
                        else list(cache.get(cache_key) or []))
-        note = None
-        if not raw_answers:
-            try:
-                variants = [scene_context, crop] if passes >= 2 else [crop]
-                for variant in variants:
-                    raw_answers.append(vlm_client.ask_vlm(
-                        variant, prompt, base_url=base_url, model=model,
-                        timeout_s=timeout_s, max_tokens=max_tokens,
-                        response_schema=_ROLE_SCHEMA,
-                    ))
-                cache[cache_key] = list(raw_answers)
-                if cache_path:
-                    temporary = cache_path + ".tmp"
-                    with open(temporary, "w", encoding="utf-8") as handle:
-                        json.dump(cache, handle, indent=2)
-                    os.replace(temporary, cache_path)
-            except Exception:
-                note = "vlm_error"
+        pending.append({
+            "line": line,
+            "crop": crop,
+            "scene_context": scene_context,
+            "prompt": prompt,
+            "cache_key": cache_key,
+            "raw_answers": raw_answers,
+            "prefetched": bool(raw_answers),
+        })
+
+    def _fetch(item: dict) -> dict:
+        if item["prefetched"]:
+            item["note"] = None
+            return item
+        try:
+            variants = (
+                [item["scene_context"], item["crop"]] if passes >= 2 else [item["crop"]]
+            )
+            answers = [
+                vlm_client.ask_vlm(
+                    variant, item["prompt"], base_url=base_url, model=model,
+                    timeout_s=timeout_s, max_tokens=max_tokens,
+                    response_schema=_ROLE_SCHEMA,
+                )
+                for variant in variants
+            ]
+            item["raw_answers"] = answers
+            item["note"] = None
+            item["wrote_cache"] = True
+        except Exception:
+            item["raw_answers"] = []
+            item["note"] = "vlm_error"
+            item["wrote_cache"] = False
+        return item
+
+    for item in vlm_client.map_parallel(_fetch, pending, workers=workers):
+        line = item["line"]
+        raw_answers = item.get("raw_answers") or []
+        note = item.get("note")
+        if item.get("wrote_cache") and raw_answers:
+            cache[item["cache_key"]] = list(raw_answers)
         parsed_answers = [_parse_ownership(value) for value in raw_answers]
+        protected_owners: set = set()
         if note is None and (not parsed_answers or any(value is None for value in parsed_answers)):
             note = "vlm_error"
         if note is None:
             actions = {value["action"] for value in parsed_answers}
             protected_owners = {value["owner"] for value in parsed_answers
                                 if value["owner"] in {"photo", "product", "card"}}
-            # Placement wording is advisory: a screenshot body can reasonably be called
-            # both printed and overlay. Destructive safety depends on the agreed action;
-            # any protected owner still vetoes recreation.
             if len(actions) != 1 or ("recreate" in actions and protected_owners):
                 note = "vlm_disagreement"
         answer = None
@@ -366,6 +389,15 @@ def classify_scene_text(image_path: str, ocr_result: dict, cfg: dict) -> dict:
         role_counts[role] += 1
         notes.append({"line_id": line.get("id"), "role": role, "ownership": decision})
 
+    if cache_path and cache:
+        try:
+            temporary = cache_path + ".tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(cache, handle, indent=2)
+            os.replace(temporary, cache_path)
+        except OSError:
+            pass
+
     result = copy.deepcopy(ocr_result)
     result["lines"] = lines
     blocks = list(result.get("blocks") or [])
@@ -376,6 +408,7 @@ def classify_scene_text(image_path: str, ocr_result: dict, cfg: dict) -> dict:
         "enabled": True,
         "model": model,
         "context_padding": padding,
+        "parallelism": workers,
         "lines_checked": checked,
         "lines_classified": classified,
         "lines_disagreed": disagreements,

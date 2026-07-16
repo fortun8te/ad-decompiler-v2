@@ -532,3 +532,119 @@ def test_residual_stream_unions_with_sam_residual_fallback(tmp_path):
     sources = fused[0]["provenance"]["sources"]
     assert "sam3:residual-fallback" in sources
     assert "residual" in sources
+
+
+def test_sibling_product_cutouts_do_not_merge_on_moderate_iou(tmp_path):
+    """Hears packshot: box + earplugs stay two products even when masks partially overlap."""
+    box = _mask(10, 20, 40, 50)
+    plugs = _mask(35, 30, 35, 40)  # partial overlap with box, IoU well below 0.85
+    metrics = element_fusion._mask_metrics(box, plugs)
+    assert metrics["iou"] < 0.85
+    assert metrics["iou"] > 0.05
+    sam3 = {
+        "elements": [
+            {
+                "id": "S-box",
+                "box": _box(10, 20, 40, 50),
+                "role": "product",
+                "kind": "photo-fragment",
+                "score": 0.93,
+                "_mask": box,
+                "provenance": {"mode": "text-prompt", "prompt": "box"},
+            },
+            {
+                "id": "S-plugs",
+                "box": _box(35, 30, 35, 40),
+                "role": "product",
+                "kind": "photo-fragment",
+                "score": 0.91,
+                "_mask": plugs,
+                "provenance": {"mode": "text-prompt", "prompt": "product"},
+            },
+        ]
+    }
+    fused = element_fusion.fuse(sam3, [], [], CANVAS, run_dir=str(tmp_path))
+    assert len(fused) == 2
+    assert {e["role"] for e in fused} == {"product"}
+
+
+def test_biomel_vs_comparison_two_products_and_vs_chip_stay_separate(tmp_path):
+    """Biomel VS panel: coffee + bag products must not merge; middle VS badge stays."""
+    coffee = _mask(5, 10, 35, 55)
+    bag = _mask(55, 8, 35, 58)
+    vs = _mask(42, 30, 12, 12)
+    assert element_fusion._mask_metrics(coffee, bag)["iou"] < 0.85
+    sam3 = {
+        "elements": [
+            {
+                "id": "S-coffee",
+                "box": _box(5, 10, 35, 55),
+                "role": "product",
+                "kind": "photo-fragment",
+                "score": 0.94,
+                "_mask": coffee,
+                "provenance": {"mode": "text-prompt", "prompt": "product"},
+            },
+            {
+                "id": "S-bag",
+                "box": _box(55, 8, 35, 58),
+                "role": "package",
+                "kind": "photo-fragment",
+                "score": 0.92,
+                "_mask": bag,
+                "provenance": {"mode": "text-prompt", "prompt": "package"},
+            },
+            {
+                "id": "S-vs",
+                "box": _box(42, 30, 12, 12),
+                "role": "badge",
+                "kind": "icon",
+                "score": 0.88,
+                "_mask": vs,
+                "provenance": {"mode": "text-prompt", "prompt": "badge"},
+            },
+        ]
+    }
+    fused = element_fusion.fuse(sam3, [], [], CANVAS, run_dir=str(tmp_path))
+    assert len(fused) == 3
+    roles = {e["role"] for e in fused}
+    assert "product" in roles or "package" in roles
+    assert "badge" in roles
+    assert sum(1 for e in fused if e["role"] in {"product", "package"}) == 2
+
+
+def test_wavy_tube_across_photo_panel_stays_top_level_cutout(tmp_path):
+    """Product tube straddling a photo panel must not nest under / merge into the panel."""
+    photo = _mask(5, 5, 90, 55)       # ends at y=60
+    tube = _mask(30, 20, 40, 75)      # extends to y=95 → spills past the panel
+    metrics = element_fusion._mask_metrics(photo, tube)
+    assert metrics["containment"] < 0.85
+    assert metrics["iou"] < 0.68
+    sam3 = {
+        "elements": [
+            {
+                "id": "S-panel",
+                "box": _box(5, 5, 90, 55),
+                "role": "photo",
+                "kind": "photo-fragment",
+                "score": 0.9,
+                "_mask": photo,
+                "provenance": {"mode": "text-prompt", "prompt": "photo"},
+            },
+            {
+                "id": "S-tube",
+                "box": _box(30, 20, 40, 75),
+                "role": "product",
+                "kind": "photo-fragment",
+                "score": 0.95,
+                "_mask": tube,
+                "provenance": {"mode": "text-prompt", "prompt": "product"},
+            },
+        ]
+    }
+    fused = element_fusion.fuse(sam3, [], [], CANVAS, run_dir=str(tmp_path))
+    assert len(fused) == 2
+    by_role = {e["role"]: e for e in fused}
+    assert "product" in by_role and "photo" in by_role
+    assert by_role["product"].get("parent_id") is None
+    assert by_role["photo"].get("parent_id") is None

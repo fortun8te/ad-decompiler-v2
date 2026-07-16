@@ -227,12 +227,13 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
     structure_degraded = False
     try:
         # 1 normalize
+        canvas = None
         if stage("normalize") or dirty or not exists("normalized.png"):
             current_stage = "normalize"
             norm_path, canvas = normalize.load_normalize(input_path, run_dir, cfg)
             dirty = True
             _log(run_dir, f"normalize → {canvas['w']}x{canvas['h']}")
-        else:
+        if canvas is None:
             canvas = load(A("canvas.json"))
         dump({"w": canvas["w"], "h": canvas["h"]}, A("canvas.json"))
         norm_path = A("normalized.png")
@@ -242,6 +243,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         configured_archetype = str((cfg.get("archetype") or {}).get("preset", "auto"))
 
         # 2 OCR facts, followed by painted-text/style/hierarchy analysis.
+        raw_ocr = None
         if stage("ocr") or dirty or not exists("ocr_raw.json"):
             current_stage = "ocr"
             dirty = True
@@ -269,7 +271,8 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 if vp.get("ensemble_disagreement_checked"):
                     vp_note += f", ensemble-proofread {vp['ensemble_disagreement_checked']}"
             _log(run_dir, f"ocr[{raw_ocr.get('engine')}] → {len(raw_ocr.get('lines', []))} lines{oj_note}{vp_note}")
-        raw_ocr = load(A("ocr_raw.json")) if exists("ocr_raw.json") else load(A("ocr.json"))
+        if raw_ocr is None:
+            raw_ocr = load(A("ocr_raw.json")) if exists("ocr_raw.json") else load(A("ocr.json"))
         # Persist a filename-independent scene decision and make its preset visible to
         # every remaining stage. Optional semantic observations can come from an
         # upstream/VLM caller; OCR and canvas facts are always available locally.
@@ -280,9 +283,24 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         facts.update(archetype.image_facts(norm_path))
         scene_decision = archetype.classify(facts, configured=configured_archetype)
         scene_decision["facts"] = facts
+        # Aspect class + capability flags (format readiness) — not a new named preset.
+        from src import format_readiness
+        format_cfg = cfg.get("format") or {}
+        scene_decision = format_readiness.attach_to_decision(
+            scene_decision,
+            canvas,
+            capability_overrides=format_cfg.get("capabilities"),
+            tags=format_cfg.get("tags"),
+        )
         dump(scene_decision, A("archetype.json"))
+        dump(scene_decision.get("format") or {}, A("format.json"))
         cfg = archetype.apply_preset(cfg, scene_decision)
-        _log(run_dir, f"archetype → {scene_decision['archetype']}")
+        fmt = (cfg.get("scene") or {}).get("format") or {}
+        caps = ",".join(fmt.get("enabled_capabilities") or []) or "none"
+        _log(run_dir,
+             f"archetype → {scene_decision['archetype']} "
+             f"(aspect={fmt.get('aspect_class', '?')}, caps={caps})")
+        ocr_res = None
         if stage("text") or dirty or not exists("ocr.json"):
             current_stage = "text"
             dirty = True
@@ -309,16 +327,19 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 fj_note = f", vlm-font-judge promoted {fj.get('styles_promoted', 0)}/{fj.get('styles_checked', 0)}"
             _log(run_dir, f"text analysis → {len(ocr_res.get('blocks', []))} blocks, "
                  f"{len(ocr_res.get('styles', []))} styles{st_note}{fj_note}")
-        ocr_res = load(A("ocr.json"))
+        if ocr_res is None:
+            ocr_res = load(A("ocr.json"))
 
         # 3 deterministic residual proposals. This also writes box-local masks.
+        residual = None
         if stage("residual") or dirty or not exists("residual.json"):
             current_stage = "residual"
             dirty = True
             residual = element_detect.detect(norm_path, ocr_res, cfg, run_dir=run_dir)
             dump(residual, A("residual.json"))
             _log(run_dir, f"residual proposals → {len(residual)}")
-        residual = load(A("residual.json"))
+        if residual is None:
+            residual = load(A("residual.json"))
 
         ep_cfg = ((cfg.get("vlm") or {}).get("element_propose") or {})
         sam_element_count = None
@@ -351,21 +372,25 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             _log(run_dir, f"vlm element propose → +{added} proposals ({len(residual)} total)")
 
         # 4 optional Qwen layers are advisory observations/assets, never the scene graph.
+        qwen = None
         if stage("qwen") or dirty or not exists("qwen.json"):
             current_stage = "qwen"
             dirty = True
             qwen = qwen_worker.propose_layers(norm_path, run_dir, cfg)
             dump(qwen, A("qwen.json")); _log(run_dir, f"qwen → {len(qwen)} layers")
-        qwen = load(A("qwen.json"))
+        if qwen is None:
+            qwen = load(A("qwen.json"))
 
         # 5 SAM 3 image prompt sweep + box-refine every residual, then mask-aware fusion.
+        sam = None
         if stage("sam") or dirty or not exists("sam3.json"):
             current_stage = "sam"
             dirty = True
             vram.stage_boundary("qwen", "sam", cfg, run_dir, log_fn=lambda msg: _log(run_dir, msg))
             sam = _sam_with_safe_retry(norm_path, residual, cfg, run_dir, report)
             _log(run_dir, f"sam3[{sam.get('status')}] → {len(sam.get('elements', []))} observations")
-        sam = load(A("sam3.json"))
+        if sam is None:
+            sam = load(A("sam3.json"))
         report.stage("ocr", str(raw_ocr.get("status") or "ok"),
                      detail="; ".join(str(item.get("error", item)) for item in raw_ocr.get("errors", [])[:2]) or None,
                      artifacts=["ocr_raw.json"])
@@ -374,6 +399,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
         report.stage("sam", str(sam.get("status") or "ok"), detail=sam.get("note"),
                      artifacts=["sam3.json", "sam3_masks"])
         runtime_violations = _model_health(raw_ocr, sam, run_dir, cfg, report)
+        els = None
         if stage("elements") or dirty or not exists("elements.json"):
             current_stage = "elements"
             dirty = True
@@ -387,7 +413,8 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             els = vlm_segment_filter.filter_elements(norm_path, fused, cfg)
             dump(els, A("elements.json"))
             _log(run_dir, f"element fusion → {len(fused)} canonical → {len(els)} after filter")
-        els = load(A("elements.json")) if exists("elements.json") else load(A("fused_elements.json"))
+        if els is None:
+            els = load(A("elements.json")) if exists("elements.json") else load(A("fused_elements.json"))
 
         # 5b OPTIONAL occlusion-attributed peel (docs/PEEL-DECOMPOSITION.md).
         # Completes layers that sit UNDER other layers so they stay whole when moved.
@@ -401,22 +428,57 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 try:
                     scene_elements = peel_scene.elements_from_run(
                         run_dir, els, canvas, cfg=cfg, ocr=ocr_res)
+                    # Unload SAM (+ lazy Flux prep) so peel can use Flux Fill on
+                    # mid/large photo holes without the 25 min SAM+Flux clash.
+                    vram.stage_boundary("elements", "peel", cfg, run_dir,
+                                        log_fn=lambda msg: _log(run_dir, msg))
 
                     def _peel_inpaint(rgb, mask, meta=None):
-                        # Peel holes are small (one occluder's footprint on one owner),
-                        # so LaMa is unconditionally the right tool — never route them
-                        # through the Flux ladder: with SAM3 still resident at this
-                        # point in the pipeline (no vram.stage_boundary before peel),
-                        # an escalation partial-offloads Flux and one call can take
-                        # ~25 minutes (observed live during validation). Flat/plate
-                        # holes are handled upstream by peel_scene's own flat-fill
-                        # before this callback ever runs.
+                        # Ladder: flat upstream → Telea (text/tiny) → Flux (photo band)
+                        # → LaMa. Bake/abandon only past flux_max inside peel_scene.
+                        import numpy as _np
                         from src import inpaint as inpaint_mod
-                        route_cfg = dict(cfg)
-                        route_cfg["inpaint"] = {**(cfg.get("inpaint") or {}), "mode": "lama"}
-                        out, _backend, _diag = inpaint_mod.inpaint_array(
-                            rgb, mask.astype("uint8") * 255, route_cfg, return_diagnostics=True)
+                        from src import peel_decompose as _peel_dec
+                        meta = dict(meta or {})
+                        peel_cfg = (cfg.get("peel") or {})
+                        hole_px = int(_np.asarray(mask, bool).sum())
+                        meta["hole_px"] = hole_px
+                        telea_max = int(peel_cfg.get("telea_max_hole_px", 2500) or 2500)
+                        text_backend = str(peel_cfg.get("text_inpaint", "telea") or "telea").lower()
+                        use_telea = False
+                        if hole_px > 0 and meta.get("text_occluder"):
+                            use_telea = text_backend in ("telea", "opencv", "opencv-telea")
+                        elif hole_px > 0 and hole_px < telea_max and not _is_photo_under(meta):
+                            use_telea = True
+                        if use_telea:
+                            out = _peel_dec.opencv_inpaint(rgb, mask)
+                            backend = "opencv-telea"
+                        else:
+                            route_cfg = dict(cfg)
+                            mode = peel_scene.peel_inpaint_mode(cfg, meta)
+                            base_inpaint = dict(cfg.get("inpaint") or {})
+                            comfy = dict(base_inpaint.get("comfy") or {})
+                            if mode != "flux_comfy":
+                                comfy["enabled"] = False
+                            else:
+                                comfy["enabled"] = True
+                                # Empty prompt won the photo-hole A/B; keep plate prompt off.
+                                vram.ensure_flux_vram(route_cfg, log_fn=lambda msg: _log(run_dir, msg))
+                            route_cfg["inpaint"] = {
+                                **base_inpaint, "mode": mode, "comfy": comfy}
+                            out, backend, _diag = inpaint_mod.inpaint_array(
+                                rgb, mask.astype("uint8") * 255, route_cfg,
+                                return_diagnostics=True)
+                        _log(run_dir,
+                             f"peel inpaint → {backend} under={meta.get('under_id')} "
+                             f"hole_px={hole_px} text={bool(meta.get('text_occluder'))} "
+                             f"kind={meta.get('under_kind')}")
                         return out
+
+                    def _is_photo_under(meta):
+                        kind = str((meta or {}).get("under_kind") or "").lower()
+                        return kind in {"photo", "photo-fragment", "image", "product",
+                                        "person", "cutout"}
 
                     result = peel_scene.peel_scene(
                         norm_path, scene_elements, inpaint=_peel_inpaint, cfg=cfg)
@@ -441,12 +503,14 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
 
         # 6 merge/routing creates semantic candidates.  Freeze the hierarchy before
         # reconstruction changes asset material or removes pixels for the clean plate.
+        merged = None
         if stage("merge") or dirty or not exists("merged.json"):
             current_stage = "merge"
             dirty = True
             merged = merge_layers.merge(ocr_res, els, peel_layers or qwen, canvas, cfg, run_dir=run_dir)
             dump(merged, A("merged.json")); _log(run_dir, f"merge → {len(merged)} candidates")
-        merged = load(A("merged.json"))
+        if merged is None:
+            merged = load(A("merged.json"))
 
         intent = load(A("scene_intent.json")) if exists("scene_intent.json") else None
         intent_stale = not scene_intent.is_current(intent, merged, canvas, cfg)
@@ -469,6 +533,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                 structure_degraded = True
                 _log(run_dir, f"structure fallback → {detail}")
 
+        reconstruction = None
         if stage("reconstruct") or dirty or not exists("reconstruction.json"):
             current_stage = "reconstruct"
             dirty = True
@@ -477,7 +542,8 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             _log(run_dir, "reconstruct → "
                  f"{reconstruction['stats']['canonical_entities']} entities, "
                  f"background={reconstruction['stats']['inpaint']['backend']}")
-        reconstruction = load(A("reconstruction.json"))
+        if reconstruction is None:
+            reconstruction = load(A("reconstruction.json"))
         inpaint_stats = (reconstruction.get("stats") or {}).get("inpaint", {}) or {}
         inpaint_backend = str(inpaint_stats.get("backend") or "")
         inpaint_class = str(inpaint_stats.get("backend_class") or "").lower()
@@ -517,6 +583,7 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             report.data["vram"] = {"boundaries": telemetry}
             report.write()
 
+        tree = None
         if stage("layout") or dirty or not exists("layout.json"):
             current_stage = "layout"
             dirty = True
@@ -555,7 +622,8 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
                     runtime_violations = report.violations
             dump(tree, A("layout.json"))
             _log(run_dir, f"layout.json → {len(tree)} root layers")
-        tree = load(A("layout.json"))
+        if tree is None:
+            tree = load(A("layout.json"))
 
         # 8 schema-v2 Figma scene graph (source of truth)
         if stage("design") or dirty or not exists("design.json"):
