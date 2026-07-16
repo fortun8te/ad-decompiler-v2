@@ -385,3 +385,330 @@ def test_worst_crop_prefers_worst_per_layer_over_milder_window():
     # Window alone (no per-layer) is unchanged — the F9 behaviour is preserved.
     only_window = {"local_ssim_worst_window": {"ssim": 0.05, "bbox": {"x": 8, "y": 8, "w": 16, "h": 16}}}
     assert qa_reward._worst_crop_box(only_window) == {"x": 8, "y": 8, "w": 16, "h": 16}
+
+
+# ── F: the second pass that changed nothing (postfix-benchmark-7 / 013) ──────────────
+#
+# Real record, runs/postfix-benchmark-7/013_attached_a32b069cce97685c:
+#
+#   [01:28:00] qa          -> ssim=0.7073 text_recall=0.8462 repairs=6
+#   [01:29:53] reconstruct -> 25 entities, background=regional        <- pass 2
+#   [01:30:09] qa          -> ssim=0.7073 text_recall=0.8462 repairs=6   IDENTICAL
+#   [01:30:10] harness     -> plateau after 1/2 round(s)
+#
+#   repair: merge:dedup c_B2, "VLM critique: duplicated text '% OFF'"
+#   resume: merge | artifacts_changed: TRUE | no_effect: null | elapsed_s: 122.5
+#
+# ``execute_repairs`` fingerprinted stage output BYTES, so re-serialized design.json
+# diagnostics plus a re-encoded preview.png flipped artifacts_changed to True while the
+# render and every QA metric were bit-identical. The round escaped the identical-artifact
+# short-circuit and burned 122.5s to change nothing — the user's "im not seeing any
+# fucking changes bruv". These tests seed 013's real numbers and layers.
+
+# 013's real merged.json text layers. Nothing is duplicated: c_B2 is the only layer
+# carrying "% OFF", and it reads "61% OFF" — the VLM's duplicate never existed.
+_013_MERGED = [
+    {"id": "c_B0", "target": "text", "text": "We NEVER\ndo this!",
+     "box": {"x": 82.0, "y": 120.0, "w": 500.0, "h": 160.0}, "meta": {"confidence": 0.9}},
+    {"id": "c_B2", "target": "text", "text": "61% OFF",
+     "box": {"x": 97.03126609325409, "y": 807.3987579345703,
+             "w": 283.7109214067459, "h": 104.68568801879883},
+     "meta": {"confidence": 0.95}},
+    {"id": "c_B13", "target": "text", "text": "ONLINE EXCLUSIVE OFFER ENDING SOON",
+     "box": {"x": 82.0, "y": 1462.0, "w": 918.0, "h": 54.0}, "meta": {"confidence": 0.88}},
+]
+
+# The repair the VLM proposed, exactly as repair.py builds it for a duplicate_text anomaly.
+_013_DEDUP_REPAIR = {
+    "stage": "merge", "action": "dedup",
+    "reason": "VLM critique: duplicated text - '% OFF'",
+    "params": {"raise_dedup_iou": True, "duplicate_text": ["% OFF"],
+               "layer_ids": ["c_B2"], "source": "vlm_critique"},
+    "severity": "high", "target_id": "c_B2",
+}
+
+# 013's real QA numbers, before and after the 122.5s no-op round.
+_013_QA = {"ok": False, "ssim": 0.7073, "text_recall": 0.8462,
+           "hard_fails": [{"rule": "visual", "detail": "local ssim 0.459 < 0.5"}]}
+
+
+def _write_preview(path, mark=None):
+    """013-shaped 1080x1920 preview; ``mark`` paints a real, local render change."""
+    from PIL import Image
+    image = Image.new("RGB", (1080, 1920), (18, 32, 24))
+    if mark:
+        pixels = image.load()
+        for y in range(mark):
+            for x in range(mark):
+                pixels[x, y] = (255, 0, 0)
+    image.save(path)
+
+
+def _013_design(layers=None):
+    return {
+        "id": "013_attached_a32b069cce97685c", "schema_version": 2,
+        "canvas": {"w": 1080, "h": 1920},
+        "layers": layers or [
+            {"id": "c_B2", "type": "text", "text": "61% OFF",
+             "box": {"x": 97.03126609325409, "y": 807.3987579345703,
+                     "w": 283.7109214067459, "h": 104.68568801879883},
+             "fill": "#FFFFFF", "meta": {"confidence": 0.95}},
+        ],
+        # Diagnostics: rewritten on every rerun, read by nobody, decide nothing.
+        "meta": {"layer_count": 12, "editable_ratio": 0.5, "warnings": [],
+                 "single_ownership": {"collapsed": 2, "noop": 1},
+                 "compiler": "scene-graph-v2"},
+    }
+
+
+def _seed_013(tmp_path, repairs, merged=None):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    input_path = tmp_path / "input.png"
+    input_path.write_bytes(b"png")
+    (run_dir / "runtime_report.json").write_text(
+        json.dumps({"input": str(input_path)}), encoding="utf-8")
+    (run_dir / "repairs.json").write_text(json.dumps(repairs), encoding="utf-8")
+    (run_dir / "qa.json").write_text(
+        json.dumps({**_013_QA, "repairs": repairs}), encoding="utf-8")
+    (run_dir / "design.json").write_text(json.dumps(_013_design(), indent=2),
+                                         encoding="utf-8")
+    (run_dir / "merged.json").write_text(
+        json.dumps(_013_MERGED if merged is None else merged), encoding="utf-8")
+    _write_preview(str(run_dir / "preview.png"))
+    return run_dir, input_path
+
+
+def _noop_rerun(run_dir):
+    """Reproduce 013's byte churn: diagnostics rewritten, preview re-encoded, QA re-emitted.
+
+    Every metric holds at ssim=0.7073 / text_recall=0.8462 and every pixel holds.
+    """
+    design_path = os.path.join(run_dir, "design.json")
+    design = _load(design_path)
+    design["meta"]["single_ownership"]["noop"] = 99      # diagnostic counter moved
+    design["meta"]["warnings"] = ["merge rerun: dedup applied to 0 layers"]
+    design["meta"]["generated_at"] = "2026-07-16T01:29:53"   # timestamp
+    design = dict(reversed(list(design.items())))            # key order churn
+    with open(design_path, "w", encoding="utf-8") as handle:
+        json.dump(design, handle, separators=(",", ":"))     # re-serialized compactly
+    _write_preview(os.path.join(run_dir, "preview.png"))      # re-encoded, same pixels
+    qa_path = os.path.join(run_dir, "qa.json")
+    qa = _load(qa_path)
+    qa["timestamp"] = qa.get("timestamp", 0) + 1
+    with open(qa_path, "w", encoding="utf-8") as handle:
+        json.dump(qa, handle)
+
+
+def test_013_byte_delta_with_identical_render_is_a_no_op(tmp_path):
+    """The bug: bytes moved, render did not. Must short-circuit, not spend a round."""
+    # An untargeted probe, so the admission dedup screen is not what is under test here.
+    repairs = [{"stage": "merge", "action": "dedup", "reason": "overlap",
+                "params": {"raise_dedup_iou": True}, "severity": "high"}]
+    run_dir, _ = _seed_013(tmp_path, repairs)
+    before_bytes = harness._artifact_fingerprint(str(run_dir / "design.json"))
+
+    def fake_run_one(path, rd, cfg, start_from="normalize"):
+        _noop_rerun(rd)
+        return {"ok": True, "run_dir": rd}
+
+    summary = harness.execute_repairs(str(run_dir), {}, max_iterations=1,
+                                      run_one=fake_run_one)
+    executed = [a for a in summary["attempts"]
+                if not a.get("admission_skipped") and not a.get("admission_rejected")]
+    assert executed, "the probe must actually run"
+    attempt = executed[0]
+    # The bytes really did change — this is the exact condition that fooled HEAD.
+    assert harness._artifact_fingerprint(str(run_dir / "design.json")) != before_bytes
+    # ...but the OUTCOME did not, so the round is a no-op and says why.
+    assert attempt["artifacts_changed"] is False, (
+        "a re-serialized diagnostic and a re-encoded PNG are not a change")
+    assert attempt["no_effect"] == "identical-render"
+    detail = attempt["no_effect_detail"]
+    assert detail["bytes_changed"] is True          # names what actually happened
+    assert "design.json" in detail["compared"] and "preview.png" in detail["compared"]
+    assert "ssim" in detail["qa_metrics_identical"]
+
+
+def test_013_identical_render_round_short_circuits_and_stops(tmp_path):
+    """122.5s of merge->reconstruct->qa must not be followed by another round."""
+    repairs = [{"stage": "merge", "action": "dedup", "reason": "overlap",
+                "params": {"raise_dedup_iou": True}, "severity": "high"}]
+    run_dir, input_path = _seed_013(tmp_path, repairs)
+    runs = []
+
+    def fake_run_one(path, rd, cfg, start_from="normalize"):
+        runs.append(start_from)
+        _noop_rerun(rd)
+        return {"ok": True, "run_dir": rd}
+
+    import src.harness_fixer as harness_fixer
+    original = harness_fixer.apply_fixer_round
+    fixer_calls = []
+
+    def spy(rd, cfg, critic_output):
+        fixer_calls.append(rd)
+        return original(rd, cfg, critic_output)
+
+    harness_fixer.apply_fixer_round = spy
+    try:
+        summary = harness_loop.run_until_acceptable(
+            str(input_path), str(run_dir), {}, max_rounds=3,
+            pipeline_already_ran=True, run_one=fake_run_one)
+    finally:
+        harness_fixer.apply_fixer_round = original
+
+    short = [r for r in summary["rounds"] if r.get("short_circuit")]
+    assert short, "an identical-render round must be short-circuited"
+    assert short[0]["short_circuit"] == "identical-render"
+    assert short[0]["fixer"]["skipped"] == "identical-render"
+    assert short[0]["short_circuit_detail"], "must record what was compared"
+    assert not fixer_calls, "no fixer pass on an unchanged design"
+    # The lever is not re-run on a second round — the 013 complaint.
+    assert summary["rounds_completed"] < 3
+    assert len(runs) == 1, f"the no-op lever must not be replayed, got {runs}"
+
+
+def test_013_targeted_dedup_screened_before_spending_122_seconds(tmp_path):
+    """The real 013 repair: screened at admission, so run_one is never called."""
+    run_dir, _ = _seed_013(tmp_path, [_013_DEDUP_REPAIR])
+    calls = []
+
+    def fake_run_one(path, rd, cfg, start_from="normalize"):
+        calls.append(start_from)
+        return {"ok": True, "run_dir": rd}
+
+    summary = harness.execute_repairs(str(run_dir), {}, max_iterations=1,
+                                      run_one=fake_run_one)
+    assert not calls, "a provably inert dedup must never start a pipeline rerun"
+    skipped = [a for a in summary["attempts"] if a.get("admission_skipped")]
+    assert skipped and skipped[0]["reason"] == "dedup-target-not-duplicated"
+    detail = skipped[0]["detail"]
+    assert "structurally incapable" in detail
+    assert "'% OFF'" in detail or "% OFF" in detail
+    assert "drops 0 of 3" in detail          # merge's own dedup, asked directly
+    # and the audit trail is persisted for the run
+    admission = _load(os.path.join(str(run_dir), "harness_admission.json"))
+    assert any(item["reason"] == "dedup-target-not-duplicated"
+               for item in admission["skipped"])
+
+
+def test_013_dedup_screen_does_not_block_capable_repairs(tmp_path):
+    """Do not over-block: a real duplicate, or an untargeted IoU probe, still runs."""
+    run_dir, _ = _seed_013(tmp_path, [])
+    patches = harness.recommended_resume([_013_DEDUP_REPAIR])["patches"]
+    # The real 013 patch against the real 013 layers: provably inert.
+    assert harness.targeted_dedup_noop_reason(str(run_dir), patches)
+
+    # A genuine duplicate ("61% OFF" twice, overlapping) is capable -> not screened.
+    duplicated = _013_MERGED + [
+        {"id": "c_B99", "target": "text", "text": "61% OFF",
+         "box": {"x": 97.03126609325409, "y": 807.3987579345703,
+                 "w": 283.7109214067459, "h": 104.68568801879883},
+         "meta": {"confidence": 0.6}},
+    ]
+    dup_dir, _ = _seed_013(tmp_path / "dup", [], merged=duplicated)
+    real = harness.recommended_resume([{
+        **_013_DEDUP_REPAIR,
+        "params": {**_013_DEDUP_REPAIR["params"], "duplicate_text": ["61% OFF"]},
+    }])["patches"]
+    assert harness.targeted_dedup_noop_reason(str(dup_dir), real) is None
+
+    # Two named layers: the id path can drop layer_ids[1:] -> capable.
+    two_ids = {"merge": {"dedup_iou": 0.72, "dedup_text": True,
+                         "layer_ids": ["c_B2", "c_B13"]}}
+    assert harness.targeted_dedup_noop_reason(str(run_dir), two_ids) is None
+    # The untargeted raise_dedup_iou probe is not this screen's business.
+    assert harness.targeted_dedup_noop_reason(
+        str(run_dir), {"merge": {"dedup_iou": 0.72}}) is None
+    # Missing evidence fails OPEN rather than silently blocking work.
+    assert harness.targeted_dedup_noop_reason(
+        str(tmp_path / "nonexistent"), patches) is None
+
+
+def test_013_genuine_improvement_still_proceeds(tmp_path):
+    """The over-block guard: a round that really moves the render is not short-circuited."""
+    repairs = [{"stage": "merge", "action": "dedup", "reason": "overlap",
+                "params": {"raise_dedup_iou": True}, "severity": "high"}]
+    run_dir, _ = _seed_013(tmp_path, repairs)
+
+    def improving_run_one(path, rd, cfg, start_from="normalize"):
+        # A real repaint plus a real node-content change and a real QA gain.
+        _write_preview(os.path.join(rd, "preview.png"), mark=60)
+        design = _013_design()
+        design["layers"][0]["text"] = "61% OFF"
+        design["layers"][0]["fill"] = "#FF0000"
+        with open(os.path.join(rd, "design.json"), "w", encoding="utf-8") as handle:
+            json.dump(design, handle)
+        with open(os.path.join(rd, "qa.json"), "w", encoding="utf-8") as handle:
+            json.dump({**_013_QA, "ssim": 0.7073 + 0.04, "repairs": repairs}, handle)
+        return {"ok": True, "run_dir": rd}
+
+    summary = harness.execute_repairs(str(run_dir), {}, max_iterations=1,
+                                      run_one=improving_run_one)
+    executed = [a for a in summary["attempts"]
+                if not a.get("admission_skipped") and not a.get("admission_rejected")]
+    attempt = executed[0]
+    assert attempt["artifacts_changed"] is True
+    assert attempt["qa_improved"] is True
+    assert "no_effect" not in attempt
+
+
+def test_013_local_render_change_survives_the_pixel_epsilon(tmp_path):
+    """A LOCAL edit must count: repairs are local, so a whole-image mean would hide them.
+
+    On 013's 1080x1920 preview a real 60x60 repaint averages to 0.243/255 — under any
+    sane mean epsilon — while a lossless re-encode moves exactly 0 pixels.
+    """
+    base = str(tmp_path / "a.png")
+    same = str(tmp_path / "b.png")
+    local = str(tmp_path / "c.png")
+    _write_preview(base)
+    _write_preview(same)          # identical pixels, independently encoded
+    _write_preview(local, mark=60)
+    before = harness._outcome_fingerprint(base)
+    assert harness._outcome_changed(before, harness._outcome_fingerprint(same)) is False
+    assert harness._outcome_changed(before, harness._outcome_fingerprint(local)) is True
+
+
+def test_semantic_json_ignores_diagnostics_but_not_content(tmp_path):
+    """Node set / text / boxes / fills decide; diagnostics, timings, key order do not."""
+    path = str(tmp_path / "design.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(_013_design(), handle, indent=2)
+    before = harness._outcome_fingerprint(path)
+
+    def rewrite(mutate):
+        design = _013_design()
+        mutate(design)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(design, handle, separators=(",", ":"))
+        return harness._outcome_changed(before, harness._outcome_fingerprint(path))
+
+    # Ignored: diagnostics, timings, key order, float jitter below QA's resolution.
+    assert rewrite(lambda d: d["meta"].update({"warnings": ["x"], "layer_count": 99})) is False
+    assert rewrite(lambda d: d.update({"meta": {"generated_at": "2026-07-16"}})) is False
+    assert rewrite(lambda d: d["layers"][0]["meta"].update({"confidence": 0.1})) is False
+    assert rewrite(lambda d: d["layers"][0]["box"].__setitem__(
+        "x", d["layers"][0]["box"]["x"] + 1e-9)) is False
+    # Honoured: the content that decides the render.
+    assert rewrite(lambda d: d["layers"][0].__setitem__("text", "62% OFF")) is True
+    assert rewrite(lambda d: d["layers"][0].__setitem__("fill", "#000000")) is True
+    assert rewrite(lambda d: d["layers"][0]["box"].__setitem__("x", 400.0)) is True
+    assert rewrite(lambda d: d["layers"].append({"id": "c_new", "type": "text"})) is True
+    assert rewrite(lambda d: d["layers"].clear()) is True
+
+
+def test_qa_metric_movement_counts_as_a_change():
+    """A QA move beyond noise is a change even if the render digest held."""
+    assert harness._qa_metrics_moved({"ssim": 0.0, "text_recall": 0.0}) is False
+    assert harness._qa_metrics_moved({"ssim": 0.001}) is False       # under tolerance
+    assert harness._qa_metrics_moved({"ssim": 0.02}) is True
+    assert harness._qa_metrics_moved({"ssim": -0.02}) is True        # regressions too
+    assert harness._qa_metrics_moved({"text_recall": 0.05}) is True
+    assert harness._qa_metrics_moved({"hard_fails": 1}) is True
+    # 013's real deltas: every metric flat.
+    assert harness._qa_metrics_moved({
+        "ssim": 0.0, "visual_score": 0.0, "text_recall": 0.0,
+        "editable_text_recall": 0.0, "edge_f1": 0.0, "color_similarity": 0.0,
+        "hard_fails": 0}) is False

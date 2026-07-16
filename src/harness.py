@@ -655,6 +655,96 @@ def ocr_truth_mismatch_refused(qa: Any, floors: Optional[dict] = None) -> Option
     return None
 
 
+def targeted_dedup_noop_reason(run_dir: str, patches: dict) -> Optional[str]:
+    """Reason a TARGETED merge:dedup provably cannot drop a layer, else None.
+
+    postfix-benchmark-7 013 (the run-4 class): the VLM reported "duplicated text
+    '% OFF'" and repair.py aimed merge:dedup at c_B2 with
+    ``duplicate_text=['% OFF'], layer_ids=['c_B2']``. Nothing was duplicated — c_B2 is
+    the sole ``'61% OFF'`` layer — so ``_dedup_text_candidates`` was structurally
+    incapable of dropping anything, three ways over:
+
+      * ``layer_ids[1:]`` is empty for a single target (it keeps the first, drops the
+        rest), so the id path can never drop with one id;
+      * ``'% OFF'`` does not normalize-equal ``'61% OFF'``, so the text path never
+        keys a group;
+      * a group needs ``len(group) >= 2`` — one layer can never be its own duplicate.
+
+    The rerun still replayed merge→…→reconstruct→qa for 122.5s to reach a
+    bit-identical render. Screen it at admission instead, by asking merge's REAL dedup
+    (ground truth, never a reimplementation that can drift) whether it drops anything.
+
+    Deliberately narrow, so a genuine experiment is never blocked:
+      * only fires for a TARGETED dedup (``duplicate_text``/``layer_ids`` present).
+        The untargeted ``raise_dedup_iou`` probe, whose whole point IS the IoU sweep,
+        is left alone;
+      * fails OPEN on any missing/unreadable evidence or import problem.
+    """
+    merge_patch = (patches or {}).get("merge")
+    if not isinstance(merge_patch, dict) or not merge_patch.get("dedup_text"):
+        return None
+    duplicate_text = [str(text) for text in (merge_patch.get("duplicate_text") or [])
+                      if str(text).strip()]
+    layer_ids = [str(layer_id) for layer_id in (merge_patch.get("layer_ids") or [])
+                 if layer_id]
+    if not duplicate_text and not layer_ids:
+        return None
+    # Two or more ids: the id path CAN drop layer_ids[1:] — a real, capable repair.
+    if len(layer_ids) >= 2:
+        return None
+    candidates = _load_json(os.path.join(run_dir, "merged.json"), None)
+    if not isinstance(candidates, list) or not candidates:
+        return None
+    try:
+        from src.merge_layers import _dedup_text_candidates, _normalize_text_key
+    except Exception:
+        return None
+    dedup_iou = merge_patch.get("dedup_iou")
+    try:
+        dedup_iou = float(dedup_iou) if dedup_iou is not None else 0.6
+    except (TypeError, ValueError):
+        return None
+    probe_cfg = {
+        "dedup_text": True,
+        "duplicate_text": list(duplicate_text),
+        "layer_ids": list(layer_ids),
+    }
+    try:
+        kept = _dedup_text_candidates([dict(item) for item in candidates],
+                                      probe_cfg, dedup_iou)
+    except Exception:
+        return None
+    if not isinstance(kept, list) or len(kept) < len(candidates):
+        return None  # it drops something — capable, let it run
+    # Provably inert. Report WHY against the real merged layers, so the audit trail
+    # shows the premise was false rather than merely "it didn't help".
+    wanted = {_normalize_text_key(text) for text in duplicate_text}
+    wanted.discard("")
+    matches = sorted(
+        str(item.get("id"))
+        for item in candidates
+        if _normalize_text_key(item.get("text")) in wanted
+    ) if wanted else []
+    details = []
+    if duplicate_text:
+        details.append(
+            f"no two layers share text {duplicate_text!r} "
+            f"(normalized matches in merged.json: {matches or 'none'})"
+        )
+    if len(layer_ids) == 1:
+        details.append(
+            f"a single target {layer_ids[0]!r} cannot dedup against itself "
+            "(merge keeps layer_ids[0] and drops only layer_ids[1:])"
+        )
+    return (
+        "merge:dedup is structurally incapable of dropping a layer here — "
+        + "; ".join(details)
+        + "; merge's own dedup drops 0 of "
+        + f"{len(candidates)} merged candidates, so the rerun would replay "
+        "merge -> reconstruct -> qa for a bit-identical render"
+    )
+
+
 def admission_reject_reason(
     repair: dict,
     *,
@@ -1209,15 +1299,147 @@ def _artifact_fingerprint(path: str) -> str | None:
         return None
 
 
+# ── render-semantic artifact comparison ──────────────────────────────────────────────
+#
+# postfix-benchmark-7 013 evidence: a merge:dedup rerun re-serialized design.json (its
+# ``meta`` block: layer_count, single_ownership counters, warnings) and re-encoded
+# preview.png. Every byte-level fingerprint flipped, so ``artifacts_changed`` said True
+# — while the render was pixel-identical and every QA metric held at ssim=0.7073 /
+# text_recall=0.8462. The round escaped the identical-artifact short-circuit and burned
+# 122.5s to change nothing. "Did anything change" must therefore be RENDER-SEMANTIC:
+# only the outcome counts — pixels, the compiled node content, and the QA metrics.
+
+# Keys carrying diagnostics, timings, or provenance rather than rendered outcome. A
+# rerun that moves only these moved nothing a viewer or a QA metric can resolve.
+_DIAGNOSTIC_KEYS = frozenset({
+    "meta", "diagnostics", "diagnostic", "timings", "timing", "timestamp",
+    "elapsed", "elapsed_s", "duration", "duration_s", "generated_at", "created_at",
+    "runtime", "telemetry", "debug", "_debug", "warnings", "log", "logs",
+    "provenance",
+})
+
+# JSON round-trips jitter floats far below anything QA can resolve (its tightest
+# tolerance is 0.005); quantize before comparing so re-serialization is not "a change".
+_SEMANTIC_FLOAT_NDIGITS = 4
+
+# Preview comparison is PER-PIXEL, never a whole-image mean. Repairs are local: a
+# deduped layer or a refit text box touches a small patch. On 013's 1080x1920 preview a
+# real 60x60 edit averages to 0.243/255 — under any sane mean epsilon — so a mean test
+# would silently swallow genuine improvements (over-blocking, the opposite failure).
+# Counting pixels that actually moved separates the cases cleanly: that same edit moves
+# 3600 pixels, while a lossless PNG re-encode moves exactly 0.
+#
+# Channel delta tolerated per pixel (0-255): absorbs any dither/AA jitter without
+# hiding a real repaint. Lossless re-encode measures 0 here.
+_PREVIEW_CHANNEL_EPSILON = 2.0
+# Moved pixels tolerated before a render counts as changed: ignores isolated speckle
+# while staying far below the footprint of any repair worth keeping.
+_PREVIEW_MIN_CHANGED_PIXELS = 16
+
+_QA_TOLERANCES = {
+    "ssim": 0.005, "visual_score": 0.005, "text_recall": 0.01,
+    "editable_text_recall": 0.01, "edge_f1": 0.005, "color_similarity": 0.005,
+}
+
+
+def _semantic_json(value):
+    """Outcome-bearing projection of a JSON artifact.
+
+    Strips diagnostics/timings and normalizes key order plus float jitter. What
+    survives is the content that decides the render: ids, boxes, text, fills, styles,
+    and the shape of the node tree.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _semantic_json(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _DIAGNOSTIC_KEYS
+        }
+    if isinstance(value, list):
+        return [_semantic_json(item) for item in value]
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        return round(value, _SEMANTIC_FLOAT_NDIGITS)
+    return value
+
+
+def _json_semantic_digest(path: str) -> str | None:
+    try:
+        with open(path, "rb") as handle:
+            payload = json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    canonical = json.dumps(_semantic_json(payload), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _image_signature(path: str):
+    """Pixel array for render comparison, or None when unreadable."""
+    try:
+        import numpy
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        with Image.open(path) as handle:
+            return numpy.asarray(handle.convert("RGB"), dtype=numpy.float32)
+    except Exception:
+        return None
+
+
+def _outcome_fingerprint(path: str) -> tuple:
+    """Render-semantic fingerprint: what this artifact contributes to the OUTCOME.
+
+    PNGs compare as pixels (epsilon-tolerant), JSON as a diagnostics-stripped digest.
+    Either falls back to raw bytes when unreadable, so an unparseable artifact is
+    never silently treated as unchanged.
+    """
+    lowered = path.lower()
+    if lowered.endswith(".png"):
+        signature = _image_signature(path)
+        if signature is not None:
+            return ("pixels", signature)
+    elif lowered.endswith(".json"):
+        digest = _json_semantic_digest(path)
+        if digest is not None:
+            return ("json", digest)
+    return ("bytes", _artifact_fingerprint(path))
+
+
+def _outcome_changed(before: tuple, after: tuple) -> bool:
+    """True when two outcome fingerprints differ beyond serialization/encode noise."""
+    kind_before, value_before = before
+    kind_after, value_after = after
+    if kind_before != kind_after:
+        return True
+    if kind_before == "pixels":
+        if value_before.shape != value_after.shape:
+            return True
+        try:
+            import numpy
+        except Exception:  # pragma: no cover - numpy present wherever pixels were read
+            return True
+        per_pixel = numpy.abs(value_before - value_after).max(axis=2)
+        moved = int((per_pixel > _PREVIEW_CHANNEL_EPSILON).sum())
+        return moved > _PREVIEW_MIN_CHANGED_PIXELS
+    return value_before != value_after
+
+
+def _qa_metrics_moved(deltas: dict) -> bool:
+    """True when any QA metric moved beyond its noise floor (either direction)."""
+    for key, minimum in _QA_TOLERANCES.items():
+        delta = (deltas or {}).get(key)
+        if isinstance(delta, (int, float)) and abs(float(delta)) >= minimum:
+            return True
+    return bool((deltas or {}).get("hard_fails"))
+
+
 def _qa_progress(before: dict, after: dict) -> tuple[bool, dict]:
     """Return meaningful metric progress, not merely a rewritten qa.json."""
     before, after = before or {}, after or {}
     deltas = {}
-    tolerances = {
-        "ssim": 0.005, "visual_score": 0.005, "text_recall": 0.01,
-        "editable_text_recall": 0.01, "edge_f1": 0.005,
-        "color_similarity": 0.005,
-    }
+    tolerances = _QA_TOLERANCES
     improved = False
     if _qa_accepts(after, allow_summary=True) and not _qa_accepts(before, allow_summary=True):
         improved = True
@@ -1686,6 +1908,24 @@ def execute_repairs(
                 _write_json(admission_path, admission)
                 continue
 
+            # Structurally-incapable targeted dedup (013): the named duplicate does not
+            # exist, so merge's dedup provably drops nothing. Ask the real dedup before
+            # spending 122s proving it the expensive way.
+            dedup_reason = targeted_dedup_noop_reason(run_dir, patches)
+            if dedup_reason:
+                exhausted.add((choice.get("stage"), choice.get("action"),
+                               choice.get("target_id")))
+                skipped = {
+                    "iteration": iteration, "resume": resume,
+                    "repair": {key: choice.get(key) for key in ("stage", "action", "target_id")},
+                    "reason": "dedup-target-not-duplicated",
+                    "detail": dedup_reason,
+                }
+                attempts.append({**skipped, "admission_skipped": True})
+                admission.setdefault("skipped", []).append(skipped)
+                _write_json(admission_path, admission)
+                continue
+
             # Semantic no-repeat for VLM opinions: two equivalent whole-image opinions (same
             # operator class, different target — the €63 vs €49 case) must not each burn a
             # pass once the class is proven non-improving.
@@ -1745,12 +1985,16 @@ def execute_repairs(
         qa_path = os.path.join(run_dir, "qa.json")
         qa_before = copy.deepcopy(qa)
         before_qa_fingerprint = _artifact_fingerprint(qa_path)
-        # Watch the resumed stage's primary outputs plus the compiled-design tail. If
-        # none change, the repair provably had no effect (qa.json alone can be rewritten
-        # with identical metrics), and the loop can short-circuit the rest of the round.
-        watched = tuple(dict.fromkeys(_STAGE_OUTPUTS.get(resume, ()) + _TAIL_OUTPUTS))
+        # Watch the resumed stage's primary outputs plus the compiled-design tail, both
+        # by raw bytes and by render-semantic outcome. Only the OUTCOME decides whether
+        # the repair did anything: bytes flip on any re-serialized diagnostic (013).
+        stage_outputs = tuple(_STAGE_OUTPUTS.get(resume, ()))
+        watched = tuple(dict.fromkeys(stage_outputs + _TAIL_OUTPUTS))
         before_watched = {
             name: _artifact_fingerprint(os.path.join(run_dir, name)) for name in watched
+        }
+        before_outcome = {
+            name: _outcome_fingerprint(os.path.join(run_dir, name)) for name in watched
         }
         attempt_started = time.monotonic()
         try:
@@ -1768,10 +2012,24 @@ def execute_repairs(
             and after_qa_fingerprint != before_qa_fingerprint
         )
         qa_improved, metric_deltas = _qa_progress(qa_before, qa) if qa_fresh else (False, {})
-        artifacts_changed = any(
+        bytes_changed = any(
             _artifact_fingerprint(os.path.join(run_dir, name)) != before_watched[name]
             for name in watched
         )
+        after_outcome = {
+            name: _outcome_fingerprint(os.path.join(run_dir, name)) for name in watched
+        }
+        changed_artifacts = [
+            name for name in watched
+            if _outcome_changed(before_outcome[name], after_outcome[name])
+        ]
+        render_changed = [name for name in changed_artifacts if name in _TAIL_OUTPUTS]
+        stage_changed = [name for name in changed_artifacts if name in stage_outputs]
+        qa_moved = _qa_metrics_moved(metric_deltas) if qa_fresh else False
+        # THE outcome test. A repair changed something only if the render moved
+        # (design.json node content / preview.png pixels) or a QA metric moved beyond
+        # noise. A re-serialized diagnostic or a re-encoded PNG is not a change.
+        artifacts_changed = bool(render_changed) or qa_moved
         attempt = {
             "iteration": iteration,
             "resume": resume,
@@ -1793,8 +2051,26 @@ def execute_repairs(
         }
         if budget_clamp:
             attempt["budget_clamp"] = budget_clamp
+        if stage_changed:
+            # Audit trail for the 013 class: the resumed stage genuinely re-emitted
+            # different content, yet nothing survived to the render. Downstream stages
+            # absorbed it — the repair still bought nothing.
+            attempt["stage_output_changed"] = stage_changed
         if result.get("ok") and not artifacts_changed and not qa_improved:
-            attempt["no_effect"] = "identical-artifacts"
+            # Byte-identical is the narrow case; render-identical-but-bytes-differ is
+            # the 013 case the byte fingerprint used to miss. Name them apart so the
+            # audit trail says which one actually happened.
+            attempt["no_effect"] = (
+                "identical-artifacts" if not bytes_changed else "identical-render"
+            )
+            attempt["no_effect_detail"] = {
+                "compared": list(watched),
+                "render_identical": sorted(set(_TAIL_OUTPUTS) & set(watched)),
+                "qa_metrics_identical": sorted(_QA_TOLERANCES),
+                "bytes_changed": bytes_changed,
+                "note": ("outcome unchanged: design.json node content and preview.png "
+                         "pixels held, and no QA metric moved beyond its noise floor"),
+            }
         attempts.append(attempt)
         seen_plans[plan_fingerprint] = {
             "plan": plan_payload, "qa_fresh": qa_fresh, "qa_improved": qa_improved,

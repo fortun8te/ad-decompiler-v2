@@ -1986,6 +1986,35 @@ def _corner_radius(local_mask):
     return {name: round(value, 2) for name, value in zip(names, radii)}
 
 
+# An "ellipse" verdict becomes a CLIP: whatever the alpha has outside the inscribed
+# ellipse is deleted from the render. So the verdict has to be earned against the pixels,
+# not guessed from aspect/fill — those three cheap features are satisfied by any tilted,
+# roughly-square blob. 013's grüns pouch scored aspect .80 / fill .76 / corners 0 and was
+# called an ellipse at IoU .787, which clipped 10.6% of the bag away (the "weird cropping"
+# of the pouch). 0.94 matches vectorize._fit_primitive's gate, the house convention for
+# "this silhouette really is that primitive".
+SIMPLE_SHAPE_MIN_IOU = 0.94
+
+
+def _inscribed_ellipse_iou(local_mask):
+    """IoU of a silhouette against the ellipse inscribed in its own bounds.
+
+    Mirrors the ellipse render_preview actually draws for ``mask={"kind": "ellipse"}``
+    (and vectorize._fit_primitive's fit), so the gate measures the real clip loss.
+    """
+    _, np, _ = _deps()
+    h, w = local_mask.shape
+    if h < 2 or w < 2:
+        return 0.0
+    yy, xx = np.mgrid[0:h, 0:w]
+    ellipse = (((xx - (w - 1) / 2.0) / (w / 2.0)) ** 2
+               + ((yy - (h - 1) / 2.0) / (h / 2.0)) ** 2) <= 1.0
+    union = float(np.logical_or(ellipse, local_mask).sum())
+    if not union:
+        return 0.0
+    return float(np.logical_and(ellipse, local_mask).sum()) / union
+
+
 def _simple_shape_geometry(local_mask):
     """Return rect/ellipse only where the segmentation really supports a primitive."""
     _, np, _ = _deps()
@@ -1997,8 +2026,10 @@ def _simple_shape_geometry(local_mask):
     corners = sum(bool(value) for value in (
         local_mask[0, 0], local_mask[0, -1], local_mask[-1, 0], local_mask[-1, -1]
     ))
-    # Keep the existing ellipse heuristic, but do not call arbitrary sparse SAM masks rects.
-    if .75 <= aspect <= 1.33 and corners <= 1 and .55 <= fill <= .90:
+    # Keep the existing ellipse heuristic as a cheap pre-filter, but only call it an
+    # ellipse once the alpha itself agrees; otherwise the clip eats real content.
+    if (.75 <= aspect <= 1.33 and corners <= 1 and .55 <= fill <= .90
+            and _inscribed_ellipse_iou(local_mask) >= SIMPLE_SHAPE_MIN_IOU):
         return "ellipse"
     if fill >= .70:
         return "rect"

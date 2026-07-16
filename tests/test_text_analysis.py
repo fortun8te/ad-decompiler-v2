@@ -150,6 +150,108 @@ def test_glyph_tight_white_text_on_dark_stays_light(tmp_path):
     assert r > 200 and g > 200 and b > 200
 
 
+def _heavy_headline_image(page=(200, 700), plate=(246, 246, 246), ink=(251, 2, 2)):
+    """A display headline whose ink OUTWEIGHS the plate inside its own tight box.
+
+    Ten fat stems across the box put the ink at ~55% of it — the real 067 headline
+    measures 54% — so ink is the MAJORITY luminance class and every in-crop heuristic
+    that assumes "ink is the minority" elects the plate instead.
+
+    The stems are blurred because a rasteriser anti-aliases glyph edges: a fixture with
+    exactly two luminance values is degenerate (Otsu's bin lands below the lower cluster
+    and the luminance split returns nothing), which would test something real images
+    never do.
+    """
+    from PIL import ImageFilter
+
+    image = np.full((page[0], page[1], 3), plate, dtype=np.uint8)
+    for i in range(10):
+        x = 60 + i * 58
+        image[60:140, x:x + 32] = ink
+    image = np.asarray(
+        Image.fromarray(image).filter(ImageFilter.GaussianBlur(0.9)), dtype=np.uint8
+    )
+    return image, (60, 60, 640, 140)  # tight box hugging the stems
+
+
+def test_majority_ink_display_headline_keeps_its_colour(tmp_path):
+    """067 regression: 'WE'RE SAYING GOODBYE' rendered #f6f6f6 white-on-white.
+
+    Its red ink is 54% of its glyph-tight box, so both in-crop polarity heuristics (the
+    contaminated border estimate AND the minority-luminance guard) elect the white plate
+    as ink. Pixels outside the box are the only ones that can adjudicate.
+    """
+    image, box = _heavy_headline_image()
+    path = tmp_path / "heavy.png"
+    Image.fromarray(image).save(path)
+    x0, y0, x1, y1 = box
+    crop = image[y0:y1, x0:x1]
+    ink_is_majority = (
+        np.linalg.norm(crop.astype(float) - np.array([251.0, 2.0, 2.0]), axis=2) < 30
+    ).mean()
+    assert ink_is_majority > 0.5, "fixture must put ink in the MAJORITY to pin the bug"
+
+    result = text_analysis.analyze_text(
+        str(path),
+        {"engine": "synthetic", "source": {"path": str(path), "w": 700, "h": 200},
+         "lines": [_line("L0", "WE'RE SAYING GOODBYE", box)]},
+        {},
+    )
+    r, g, b = result["lines"][0]["style"]["colorRGB"]
+    assert r > 200 and g < 60 and b < 60, f"headline inverted to plate: {(r, g, b)}"
+
+
+def test_exterior_plate_prior_abstains_when_the_band_has_no_single_plate():
+    """The constraint that makes the prior safe (and that sank the collar attempt).
+
+    Widening the LINE sampling window was a net regression because a line box's
+    surroundings need not be one plate. So the prior speaks only for a band that is
+    substantially ONE colour, and abstains on a band with no dominant plate (091's text
+    over busy scene art measures 0.04 uniformity) rather than reducing it to a per-channel
+    median — which on a mixed band is a phantom colour matching neither side.
+    """
+    box = {"x": 40.0, "y": 40.0, "w": 120.0, "h": 40.0}
+    uniform = np.full((160, 240, 3), 246, dtype=np.uint8)
+    prior = text_analysis._exterior_plate_prior(uniform, box)
+    assert prior is not None
+    assert np.allclose(prior[0], [246, 246, 246], atol=2)
+    assert prior[1] == pytest.approx(1.0)
+
+    rng = np.random.default_rng(7)
+    busy = rng.integers(0, 256, size=(160, 240, 3), dtype=np.uint8)  # scene art
+    assert text_analysis._exterior_plate_prior(busy, box) is None
+
+
+def test_ink_polarity_is_not_retuned_when_the_mask_is_already_ink():
+    """Only inversions may be corrected — never a shade.
+
+    A correct mask that includes anti-aliased edge pixels sits BETWEEN the two classes
+    (101's body copy elects #2a2a2a where the glyph core is #080808). Nudging those would
+    churn every line's fill and reshape ink mass for no correctness gain.
+    """
+    crop = np.full((40, 200, 3), 255, dtype=np.uint8)
+    crop[10:30, 20:60] = 0            # glyph core
+    crop[10:30, 60:66] = 90           # AA fringe
+    plate_prior = (np.array([255.0, 255.0, 255.0]), 1.0)
+    mask = np.zeros(crop.shape[:2], bool)
+    mask[10:30, 20:66] = True         # correct ink mask, fringe included
+    out = text_analysis._resolve_ink_polarity(crop, mask, plate_prior)
+    assert out is mask, "a mask already on the ink side must be returned untouched"
+
+
+def test_ink_polarity_flip_reverses_a_mask_that_elected_the_plate():
+    image, box = _heavy_headline_image()
+    x0, y0, x1, y1 = box
+    crop = image[y0:y1, x0:x1]
+    plate_prior = (np.array([246.0, 246.0, 246.0]), 0.95)
+    is_ink = np.linalg.norm(crop.astype(float) - np.array([251.0, 2.0, 2.0]), axis=2) < 40
+    inverted = ~is_ink                # mask elected the white plate as "ink"
+    out = text_analysis._resolve_ink_polarity(crop, inverted, plate_prior)
+    assert out is not inverted
+    assert np.median(crop[out].astype(float), axis=0)[0] > 200   # red channel high
+    assert np.median(crop[out].astype(float), axis=0)[1] < 60    # green channel low
+
+
 def test_saturated_price_strike_and_underline_become_vector_evidence():
     image = np.full((100, 360, 3), 255, dtype=np.uint8)
     # Diagonal strike through the old price and horizontal underline below the new.

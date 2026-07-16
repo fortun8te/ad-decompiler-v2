@@ -746,20 +746,34 @@ def _run_round(
             round_record["stopped"] = "qa_ok_after_repairs"
             return round_record, working_cfg, True
 
-    # Identical-artifact short-circuit: every executed repair this round left the
-    # watched stage outputs AND the compiled design/preview byte-identical. Nothing
-    # downstream (fixer config proposals scored against this same evidence, another
-    # pipeline rerun) can learn anything new from an unchanged design — end the round
-    # now. The loop's no-progress steering still tries other repairs next round.
+    # Identical-outcome short-circuit: every executed repair this round left the
+    # RENDER and every QA metric where they were. Nothing downstream (fixer config
+    # proposals scored against this same evidence, another pipeline rerun) can learn
+    # anything new from an unchanged design — end the round now. The loop's
+    # no-progress steering still tries other repairs next round.
+    #
+    # ``artifacts_changed`` is render-semantic (harness._outcome_changed), not
+    # byte-level: postfix-benchmark-7 013 re-serialized design.json's diagnostics and
+    # re-encoded preview.png, which flipped every byte fingerprint and let a provably
+    # inert round escape this short-circuit and burn 122.5s.
     executed = [attempt for attempt in (repair_summary.get("attempts") or [])
                 if not attempt.get("admission_skipped")
                 and not attempt.get("admission_rejected")]
     if executed and not repair_improved and all(
         attempt.get("artifacts_changed") is False for attempt in executed
     ):
-        round_record["short_circuit"] = "identical-artifacts"
-        round_record["fixer"] = {"fixes": [], "fix_count": 0,
-                                 "skipped": "identical-artifacts"}
+        # Name the two cases apart: bytes held everywhere, vs bytes moved but the
+        # render/metrics did not (013).
+        label = ("identical-render"
+                 if any(attempt.get("no_effect") == "identical-render"
+                        for attempt in executed)
+                 else "identical-artifacts")
+        round_record["short_circuit"] = label
+        round_record["short_circuit_detail"] = [
+            attempt.get("no_effect_detail") for attempt in executed
+            if attempt.get("no_effect_detail")
+        ]
+        round_record["fixer"] = {"fixes": [], "fix_count": 0, "skipped": label}
         round_record["next_resume"] = _resume_after_fixer(run_dir, working_cfg, critic_output)
         round_record["stopped"] = "no_progress"
         return round_record, working_cfg, True

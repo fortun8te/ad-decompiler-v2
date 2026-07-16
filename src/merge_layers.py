@@ -170,6 +170,93 @@ def _is_vs_chip_text(candidate: dict) -> bool:
     return bool(re.match(r"^\s*(vs\.?|versus)\s*$", text, re.I))
 
 
+def _rotated_box_overlap_frac(a: dict, b: dict) -> float:
+    """Intersection of two OCR boxes as a fraction of the SMALLER box's area.
+
+    Genuine overlap — not mere adjacency — is what separates lines printed on one
+    small carrier from lines that merely neighbour each other across two surfaces.
+    On 013 the seal's own two lines overlap 43.8%, while the nearest bag label
+    ('gruns') only grazes them at 8.1%; a padded touch test chains the badge into
+    the bag's label stack and dilutes the carrier angle.
+    """
+    def _edges(box):
+        x = float((box or {}).get("x", 0) or 0)
+        y = float((box or {}).get("y", 0) or 0)
+        return (x, y,
+                x + float((box or {}).get("w", 0) or 0),
+                y + float((box or {}).get("h", 0) or 0))
+    ax0, ay0, ax1, ay1 = _edges(a)
+    bx0, by0, bx1, by1 = _edges(b)
+    iw = min(ax1, bx1) - max(ax0, bx0)
+    ih = min(ay1, by1) - max(ay0, by0)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    smaller = min(max((ax1 - ax0) * (ay1 - ay0), 1.0), max((bx1 - bx0) * (by1 - by0), 1.0))
+    return (iw * ih) / smaller
+
+
+def _rotated_carrier_consensus(text_cands: list, min_deg: float,
+                               agree_deg: float = 5.0,
+                               overlap_frac: float = 0.25) -> dict:
+    """Map text id -> the consensus rotation of the CARRIER its line is printed on.
+
+    A seal/ribbon/sticker prints every one of its lines onto a single physical
+    surface, so "is this scene ink?" is a property of the CARRIER, not of one OCR
+    line. OCR measures each line's angle independently and the spread across one
+    carrier is easily a degree or two, so a hard per-line gate can split a badge in
+    half: 013's 61%-OFF seal measured 7.80 deg for '61% OFF' and 8.96 deg for
+    '+ FREE GIFTS' — 1.16 deg apart on the same disc — landing either side of the
+    8 deg gate. Half the seal baked, the other half re-rendered as native Inter on
+    top of its own baked pixels (the user's "the badge is off").
+
+    Lines that genuinely OVERLAP and AGREE on an angle are one carrier and share one
+    verdict: the cluster's median angle. The result is combined with each line's own
+    angle via max() by the caller, so this can only ever RAISE a line to its
+    neighbours' consensus — never demote a line that already clears the gate alone.
+    Axis-aligned overlay copy never joins a rotated cluster (``agree_deg``, plus the
+    floor below), so genuine native headlines/CTAs are untouched.
+    """
+    floor = max(0.0, float(min_deg) - float(agree_deg))
+    members = []
+    for c in text_cands:
+        rot = abs(float(c.get("rotation") or (c.get("meta") or {}).get("rotation") or 0.0))
+        if rot >= floor and c.get("id"):
+            members.append((c.get("id"), rot, c.get("box") or {}))
+    if len(members) < 2:
+        return {}
+    # Single-linkage: same carrier == touching boxes whose angles agree.
+    parent = {mid: mid for mid, _, _ in members}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(members)):
+        for j in range(i + 1, len(members)):
+            (id_a, rot_a, box_a), (id_b, rot_b, box_b) = members[i], members[j]
+            if abs(rot_a - rot_b) > agree_deg:
+                continue
+            if _rotated_box_overlap_frac(box_a, box_b) < overlap_frac:
+                continue
+            ra, rb = find(id_a), find(id_b)
+            if ra != rb:
+                parent[ra] = rb
+    clusters: dict = {}
+    for mid, rot, _ in members:
+        clusters.setdefault(find(mid), []).append(rot)
+    out = {}
+    for mid, _, _ in members:
+        rots = sorted(clusters[find(mid)])
+        if len(rots) < 2:
+            continue
+        mid_i = len(rots) // 2
+        median = rots[mid_i] if len(rots) % 2 else (rots[mid_i - 1] + rots[mid_i]) / 2.0
+        out[mid] = median
+    return out
+
+
 def _bake_text_into_chrome_host(text: dict, host: dict, diagnostics: dict, *, action: str) -> None:
     """Mark OCR as kept_in_photo on a chrome-as-raster badge/seal host (no sibling TEXT)."""
     meta = text.setdefault("meta", {})
@@ -3100,6 +3187,12 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     # ── assemble + route ──────────────────────────────────────────────────────────────
     candidates = text_cands + elem_cands
 
+    # Carrier-level rotation consensus, so a seal's lines cannot be split across the
+    # rotated-scene-ink gate by per-line OCR angle noise (013's 61%-OFF badge).
+    _rotated_carrier_rot = _rotated_carrier_consensus(
+        text_cands, float((cfg.get("merge") or {}).get("rotated_scene_ink_deg", 8.0))
+    )
+
     # scene text: OCR line inside a photo region -> keep baked in the base.
     # VLM scene_text_role overrides geometry when confident; geometry remains fallback.
     for c in text_cands:
@@ -3478,6 +3571,12 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
         _rot = abs(float(c.get("rotation") or c["meta"].get("rotation") or 0.0))
         _rot_scene_min = float(
             (cfg.get("merge") or {}).get("rotated_scene_ink_deg", 8.0))
+        # One carrier, one verdict: a seal's lines share the disc they are printed on,
+        # so a line whose touching, co-angled neighbours read as scene ink is scene ink
+        # too. max() keeps this a pure rescue — never demotes a line that clears alone.
+        _carrier_rot = _rotated_carrier_rot.get(c.get("id"))
+        if _carrier_rot is not None:
+            _rot = max(_rot, float(_carrier_rot))
         if _rot >= _rot_scene_min:
             meta = c["meta"]
             positive_overlay = bool(

@@ -253,6 +253,60 @@ def _minority_luminance_mask(crop):
     return min(candidates, key=lambda item: item[0])[1] if candidates else dark
 
 
+# ── exterior plate prior (ink/plate polarity adjudication) ────────────────────
+# A band outside the line box is trusted as "the plate" only when this fraction of it
+# sits within _PLATE_RING_TOLERANCE of its own median; a band crossing a plate boundary
+# is bimodal, falls below it, and the prior abstains (see _exterior_plate_prior).
+_PLATE_RING_UNIFORMITY = 0.5
+_PLATE_RING_TOLERANCE = 30.0
+_PLATE_RING_MIN_PIXELS = 20
+# The elected ink must sit at least this much closer to the true plate than the rejected
+# class before we call it an inversion — well beyond AA/JPEG noise, so a merely darker
+# median never trips it.
+_PLATE_INVERSION_MARGIN = 40.0
+
+
+def _resolve_ink_polarity(crop, mask, plate_prior):
+    """Reverse ``mask`` when it demonstrably elected the PLATE as ink.
+
+    Uses ``plate_prior`` (pixels outside the box — the only ones a glyph-tight box cannot
+    contaminate) purely as an adjudicator between the two luminance classes: ink is the
+    class FARTHER from the true plate.
+
+    Fires only on a true INVERSION — the elected mask's colour belongs to the plate class
+    rather than the ink class. It deliberately does NOT act when the elected mask merely
+    sits between the two (the signature of a correct mask that includes anti-aliased edge
+    pixels: 101's body copy elects #2a2a2a where the pure glyph core is #080808). Nudging
+    those would churn every line's fill and reshape ink mass for no correctness gain, so
+    a mask that is already on the ink side is left exactly as found.
+    """
+    import numpy as np
+
+    if plate_prior is None or mask is None or not mask.any() or not (~mask).any():
+        return mask
+    plate = np.asarray(plate_prior[0], dtype=np.float32)
+    minority = _minority_luminance_mask(crop)
+    if minority is None or not minority.any() or not (~minority).any():
+        return mask
+    c_minority = np.median(crop[minority].astype(np.float32), axis=0)
+    c_majority = np.median(crop[~minority].astype(np.float32), axis=0)
+    d_minority = float(np.linalg.norm(c_minority - plate))
+    d_majority = float(np.linalg.norm(c_majority - plate))
+    # Both classes equally far from the plate ⇒ no confident call (e.g. two-tone art).
+    if abs(d_majority - d_minority) < _PLATE_INVERSION_MARGIN:
+        return mask
+    if d_majority > d_minority:
+        ink_mask, c_ink, c_plate = ~minority, c_majority, c_minority
+    else:
+        ink_mask, c_ink, c_plate = minority, c_minority, c_majority
+    current = np.median(crop[mask].astype(np.float32), axis=0)
+    to_plate = float(np.linalg.norm(current - c_plate))
+    to_ink = float(np.linalg.norm(current - c_ink))
+    if to_plate + _PLATE_INVERSION_MARGIN < to_ink:
+        return ink_mask
+    return mask
+
+
 def _clean_ink_mask(mask):
     """Remove tiny specks when OpenCV is present; otherwise return unchanged."""
     try:
@@ -271,13 +325,66 @@ def _clean_ink_mask(mask):
         return mask
 
 
-def _ink_mask(crop):
+def _exterior_plate_prior(image, box) -> Optional[tuple]:
+    """Median colour of a band strictly OUTSIDE ``box``, when that band is uniform.
+
+    Both polarity heuristics inside ``_ink_mask`` estimate the plate from pixels INSIDE
+    the crop, so a glyph-tight box gives them no clean plate to compare against. The
+    pixels just outside the box are the only ones guaranteed to be plate — *if* the band
+    does not cross a plate boundary.
+
+    That "if" is the whole design. ``_collar_box``'s docstring records that widening the
+    LINE sampling window by a collar is a net regression precisely because a line box's
+    collar can leave its plate. So this returns the band's median ONLY when the band is
+    demonstrably a single colour (>= ``_PLATE_RING_UNIFORMITY`` of it near its own
+    median); a band straddling two plates is bimodal, fails that test, and we abstain
+    rather than guess. Crucially the band is used only to ADJUDICATE polarity, never as
+    the crop, so geometry and mass stay measured on the tight box.
+
+    Returns ``(plate_rgb, uniformity)`` or ``None``.
+    """
+    import numpy as np
+
+    if image is None:
+        return None
+    box = _clean_box(box)
+    ih, iw = image.shape[:2]
+    pad = max(3.0, min(16.0, min(box["w"], box["h"]) * 0.25))
+    ox0, oy0 = int(max(0, box["x"] - pad)), int(max(0, box["y"] - pad))
+    ox1, oy1 = int(min(iw, box["x"] + box["w"] + pad)), int(min(ih, box["y"] + box["h"] + pad))
+    ix0, iy0 = int(max(0, box["x"])), int(max(0, box["y"]))
+    ix1, iy1 = int(min(iw, box["x"] + box["w"])), int(min(ih, box["y"] + box["h"]))
+    outer = image[oy0:oy1, ox0:ox1]
+    if outer.size == 0:
+        return None
+    keep = np.ones(outer.shape[:2], dtype=bool)
+    keep[iy0 - oy0:iy1 - oy0, ix0 - ox0:ix1 - ox0] = False
+    ring = outer[keep]
+    if ring.size == 0 or len(ring) < _PLATE_RING_MIN_PIXELS:
+        return None
+    ring = ring.astype(np.float32)
+    plate = np.median(ring, axis=0)
+    uniformity = float((np.linalg.norm(ring - plate, axis=1) < _PLATE_RING_TOLERANCE).mean())
+    if uniformity < _PLATE_RING_UNIFORMITY:
+        return None
+    return plate, uniformity
+
+
+def _ink_mask(crop, plate_prior=None):
     """Return (mask, confidence) using border-estimated background contrast.
 
     Glyph-tight OCR boxes can contaminate the border estimate with ink. In that
     case the contrast mask selects the white plate and text colour inference flips
     black copy to white-on-white (002's KRACHTSPORT headline). Prefer the minority
     luminance class when the estimated border is demonstrably closer to that class.
+
+    That minority rule assumes ink is the SMALLER luminance class, which an ultra-heavy
+    display headline breaks: 067's red "WE'RE SAYING GOODBYE" is 54% of its own tight box,
+    so the plate is the minority and both heuristics elect the plate as ink (#f6f6f6
+    instead of #fb0202) and the line renders invisible. ``plate_prior`` — from
+    ``_exterior_plate_prior`` — breaks that tie with pixels the box cannot contaminate,
+    and is applied only to REVERSE a demonstrated inversion (the elected ink sits on the
+    true plate while the rejected class does not), never to retune a shade.
     """
     import numpy as np
 
@@ -313,6 +420,7 @@ def _ink_mask(crop):
             if dist_minority + 12.0 < dist_majority:
                 mask = minority
                 ratio = float(mask.mean())
+    mask = _resolve_ink_polarity(crop, mask, plate_prior)
     mask = _clean_ink_mask(mask)
     ratio = float(mask.mean())
     if mask.any() and (~mask).any():
@@ -1022,7 +1130,7 @@ def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, d
     x1 = max(x0, min(iw, int(math.ceil(box["x"] + box["w"]))))
     y1 = max(y0, min(ih, int(math.ceil(box["y"] + box["h"]))))
     crop = image[y0:y1, x0:x1]
-    mask, confidence = _ink_mask(crop)
+    mask, confidence = _ink_mask(crop, plate_prior=_exterior_plate_prior(image, box))
     if mask is None or not mask.any():
         painted, baseline, fallback_conf, _ = _fallback_geometry(line, snap_deg)
         paint = {"fill": dict(_FLAT_FILL_BLACK), "stroke": None}
@@ -2397,13 +2505,61 @@ def needs_vlm_font_judge(ocr_result: dict, cfg: Optional[dict] = None) -> bool:
     return False
 
 
+# Vertical extents as a fraction of the CAP height, for a typical sans (cap 0.72em):
+# ascenders reach slightly above the caps, the x-height is ~0.52em, descenders drop
+# ~0.21em below the baseline. Used to predict how much of the em a line's ink SHOULD
+# span given the glyphs it actually contains.
+_ASCENDER_OF_CAP = 1.04
+_XHEIGHT_OF_CAP = 0.72
+_DESCENDER_OF_CAP = 0.29
+_ASCENDER_CHARS = frozenset("bdfhklt")
+_DESCENDER_CHARS = frozenset("gjpqy")
+
+
+def _expected_ink_ratio(text: str, cap_ratio: float) -> float:
+    """Fraction of the em that THIS line's ink bbox should span, from its own glyphs.
+
+    Sizing a line as ``ink_height / cap_ratio`` silently assumes every line's ink spans
+    exactly the caps. It does not: ink runs from the tallest glyph to the lowest, so the
+    same font size measures ~0.72em all-caps, ~0.96em with both an ascender and a
+    descender, and only ~0.52em for x-height-only copy like "no". The fixed ratio turns
+    that glyph mix into phantom size differences — 009's tweet body is one size in the
+    source yet emitted 37.0…50.0 — which is exactly the "similar elements should share a
+    scale" complaint. Measuring the ratio per line removes the cause instead of snapping
+    peers to a median afterwards.
+    """
+    text = str(text or "")
+    letters = [ch for ch in text if ch.isalpha() or ch.isdigit()]
+    if not letters:
+        return cap_ratio
+    has_ascender = any(ch in _ASCENDER_CHARS for ch in text if ch.islower())
+    has_cap = any(ch.isupper() or ch.isdigit() for ch in text)
+    has_descender = any(ch in _DESCENDER_CHARS for ch in text if ch.islower())
+    if has_ascender:
+        top = cap_ratio * _ASCENDER_OF_CAP
+    elif has_cap:
+        top = cap_ratio
+    else:
+        top = cap_ratio * _XHEIGHT_OF_CAP
+    bottom = cap_ratio * _DESCENDER_OF_CAP if has_descender else 0.0
+    return max(0.2, top + bottom)
+
+
 def _pre_font_signals(line: dict, painted: dict, mask, config: dict) -> dict:
     """Signals available cheaply, before any (expensive) font-file rendering: the
     estimated size/weight and a glyph-shear (italic) measurement from the ink mask
     alone. Used both to assemble the final style and to cluster same-style lines
     before font matching runs."""
     cap_ratio = max(0.45, min(0.90, _num(config.get("cap_height_ratio"), 0.72)))
-    font_size = max(1.0, min(512.0, painted["h"] / cap_ratio if painted["h"] else line["box"]["h"] * 0.9))
+    # The glyph-mix correction reads a MEASURED ink bbox. Without a mask the height is
+    # the OCR line box, which already includes ascender/descender room for every line
+    # regardless of glyphs, so correcting it would invent size differences instead of
+    # removing them (and split a column's lines across style clusters).
+    ink_ratio = (
+        _expected_ink_ratio(line.get("text"), cap_ratio)
+        if mask is not None and getattr(mask, "any", bool)() else cap_ratio
+    )
+    font_size = max(1.0, min(512.0, painted["h"] / ink_ratio if painted["h"] else line["box"]["h"] * 0.9))
     weight = _estimate_weight(mask, painted)
     shear_angle = _measure_shear_angle(mask)
     return {"font_size": font_size, "weight": weight, "shear_angle": shear_angle}
