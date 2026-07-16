@@ -1728,6 +1728,23 @@ def _match_fonts(text: str, source_mask, estimated_size: float, options: dict,
 
     scored = []
     target_height = tight.shape[0]
+    # HARD italic gate: shape similarity can prefer an Italic variant on upright ink
+    # (013: "We NEVER do this!" shipped Poppins 800 ITALIC — the soft -0.06 alignment
+    # penalty was outscored by incidental shape overlap). When the measured shear is
+    # decisively upright (<4°), italic/oblique variants are excluded outright; when
+    # decisively slanted (>8°), upright variants are excluded. The ambiguous 4-8°
+    # band keeps both and lets rendered-fit evidence decide.
+    shear = profile.get("shear_angle")
+    if shear is None and profile.get("italic") is not None:
+        shear = 10.0 if profile.get("italic") else 0.0
+    if shear is not None:
+        def _is_italic_variant(m):
+            s = str(m.get("style") or "") + " " + str(m.get("path") or "")
+            return "italic" in s.lower() or "oblique" in s.lower()
+        if abs(float(shear)) < 4.0:
+            fonts = [m for m in fonts if not _is_italic_variant(m)] or fonts
+        elif abs(float(shear)) > 8.0:
+            fonts = [m for m in fonts if _is_italic_variant(m)] or fonts
     for meta in fonts:
         rendered = _render_font_mask(text, meta["path"], estimated_size)
         if rendered is None:

@@ -3418,10 +3418,11 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
         if tree is not None:
             found = _find_layer_node(tree, rid)
             if found:
-                targets.append(found)
-        design_hit = _find_layer_node(design.get("layers") or [], rid)
+                targets.append((found, tree))
+        design_root = design.get("layers") or []
+        design_hit = _find_layer_node(design_root, rid)
         if design_hit:
-            targets.append(design_hit)
+            targets.append((design_hit, design_root))
         candidate = candidates_by_id.get(rid)
         if not targets and candidate is None:
             report["skipped"].append({"id": rid, "reason": "layer-not-found"})
@@ -3431,7 +3432,7 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
             # This layer's pixels were never inpainted out of the plate (e.g. a
             # keep_underlay overlay): the plate already shows the original, so
             # dropping the wrong reconstruction is the pixel-exact fallback.
-            for container, index, node, _offset in targets:
+            for (container, index, node, _offset), _root in targets:
                 if "target" in node:
                     _apply_drop_mutation(node, scores, reasons)
                 else:
@@ -3454,11 +3455,19 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
         ])
         src_rel = _write_asset(Image.fromarray(tile), assets_dir, f"{rid}_slice")
         abs_box = {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
-        for _container, _index, node, offset in targets:
-            local_box = {"x": abs_box["x"] - offset[0], "y": abs_box["y"] - offset[1],
-                         "w": abs_box["w"], "h": abs_box["h"]}
-            _apply_slice_mutation(node, local_box, src_rel, scores, reasons)
-        if candidate is not None and not any(node is candidate for _c, _i, node, _o in targets):
+        # Slices are POSITIONED rasters measured in canvas space. Leaving them nested
+        # under their original group re-derives their position through parent offsets —
+        # and design-compile can later EXPAND a group box to its child union, shifting
+        # every parent-relative child (013: c_E007__hostbg_P12 rendered as a displaced
+        # plain-green square over the bag's printed bear logo). Hoist each slice to its
+        # tree ROOT with its absolute box: root placement cannot drift.
+        for (container, index, node, _offset), root in targets:
+            _apply_slice_mutation(node, abs_box, src_rel, scores, reasons)
+            if root is not None and container is not root:
+                container.pop(index)
+                node["z_index"] = float(node.get("z_index") or node.get("z") or 60.0)
+                root.append(node)
+        if candidate is not None and not any(node is candidate for (_c, _i, node, _o), _r in targets):
             _apply_slice_mutation(candidate, abs_box, src_rel, scores, reasons)
         covered = True
         if removal_union is not None:
