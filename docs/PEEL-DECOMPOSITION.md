@@ -597,3 +597,25 @@ on numpy/opencv alone with Telea (2–3 s per 1080² ad, 0 VRAM). Optional extra
   stops bound the damage.
 * **transformers 5.x fallback loader** relies on the checkpoint's `auto_map` and
   `model.safetensors` names; pin an HF revision if CyberAgent restructures the repo.
+
+## §10 Top-down peel discipline (external survey, 2026-07-16 — user-supplied)
+
+Every serious layered-decomposition system (LayerD ICCV 2025: BiRefNet matte → LaMa →
+iterate ~3x with flat-color refinement for design graphics; Inpaint-Anything: SAM mask →
+dilate once → LaMa once; Qwen-Image-Layered; Plakat/Playyy) converges on the same
+skeleton we have — the differences are discipline, not architecture:
+
+1. **Peel unoccluded TOP layers only, iterate (~3 max)** — never punch every SAM
+   fragment in one pass. Underlying layers become peelable on the next iteration's plate.
+2. **LaMa/flat/analytic for design plates; Flux for photos ONLY** — LayerD literally
+   applies a flat-color assumption to design graphics. (Our gradient/solid routing and
+   non-photo→opencv routing implement this; the Flux budget cap enforces it.)
+3. **Text is a PARALLEL track (OCR → native), never a peel target** — nobody inpaints
+   text away before extracting it. Card/checklist interiors never enter a peel mask
+   until their native text owners exist.
+4. **Dilate once, inpaint once per layer** — 013's repeated near-identical full-canvas
+   holes and 60%+ plate destruction are the anti-pattern.
+5. **Budget caps as first-class limits**: iterations, per-run Flux call count, per-hole
+   and per-iteration mask area.
+6. Later option: LayerD's matting weights (BiRefNet-class) as a peel-matte upgrade —
+   not a Qwen-layers revival (rejected for speed; qwen stage stays disabled).
