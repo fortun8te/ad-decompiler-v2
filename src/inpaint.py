@@ -1125,6 +1125,56 @@ def _multipass_inpaint(rgb, mask, cfg: Optional[dict] = None):
     return generated, used, diagnostics
 
 
+def _gradient_hole_fill(rgb, mask, cfg: Optional[dict] = None):
+    """Fill mask holes analytically when the visible plate is a clean linear gradient.
+
+    Fits colour(x,y) = a·x + b·y + c per channel (least squares) on visible pixels,
+    validates the fit on a held-out visible subsample, and fills masked pixels by
+    evaluating the plane. Returns ``(filled, remaining_mask, info)`` or ``None`` when
+    the plate is not a clean gradient (validation residual too high). Deliberately
+    linear-only: radial/blob washes fail validation and keep their generative route.
+    """
+    cv2, np, _ = _deps()
+    opts = ((cfg or {}).get("inpaint") or {}).get("gradient_fill") or {}
+    if opts.get("enabled", True) is False:
+        return None
+    img = np.asarray(rgb, dtype=np.uint8)
+    hole = np.asarray(mask) > 0
+    visible = ~hole
+    h, w = img.shape[:2]
+    n_visible = int(visible.sum())
+    # Need a real plate sample and a hole worth the fit.
+    if n_visible < 500 or float(hole.sum()) / hole.size < float(opts.get("min_hole_fraction", 0.02)):
+        return None
+    ys, xs = np.nonzero(visible)
+    rng = np.random.default_rng(0)
+    take = min(len(xs), int(opts.get("fit_samples", 40000)))
+    idx = rng.choice(len(xs), size=take, replace=False)
+    fit_n = take * 3 // 4
+    fi, vi = idx[:fit_n], idx[fit_n:]
+    A = np.stack([xs[fi] / max(1, w), ys[fi] / max(1, h), np.ones(fit_n)], axis=1).astype(np.float64)
+    Av = np.stack([xs[vi] / max(1, w), ys[vi] / max(1, h), np.ones(len(vi))], axis=1).astype(np.float64)
+    coeffs = []
+    max_err = float(opts.get("max_validation_error", 6.0))
+    for ch in range(3):
+        b = img[ys[fi], xs[fi], ch].astype(np.float64)
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+        pred_v = Av @ sol
+        err = float(np.median(np.abs(pred_v - img[ys[vi], xs[vi], ch].astype(np.float64))))
+        if err > max_err:
+            return None
+        coeffs.append(sol)
+    hy, hx = np.nonzero(hole)
+    filled = img.copy()
+    Ah = np.stack([hx / max(1, w), hy / max(1, h), np.ones(len(hx))], axis=1).astype(np.float64)
+    for ch in range(3):
+        filled[hy, hx, ch] = np.clip(Ah @ coeffs[ch], 0, 255).astype(np.uint8)
+    remaining = np.zeros_like(np.asarray(mask, dtype=np.uint8))
+    info = {"kind": "linear", "validation_max_err": max_err,
+            "hole_fraction": round(float(hole.sum()) / hole.size, 4)}
+    return filled, remaining, info
+
+
 def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: bool = False):
     """Inpaint RGB pixels and guarantee that pixels outside ``mask`` stay byte-identical."""
     cv2, np, Image = _deps()
@@ -1169,6 +1219,36 @@ def inpaint_array(rgb, mask, cfg: Optional[dict] = None, return_diagnostics: boo
         }
         result = (out, "solid-flat", diagnostics)
         return result if return_diagnostics else result[:2]
+
+    # Gradient plates (013 grüns: green→yellow wash): a smooth gradient background fails
+    # the solid-median test above (no single flat colour) and previously fell straight
+    # through to the generative backend — Big-LaMa then re-painted a near-full-canvas
+    # hole per layer, tripping excessive-plate-destruction at 55%+. A linear per-channel
+    # plane colour(x,y)=a·x+b·y+c fitted on the VISIBLE plate reconstructs such holes
+    # exactly and analytically; a plate that is not a clean gradient fails the residual
+    # check and routes to the generative backend as before.
+    gradient_info = None
+    if np.any(generative_mask):
+        grad = _gradient_hole_fill(flat_source, generative_mask, cfg)
+        if grad is not None:
+            flat_source, generative_mask, gradient_info = grad
+            if not np.any(generative_mask):
+                out = original.copy()
+                selected = composite_mask > 0
+                out[selected] = flat_source[selected]
+                diagnostics = {
+                    "backend_class": "analytic", "gradient_flat": gradient_info,
+                    "backend_route": {
+                        "requested": str((cfg.get("inpaint") or {}).get("mode", "auto")).lower(),
+                        "selected": "gradient-flat", "selected_class": "analytic",
+                        "strict_acceptance": bool((cfg.get("inpaint") or {}).get("strict_acceptance", False)),
+                        "opencv_fallback_used": False, "fallback_reason": None,
+                    },
+                }
+                if solid_flat_info is not None:
+                    diagnostics["solid_flat"] = solid_flat_info
+                result = (out, "gradient-flat", diagnostics)
+                return result if return_diagnostics else result[:2]
 
     generated, used, diagnostics = _multipass_inpaint(
         flat_source, generative_mask, cfg,
