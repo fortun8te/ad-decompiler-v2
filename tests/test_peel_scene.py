@@ -800,8 +800,11 @@ def test_peel_inpaint_mode_routes_photo_band_to_flux():
         cfg, {"under_kind": "photo-fragment", "hole_px": 20000}) == "flux_comfy"
     assert peel_scene.peel_inpaint_mode(
         cfg, {"under_kind": "photo-fragment", "hole_px": 500}) == "lama"
+    # Non-photo unders (shape/chrome/wash plates) route to opencv, NOT LaMa: LaMa's
+    # texture synthesis hallucinates blotchy bands on smooth plates (013's headline
+    # smudge). opencv mode tries the analytic gradient fill first, then Telea.
     assert peel_scene.peel_inpaint_mode(
-        cfg, {"under_kind": "shape", "hole_px": 20000}) == "lama"
+        cfg, {"under_kind": "shape", "hole_px": 20000}) == "opencv"
     assert peel_scene.peel_inpaint_mode(
         cfg, {"under_kind": "photo", "hole_px": 20000, "text_occluder": True}) == "lama"
 

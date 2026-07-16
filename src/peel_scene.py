@@ -294,6 +294,14 @@ def peel_inpaint_mode(cfg: Optional[dict] = None, meta: Optional[dict] = None) -
         hi = int(opts.get("flux_max_hole_px") or 0) or 10**9
         if lo <= hole_px <= hi:
             return "flux_comfy"
+    # Big-LaMa's strength is TEXTURE synthesis; on smooth chrome/wash plates it
+    # hallucinates blotchy bands (013's smudge under the headline came from LaMa on a
+    # green→yellow gradient). Non-photo unders route through opencv mode, whose
+    # inpaint_array chain tries the analytic gradient fill first (exact on clean
+    # washes) and falls back to Telea (measured 18.9/255 on 013's eased transition
+    # zone vs LaMa-class 23+ with banding).
+    if not _is_photo_kind(under):
+        return "opencv"
     return "lama"
 
 
@@ -778,8 +786,44 @@ def background_plate_kind(flat, bg_visible, opts) -> str:
     sq = cv2.blur(img * img, (5, 5))
     std = np.sqrt(np.clip(sq - mean * mean, 0.0, None)).max(axis=2)
     sigma = float(np.median(std[vis]))
-    return "photo" if sigma > float(opts.get("background_photo_sigma") or 7.0) \
-        else "background"
+    if sigma <= float(opts.get("background_photo_sigma") or 7.0):
+        return "background"
+    # Gradient-wash rescue: undetected foreground scraps (013's floating gummies) push
+    # the windowed-stddev median over the photo threshold even though the plate itself
+    # is a smooth wash. A trimmed quadratic surface fit over the visible plate ignores
+    # a minority of contaminating pixels; when it fits tightly the plate is chrome, not
+    # photograph, and its holes must never route to LaMa's texture synthesis.
+    try:
+        vy, vx = np.nonzero(vis)
+        if len(vx) >= 2000:
+            rng = np.random.default_rng(0)
+            take = min(len(vx), 20000)
+            pick = rng.choice(len(vx), size=take, replace=False)
+            sy, sx = vy[pick].astype(np.float64), vx[pick].astype(np.float64)
+            hh, ww = img.shape[:2]
+            A = np.stack([sx / ww, sy / hh, (sy / hh) ** 2, (sx / ww) ** 2,
+                          np.ones(take)], axis=1)
+            wash = True
+            for ch in range(3):
+                b = img[vy[pick], vx[pick], ch].astype(np.float64)
+                sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+                keep = np.ones(take, dtype=bool)
+                for _ in range(3):
+                    resid = np.abs(A @ sol - b)
+                    new_keep = resid <= np.quantile(resid[keep], 0.75)
+                    if int(new_keep.sum()) < 200:
+                        break
+                    keep = new_keep
+                    sol, *_ = np.linalg.lstsq(A[keep], b[keep], rcond=None)
+                if float(np.quantile(np.abs(A @ sol - b), 0.40)) > float(
+                        opts.get("wash_fit_max_err") or 6.0):
+                    wash = False
+                    break
+            if wash:
+                return "background"
+    except Exception:
+        pass
+    return "photo"
 
 
 def _is_plate_kind(kind) -> bool:

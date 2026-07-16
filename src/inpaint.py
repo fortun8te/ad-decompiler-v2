@@ -1140,11 +1140,21 @@ def _gradient_hole_fill(rgb, mask, cfg: Optional[dict] = None):
         return None
     img = np.asarray(rgb, dtype=np.uint8)
     hole = np.asarray(mask) > 0
-    visible = ~hole
     h, w = img.shape[:2]
+    if float(hole.sum()) / hole.size < float(opts.get("min_hole_fraction", 0.02)):
+        return None
+    # Fit on a LOCAL ring around the hole, not the whole visible canvas: on a real ad
+    # the global visible set includes products/badges/photos, so a whole-image plane
+    # fit never validates and the fill never fired (013 run-3: headline smudge band
+    # survived because the grüns bag dominated the fit). The ring is the plate the
+    # hole actually continues into.
+    cv2_mod, _, _ = _deps()
+    ring_px = max(16, int(opts.get("ring_px", 48)))
+    kernel = np.ones((2 * ring_px + 1,) * 2, np.uint8)
+    ring = (cv2_mod.dilate(hole.astype(np.uint8), kernel) > 0) & ~hole
+    visible = ring
     n_visible = int(visible.sum())
-    # Need a real plate sample and a hole worth the fit.
-    if n_visible < 500 or float(hole.sum()) / hole.size < float(opts.get("min_hole_fraction", 0.02)):
+    if n_visible < 500:
         return None
     ys, xs = np.nonzero(visible)
     rng = np.random.default_rng(0)
@@ -1152,19 +1162,45 @@ def _gradient_hole_fill(rgb, mask, cfg: Optional[dict] = None):
     idx = rng.choice(len(xs), size=take, replace=False)
     fit_n = take * 3 // 4
     fi, vi = idx[:fit_n], idx[fit_n:]
-    A = np.stack([xs[fi] / max(1, w), ys[fi] / max(1, h), np.ones(fit_n)], axis=1).astype(np.float64)
-    Av = np.stack([xs[vi] / max(1, w), ys[vi] / max(1, h), np.ones(len(vi))], axis=1).astype(np.float64)
+
+    # Quadratic basis: ad washes are commonly EASED, not linear (013's red channel
+    # ramps ~273 levels with visible easing — a plane misfits it by ~15 levels).
+    def _design(xa, ya):
+        x = xa / max(1, w)
+        y = ya / max(1, h)
+        return np.stack([x, y, y * y, x * x, np.ones(len(xa))], axis=1).astype(np.float64)
+
+    A = _design(xs[fi], ys[fi])
+    Av = _design(xs[vi], ys[vi])
     coeffs = []
-    max_err = float(opts.get("max_validation_error", 6.0))
+    # Validation is a TRIMMED quantile (q35): the ring legitimately clips stray element
+    # edges (gummy bears, badge rims) whose pixels are not plate; the plate's own pixels
+    # must fit tightly, contamination may not. A loose median guard rejects the
+    # bimodal case where "q35 fits" only because half the ring is one flat color.
+    max_err = float(opts.get("max_validation_error", 7.0))
+    max_median = float(opts.get("max_validation_median", 18.0))
     slope = 0.0
     for ch in range(3):
         b = img[ys[fi], xs[fi], ch].astype(np.float64)
         sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-        pred_v = Av @ sol
-        err = float(np.median(np.abs(pred_v - img[ys[vi], xs[vi], ch].astype(np.float64))))
-        if err > max_err:
+        # Iterated trimmed refit (IRLS-lite): one trim pass is not enough when a large
+        # element (013's product bag) clips the ring — its pixels survive the first
+        # quartile cut and skew the surface (measured 25/255 truth error on a clean
+        # plate strip). Three fit→trim rounds converge on the dominant smooth plate.
+        keep = np.ones(len(b), dtype=bool)
+        for _ in range(3):
+            resid = np.abs(A @ sol - b)
+            thresh = np.quantile(resid[keep], 0.75)
+            new_keep = resid <= thresh
+            if int(new_keep.sum()) < 50:
+                break
+            keep = new_keep
+            sol, *_ = np.linalg.lstsq(A[keep], b[keep], rcond=None)
+        errs = np.abs(Av @ sol - img[ys[vi], xs[vi], ch].astype(np.float64))
+        if float(np.quantile(errs, 0.35)) > max_err or float(np.median(errs)) > max_median:
             return None
-        slope = max(slope, abs(float(sol[0])), abs(float(sol[1])))
+        slope = max(slope, abs(float(sol[0])), abs(float(sol[1])),
+                    abs(float(sol[2])), abs(float(sol[3])))
         coeffs.append(sol)
     # A (near-)constant plate is not a gradient — that is solid-flat's territory, and if
     # solid-flat already declined it there was a reason (e.g. hole-interior evidence).
@@ -1173,7 +1209,7 @@ def _gradient_hole_fill(rgb, mask, cfg: Optional[dict] = None):
         return None
     hy, hx = np.nonzero(hole)
     filled = img.copy()
-    Ah = np.stack([hx / max(1, w), hy / max(1, h), np.ones(len(hx))], axis=1).astype(np.float64)
+    Ah = _design(hx, hy)
     for ch in range(3):
         filled[hy, hx, ch] = np.clip(Ah @ coeffs[ch], 0, 255).astype(np.uint8)
     remaining = np.zeros_like(np.asarray(mask, dtype=np.uint8))
