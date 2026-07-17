@@ -3163,6 +3163,87 @@ def _unify_repeated_row_labels(enriched: list[dict]) -> list[dict]:
     return changes
 
 
+# Sibling lines whose fitted sizes already agree this closely are one scale that drifted,
+# not a hierarchy. Kept tight: a real step (headline over body, 013's headline vs subhead)
+# is far larger than this, so it splits into its own cluster and survives untouched.
+_PEER_SIZE_TOLERANCE = 0.15
+
+
+def _unify_peer_text_scale(enriched: list[dict]) -> list[dict]:
+    """Snap sibling lines of one block that measure the same scale to a single size.
+
+    Sizes are fitted per line, so lines a reader sees as one element drift apart: 016's
+    '21+ vitamins' / '& minerals' callout emits 29.4 and 26.8, and 101's checklist rows
+    scatter. Group by block, cluster the block's lines by fitted size, and snap each
+    cluster of 2+ to its median.
+
+    The clustering IS the hierarchy guard, and it is why this cannot flatten a design:
+    peers are only ever lines already within ``_PEER_SIZE_TOLERANCE`` of each other, so a
+    genuine size step (013's headline over its subhead, 025's card headings) exceeds the
+    band, lands in its own cluster, and is never merged with the copy beside it. Family
+    and weight move only on a strict majority — never on a tie — so a deliberate bold lead
+    line inside a paragraph keeps its contrast.
+    """
+    from collections import Counter
+
+    by_block: dict[str, list[dict]] = {}
+    for line in enriched:
+        style = line.get("style") or {}
+        text = str(line.get("text") or "").strip()
+        # Sub-glyph OCR speckle ('-', '- -', '.') measures nonsense sizes; never let it
+        # vote on, or be dragged by, a real peer group.
+        if not style.get("fontFamily") or len(text) < 2 or not any(c.isalnum() for c in text):
+            continue
+        block_id = str(line.get("block_id") or "")
+        if block_id:
+            by_block.setdefault(block_id, []).append(line)
+
+    changes: list[dict] = []
+    for block_id, members in by_block.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda m: _num((m.get("style") or {}).get("fontSize"), 16.0))
+        clusters: list[list[dict]] = []
+        for member in members:
+            size = _num((member.get("style") or {}).get("fontSize"), 16.0)
+            if clusters:
+                base = _num((clusters[-1][0].get("style") or {}).get("fontSize"), 16.0)
+                if size <= base * (1.0 + _PEER_SIZE_TOLERANCE):
+                    clusters[-1].append(member)
+                    continue
+            clusters.append([member])
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            sizes = sorted(_num((m.get("style") or {}).get("fontSize"), 16.0) for m in cluster)
+            med_size = sizes[len(sizes) // 2]
+            fams = Counter(str((m.get("style") or {}).get("fontFamily")) for m in cluster)
+            weights = Counter(int(_num((m.get("style") or {}).get("fontWeight"), 400)) for m in cluster)
+            fam, fam_n = fams.most_common(1)[0]
+            weight, weight_n = weights.most_common(1)[0]
+            for member in cluster:
+                style = member.get("style") or {}
+                changed = []
+                if abs(_num(style.get("fontSize"), 16.0) - med_size) > 0.5:
+                    style["fontSize"] = round(med_size, 2)
+                    style["fontSizeCandidates"] = _size_candidates(med_size)
+                    changed.append("size")
+                if fam_n * 2 > len(cluster) and str(style.get("fontFamily")) != fam:
+                    style["fontFamily"] = fam
+                    changed.append("family")
+                if weight_n * 2 > len(cluster) and int(_num(style.get("fontWeight"), 400)) != weight:
+                    style["fontWeight"] = weight
+                    style["fontWeightCandidates"] = _weight_candidates(weight)
+                    changed.append("weight")
+                if changed:
+                    member.setdefault("meta", {})["peer_scale_unified"] = {
+                        "block": block_id, "size": round(med_size, 2), "changed": changed,
+                    }
+                    changes.append({"text": member.get("text"), "block": block_id,
+                                    "changed": changed})
+    return changes
+
+
 def _apply_font_consensus(prepared: list[dict], render_fit_options: dict,
                           font_options: dict) -> Optional[dict]:
     """Document-level font family consensus across all matched lines.
@@ -4402,6 +4483,9 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
     row_label_unify = _unify_repeated_row_labels(enriched)
     if row_label_unify:
         result["row_label_unification"] = row_label_unify
+    peer_scale_unify = _unify_peer_text_scale(enriched)
+    if peer_scale_unify:
+        result["peer_scale_unification"] = peer_scale_unify
     sections = _make_sections(blocks, canvas)
     styles = _assign_style_ids(enriched, blocks)
 

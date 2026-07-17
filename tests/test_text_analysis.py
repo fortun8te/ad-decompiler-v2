@@ -252,6 +252,70 @@ def test_ink_polarity_flip_reverses_a_mask_that_elected_the_plate():
     assert np.median(crop[out].astype(float), axis=0)[1] < 60    # green channel low
 
 
+def test_expected_ink_ratio_tracks_the_glyphs_the_line_actually_has():
+    """009 regression: one tweet body, emitted 37.0…50.0.
+
+    Sizing as ink_height/cap_ratio assumes every line's ink spans the caps. Ink actually
+    runs tallest-glyph to lowest, so the same font size measures ~0.72em all-caps but
+    ~0.96em once an ascender AND a descender appear — inventing a 25% size step between
+    lines a reader sees as identical.
+    """
+    cap = 0.72
+    caps_only = text_analysis._expected_ink_ratio("LAATSTE SITE WIDE SALE", cap)
+    asc_desc = text_analysis._expected_ink_ratio("woensdag 20 mei om 20:00 uur.", cap)
+    x_only = text_analysis._expected_ink_ratio("no", cap)
+    assert caps_only == pytest.approx(0.72, abs=0.01)
+    assert asc_desc == pytest.approx(0.96, abs=0.02)
+    assert x_only < caps_only, "x-height-only copy spans less ink than caps"
+
+    # The payoff: identical source size, different glyph mix -> same recovered size.
+    assert (36.0 / asc_desc) == pytest.approx(37.6, abs=0.6)
+    assert (27.0 / caps_only) == pytest.approx(37.5, abs=0.6)
+
+
+def test_peer_lines_of_one_block_unify_to_a_single_scale():
+    """016 regression: '21+ vitamins' (29.4) / '& minerals' (26.8) are one callout."""
+    lines = [
+        {"id": "L2", "text": "21+ vitamins", "block_id": "B2",
+         "style": {"fontFamily": "Poppins", "fontSize": 29.4, "fontWeight": 400}},
+        {"id": "L3", "text": "& minerals", "block_id": "B2",
+         "style": {"fontFamily": "Poppins", "fontSize": 26.8, "fontWeight": 400}},
+    ]
+    changes = text_analysis._unify_peer_text_scale(lines)
+    assert changes
+    sizes = {ln["style"]["fontSize"] for ln in lines}
+    assert len(sizes) == 1, f"callout peers must share one size, got {sizes}"
+
+
+def test_peer_unification_never_flattens_a_real_size_step():
+    """The hard constraint: a headline beside its body copy must keep its contrast."""
+    lines = [
+        {"id": "L0", "text": "We NEVER do this!", "block_id": "B0",
+         "style": {"fontFamily": "Inter", "fontSize": 88.0, "fontWeight": 700}},
+        {"id": "L1", "text": "read the fine print below", "block_id": "B0",
+         "style": {"fontFamily": "Inter", "fontSize": 24.0, "fontWeight": 400}},
+    ]
+    text_analysis._unify_peer_text_scale(lines)
+    assert lines[0]["style"]["fontSize"] == 88.0
+    assert lines[1]["style"]["fontSize"] == 24.0
+    assert lines[0]["style"]["fontWeight"] == 700, "a deliberate bold lead keeps its weight"
+
+
+def test_peer_unification_ignores_sub_glyph_ocr_speckle():
+    """'-' / '- -' lines measure nonsense sizes; they must not drag a real peer group."""
+    lines = [
+        {"id": "L0", "text": "-", "block_id": "B1",
+         "style": {"fontFamily": "Inter", "fontSize": 233.3, "fontWeight": 600}},
+        {"id": "L1", "text": "Gut health", "block_id": "B1",
+         "style": {"fontFamily": "Poppins", "fontSize": 26.7, "fontWeight": 400}},
+        {"id": "L2", "text": "prebiotics", "block_id": "B1",
+         "style": {"fontFamily": "Poppins", "fontSize": 23.5, "fontWeight": 400}},
+    ]
+    text_analysis._unify_peer_text_scale(lines)
+    assert lines[0]["style"]["fontSize"] == 233.3, "speckle is skipped, not unified"
+    assert lines[1]["style"]["fontSize"] == lines[2]["style"]["fontSize"]
+
+
 def test_saturated_price_strike_and_underline_become_vector_evidence():
     image = np.full((100, 360, 3), 255, dtype=np.uint8)
     # Diagonal strike through the old price and horizontal underline below the new.
