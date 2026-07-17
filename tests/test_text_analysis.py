@@ -337,6 +337,104 @@ def test_101_column_peers_unify_across_role_shattered_blocks():
     assert {ln["style"]["fontWeight"] for ln in lines} == {400}, "and one weight"
 
 
+def _067_body_line(ident, text, y, height, baseline, size, role):
+    """One body line of 067, with the geometry MEASURED off the fixture."""
+    box = {"x": 60.0, "y": y, "w": 1400.0, "h": height}
+    return {"id": ident, "text": text, "role": role,
+            "box": dict(box), "painted_box": dict(box),
+            "baseline": {"y0": baseline},
+            "style": {"fontFamily": "Poppins", "fontSize": size,
+                      "fontWeight": 400, "color": "#000000", "align": "LEFT"}}
+
+
+# 067's body copy: seven lines, one size, one colour, an exact 90.0 baseline rhythm and a
+# single paragraph break (139.0) after 'botanicals'. Box heights swing 76.7-102.0 purely on
+# which glyphs carry ascenders/descenders.
+_067_BODY = [
+    _067_body_line("L6", "At Frøya, we believe nature holds the key", 239.8, 81.4, 307.0, 79.53, "subheadline"),
+    _067_body_line("L7", "to clear, healthy skin. Say goodbye to", 337.3, 75.1, 397.0, 79.53, "subheadline"),
+    _067_body_line("L8", "artificial ingredients and hello to the pure,", 425.2, 77.9, 487.0, 79.50, "subheadline"),
+    _067_body_line("L1", "potent power of organic Arctic botanicals", 507.0, 102.0, 577.0, 79.53, "subheadline"),
+    _067_body_line("L9", "Don't wait — we're saying goodbye to", 655.2, 76.7, 716.0, 79.53, "subheadline"),
+    _067_body_line("L10", "our Sale with 40% OFF soon. Experience", 744.6, 72.8, 806.0, 79.32, "offer"),
+    _067_body_line("L2", "the Arctic difference before it's gone.", 828.0, 97.0, 896.0, 79.53, "subheadline"),
+]
+
+
+def test_067_offer_regex_does_not_veto_a_join_between_identical_faces():
+    """067: 'our Sale with 40% OFF soon.' trips _OFFER_RE mid-paragraph.
+
+    It is the same face as every line around it (fontSize 79.3-79.5, #000000), so the role
+    disagreement is a fact about the sentence, not the layout. Vetoing on it stranded the
+    line AND the line under it in singleton blocks, which is what shoved 067's paragraph
+    break a line late. Same root cause as 101's '50% thicker' / 'repairs & sealant use'.
+    """
+    body = json.loads(json.dumps(_067_BODY))
+    previous, current = body[4], body[5]  # 'Don't wait…' -> 'our Sale with 40% OFF…'
+    assert previous["role"] != current["role"], "precondition: the role labeller disagrees"
+    assert not text_analysis._compatible_roles(previous["role"], current["role"])
+    assert text_analysis._can_join(previous, current, {}), \
+        "identical faces one pitch apart are one paragraph whatever the regex called them"
+
+
+def test_role_veto_still_fires_when_the_faces_actually_differ():
+    """The relaxation is licensed by typographic identity ONLY — a real step still splits."""
+    previous, current = json.loads(json.dumps(_067_BODY[4:6]))
+    current["style"]["fontSize"] = 120.0  # a genuine display step beside body copy
+    assert not text_analysis._can_join(previous, current, {}), "a size step is hierarchy"
+    recoloured = json.loads(json.dumps(_067_BODY[5]))
+    recoloured["style"]["color"] = "#D42A2A"
+    assert not text_analysis._can_join(previous, recoloured, {}), "a colour step is hierarchy"
+
+
+def test_067_paragraph_break_is_read_from_baseline_pitch_not_box_gaps():
+    """067: the real break (a 139.0 pitch among 90.0s) hides under _can_join's gap band.
+
+    The box gap at the break is 46.2px against a 127.5px allowance (1.25 x the tallest
+    box), so the absolute test passes EVERY pair and cannot see the paragraph at all. The
+    block's own established rhythm is the signal.
+    """
+    body = json.loads(json.dumps(_067_BODY))
+    para1, break_line = body[:4], body[4]
+    # The gap band genuinely cannot discriminate — this is why the pitch test exists.
+    assert text_analysis._can_join(para1[-1], break_line, {}), \
+        "precondition: the absolute gap band waves the paragraph break through"
+    assert text_analysis._pitch_break(para1, break_line, {}), \
+        "a 139.0 step against a 90.0 rhythm is a new paragraph"
+    # …and every genuine continuation inside a paragraph is left alone.
+    for index in range(1, len(para1)):
+        assert not text_analysis._pitch_break(para1[:index], para1[index], {}), \
+            f"line {index} continues the rhythm and must not break it"
+    para2 = body[4:]
+    for index in range(1, len(para2)):
+        assert not text_analysis._pitch_break(para2[:index], para2[index], {}), \
+            f"paragraph 2 line {index} continues the rhythm"
+
+
+def test_pitch_break_needs_an_established_rhythm():
+    """A lone line has no rhythm to break — the pitch test must abstain, not guess."""
+    body = json.loads(json.dumps(_067_BODY))
+    assert not text_analysis._pitch_break(body[:1], body[1], {}), \
+        "one line establishes no pitch; the absolute band is the only guard there"
+
+
+def test_067_body_splits_into_exactly_two_paragraphs():
+    """End-to-end: the two fixes together must reproduce 067's authored structure."""
+    body = json.loads(json.dumps(_067_BODY))
+    for line in body:
+        line["hierarchy"] = {"level": 2, "parent_id": None}
+    blocks = text_analysis._make_blocks(body, {"w": 1620.0, "h": 1620.0}, {})
+    groups = {}
+    for line in body:
+        groups.setdefault(line["block_id"], []).append(line["text"])
+    assert len(groups) == 2, f"067's body is two paragraphs, got {len(groups)}: {groups}"
+    first, second = [groups[k] for k in sorted(groups)]
+    assert first[-1].endswith("botanicals"), f"paragraph 1 ends at 'botanicals', got {first}"
+    assert second[0].startswith("Don't wait"), f"paragraph 2 opens at 'Don't wait', got {second}"
+    assert len(second) == 3, f"paragraph 2 keeps all three of its lines, got {second}"
+    assert blocks, "blocks are still emitted"
+
+
 def test_column_unification_never_flattens_a_real_size_step():
     """091's authored 1.222 step sits in the same column and must survive it."""
     def row(ident, text, y, size):

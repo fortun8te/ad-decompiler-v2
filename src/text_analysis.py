@@ -4306,6 +4306,68 @@ def _compatible_roles(a: str, b: str) -> bool:
     return any(a in family and b in family for family in families)
 
 
+def _same_typography(previous: dict, current: dict, config: dict) -> bool:
+    """True when two lines render as the same face — same size band and same colour.
+
+    Deliberately much tighter than the ``paragraph_size_ratio``/``paragraph_color_distance``
+    bands in _can_join: those bands ask "could these share a block?", this asks "is there
+    any VISIBLE difference at all?". Only the latter licenses ignoring a role label.
+    """
+    a_size = _num((previous.get("style") or {}).get("fontSize"), 0.0)
+    b_size = _num((current.get("style") or {}).get("fontSize"), 0.0)
+    if a_size <= 0.0 or b_size <= 0.0:
+        return False
+    if max(a_size, b_size) / max(1e-6, min(a_size, b_size)) > _num(
+            config.get("paragraph_role_size_ratio"), 1.08):
+        return False
+    return _colour_distance(
+        str((previous.get("style") or {}).get("color") or "#000000"),
+        str((current.get("style") or {}).get("color") or "#000000"),
+    ) <= _num(config.get("paragraph_role_color_distance"), 30.0)
+
+
+def _baseline_y(line: dict) -> float:
+    """Baseline y for pitch maths, falling back to the box bottom when absent."""
+    baseline = line.get("baseline") or {}
+    y0 = baseline.get("y0")
+    if y0 is not None:
+        return _num(y0, 0.0)
+    box = line.get("box") or {}
+    return _num(box.get("y"), 0.0) + _num(box.get("h"), 0.0)
+
+
+def _pitch_break(group: list[dict], current: dict, config: dict) -> bool:
+    """True when ``current`` sits a visibly LARGER baseline step below the block's rhythm.
+
+    _can_join's gap test is an ABSOLUTE band (``max(a.h, b.h) * 1.25``) measured between
+    OCR *box* edges, and box height is the noisiest number the OCR emits: it tracks which
+    glyphs happen to carry ascenders/descenders, not the type size. On 067 the seven body
+    lines are all exactly 90.0px apart baseline-to-baseline, yet their box heights range
+    76.7-102.0 (a 33% spread at one font size) -- so the real paragraph break (a 46.2px
+    box gap) sits far under the 127.5px band that the tallest box buys, and EVERY pair
+    passes. The gap test cannot see paragraphs at all here; it only rejects wild outliers.
+
+    Baseline PITCH is the stable measure, and a paragraph break is *relative*: it is a step
+    larger than the rhythm THIS block has already established (067: 90,90,90 then 139 =
+    1.54x). Comparing against the block's own median rather than a global constant keeps it
+    scale-free, so it reads a 79px body column and a 230px display headline alike.
+    """
+    if len(group) < 2:
+        return False  # a single line has established no rhythm to break
+    baselines = [_baseline_y(line) for line in group]
+    deltas = [baselines[i + 1] - baselines[i] for i in range(len(baselines) - 1)]
+    deltas = [d for d in deltas if d > 1.0]
+    if not deltas:
+        return False
+    established = _median(deltas, 0.0)
+    if established <= 1.0:
+        return False
+    step = _baseline_y(current) - baselines[-1]
+    if step <= 0.0:
+        return False
+    return step > established * _num(config.get("paragraph_pitch_break_factor"), 1.35)
+
+
 def _can_join(previous: dict, current: dict, config: dict) -> bool:
     a, b = previous["box"], current["box"]
     acy, bcy = _box_center(a)[1], _box_center(b)[1]
@@ -4324,7 +4386,21 @@ def _can_join(previous: dict, current: dict, config: dict) -> bool:
             config.get("paragraph_color_distance"), 90.0):
         return False
     if not _compatible_roles(previous["role"], current["role"]):
-        return False
+        # ...unless the two lines are typographically INDISTINGUISHABLE. Roles are
+        # semantic labels keyed on CONTENT (regex) and POSITION (y-thresholds), not on
+        # appearance, so a role disagreement between two lines that render identically
+        # is a fact about the sentence, never about the layout. 067's body copy is seven
+        # lines at fontSize 79.3-79.5 / #000000 on an exact 90.0px baseline rhythm, yet
+        # 'our Sale with 40% OFF soon. Experience' trips _OFFER_RE on "40% OFF" and is
+        # labelled *offer* among *subheadline* peers -- vetoing BOTH of its joins and
+        # stranding it plus the line under it in singleton blocks, which is what pushed
+        # the visible paragraph break a line late. Same root cause as 101's '50% thicker'
+        # (offer regex) and 'repairs & sealant use' (footer y-threshold); that fixture was
+        # treated downstream in _unify_column_text_scale, which recovers the SCALE but
+        # cannot rebuild the blocks. A genuine role step (a price/headline beside body)
+        # differs in size or colour and is still vetoed by the bands above and here.
+        if not _same_typography(previous, current, config):
+            return False
     aligned = (
         _horizontal_overlap(a, b) >= 0.22
         or abs(a["x"] - b["x"]) <= max(a["h"], b["h"]) * 1.15
@@ -4439,6 +4515,9 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
             if not _can_join(previous, line, config):
                 continue
             if _interleaved(previous, line, ordered):
+                continue
+            # A step that breaks the block's own baseline rhythm is a paragraph break.
+            if _pitch_break(group, line, config):
                 continue
             a, b = previous["box"], line["box"]
             gap = max(0.0, b["y"] - (a["y"] + a["h"]))
