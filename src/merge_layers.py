@@ -1345,6 +1345,65 @@ _OFFER_BADGE_TEXT_RE = re.compile(
 )
 
 
+def _clip_text_boxes_off_row_bullets(candidates: list) -> int:
+    """Mirror of the chrome-icon clip for LIST ROW bullets that sit BEFORE the text.
+
+    066's two overlapping rows ('Xnudges on upper lid', 'XUp to 3 shades'): OCR read the
+    red cross as the letter 'X' and merged it, inflating the line box 31-36px LEFT over
+    the icon. icon_detect measures the list's own clean gap and publishes
+    ``meta.row.text_clip_x`` + ``overlaps_text`` on exactly those rows (066 -> x=877,
+    inside the clean column's 872-880 band). Consume it here. Guard: only clip a box
+    that ACTUALLY overlaps (tx <= icon right edge) — a bare ``tx < clip_x`` would shave
+    5px off clean rows that legitimately start at 872. Keyed off ``meta.row`` because
+    _CHROME_ICON_ROLES lacks the cv glyph roles (066's E026 never matches by role).
+    """
+    clip_specs = []
+    for c in candidates:
+        meta = c.get("meta") or {}
+        row = meta.get("row") or {}
+        if row.get("text_clip_x") is None or not row.get("overlaps_text"):
+            continue
+        if c.get("target") == "drop":
+            continue
+        ibox = c.get("box") or {}
+        icon_right = float(ibox.get("x", 0) or 0) + float(ibox.get("w", 0) or 0)
+        clip_specs.append((row, float(row["text_clip_x"]), icon_right))
+    if not clip_specs:
+        return 0
+    by_id = {str(c.get("id") or "").lstrip("c_B"): c for c in candidates
+             if c.get("target") == "text" or (c.get("meta") or {}).get("source") == "ocr"}
+    clipped = 0
+    for row, clip_x, icon_right in clip_specs:
+        text = by_id.get(str(row.get("text_id") or "").lstrip("c_B"))
+        if text is None:
+            # Fall back to geometry: the text candidate whose box starts on/over the icon.
+            for c in candidates:
+                if not (c.get("target") == "text"
+                        or (c.get("meta") or {}).get("source") == "ocr"):
+                    continue
+                tb = c.get("box") or {}
+                tx = float(tb.get("x", 0) or 0)
+                same_row = abs(float(tb.get("y", 0) or 0) - float(row.get("line_box", {}).get("y", tx))) < 1e9
+                if tx <= icon_right and tx + float(tb.get("w", 0) or 0) > clip_x and same_row:
+                    text = c
+                    break
+        if text is None:
+            continue
+        tbox = text.get("box") or {}
+        tx = float(tbox.get("x", 0) or 0)
+        if tx > icon_right:          # no real overlap — never shave clean rows
+            continue
+        tw = float(tbox.get("w", 0) or 0)
+        new_w = tw - (clip_x - tx)
+        if new_w <= 4:
+            continue
+        tbox["x"], tbox["w"] = clip_x, new_w
+        text["box"] = tbox
+        text.setdefault("meta", {})["row_bullet_clipped"] = {"from_x": tx, "to_x": clip_x}
+        clipped += 1
+    return clipped
+
+
 def _clip_text_boxes_away_from_chrome_icons(candidates: list) -> int:
     """Shrink editable text that horizontally overlaps a chrome icon (009 verified)."""
     icons = [
@@ -3941,6 +4000,7 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     # 009: username OCR boxes often swallow the verified badge slot — clip text to
     # the left of overlapping chrome icons so the cutout stays visible.
     _clip_text_boxes_away_from_chrome_icons(candidates)
+    _clip_text_boxes_off_row_bullets(candidates)
     # 013: SAM labels circular offer seals as product fragments — promote to badge.
     _promote_circular_offer_products_to_badges(candidates, canvas)
 
