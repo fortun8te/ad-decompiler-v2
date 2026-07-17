@@ -518,6 +518,58 @@ def _plate_ring_is_flat(rgb, box, ink_mask, rcfg) -> bool:
     return float(np.max(np.std(bg, axis=0))) <= float(rcfg.get("residual_glyph_flat_std", 14.0))
 
 
+# Fragment roles eligible for the flat-plate glyph keep: generic un-roled fragments plus
+# the buckets residual-CC slices actually land in.  088's four residual raster-slice
+# fragments (c_E000 / c_E002 / c_E006 / c_E007, the "SALE" letterforms) are ALL role
+# "shape"; its remaining residual-provenance ownership cutouts are "icon" (c_E003 /
+# c_E005 / c_E008) — inside the list — and "product" (c_E009) — deliberately OUT, since
+# a photographic cutout must vacate the plate to swap cleanly.
+_RESIDUAL_GLYPH_KEEP_ROLES = frozenset({"", "shape", "icon"})
+
+
+def _skip_removal_for_flat_residual_glyph(c, candidate_mask, ownership, owner_number,
+                                          rgb, rcfg):
+    """Ownership fraction when a residual-CC baked glyph may keep its ink in the plate.
+
+    Returns the fraction of the fragment's own mask that front-to-back ownership actually
+    handed it when plate removal must be WITHHELD (under-covered ownership on a flat
+    plate ring), ``None`` when the normal removal path applies.  A pure predicate — the
+    caller stamps the meta and skips; the full reasoning comment lives at that call site
+    in ``reconstruct``.  Role-scoped by ``_RESIDUAL_GLYPH_KEEP_ROLES`` and gated on
+    ``reconstruct.keep_flat_residual_glyphs`` so photographic cutouts stay untouched.
+    """
+    _, np, _ = _deps()
+    role = str((c.get("meta") or {}).get("role") or "").lower()
+    if (c.get("target") != "image"
+            or candidate_mask is None
+            or role not in _RESIDUAL_GLYPH_KEEP_ROLES
+            or not _residual_baked_raster(c.get("meta"))
+            or not bool(rcfg.get("keep_flat_residual_glyphs", True))):
+        return None
+    owned_here = int(np.count_nonzero(
+        (ownership == owner_number.get(c.get("id"), 0)) & (candidate_mask > 0)))
+    mask_here = int(np.count_nonzero(candidate_mask))
+    frac = owned_here / max(1, mask_here)
+    if (frac < float(rcfg.get("residual_glyph_ownership_full", 0.995))
+            and _plate_ring_is_flat(rgb, c.get("box") or {}, candidate_mask, rcfg)):
+        return frac
+    return None
+
+
+def _stamp_residual_glyph_overlay(c: dict, ownership_fraction: float) -> None:
+    """Mark a kept-in-plate residual glyph: original ink stays, the slice ships on top.
+
+    ``overlay_without_removal`` is the vocabulary ``_keeps_underlay`` (and routing's
+    preserve-underlay read) honour when later passes consider erasing an underlay;
+    ``removal_skipped`` records WHY the removal ledger holds no pixels for this id — so a
+    later raster-slice fallback drops to plate-passthrough instead of slicing on top.
+    """
+    meta = c.setdefault("meta", {})
+    meta["removal_skipped"] = "flat-residual-glyph-kept-in-plate"
+    meta["overlay_without_removal"] = True
+    meta["residual_glyph_ownership_fraction"] = round(ownership_fraction, 4)
+
+
 def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
     """Select independent foreground owners while retaining only scene fragments in the plate.
 
@@ -1121,6 +1173,18 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
     smear_min_ratio = float(audit_cfg.get("smear_min_ratio", 0.18))
     smear_ring = max(3, int(audit_cfg.get("smear_ring", 13)) | 1)
     smear_window = max(5, int(audit_cfg.get("smear_window", 21)) | 1)
+    # Gradient-tolerant smear path (025 'Blocks everything' row): when the ring is NOT
+    # smooth — a soft card gradient, vignette or panel wash — the flat local-mean model
+    # is invalid and the detector used to fail closed, shipping baked ink UNDER the
+    # emitted native TEXT (ghost double).  Fit the plate per-pixel instead and score
+    # surviving glyph contrast against that model.  Floors sit slightly looser than the
+    # flat bars (a gradient fit is noisier than a local mean) but stay conservative:
+    # genuine photographic texture fails the ring-fit gate and is left to the absolute
+    # tests — a false fill over a real photo is worse than a miss.
+    smear_grad_min_contrast = float(audit_cfg.get("smear_grad_min_contrast", 18.0))
+    smear_grad_min_ratio = float(audit_cfg.get("smear_grad_min_ratio", 0.14))
+    smear_grad_max_ring_residual = float(
+        audit_cfg.get("smear_grad_max_ring_residual", 8.0))
     smear_gradient_fill = bool(audit_cfg.get("smear_gradient_fill", True))
     smear_fill_window = max(5, int(audit_cfg.get("smear_fill_window", 41)) | 1)
     smear_fill_min_samples = float(audit_cfg.get("smear_fill_min_samples", 8))
@@ -1152,20 +1216,43 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         pixel's ORIGINAL local contrast still survives on the plate.
 
         The local background is estimated from NON-ink pixels only, so a backdrop shared
-        by source and plate cancels and only glyph-shaped energy is measured.  Gated on
-        the plate around the glyphs being locally smooth: on fine texture (025's hair
-        headline, whose plate is genuinely clean) the local-background estimate is noise
-        and the solid-fill remedy would be wrong anyway, so a photographic backdrop is
-        left to the absolute tests.  Returns ``(mask, ratio)`` or ``(None, 0.0)``.
+        by source and plate cancels and only glyph-shaped energy is measured.  Two plate
+        regimes, one verdict shape — ``(mask, ratio, gate, variant)`` where ``gate`` is
+        the flag bar the caller must apply for that variant:
+
+          * FLAT (ring is locally smooth on BOTH plate and source): the classic
+            local-mean background below — unchanged fast path, same result as before.
+          * GRADIENT (ring is not smooth): a soft gradient/vignette/panel wash used to
+            fail closed here and ship 025's 'Blocks everything' row doubled; hand off to
+            ``_gradient_smear_residue``, which fits the plate per-pixel.  GENUINE fine
+            texture (025's hair headline, whose plate is genuinely clean) still fails
+            closed inside that variant: there the smooth model cannot even explain the
+            ring, the estimate is noise, and the plate-colour fill would be wrong anyway,
+            so a photographic backdrop is left to the absolute tests.
+
+        Only ever called for text-removal rows post-inpaint, so kept photo fragments
+        (a different ownership path) never reach it.  Abstentions return ``None``.
         """
         ring_k = np.ones((smear_ring, smear_ring), np.uint8)
         ring = (cv2.dilate(ink.astype(np.uint8), ring_k) > 0) & (~ink)
         if int(np.count_nonzero(ring)) < 20:
-            return None, 0.0
+            return None, 0.0, smear_min_ratio, "flat"
         plate_l = _luma(plate_arr)
+        src_l = _luma(source)
         hf = np.abs(plate_l - cv2.GaussianBlur(plate_l, (5, 5), 0))
-        if float(np.median(hf[ring])) > smear_max_plate_hf:
-            return None, 0.0  # photographic backdrop, not a smooth plate
+        hf_src = np.abs(src_l - cv2.GaussianBlur(src_l, (5, 5), 0))
+        # The smoothness precondition must hold on BOTH sides of the comparison: a
+        # generous inpaint can flatten the plate halo to a single colour (smooth plate
+        # ring) while the SOURCE backdrop is genuine fine texture (photo grain, hair,
+        # fabric).  There the flat local-mean "background" of the source is just noise
+        # and any retained-contrast verdict — including a true positive — is untrusted:
+        # fail over to the per-pixel variant, whose source-ring fit gate abstains.
+        if (float(np.median(hf[ring])) > smear_max_plate_hf
+                or float(np.median(hf_src[ring])) > smear_max_plate_hf):
+            # Not a smooth plate — that is no longer an automatic fail-closed.  A soft
+            # gradient is exactly what the per-pixel fill estimator models; let the
+            # gradient-tolerant variant decide (it keeps real photos out itself).
+            return _gradient_smear_residue(plate_arr, ink, ring, plate_l)
         keep = (~ink).astype(np.float32)
         win = (smear_window, smear_window)
         den = cv2.boxFilter(keep, -1, win, normalize=False)
@@ -1180,11 +1267,11 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         strong = ink & (den > 4) & (np.abs(c_src) > smear_min_contrast)
         strong_px = int(np.count_nonzero(strong))
         if strong_px < max(8, min_px):
-            return None, 0.0
+            return None, 0.0, smear_min_ratio, "flat"
         retained = np.zeros_like(c_src)
         np.divide(c_plate, c_src, out=retained, where=np.abs(c_src) > 1e-6)
         hit = strong & (retained > smear_retain_frac)
-        return hit, int(np.count_nonzero(hit)) / max(1, strong_px)
+        return hit, int(np.count_nonzero(hit)) / max(1, strong_px), smear_min_ratio, "flat"
 
     def _gradient_plate_fill(plate_u8_arr, fill_area):
         """Per-pixel plate estimate for a smear fill, sampled from OUTSIDE the fill.
@@ -1210,6 +1297,74 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         for ch in range(3):
             out[..., ch] = cv2.boxFilter(src[..., ch] * keep, -1, win, normalize=False) / safe
         return np.clip(out, 0, 255).astype(np.uint8)
+
+    def _gradient_smear_residue(plate_arr, ink, ring, plate_l):
+        """Smear verdict for a NON-smooth plate (gradient / vignette / panel wash).
+
+        025's 'Blocks everything' row sits on a soft card gradient over a vignette: the
+        ring's high-freq energy tops ``smear_max_plate_hf``, so the flat path used to
+        fail closed and the dimmed smear shipped UNDER the emitted native TEXT (ghost
+        double).  The same per-pixel estimator the smear FILL trusts
+        (``_gradient_plate_fill``) is a valid background model here — the precondition
+        that makes a gradient fill honest is exactly the one that makes scoring against
+        it honest — so fit the plate (and the source) per-pixel and measure how much of
+        each strong glyph pixel's original local contrast survives against the model.
+
+        Conservatisms keep genuine photos out (a false fill over real texture is worse
+        than the miss, and this audit only ever sees text-removal rows post-inpaint):
+          * the RING must be explained by the smooth model ON BOTH SIDES — if the
+            plate's own ring pixels (or the source's: a generous inpaint can flatten
+            the plate halo while the source backdrop stays photographic) deviate from
+            their fits by more than ``smear_grad_max_ring_residual`` the backdrop is
+            real fine texture, not a gradient, and we abstain;
+          * the contrast/ratio floors stay close to the flat path's bars
+            (``smear_grad_min_contrast`` / ``smear_grad_min_ratio``), only slightly
+            looser because the fit is noisier than a local mean.
+
+        Returns the same ``(mask, ratio, gate, variant)`` shape as the flat path.
+        """
+        plate_u8_local = np.clip(plate_arr, 0, 255).astype(np.uint8)
+        model_plate = _gradient_plate_fill(plate_u8_local, ink)
+        if model_plate is None:
+            # Too crowded to sample honestly — fail closed exactly as the flat gate did.
+            return None, 0.0, smear_grad_min_ratio, "gradient"
+        fit = np.abs(plate_l - _luma(model_plate))
+        if float(np.median(fit[ring])) > smear_grad_max_ring_residual:
+            # The smooth model cannot even explain the plate AROUND the glyphs: genuine
+            # photographic texture (hair, fabric, grain), not a gradient.  Leave it to
+            # the absolute tests — a plate-colour fill would paint a slab over a photo.
+            return None, 0.0, smear_grad_min_ratio, "gradient"
+        src_u8 = np.clip(source, 0, 255).astype(np.uint8)
+        model_src = _gradient_plate_fill(src_u8, ink)
+        if model_src is None:
+            return None, 0.0, smear_grad_min_ratio, "gradient"
+        src_l = _luma(source)
+        fit_src = np.abs(src_l - _luma(model_src))
+        if float(np.median(fit_src[ring])) > smear_grad_max_ring_residual:
+            # The SOURCE ring is genuine fine texture, not a gradient: the contrast
+            # baseline itself is noise (a generous inpaint can leave the plate ring
+            # smooth — halo flattened to one colour — while the source backdrop is a
+            # photo).  A retained-contrast verdict there is untrusted in BOTH
+            # directions, so abstain: a plate-colour fill over real texture is worse
+            # than the miss (025 hair headline; ghost photographic-plate guard).
+            return None, 0.0, smear_grad_min_ratio, "gradient"
+        c_src = src_l - _luma(model_src)
+        c_plate = plate_l - _luma(model_plate)
+        # Mirror the flat path's density term: a strong pixel must sit in a real glyph
+        # neighbourhood (den > 4), or a 4x4 sliver's isolated pixels clear the count
+        # floor and the variant guesses instead of abstaining (few_strong_pixels test).
+        # Computed locally — the flat path's own ``den`` is a sibling scope's local.
+        den = cv2.boxFilter((~ink).astype(np.float32), -1,
+                            (smear_window, smear_window), normalize=False)
+        strong = ink & (den > 4) & (np.abs(c_src) > smear_grad_min_contrast)
+        strong_px = int(np.count_nonzero(strong))
+        if strong_px < max(8, min_px):
+            return None, 0.0, smear_grad_min_ratio, "gradient"
+        retained = np.zeros_like(c_src)
+        np.divide(c_plate, c_src, out=retained, where=np.abs(c_src) > 1e-6)
+        hit = strong & (retained > smear_retain_frac)
+        ratio = int(np.count_nonzero(hit)) / max(1, strong_px)
+        return hit, ratio, smear_grad_min_ratio, "gradient"
 
     def _ink_safe_exterior(samples, ink_color):
         """Keep ring samples that are clearly plate-coloured, not leftover glyph ink."""
@@ -1317,9 +1472,10 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
             if not reverted and t.get("kind") == "smear":
                 # A smear was never visible to the absolute tests, so their "resolved"
                 # verdict cannot clear it either — re-run the detector that flagged it.
-                _smear_after, smear_after_ratio = _smear_residue(trial, ink)
+                # The returned gate tracks the variant (flat vs gradient) that re-fires.
+                _smear_after, smear_after_ratio, after_gate, _ = _smear_residue(trial, ink)
                 reverted = (_smear_after is not None
-                            and smear_after_ratio >= smear_min_ratio)
+                            and smear_after_ratio >= after_gate)
             if reverted:
                 plate_u8[fill_area] = before
                 plate_f32 = None
@@ -1393,18 +1549,21 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         ratio = count / total
         kind = None
         smear_ratio = None
+        smear_variant = None
         if count >= min_px and ratio >= min_ratio:
             kind = "ink-match"
         elif smear_enabled:
             # The absolute tests cleared it; a partial smear still reads as doubled copy.
-            smear, s_ratio = _smear_residue(plate, ink)
-            if (smear is not None and s_ratio >= smear_min_ratio
+            # The detector returns the gate for whichever variant (flat / gradient) fired.
+            smear, s_ratio, s_gate, s_variant = _smear_residue(plate, ink)
+            if (smear is not None and s_ratio >= s_gate
                     and int(smear.sum()) >= min_px):
                 residue = residue | smear
                 count = int(residue.sum())
                 ratio = count / total
                 kind = "smear"
                 smear_ratio = round(float(s_ratio), 4)
+                smear_variant = s_variant
         if kind is None:
             continue
         flag = {
@@ -1414,6 +1573,8 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         }
         if smear_ratio is not None:
             flag["smear_ratio"] = smear_ratio
+        if smear_variant is not None:
+            flag["smear_variant"] = smear_variant
         tracked.append({
             "item": item, "ink": ink, "ink_color": ink_color, "total": total,
             "residue": residue, "kind": kind,
@@ -3712,23 +3873,11 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         # not.  Withhold removal for these; the plate keeps the exact glyphs and the slices
         # still ship on top for editability.  Scoped to flat plates + under-covered ownership
         # so photographic cutouts (which must vacate the plate to swap cleanly) are untouched.
-        _frag_role = str((c.get("meta") or {}).get("role") or "").lower()
-        if (c.get("target") == "image"
-                and candidate_mask is not None
-                and _frag_role in {"", "shape", "icon"}
-                and _residual_baked_raster(c.get("meta"))
-                and bool(rcfg.get("keep_flat_residual_glyphs", True))):
-            _cid = c.get("id")
-            _owned_here = int(np.count_nonzero(
-                (ownership == owner_number.get(_cid, 0)) & (candidate_mask > 0)))
-            _mask_here = int(np.count_nonzero(candidate_mask))
-            _frac = _owned_here / max(1, _mask_here)
-            if (_frac < float(rcfg.get("residual_glyph_ownership_full", 0.995))
-                    and _plate_ring_is_flat(rgb, box, candidate_mask, rcfg)):
-                c["meta"]["removal_skipped"] = "flat-residual-glyph-kept-in-plate"
-                c["meta"]["overlay_without_removal"] = True
-                c["meta"]["residual_glyph_ownership_fraction"] = round(_frac, 4)
-                continue
+        _glyph_frac = _skip_removal_for_flat_residual_glyph(
+            c, candidate_mask, ownership, owner_number, rgb, rcfg)
+        if _glyph_frac is not None:
+            _stamp_residual_glyph_overlay(c, _glyph_frac)
+            continue
         if c.get("target") == "text":
             ownership_decision = (c.get("meta") or {}).get("ownership_decision")
             text_meta = c.get("meta") or {}
