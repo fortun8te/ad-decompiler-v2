@@ -2,7 +2,7 @@
 // No build step on purpose: this file runs directly in Figma's plugin sandbox.
 // It accepts the legacy flat design.json contract and scene-graph v2 documents.
 
-const PLUGIN_BUILD = {"version":"2.1.0","build":99,"commit":"4c2fe7b","dirty":true,"built_at":"2026-07-17T13:57:37Z","label":"v2.1.0+b99.4c2fe7b-dirty","source":"git"};
+const PLUGIN_BUILD = {"version":"2.1.0","build":106,"commit":"91c9951","dirty":false,"built_at":"2026-07-17T16:37:24Z","label":"v2.1.0+b106.91c9951","source":"git"};
 
 figma.showUI(__html__, {
   width: 388,
@@ -1257,6 +1257,31 @@ async function createTextLayer(layer, parent, context) {
   const runs = await applyTextRuns(node, layer, content, context);
   const fitWinner = await fitTextWithCandidates(node, layer, style, context, runs.length > 0);
   await attachTextStyle(node, layer, style, fitWinner.fontName, context, runs.length > 0);
+  // Partial decorations: a strike that covers only part of the line (091 'Foggy',
+  // 002's euro-63) ships as style.decorationSpan (fraction of the text the strike
+  // covers, from the start). Whole-node textDecoration was applied above as the
+  // fallback; when a genuine partial span exists, narrow it to the character range
+  // AFTER fitting/styling so later restyles cannot wipe the range. Range setters
+  // need the fonts already loaded, which attachTextStyle guarantees.
+  const decoSpan = finite(pick(style, "decorationSpan", "decoration_span"), NaN);
+  const decoKind = textDecorationValue(pick(style, "textDecoration", "text_decoration", "decoration"));
+  if (decoKind && Number.isFinite(decoSpan) && decoSpan > 0 && decoSpan < 0.999) {
+    const chars = node.characters || "";
+    const end = Math.max(1, Math.min(chars.length, Math.round(chars.length * decoSpan)));
+    try {
+      node.setRangeTextDecoration(0, end, decoKind);
+      if (end < chars.length) node.setRangeTextDecoration(end, chars.length, "NONE");
+      const decoColorRaw = pick(style, "decorationColor", "decoration_color");
+      const decoColor = decoColorRaw != null ? parseColor(decoColorRaw, null) : null;
+      if (decoColor && typeof node.setRangeTextDecorationColor === "function") {
+        try {
+          node.setRangeTextDecorationColor(0, end, { value: { type: "SOLID", color: decoColor }, type: "COLOR" });
+        } catch (_) {
+          try { node.setRangeTextDecorationColor(0, end, { type: "SOLID", color: decoColor }); } catch (_) {}
+        }
+      }
+    } catch (_) { /* whole-node decoration from above remains the fallback */ }
+  }
   const baselineEvidence = layer.meta && (layer.meta.baseline || layer.meta.baseline_first || layer.meta.baselineFirst);
   if (baselineEvidence) {
     try { node.setPluginData("adDecompilerBaseline", JSON.stringify(baselineEvidence)); } catch (_) {}
