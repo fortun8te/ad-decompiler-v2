@@ -1996,6 +1996,68 @@ def _discover_google_fonts(options: dict) -> list[dict]:
     return fonts
 
 
+_FAMILY_PATH_CACHE: dict = {}
+
+
+def _resolve_family_path(family: Any, weight: int, italic: bool,
+                         options: Optional[dict] = None) -> Optional[str]:
+    """On-disk file for a DECLARED family, at the closest weight/slant.
+
+    The platform-UI prior (and the design-time family stamp) OVERRIDE a line's
+    family with a declared one. Keeping the outvoted candidate's ``path`` then
+    leaves design.json and the preview drawing different fonts — and, worse,
+    leaves the emitted ``fontSize`` fitted to a face Figma will never load
+    (009's tweet body fits Lato-Medium at 34.54 where its own twin line, which
+    resolved real Inter, fits 35.77; Figma then renders the declared Inter 6%
+    narrow). Resolving the declared family to a real file keeps label, path, fit
+    and preview on ONE font.
+
+    Returns ``None`` when the family is not installed, so callers can fall back to
+    dropping the stale path rather than lying about it.
+    """
+    name = _norm_family(family)
+    if not name:
+        return None
+    key = (name, int(weight), bool(italic))
+    if key in _FAMILY_PATH_CACHE:
+        return _FAMILY_PATH_CACHE[key]
+    opts = dict(options or {})
+    # The declared family is a NAME, not a member of any caller-pinned universe:
+    # resolve it against the ambient corpus (curated OFL + installed system faces).
+    opts.pop("font_files", None)
+    fonts = list(_discover_google_fonts(opts))
+    try:
+        fonts.extend(_discover_fonts({"font_dirs": _platform_font_dirs()}))
+    except Exception:
+        pass
+    matches = [meta for meta in fonts if _norm_family(meta.get("family")) == name]
+    if not matches:
+        _FAMILY_PATH_CACHE[key] = None
+        return None
+
+    def rank(meta: dict) -> tuple:
+        path = str(meta.get("path") or "")
+        try:
+            from src import font_fit
+
+            axes = font_fit.variable_axes(path)
+        except Exception:
+            axes = {}
+        wght = axes.get("wght") if axes else None
+        if wght and float(wght[0]) <= weight <= float(wght[2]):
+            distance = 0.0          # a variable face dials to the exact weight
+        else:
+            distance = abs(float(meta.get("weight") or 400) - weight)
+        is_italic = "italic" in str(meta.get("style") or "").lower()
+        return (0 if is_italic == bool(italic) else 1, distance, path)
+
+    best = str(sorted(matches, key=rank)[0].get("path") or "") or None
+    if best and not os.path.exists(best):
+        best = None
+    _FAMILY_PATH_CACHE[key] = best
+    return best
+
+
 def _candidate_key(item: dict) -> tuple:
     return (
         str(item.get("family", "")).lower(),
@@ -2704,9 +2766,17 @@ def _apply_line_render_fit(line: dict, mask, painted: dict, render_fit_options: 
     try:
         from src import font_fit
 
+        # Only a face we resolved BY NAME gets its variable axis driven. A
+        # matcher-chosen face was scored and fitted at its file's own default
+        # instance, so re-rendering it at some other weight would fit a face nothing
+        # upstream evaluated — that perturbs fitted sizes, which shifts peer-cluster
+        # medians, which flips 066's rows to the cluster majority weight and costs
+        # text recall. `None` keeps the default instance, exactly as before.
         fit = font_fit.fit_line(
             line.get("text", ""), chosen["path"], mask,
             _num(style.get("fontSize"), 16.0), render_fit_options,
+            weight=(_num(chosen.get("weight"), 400.0)
+                    if chosen.get("family_resolved") else None),
         )
     except Exception:
         return None
@@ -2895,6 +2965,7 @@ def _apply_platform_ui_font_prior(prepared: list[dict], cfg: Optional[dict],
         return None
     family = _platform_ui_family(cfg)
     tcfg = _platform_ui_cfg(cfg)
+    font_options = _font_options(tcfg)
     strong_keep = _num((tcfg.get("platform_ui") or {}).get("strong_keep"), 0.72)
     applied = []
     skipped = []
@@ -2961,15 +3032,40 @@ def _apply_platform_ui_font_prior(prepared: list[dict], cfg: Optional[dict],
             rest = [c for c in candidates if c is not inter_cand]
             style["fontCandidates"] = [promoted] + rest
         elif top:
-            # Relabel the best sans match to the platform family; keep path for preview.
+            # The prior REPLACES the family, so the outvoted face's path must go with
+            # it. Keeping that path made design.json and the preview draw different
+            # fonts (009's tweet body: family "Inter", path Lato-Medium.ttf) and — the
+            # real defect — left the emitted fontSize fitted to a face Figma never
+            # loads, so the DELIVERABLE renders ~6% narrow. Resolve the declared family
+            # to a real file and re-fit against it; only when it is not installed do we
+            # fall back to the documented relabel (keep path, record local_family).
             promoted = dict(top)
             promoted["family"] = family
-            promoted["local_family"] = current
             promoted["weight"] = weight
             promoted["style"] = style_label
             promoted["source"] = promoted.get("source") or "platform-ui-prior"
             promoted["figma_loadable"] = True
+            resolved = _resolve_family_path(family, weight, italic, font_options)
+            if resolved:
+                promoted["path"] = resolved
+                promoted.pop("local_family", None)
+                promoted.pop("fit", None)      # the old face's fit is not this face's
+                # We picked this file BY NAME for a declared weight, so a variable
+                # face must be dialled to it. Only such candidates carry the flag:
+                # a matcher-chosen face was fitted at its file's own default instance
+                # (Archivo[wdth,wght] defaults to wght 600, not the 400 its OS/2
+                # record reports), so touching its axis would re-render something
+                # nothing upstream evaluated and shift 066's peer clusters.
+                promoted["family_resolved"] = True
+            else:
+                promoted["local_family"] = current
             style["fontCandidates"] = [promoted] + candidates[1:]
+            if resolved:
+                refit = _apply_line_render_fit(
+                    line, item.get("font_mask"), item.get("painted"), render_fit_options,
+                )
+                if refit is not None:
+                    item["line_fit"] = refit
         else:
             style["fontCandidates"] = [{
                 "family": family, "style": style_label, "weight": weight,

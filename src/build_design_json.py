@@ -9,7 +9,10 @@ from typing import Optional
 from .schema import (
     DesignDoc, Layer, SCHEMA_VERSION, dump, validate_design, fallback_kind,
 )
-from .text_analysis import fit_text_box, _fit_font, _line_advance, _style_name, _weight_candidates
+from .text_analysis import (
+    fit_text_box, _fit_font, _line_advance, _norm_family, _resolve_family_path,
+    _style_name, _weight_candidates,
+)
 from .raster_clusters import is_intentional_raster_cluster
 
 # Candidate keys that ``_compile`` already routes to a concrete Layer field.  Anything
@@ -1041,8 +1044,22 @@ def _promote_weight_candidate(style: dict) -> None:
         italic_path = _italic_variant_path(top.get("path"), weight)
         if italic_path:
             top["path"] = italic_path
-    if preferred_family:
+    if preferred_family and _norm_family(top.get("family")) != _norm_family(preferred_family):
+        # Stamping the declared family onto a candidate while KEEPING its path makes
+        # design.json and the preview name different fonts (009 read family "Inter"
+        # pointing at Lato-Medium.ttf; 013 declared upright Inter while drawing
+        # Lato-ExtraBold*Italic*). Resolve the declared family to a real file so the
+        # label, the path and the preview agree; if it is not installed, drop the
+        # stale path rather than lie about it — the same pattern the weight-mismatch
+        # branch above already uses.
         top["family"] = preferred_family
+        resolved = _resolve_family_path(preferred_family, weight, italic)
+        if resolved:
+            top["path"] = resolved
+            top.pop("local_family", None)
+            top["family_resolved"] = True   # picked by name: drive its variable axis
+        else:
+            top.pop("path", None)
     rest = [c for c in ranked[1:]]
     style["fontCandidates"] = [top] + rest
     if preferred_family:

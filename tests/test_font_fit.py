@@ -314,3 +314,65 @@ def test_classify_source_reports_high_text_confidence_for_plain_text():
     script_info = font_fit.classify_source(
         "Sale", _render_line_mask("Sale", SCRIPT_PATH, 44), 44, options)
     assert script_info["class"] == font_fit.SCRIPT
+
+
+# --- variable-font instance selection -------------------------------------
+
+
+def _variable_font(*names):
+    """A variable face from the on-disk OFL corpus, if this machine has one."""
+    roots = [os.path.expanduser("~/.cache/google-fonts/ofl")]
+    for name in names:
+        for root in roots:
+            for current, _dirs, files in os.walk(root):
+                if name in files:
+                    return os.path.join(current, name)
+    return None
+
+
+VAR_PATH = _variable_font("Inter[opsz,wght].ttf", "NotoSans[wdth,wght].ttf")
+
+
+def _ink_width(font, text="Post"):
+    image = Image.new("L", (1200, 240), 0)
+    ImageDraw.Draw(image).text((20, 40), text, font=font, fill=255)
+    columns = np.flatnonzero(np.asarray(image).max(axis=0) > 40)
+    return int(columns[-1] - columns[0] + 1) if columns.size else 0
+
+
+@pytest.mark.skipif(not VAR_PATH, reason="no variable font in the local OFL corpus")
+def test_load_font_drives_the_variable_weight_axis():
+    """A variable face must render the DECLARED weight, not its default instance.
+
+    Without this a fontWeight-700 node draws Regular: lighter, and narrower — a real
+    width deficit in the fitted size, not merely a preview artefact.
+    """
+    assert "wght" in font_fit.variable_axes(VAR_PATH)
+    light = _ink_width(font_fit.load_font(VAR_PATH, 44, 400))
+    heavy = _ink_width(font_fit.load_font(VAR_PATH, 44, 700))
+    assert heavy > light
+
+
+@pytest.mark.skipif(not VAR_PATH, reason="no variable font in the local OFL corpus")
+def test_load_font_without_weight_keeps_the_files_own_default_instance():
+    """``weight=None`` must be byte-identical to plain truetype.
+
+    A matcher-chosen face was scored and fitted at its file's DEFAULT instance, and a
+    default is not always the OS/2 weight class (Archivo[wdth,wght] reports 400 but
+    defaults to 600). Dialling such a face to its reported weight silently re-renders
+    something nothing upstream evaluated — that perturbs fitted sizes, shifts
+    peer-cluster medians and cost 066 its text recall. None means "do not touch".
+    """
+    default = _ink_width(ImageFont.truetype(VAR_PATH, 44))
+    untouched = _ink_width(font_fit.load_font(VAR_PATH, 44, None))
+    assert untouched == default
+
+
+@pytest.mark.skipif(not VAR_PATH, reason="no variable font in the local OFL corpus")
+def test_fit_line_keys_its_cache_on_weight():
+    """Two weights of one face/text must not return each other's cached fit."""
+    mask = _render_line_mask("Post", VAR_PATH, 44)
+    thin = font_fit.fit_line("Post", VAR_PATH, mask, 44, {}, weight=300)
+    fat = font_fit.fit_line("Post", VAR_PATH, mask, 44, {}, weight=900)
+    assert thin is not None and fat is not None
+    assert thin["fontSize"] != fat["fontSize"] or thin["score"] != fat["score"]

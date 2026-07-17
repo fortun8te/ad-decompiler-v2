@@ -353,27 +353,43 @@ def _text_font(style, font_size):
                                            "arialbd.ttf" if target_weight >= 600 else "arial.ttf"))
     # Prefer weight-matched files; if every candidate is Regular for a Bold node,
     # try a system bold face BEFORE loading the mismatched Regular path.
-    matched_paths = [
-        candidate["path"] for candidate in usable
+    # A path's weight is driven ONLY when its candidate was resolved by family name
+    # (`family_resolved`): that file was picked for a declared weight, so a variable
+    # face must be dialled to it. A matcher-chosen face keeps None — it was fitted at
+    # its file's own default instance and must render as that same instance here
+    # (see _apply_line_render_fit).
+    def _axis_weight(candidate):
+        return _candidate_weight(candidate) if candidate.get("family_resolved") else None
+
+    matched = [
+        (candidate["path"], _axis_weight(candidate)) for candidate in usable
         if abs(_candidate_weight(candidate) - target_weight) <= 150
     ]
-    mismatched_paths = [
-        candidate["path"] for candidate in usable
+    matched_paths = {path for path, _ in matched}
+    mismatched = [
+        (candidate["path"], _axis_weight(candidate)) for candidate in usable
         if candidate["path"] not in matched_paths
     ]
-    paths = selected_paths + matched_paths
+    paths = [(path, target_weight) for path in selected_paths] + matched
     if target_weight >= 600:
-        paths += ["arialbd.ttf"]
-    paths += mismatched_paths
-    paths += ["arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
+        paths += [("arialbd.ttf", target_weight)]
+    paths += mismatched
+    paths += [(name, None) for name in
+              ("arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf")]
     size_key = max(1, int(round(_number(font_size, 12))))
-    for path in paths:
-        cache_key = (path, size_key)
+    for path, path_weight in paths:
+        # The weight picks the VARIABLE INSTANCE, so it must key the cache too — a
+        # variable face (Inter[opsz,wght].ttf) renders Regular unless wght is driven,
+        # which is how a fontWeight-700 node drew light, narrow ink (font_fit.load_font).
+        weight_key = None if path_weight is None else int(round(path_weight))
+        cache_key = (path, size_key, weight_key)
         cached = _TEXT_FONT_CACHE.get(cache_key)
         if cached is not None:
             return cached
         try:
-            font = ImageFont.truetype(path, size_key)
+            from src import font_fit
+
+            font = font_fit.load_font(path, size_key, weight_key)
         except Exception:
             continue
         _TEXT_FONT_CACHE[cache_key] = font

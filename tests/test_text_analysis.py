@@ -1802,6 +1802,82 @@ def test_platform_ui_prior_forces_inter_on_social_screenshot():
     assert prepared[1]["line"]["style"]["fontFamily"] == "Playfair Display"
 
 
+def test_platform_ui_prior_resolves_the_declared_family_instead_of_relabelling_a_foreign_path():
+    """The prior REPLACES the family, so the outvoted face's path must go with it.
+
+    Stamping "Inter" onto the best sans match while keeping its path made design.json
+    and the preview draw different fonts (009's tweet body read family "Inter" while
+    pointing at Lato-Medium.ttf; 013 declared Inter while drawing Lato-ExtraBold*Italic*)
+    — and, worse, left the emitted fontSize fitted to a face Figma never loads, so the
+    DELIVERABLE rendered ~6% narrow. Resolve the declared family to a real file so the
+    label, the path, the fit and the preview all name one font.
+    """
+    real_inter = text_analysis._resolve_family_path("Inter", 400, False, {})
+    if not real_inter:
+        pytest.skip("Inter is not installed in this environment")
+    prepared = [
+        {"line": {
+            "id": "L0",
+            "text": "Daarbovenop krijgen de eerste 500 bestellingen hun",
+            "style": {"fontFamily": "Lato", "fontWeight": 400, "fontSize": 34,
+                      "fontCandidates": [
+                          {"family": "Lato", "path": "/tmp/Lato-Medium.ttf", "weight": 500,
+                           "score": 0.97, "source": "google-cache"},
+                      ]},
+            "meta": {"render_fit": {"score": 0.42}},
+        }},
+    ]
+    evidence = text_analysis._apply_platform_ui_font_prior(
+        prepared, {"scene": {"archetype": "social_screenshot"}}, {},
+    )
+    assert evidence is not None
+    style = prepared[0]["line"]["style"]
+    top = style["fontCandidates"][0]
+    assert style["fontFamily"] == "Inter"
+    assert top["family"] == "Inter"
+    # The path must BE Inter, not the outvoted Lato it replaced.
+    assert top["path"] == real_inter
+    assert "lato" not in os.path.basename(str(top["path"])).lower()
+    # No stale provenance claiming we merely relabelled a local face.
+    assert not top.get("local_family")
+    # Marked so the renderer may dial its variable axis (see font_fit.load_font).
+    assert top.get("family_resolved") is True
+
+
+def test_platform_ui_prior_keeps_the_local_face_when_the_declared_family_is_missing():
+    """Fail soft: if the declared family is not installed we must NOT drop the path.
+
+    Keeping the fitted local face (and recording local_family) is the documented
+    relabel behaviour and what every corpus-less environment relies on; claiming a
+    font we cannot draw would be strictly worse than the honest substitution.
+    """
+    prepared = [
+        {"line": {
+            "id": "L0",
+            "text": "hello",
+            "style": {"fontFamily": "Carlito", "fontWeight": 400, "fontSize": 34,
+                      "fontCandidates": [
+                          {"family": "Carlito", "path": "/tmp/c.ttf", "score": 0.4,
+                           "source": "local-render"},
+                      ]},
+            "meta": {"render_fit": {"score": 0.42}},
+        }},
+    ]
+    original = text_analysis._resolve_family_path
+    text_analysis._resolve_family_path = lambda *a, **k: None
+    try:
+        text_analysis._apply_platform_ui_font_prior(
+            prepared, {"scene": {"archetype": "social_screenshot"}}, {},
+        )
+    finally:
+        text_analysis._resolve_family_path = original
+    top = prepared[0]["line"]["style"]["fontCandidates"][0]
+    assert top["family"] == "Inter"
+    assert top["path"] == "/tmp/c.ttf"          # kept: we can still draw it
+    assert top["local_family"] == "Carlito"     # and we say so
+    assert not top.get("family_resolved")
+
+
 def test_mapping_targets_are_all_license_clean_google_families():
     # Internal consistency of the OFL corpus path: every mapping target is a
     # curated Google family, and none of it depends on the (non-commercial) Lens

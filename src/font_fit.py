@@ -163,14 +163,76 @@ def _mask_fingerprint(tight) -> str:
     return hashlib.sha1(np.asarray(small).tobytes()).hexdigest()[:16]
 
 
-def _render_tracked_mask(text: str, font_path: str, size: float, tracking: float):
+_VAR_AXES_CACHE: dict = {}
+
+
+def variable_axes(path: str) -> dict:
+    """``{tag: (min, default, max)}`` for a variable font; ``{}`` for a static one.
+
+    Order matters: ``set_variation_by_axes`` takes positional values in fvar order.
+    """
+    key = str(path)
+    if key in _VAR_AXES_CACHE:
+        return _VAR_AXES_CACHE[key]
+    axes: dict = {}
+    try:
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(key, lazy=True, fontNumber=0)
+        if "fvar" in font:
+            axes = {a.axisTag: (a.minValue, a.defaultValue, a.maxValue)
+                    for a in font["fvar"].axes}
+        font.close()
+    except Exception:
+        axes = {}
+    _VAR_AXES_CACHE[key] = axes
+    return axes
+
+
+def load_font(font_path: str, size: float, weight: Optional[float] = None):
+    """``ImageFont`` at ``size`` with the variable ``wght`` axis driven to ``weight``.
+
+    A variable font renders at its DEFAULT instance unless the axes are set: the
+    corpus ships Inter, Noto Sans, Albert Sans et al as variable-only files, so a
+    node declaring Inter at 700 silently drew Inter *Regular*. That understates
+    both stroke weight and ADVANCE WIDTH (Inter 'Post' @44: 87px at the default
+    vs 94px at the declared 700). Static faces have no fvar and are untouched.
+
+    ``weight=None`` keeps the file's own default instance and is the ONLY safe
+    value for a matcher-chosen face: that face was scored and fitted at its
+    default, and a font's default is NOT necessarily its OS/2 weight class
+    (Archivo[wdth,wght] reports 400 but defaults to wght 600), so passing the
+    candidate's reported weight would silently re-render it. Callers pass a
+    weight only for a face resolved BY FAMILY NAME for a declared weight.
+    """
+    from PIL import ImageFont
+
+    font = ImageFont.truetype(font_path, max(1, int(round(size))))
+    axes = variable_axes(font_path)
+    if not axes or weight is None or "wght" not in axes:
+        return font
+    values = []
+    for tag, (lo, default, hi) in axes.items():
+        if tag == "wght":
+            values.append(max(float(lo), min(float(hi), float(weight))))
+        else:
+            values.append(float(default))
+    try:
+        font.set_variation_by_axes(values)
+    except Exception:
+        pass
+    return font
+
+
+def _render_tracked_mask(text: str, font_path: str, size: float, tracking: float,
+                         weight: Optional[float] = None):
     """Tight ink mask of ``text`` rendered char-by-char with per-glyph tracking,
     exactly the way the preview renderer and Figma apply letterSpacing."""
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
         import numpy as np
 
-        font = ImageFont.truetype(font_path, max(1, int(round(size))))
+        font = load_font(font_path, size, weight)
         probe = Image.new("L", (8, 8), 0)
         bbox = ImageDraw.Draw(probe).textbbox((0, 0), text, font=font)
         height = max(1, bbox[3] - bbox[1])
@@ -252,7 +314,7 @@ def _length_reliability(text: Any) -> float:
 
 
 def fit_line(text: str, font_path: str, source_mask, initial_size: float,
-             options: Optional[dict] = None) -> Optional[dict]:
+             options: Optional[dict] = None, weight: Optional[float] = None) -> Optional[dict]:
     """Optimize font size and tracking of ``text`` in ``font_path`` against the
     source ink mask.  Returns ``{"fontSize", "letterSpacing", "score"}`` or
     ``None`` when the fit cannot be computed (missing font/mask/text).
@@ -274,7 +336,10 @@ def fit_line(text: str, font_path: str, source_mask, initial_size: float,
     if source_h < 4 or source_w < 4:
         return None
 
-    key = (str(font_path), text, _mask_fingerprint(tight))
+    # The weight selects the variable instance, so it MUST key the cache: without
+    # it a Bold and a Regular node sharing one face/text would return each other's fit.
+    key = (str(font_path), text, _mask_fingerprint(tight),
+           None if weight is None else int(round(float(weight))))
     if key in _FIT_CACHE:
         cached = _FIT_CACHE[key]
         return dict(cached) if cached else None
@@ -295,11 +360,11 @@ def fit_line(text: str, font_path: str, source_mask, initial_size: float,
     score_at_zero = bool(options.get("score_letter_spacing_zero", False))
     result = None
     for _ in range(iterations):
-        rendered = _render_tracked_mask(text, font_path, size, tracking)
+        rendered = _render_tracked_mask(text, font_path, size, tracking, weight)
         if rendered is None:
             break
         size = max(4.0, min(512.0, size * source_h / max(1, rendered.shape[0])))
-        natural = _render_tracked_mask(text, font_path, size, 0.0)
+        natural = _render_tracked_mask(text, font_path, size, 0.0, weight)
         if natural is None:
             break
         # Source width expressed at the candidate's pixel scale (heights match
@@ -309,7 +374,7 @@ def fit_line(text: str, font_path: str, source_mask, initial_size: float,
         tracking = max(-_MAX_NEG_TRACKING_EM * size, min(_MAX_POS_TRACKING_EM * size, tracking))
     else:
         score_tracking = 0.0 if score_at_zero else tracking
-        final = _render_tracked_mask(text, font_path, size, score_tracking)
+        final = _render_tracked_mask(text, font_path, size, score_tracking, weight)
         if final is not None:
             result = {
                 "fontSize": round(size, 2),
