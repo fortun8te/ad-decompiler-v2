@@ -1928,7 +1928,15 @@ def _text_candidate(line):
         # changes across its lines.
         "text_runs": copy.deepcopy(line.get("text_runs") or _word_aligned_text_runs(line)),
         "visible_box": dict(line.get("ink_box") or line.get("painted_box") or line["box"]),
-        "rotation": float(line.get("rotation", 0.0) or 0.0),
+        # Small OCR rotations on upright ink are engine noise, not design (measured:
+        # 088's 'OFF' reports rot=4.42 on ink verified upright; 025's checklist block
+        # carried 2.348 — the user sees tilted text where the source is flat). Snap the
+        # EMITTED rotation below a 5-degree deadzone; genuine tilts survive (013's badge
+        # lines measure -7.8/-9.0, ribbons far more) and ROUTING is untouched — the
+        # rotated-carrier bake gate reads the raw line rotation upstream at its own
+        # 8-degree threshold.
+        "rotation": (float(line.get("rotation", 0.0) or 0.0)
+                     if abs(float(line.get("rotation", 0.0) or 0.0)) >= 5.0 else 0.0),
         "quad": line.get("quad"),
         "meta": meta,
     }

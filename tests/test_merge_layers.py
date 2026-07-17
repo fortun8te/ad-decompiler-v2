@@ -1782,3 +1782,19 @@ def test_axis_aligned_overlay_copy_never_joins_a_rotated_carrier():
     cons = merge_layers._rotated_carrier_consensus(
         [dict(c, meta={}) for c in lines], 8.0)
     assert "H0" not in cons, "axis-aligned overlay copy is never seal chrome"
+
+
+def test_small_ocr_rotation_snaps_to_zero_but_real_tilt_survives():
+    """088's 'OFF' reported rot=4.42 on upright ink; 025's block carried 2.348 — both
+    rendered visibly tilted. Below the 5-deg deadzone the EMITTED rotation snaps to 0;
+    013's genuine badge tilt (-7.8) must survive."""
+    canvas = {"w": 1000, "h": 1000}
+    ocr = {"lines": [
+        {"id": "a", "text": "OFF UPRIGHT", "conf": 0.9, "rotation": 4.42,
+         "box": {"x": 10, "y": 10, "w": 200, "h": 40}},
+        {"id": "b", "text": "REAL TILT", "conf": 0.9, "rotation": -7.8,
+         "box": {"x": 10, "y": 200, "w": 200, "h": 40}},
+    ]}
+    m = {c["id"]: c for c in merge_layers.merge(ocr, [], [], canvas, {})}
+    assert float(m["c_a"].get("rotation") or 0) == 0.0
+    assert abs(float(m["c_b"].get("rotation") or 0)) >= 5.0
