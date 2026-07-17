@@ -1360,6 +1360,92 @@ def _restore_dropped_punctuation(text: str, alternatives: Iterable[str]) -> str:
     return "".join(out)
 
 
+# Glyph pairs display-font OCR reliably swaps, grouped into equivalence classes.
+# Each class maps to one canonical member so two readings of the SAME line can be
+# compared for "same ink, different glyph guesses" without the guesses themselves
+# deciding the comparison.  Benchmark 7 / ad 131: doctr read ``FREE SHIPPING`` as
+# ``FREE SHIPPINC`` (G->C) and ``GET 1 FREE`` as ``GETIFREE`` (1->I), while easyocr
+# read both correctly — the classes below make those two readings normalize equal.
+# Deliberately conservative: only pairs with a shared skeleton at display weight.
+# V/Y, E/F, P/R etc. are NOT included — they are real letter differences that would
+# let a peer overwrite a correct brand token (067's ``PROYK``).
+_CONFUSABLE_CLASSES = (
+    ("c", "g"),          # 131 SHIPPING->SHIPPINC, 067 SAYING->SAYINC / GOODBYE->COODBYE
+    ("0", "o", "d"),     # 131 $100+ -> $1OO+
+    ("1", "i", "l", "|", "ı"),   # 131 GET 1 FREE -> GETIFREE
+    ("5", "s"),
+    ("8", "b"),
+    ("2", "z"),
+)
+_CONFUSABLE_CANON = {
+    member: klass[0] for klass in _CONFUSABLE_CLASSES for member in klass
+}
+
+
+def _confusable_key(text: Any) -> str:
+    """Canonical form of ``text`` under known OCR glyph confusion.
+
+    Case-folds, drops every non-alphanumeric character (spacing and punctuation are
+    exactly what the confused engine gets wrong), then collapses each confusable
+    class to its canonical member.  ``BUY2. GETIFREE + FREE SHIPPINC +OOLS`` and
+    ``BUY 2, GET 1 FREE + FREE SHIPPING $1OO+`` share a ~0.87 ratio under this key
+    while reading very differently as plain text.
+    """
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(_CONFUSABLE_CANON.get(ch, ch) for ch in value if ch.isalnum())
+
+
+def _confusable_similarity(a: Any, b: Any) -> float:
+    """``_text_similarity`` computed on ``_confusable_key`` — "is this the same line?"."""
+    aa, bb = _confusable_key(a), _confusable_key(b)
+    if not aa or not bb:
+        return 0.0
+    if aa == bb:
+        return 1.0
+    return SequenceMatcher(None, aa, bb).ratio()
+
+
+# Ad-copy lexicon for *arbitration only*: it never rewrites text, it only decides
+# which of two engine readings of the same line is more plausible, and both readings
+# are scored against the same list — so a word missing here costs both equally.
+# Absence is therefore "unknown", never "wrong" (brands, wordmarks and foreign copy
+# live outside any list and must survive: 067 ``frøya``, 013 ``grüns``).
+_LEXICON = frozenset("""
+a about all also always an and any are as at available back be because been before best
+better big black book both browse business but buy by call can cart check checkout claim
+clean clear click code collection come comfort comfortable complete contact cover
+customer customers cut daily day days deal deals design designed discount discover do
+does dont down download each easy end ends enjoy every everyone exclusive experience
+extra fast feel first fits for free fresh friday from full get gift gifts give glow go
+good goodbye great grade guarantee had has have healthy hello help here high home hours
+how in included ingredients inside instant into is it its join just keep key kit know
+last learn left less life like limited live long look love low made make many market
+may me minutes money month more most much must my natural need never new no not now
+of off offer offers on once one online only or order orders organic our out over pack
+packs per pick plus power premium price prices pro product products pure quality
+quick ready real reduce refund return reusable review reviews right sale sales save
+saving savings say saying see sell set shipping shop shopping single site size skin
+small smart so soft sold some soon start stock stop store style subscribe such support
+sure switch take taste team than that the their them then there these they this those
+time to today top total try two up us use used value very view visit wait want was
+way we wear week weeks well what when where which while who why will with within
+without work world worth would year years you your yours
+""".split())
+
+# Glued display-copy phrases OCR emits as one token because the ad's letter-spacing
+# is tighter than the word gap.  Curated, NOT lexicon-derived: a generic "split when
+# both halves are words" rule also splits authored compounds (013's ``Superfoods`` ->
+# ``Super foods``, ``grüns``' ``COMPREHENSIVE``), which is a worse error than the one
+# it fixes.  Only fixed multi-word proper phrases that no brand would author solid.
+# Ad 131: both engines read ``BLACK FRIDAY SALE`` glued (doctr ``BLACKFRIDAYSALE``,
+# easyocr ``BLACKFRIDAY SALE``) — there is no peer evidence to recover the space from.
+_GLUED_PHRASE_MAP = {
+    "blackfriday": "black friday",
+    "cybermonday": "cyber monday",
+    "boxingday": "boxing day",
+}
+
+
 # Glyphs OCR engines confuse with a trailing exclamation mark on display fonts.
 # Ad 013: doctr read ``do this!`` as ``do1 this`` (the '!' became a '1' and was
 # relocated into the first token) while easyocr read ``do thisı`` (trailing
@@ -1422,6 +1508,176 @@ def _fix_exclamation_confusion(winner_text: str, peer_texts: Iterable[str]) -> O
         if not p_bang and p_index != w_index and (w_end or p_end):
             return w_clean + "!"
     return None
+
+
+# --------------------------------------------------------------------------------
+# Lexical arbitration between disagreeing engine readings of one line.
+#
+# `_reconcile` picks a winner mostly on calibrated confidence, which is a *glyph*
+# confidence: it says nothing about whether the letters spell anything.  Benchmark 7
+# ad 131 line 0 is the failure mode in full — both readings were present and the
+# wrong one won on confidence alone:
+#
+#   doctr   0.765  "BUY2. GETIFREE + FREE SHIPPINC +OOLS"   <- selected
+#   easyocr 0.519  "BUY 2, GET 1 FREE + FREE SHIPPING $1OO+" <- correct, discarded
+#
+# The VLM judge exists to arbitrate exactly this (meta.disagreement was set), but it
+# is nondeterministic and errored on all 11 lines of that run, so the corruption
+# shipped.  These backstops make the recovery deterministic.
+
+_STRIP_EDGE_PUNCT = re.compile(r"^[^\w$€£¥]+|[^\w%+]+$")
+
+
+def _token_core(token: str) -> str:
+    """Token without decorative edge punctuation (keeps currency/percent affixes)."""
+    return _STRIP_EDGE_PUNCT.sub("", str(token or ""))
+
+
+def _classify_token(token: str) -> str:
+    """One of ``punct`` / ``numeric`` / ``word`` / ``unknown`` / ``mixed``.
+
+    ``numeric`` and ``word`` are *plausible* readings; ``mixed`` (letters spliced into
+    a digit run, e.g. ``BUY2.``) is a positive corruption signal; ``unknown`` is an
+    alphabetic token absent from the lexicon — neither credit nor evidence of damage.
+    """
+    core = _token_core(token)
+    if not core:
+        return "punct"
+    body = core.strip("$€£¥%+")
+    if not body:
+        return "punct"
+    has_alpha = any(ch.isalpha() for ch in body)
+    has_digit = any(ch.isdigit() for ch in body)
+    if has_digit and not has_alpha:
+        return "numeric"
+    if has_digit and has_alpha:
+        return "mixed"
+    if not has_alpha:
+        return "punct"
+    return "word" if body.casefold() in _LEXICON else "unknown"
+
+
+def _lexical_plausibility(text: str) -> float:
+    """Share of a line's content tokens that read as real words or clean numbers."""
+    classes = [_classify_token(tok) for tok in str(text or "").split()]
+    scored = [klass for klass in classes if klass != "punct"]
+    if not scored:
+        return 0.0
+    plausible = sum(1 for klass in scored if klass in ("word", "numeric"))
+    return plausible / len(scored)
+
+
+def _corruption_signals(winner_text: str, peer_text: str) -> list[str]:
+    """Positive evidence that ``winner_text`` is damaged (not merely unrecognised).
+
+    A low lexical score alone must never promote a peer: an out-of-lexicon brand
+    wordmark scores 0 while being perfectly correct.  A peer only wins when the
+    winner shows a *signature* of engine damage.
+    """
+    signals: list[str] = []
+    winner_tokens = str(winner_text or "").split()
+    peer_tokens = str(peer_text or "").split()
+    peer_words = {_token_core(tok).casefold() for tok in peer_tokens
+                  if _classify_token(tok) == "word"}
+    for token in winner_tokens:
+        klass = _classify_token(token)
+        core = _token_core(token)
+        if klass == "mixed":
+            signals.append(f"mixed-alnum:{token}")
+            continue
+        if klass != "unknown":
+            continue
+        # A non-word the peer reads as a real word using the same glyph skeleton is
+        # the G->C / 1->I signature (SHIPPINC vs SHIPPING).
+        key = _confusable_key(core)
+        if any(_confusable_key(word) == key for word in peer_words):
+            signals.append(f"confusable-of-word:{token}")
+        elif len(core) >= 7:
+            # Long unknown run where the peer spells the same skeleton as several
+            # words — the space-collapse signature (GETIFREE vs GET 1 FREE).
+            signals.append(f"glued-run:{token}")
+    return signals
+
+
+def _fix_confusable_against_peers(winner_text: str, peer_texts: Iterable[str]) -> Optional[str]:
+    """Repair single tokens a peer spells as a real word with the same glyph skeleton.
+
+    Token-local and order-free: for each winner token that is *not* a known word, look
+    for any peer token that (a) IS a known word and (b) has the same ``_confusable_key``.
+    ``FREE SHIPPINC`` + peer ``FREE SHIPPING`` -> ``FREE SHIPPING``.  The peer supplies
+    only the glyph choice within a confusable class, never new letters, so a peer's own
+    misreads cannot be adopted.  Returns ``None`` when nothing is confidently fixable.
+    """
+    tokens = str(winner_text or "").split()
+    if not tokens:
+        return None
+    candidates: list[str] = []
+    for peer_text in peer_texts:
+        candidates.extend(str(peer_text or "").split())
+    peer_words = [_token_core(tok) for tok in candidates
+                  if _classify_token(tok) == "word"]
+    if not peer_words:
+        return None
+    out = list(tokens)
+    changed = False
+    for index, token in enumerate(tokens):
+        if _classify_token(token) != "unknown":
+            continue
+        core = _token_core(token)
+        if len(core) < 3:
+            continue
+        key = _confusable_key(core)
+        match = next((word for word in peer_words if _confusable_key(word) == key), None)
+        if match is None or match.casefold() == core.casefold():
+            continue
+        out[index] = token.replace(core, _preserve_word_case(core, match), 1)
+        changed = True
+    return " ".join(out) if changed else None
+
+
+def _pick_lexical_peer(members: list[dict], winner_index: int) -> Optional[tuple[int, dict]]:
+    """Promote a peer reading of the same line that is decisively more plausible.
+
+    Every gate must hold, because overriding the confidence winner is the riskiest
+    move in reconciliation:
+      * both readings are >= 3 content tokens (never gamble on a short label),
+      * they are the SAME line under ``_confusable_key`` (>= 0.6) — otherwise the
+        cluster holds two genuinely different texts and this is not our call,
+      * they are NOT already near-identical as plain text (nothing to arbitrate),
+      * the winner carries at least one positive corruption signal,
+      * the peer's plausibility beats the winner's by a decisive margin,
+      * the peer splits into at least as many tokens (a fix must not lose words).
+    """
+    winner_text = str(members[winner_index].get("text") or "")
+    winner_score = _lexical_plausibility(winner_text)
+    if len(winner_text.split()) < 3:
+        return None
+    best: Optional[tuple[float, int, dict]] = None
+    for index, member in enumerate(members):
+        if index == winner_index:
+            continue
+        peer_text = str(member.get("text") or "")
+        if len(peer_text.split()) < 3:
+            continue
+        if _text_key(peer_text) == _text_key(winner_text):
+            continue
+        if _confusable_similarity(peer_text, winner_text) < 0.6:
+            continue
+        if _text_similarity(peer_text, winner_text) >= 0.92:
+            continue
+        peer_score = _lexical_plausibility(peer_text)
+        if peer_score - winner_score < 0.34:
+            continue
+        if len(peer_text.split()) < len(winner_text.split()):
+            continue
+        if not _corruption_signals(winner_text, peer_text):
+            continue
+        if best is None or peer_score > best[0]:
+            best = (peer_score, index, member)
+    if best is None:
+        return None
+    _, index, member = best
+    return index, member
 
 
 # Isolated dash-like tokens (`` - ``) that one engine hallucinates mid-line.
@@ -1766,6 +2022,32 @@ def _reconcile(primary_lines, challenger_sets, iou_thresh=0.42, cfg=None):
                     break
             else:
                 winner["text"] = cleaned_winner
+
+        # Lexical arbitration: calibrated confidence ranks glyph legibility, not
+        # whether the letters spell anything. When a peer reads the same ink as real
+        # words and the winner reads it as damaged nonsense, the peer is right no
+        # matter how confident the winner was (131: doctr 0.765 "GETIFREE ... SHIPPINC
+        # +OOLS" beat easyocr 0.519 "GET 1 FREE ... SHIPPING $1OO+"). Heavily gated —
+        # see _pick_lexical_peer.
+        promoted = _pick_lexical_peer(members, winner_index)
+        if promoted is not None:
+            peer_index, peer_member = promoted
+            demoted_text = str(winner.get("text") or "")
+            demoted_engine = engines[winner_index]
+            winner = copy.deepcopy(peer_member)
+            winner_index = peer_index
+            promoted_text = str(winner.get("text") or "")
+            fix_meta = winner.setdefault("meta", {})
+            fix_meta["lexical_arbitration"] = {
+                "from": demoted_text,
+                "to": promoted_text,
+                "from_engine": demoted_engine,
+                "to_engine": engines[peer_index],
+                "from_plausibility": round(_lexical_plausibility(demoted_text), 4),
+                "to_plausibility": round(_lexical_plausibility(promoted_text), 4),
+                "signals": _corruption_signals(demoted_text, promoted_text),
+            }
+
         agreeing_indices = [
             index for index, member in enumerate(members)
             if _text_similarity(winner.get("text"), member.get("text")) >= agreement_threshold
@@ -1806,6 +2088,22 @@ def _reconcile(primary_lines, challenger_sets, iou_thresh=0.42, cfg=None):
             str(member.get("text") or "") for index, member in enumerate(members)
             if index != winner_index
         ]
+        # G->C on display caps is the most repeated misread in the benchmark set
+        # (067 SAYING->SAYINC / GOODBYE->COODBYE, 131 SHIPPING->SHIPPINC). When a peer
+        # spelled the same skeleton as a real word, take its glyph choice — token-local,
+        # so it also fires on lines the whole-reading promotion above declines.
+        confusable_fixed = _fix_confusable_against_peers(
+            str(winner.get("text") or ""), all_peer_texts
+        )
+        if confusable_fixed:
+            fix_meta = winner.setdefault("meta", {})
+            fix_meta["confusable_fix"] = {
+                "from": str(winner.get("text") or ""),
+                "to": confusable_fixed,
+                "readings": [str(member.get("text") or "") for member in members],
+            }
+            winner["text"] = confusable_fixed
+
         exclaim_fixed = _fix_exclamation_confusion(str(winner.get("text") or ""), all_peer_texts)
         if exclaim_fixed:
             fix_meta = winner.setdefault("meta", {})
@@ -2109,9 +2407,12 @@ _PUNCT_TOKEN_RE = re.compile(r"^\W+$")
 # camelCase brands like "iPhone" are left alone.
 _CASE_SMASH_RE = re.compile(r"(?<=[a-z])(?=[A-Z]{2,})")
 
-# High-confidence UI OCR typos only (Dutch social chrome, etc.). Keys are casefold.
+# High-confidence UI OCR typos and glued display phrases. Keys are casefold; values
+# are replaced case-preservingly, so a value may carry the space a glued key lost
+# (``BLACKFRIDAY`` -> ``BLACK FRIDAY``, ad 131).
 _OCR_TYPO_MAP = {
     "weergaver": "weergaven",  # X/Twitter "views" — final n misread as r
+    **_GLUED_PHRASE_MAP,
 }
 _OCR_TYPO_RE = re.compile(
     r"\b(" + "|".join(re.escape(k) for k in sorted(_OCR_TYPO_MAP, key=len, reverse=True)) + r")\b",
@@ -2191,13 +2492,90 @@ def _split_case_smash(text: str) -> str:
     )
 
 
+# Letters that are the same ink as a digit at display weight. Restricted to the three
+# unambiguous shapes; S/5, B/8 and Z/2 are excluded because they routinely appear as
+# real letters inside alphanumeric product codes ("B2B", "5G", "SIZE10").
+_DIGIT_LOOKALIKES = {"o": "0", "O": "0", "l": "1", "I": "1", "i": "1"}
+# Currency/percent/sign affixes that may legitimately bracket a numeric token.
+_NUMERIC_AFFIX_RE = re.compile(r"^([$€£¥]?)([^\W_]+)([%+]?[.,:;!]?)$")
+
+
+def _fix_digit_run_letters(text: str) -> str:
+    """Fold digit-lookalike letters back into an otherwise all-numeric token.
+
+    Ad 131 read ``$100+`` as ``$1OO+`` (both engines) and the corrupted price shipped.
+    Fires only when the token already proves it is a number — it must contain a real
+    digit, and every remaining character must map to a digit — so ``6g``, ``5G``,
+    ``B2B``, ``3D`` and ``100ri0`` are all left untouched.
+    """
+    def _fix_token(token: str) -> str:
+        match = _NUMERIC_AFFIX_RE.match(token)
+        if not match:
+            return token
+        prefix, body, suffix = match.groups()
+        if len(body) < 2 or not any(ch.isdigit() for ch in body):
+            return token
+        if all(ch.isdigit() for ch in body):
+            return token
+        converted = "".join(_DIGIT_LOOKALIKES.get(ch, ch) for ch in body)
+        if not converted.isdigit():
+            return token
+        return f"{prefix}{converted}{suffix}"
+
+    return " ".join(_fix_token(tok) for tok in str(text or "").split())
+
+
 def cleanup_line_text(text: str) -> str:
     """Deterministic OCR text hygiene: un-smash case merges, drop repeated tokens, safe typos."""
     cleaned = _split_case_smash(str(text or ""))
     cleaned = _collapse_repeated_tokens(cleaned)
     cleaned = _apply_ocr_typos(cleaned)
+    cleaned = _fix_digit_run_letters(cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
     return cleaned
+
+
+# Sub-glyph marks detectors emit for icon strokes, rule lines, chart ticks and
+# gradient seams. Ad 016 shipped ``-``, ``- -``, ``- 6`` and ``.`` as real text lines:
+# they paint as stray ink, and they inflate the text-recall denominator with strings
+# no ground truth will ever contain.
+_SUBGLYPH_MARK = frozenset("-–—−_.·•|,'\"’‘“”:;")
+
+
+def _is_glyphless_noise(text: str) -> bool:
+    """Whether a line carries no recoverable glyph content.
+
+    Conservative on purpose — a dropped line is unrecoverable downstream:
+      * any letter at all -> real text (``Off``),
+      * two or more digits -> a real number (``45%``, ``$100+``),
+      * a lone digit with no stray marks -> keep (131's ``8``),
+      * everything else must be entirely sub-glyph marks (plus at most one digit
+        alongside a mark, which is 016's ``- 6``).
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return True
+    if any(ch.isalpha() for ch in stripped):
+        return False
+    body = [ch for ch in stripped if not ch.isspace()]
+    digits = [ch for ch in body if ch.isdigit()]
+    if len(digits) >= 2:
+        return False
+    marks = [ch for ch in body if ch in _SUBGLYPH_MARK]
+    if len(marks) + len(digits) != len(body):
+        return False   # some other symbol ("%", "+", "€") — not ours to judge
+    return bool(marks)
+
+
+def _drop_glyphless_lines(lines: list[dict]) -> tuple[list[dict], list[str]]:
+    """Remove sub-glyph noise lines; return the survivors and the dropped strings."""
+    kept, dropped = [], []
+    for line in lines:
+        if _is_glyphless_noise(line.get("text")):
+            dropped.append(str(line.get("text") or ""))
+        else:
+            kept.append(line)
+    return kept, dropped
 
 
 def _apply_line_text_cleanup(lines: list[dict]) -> list[dict]:
@@ -3024,6 +3402,9 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
     merged = _suppress_contained_duplicates(merged, cfg=cfg)
     repaired = _recombine_fragments(merged, cfg=cfg)
     repaired = _apply_line_text_cleanup(repaired)
+    # After cleanup, so a line only reduced to noise by it is caught too. Before
+    # ordering/emit, so noise reaches neither design.json nor the recall denominator.
+    repaired, dropped_noise = _drop_glyphless_lines(repaired)
     try:
         repaired = _fix_strikethrough_lines(img_path, repaired, cfg)
     except Exception as error:  # deterministic backstop must never sink OCR
@@ -3078,6 +3459,11 @@ def run_ocr(img_path: str, cfg: Optional[dict] = None, run_dir: Optional[str] = 
             "geometry": geometry,
         },
     }
+    if dropped_noise:
+        result["metrics"]["subglyph_noise_dropped"] = {
+            "count": len(dropped_noise),
+            "texts": dropped_noise,
+        }
     if numeric_verify and numeric_verify.get("checked"):
         result["numeric_verify"] = numeric_verify
     if run_dir is None:

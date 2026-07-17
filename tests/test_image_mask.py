@@ -87,6 +87,63 @@ def test_round_image_cutout_infers_ellipse_mask_without_role_hint(tmp_path):
     assert out["mask"]["kind"] == "ellipse"
 
 
+def _pouch_mask(path, box):
+    """A tilted product pouch: fills its bounds like 013's grüns bag (aspect ~0.80,
+    fill ~0.76, no box corner covered) but is emphatically NOT an ellipse."""
+    mask = Image.new("L", (box["w"], box["h"]), 0)
+    w, h = box["w"], box["h"]
+    ImageDraw.Draw(mask).polygon(
+        [(0.06 * w, 0.10 * h), (0.92 * w, 0.02 * h), (1.0 * w, 0.88 * h),
+         (0.14 * w, 1.0 * h)], fill=255)
+    mask.save(path)
+
+
+def test_tilted_pouch_cutout_is_not_clipped_to_an_ellipse(tmp_path):
+    """013 regression: the grüns pouch shipped ``mask={"kind":"ellipse"}``, so the render
+    clipped it to the ellipse inscribed in its box and deleted 10.6% of the bag — the four
+    corners, taking half the 'snacks' logo with them (the user's "weird cropping of the
+    pouch"). A tilted pouch trivially satisfies the cheap aspect/fill/corner heuristic
+    (aspect .80, fill .76, corners 0) while scoring only .787 IoU against that ellipse.
+    An image cutout that is not really an ellipse must keep its own lossless alpha."""
+    box = {"x": 20, "y": 20, "w": 160, "h": 200}
+    source = tmp_path / "pouch.png"
+    _noise_source(source, (200, 240), box)
+    masks = tmp_path / "m"; masks.mkdir()
+    _pouch_mask(masks / "b.png", box)
+    candidate = {
+        "id": "b", "target": "image", "box": box,
+        "mask": {"kind": "alpha", "src": "m/b.png"},
+        "meta": {"role": "product", "source": "element", "confidence": 0.9},
+    }
+    out = _run(source, [candidate], tmp_path)["candidates"][0]
+    assert out["target"] == "image"
+    # alpha == the cutout's own transparency == nothing is clipped away.
+    assert out["mask"]["kind"] == "alpha", (
+        "a non-elliptical product cutout must never take an ellipse/rrect clip"
+    )
+
+
+def test_simple_shape_geometry_requires_the_alpha_to_actually_be_an_ellipse():
+    """The ellipse verdict becomes a CLIP, so it has to be earned against the pixels."""
+    disc = np.zeros((200, 200), dtype=bool)
+    yy, xx = np.mgrid[0:200, 0:200]
+    disc[(((xx - 99.5) / 100.0) ** 2 + ((yy - 99.5) / 100.0) ** 2) <= 1.0] = True
+    assert reconstruct._simple_shape_geometry(disc) == "ellipse"
+    assert reconstruct._inscribed_ellipse_iou(disc) >= 0.99
+
+    # 013's pouch silhouette: passes aspect/fill/corners, fails the pixels.
+    pouch = np.array(Image.open(_pouch_tmp()).convert("L")) > 127
+    assert reconstruct._inscribed_ellipse_iou(pouch) < 0.94
+    assert reconstruct._simple_shape_geometry(pouch) != "ellipse"
+
+
+def _pouch_tmp():
+    import tempfile, os
+    path = os.path.join(tempfile.mkdtemp(), "pouch_mask.png")
+    _pouch_mask(path, {"x": 0, "y": 0, "w": 160, "h": 200})
+    return path
+
+
 def test_icon_image_cutout_keeps_its_own_alpha(tmp_path):
     """An icon's shape IS its art; it must keep its raster alpha, not a primitive clip."""
     box = {"x": 30, "y": 30, "w": 100, "h": 100}

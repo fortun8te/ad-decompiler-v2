@@ -1,0 +1,22 @@
+Updating the app...
+Already up to date.
+Repo at 65dfd32
+Inbox: C:\Users\micha\figma-inbox
+
+================================================
+  Ad Decompiler Bridge
+  http://127.0.0.1:8790
+================================================
+Inbox:  C:\Users\micha\figma-inbox
+Config: C:\Users\micha\ad-decompiler-v2\config.yaml
+
+1. Import figma-plugin\manifest.json in Figma (once)
+2. Open the plugin and upload an image
+
+Processing is not ready yet:
+ - vectorization stack: needs color-capable VTracer plus CairoSVG or resvg render-back validation; Potrace remains a monochrome fallback
+   Fix: Rerun setup_rtx.ps1 to install VTracer and the SVG render-back checker.
+Run .\.venv\Scripts\python.exe doctor.py for the full fix list.
+
+Press Ctrl+C to stop the bridge.
+

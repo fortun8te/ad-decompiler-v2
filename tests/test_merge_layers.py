@@ -1702,3 +1702,83 @@ def test_066_photo_stays_separate_from_editable_checklist_card():
     assert "c_E002__column" not in m
     assert m["c_L18"]["target"] == "text"
     assert m["c_L19"]["target"] == "text"
+
+
+# ── 013 badge/seal: one carrier, one verdict ──────────────────────────────────────────
+
+def _seal_ocr():
+    """013's 61%-OFF seal, verbatim geometry/angles from the bench-7 run.
+
+    The two lines are printed on ONE disc, but OCR measures each line's angle
+    independently: 7.80 deg vs 8.96 deg — 1.16 deg apart, straddling the 8 deg
+    rotated-scene-ink gate. The nearest bag label ('gruns') is a DIFFERENT carrier.
+    """
+    return {"lines": [
+        {"id": "B2", "text": "61% OFF", "conf": 0.97, "role": "offer",
+         "box": {"x": 97, "y": 807, "w": 284, "h": 105}, "rotation": -7.798},
+        {"id": "B4", "text": "+ FREE GIFTS", "conf": 0.96, "role": "offer",
+         "box": {"x": 117, "y": 873, "w": 268, "h": 88}, "rotation": -8.962},
+    ]}
+
+
+def test_seal_lines_share_one_bake_verdict_across_the_rotation_gate():
+    """013 regression — the user's "the badge is off".
+
+    '+ FREE GIFTS' (8.96 deg) baked while '61% OFF' (7.80 deg) fell just under the
+    8 deg gate and shipped as a NATIVE Inter text node re-rendered on top of the
+    seal's own baked pixels, with an inpaint scar where its original glyphs were
+    removed. Badge/seal copy is pixel-exact raster with its text baked — ALL of it
+    or none. The two lines sit on one disc, so they get one verdict.
+    """
+    canvas = {"w": 1080, "h": 1920}
+    m = _by_id(merge_layers.merge(_seal_ocr(), [], [], canvas, {}))
+    for cid, text in (("c_B2", "61% OFF"), ("c_B4", "+ FREE GIFTS")):
+        assert m[cid]["meta"].get("kept_in_photo") is True, (
+            f"{text!r} must bake with the rest of its seal, not re-render natively"
+        )
+        assert m[cid].get("kept_in_photo") is True
+        # Baked seal ink is never inpainted out of the plate.
+        assert not m[cid]["meta"].get("removal_required")
+
+
+def test_carrier_consensus_never_merges_lines_on_different_surfaces():
+    """The seal must not chain into the bag's label stack.
+
+    Consensus is single-linkage over lines that genuinely OVERLAP and agree on an
+    angle. 013's seal lines overlap 43.8% of the smaller box; the adjacent bag
+    wordmark only grazes them at 8.1%. A padded touch test chained badge->bag and
+    dragged the carrier angle down to 7.86 deg, which left the badge split.
+    """
+    seal = _seal_ocr()["lines"]
+    gruns = {"id": "B5", "text": "gruns", "conf": 0.95, "role": "body",
+             "box": {"x": 361, "y": 882, "w": 495, "h": 237}, "rotation": -5.62}
+    cons = merge_layers._rotated_carrier_consensus(
+        [dict(c, meta={}) for c in seal + [gruns]], 8.0)
+    assert cons["B2"] == cons["B4"], "the seal's two lines are one carrier"
+    assert cons["B2"] >= 8.0, "seal consensus must clear the rotated-scene-ink gate"
+    assert "B5" not in cons, "a different surface must not join the seal's carrier"
+
+
+def test_carrier_consensus_never_demotes_a_line_that_clears_the_gate_alone():
+    """Consensus is a pure rescue: it is combined with each line's own angle via max()."""
+    lines = [
+        {"id": "R0", "text": "STEEP", "box": {"x": 10, "y": 10, "w": 100, "h": 40},
+         "rotation": -14.0, "meta": {}},
+        {"id": "R1", "text": "shallow", "box": {"x": 12, "y": 22, "w": 96, "h": 40},
+         "rotation": -9.5, "meta": {}},
+    ]
+    cons = merge_layers._rotated_carrier_consensus(lines, 8.0)
+    # Median (11.75) is BELOW R0's own 14.0 — the caller's max() keeps R0 at 14.0.
+    assert max(14.0, cons["R0"]) >= 14.0
+    assert max(9.5, cons["R1"]) >= 9.5
+
+
+def test_axis_aligned_overlay_copy_never_joins_a_rotated_carrier():
+    """A native headline overlapping a rotated seal keeps its own (0 deg) verdict."""
+    lines = _seal_ocr()["lines"] + [
+        {"id": "H0", "text": "We NEVER do this!", "role": "headline",
+         "box": {"x": 71, "y": 800, "w": 956, "h": 200}, "rotation": 0.0},
+    ]
+    cons = merge_layers._rotated_carrier_consensus(
+        [dict(c, meta={}) for c in lines], 8.0)
+    assert "H0" not in cons, "axis-aligned overlay copy is never seal chrome"
