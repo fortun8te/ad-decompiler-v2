@@ -708,6 +708,29 @@ def _text_tile(layer, size):
     deco_extra = font_size * 0.22 if decoration else 0.0
     content_h = (line_count - 1) * line_height + max_ascent + max_descent + deco_extra
 
+    # Cap-height leading trim (matches the Figma plugin, which sets leadingTrim =
+    # CAP_HEIGHT on every text node: code.js `safeSet(node,"leadingTrim",...)`).
+    # PIL positions a block by the font's FULL ascent, so the cap-top sits `cap_gap`
+    # px below the cell top -- and since the emitted box.y is the SOURCE ink (cap) top,
+    # anchoring by the cell top drew every line low by that gap (worst on large TOP-
+    # aligned display headlines: +26px on 067, +63px on 107). Figma trims that gap so
+    # the CAP-BOX (first-line cap-top .. last-line baseline), not the ascent/descent
+    # cell, is what aligns to the box. Mirror it here so preview == deliverable == source.
+    # `cap_gap` = cell-top -> cap-top for the ascent-defining font (getbbox("H")[1]).
+    trim = str(style.get("leadingTrim", style.get("leading_trim", "CAP_HEIGHT"))).upper().replace("-", "_")
+    cap_gap = 0.0
+    if trim not in ("NONE", "STANDARD"):
+        cap_gap = max(0.0, max_ascent - 0.72 * font_size)  # fallback: cap ~0.72em
+        try:
+            measured = float(font.getbbox("H")[1])
+            if measured > 0:
+                cap_gap = measured
+        except Exception:
+            pass
+        cap_gap = min(cap_gap, max_ascent)
+    # Height from first-line cap-top to last-line baseline (what CAP_HEIGHT trim keeps).
+    trimmed_h = (line_count - 1) * line_height + (max_ascent - cap_gap)
+
     # A small margin guards side bearings, negative-tracking overshoot, descenders
     # and outside strokes so measured content never touches the tile edge.
     pad = max(2, int(math.ceil(font_size * 0.12 + stroke_width + (deco_extra * 0.5))))
@@ -763,12 +786,18 @@ def _text_tile(layer, size):
         anchor_x = box_w - content_w
     else:
         anchor_x = 0.0
+    # Align the CAP-BOX (not the ascent/descent cell) to the target box, matching the
+    # Figma plugin's leadingTrim=CAP_HEIGHT. The tile still lays glyphs out by full
+    # metrics (baseline = y + max_ascent); only the returned OFFSET shifts so the
+    # first-line cap-top lands where CAP_HEIGHT trim would place it. `anchor_y` is
+    # chosen so cap-top on canvas == box.y + (box_h - trimmed_h)*yFactor:
+    #   cap-top_canvas = box.y + anchor_y + cap_gap  ->  anchor_y = align - cap_gap
     if vertical in ("center", "middle"):
-        anchor_y = (box_h - content_h) / 2.0
+        anchor_y = (box_h - trimmed_h) / 2.0 - cap_gap
     elif vertical in ("bottom", "end"):
-        anchor_y = box_h - content_h
+        anchor_y = (box_h - trimmed_h) - cap_gap
     else:
-        anchor_y = 0.0
+        anchor_y = -cap_gap
     return tile, (anchor_x - pad, anchor_y - pad)
 
 

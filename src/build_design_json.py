@@ -1679,8 +1679,16 @@ def _generous_text_box(box: dict, style: dict, text: str, stroke=None,
             top_grow = (min_h - h) / 2.0
             new_y = y - top_grow
             if new_y < min_y:
-                # Prefer on-frame ink over symmetric CENTER slack (067/131 top lines).
-                new_y = min_y
+                # Symmetric CENTER slack would push the box above the frame. Switch to
+                # TOP align, but anchor the box top at the INK TOP (``y``), not at
+                # ``min_y``. The plugin uses leadingTrim=CAP_HEIGHT and the preview
+                # mirrors it, so a TOP box lands the first-line CAP-TOP exactly at
+                # box.y. Yanking box.y up to the canvas edge (min_y) — which is what
+                # this did — put the cap-top ABOVE the ink by however close the ink sat
+                # to the frame top, so near-top headlines (094/002/016/135, ink 8-15px
+                # down) rendered that far too HIGH. ``y`` is the ink top and is already
+                # >= min_y for on-canvas ink, so max() only guards the pathological case.
+                new_y = max(min_y, y)
                 if isinstance(style, dict):
                     style["verticalAlign"] = "TOP"
             out["y"] = new_y

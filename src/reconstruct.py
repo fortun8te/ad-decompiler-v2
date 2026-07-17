@@ -464,6 +464,60 @@ def _keeps_underlay(candidate: dict) -> bool:
                 or meta.get("overlay_without_removal"))
 
 
+def _residual_baked_raster(meta: dict) -> bool:
+    """A pixel-exact baked slice sourced from a residual connected component.
+
+    Display glyphs a display face defeats OCR on (088 "SALE"/"21%") never become TEXT;
+    they survive as residual-CC observations and ship as baked raster slices
+    (``fallback: raster-slice`` / ``ownership_cutout`` with a ``residual`` provenance
+    source).  Those slices are literally original pixels at the original position.
+    """
+    meta = meta or {}
+    if str(meta.get("fallback") or "") == "raster-slice":
+        return True
+    provenance = meta.get("provenance") or {}
+    sources = set()
+    if isinstance(provenance, dict):
+        sources = {str(s).lower() for s in (provenance.get("sources") or [])}
+    src = str(meta.get("source") or "").lower()
+    return bool(meta.get("ownership_cutout")) and (
+        "residual" in src or any("residual" in s for s in sources)
+    )
+
+
+def _plate_ring_is_flat(rgb, box, ink_mask, rcfg) -> bool:
+    """Is the plate around this ink fragment a flat, uniform colour?
+
+    Used to decide whether a residual-CC baked glyph may keep its ink in the plate: on a
+    flat plate the kept ink is exactly the scene colour the slice re-paints, so leaving it
+    fills the ownership gaps between fragmented slices without any photographic double.  A
+    fragment sitting on a gradient/photographic carrier (a ribbon, a product) fails this and
+    is left to the normal removal path.
+    """
+    _, np, _ = _deps()
+    h, w = rgb.shape[:2]
+    bx = int(round(float(box.get("x", 0) or 0)))
+    by = int(round(float(box.get("y", 0) or 0)))
+    bw = max(1, int(round(float(box.get("w", 0) or 0))))
+    bh = max(1, int(round(float(box.get("h", 0) or 0))))
+    pad = int(rcfg.get("residual_glyph_ring_pad", 8))
+    x0, y0 = max(0, bx - pad), max(0, by - pad)
+    x1, y1 = min(w, bx + bw + pad), min(h, by + bh + pad)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return False
+    region = rgb[y0:y1, x0:x1].astype(np.float32)
+    bg = region.reshape(-1, 3)
+    if ink_mask is not None:
+        sub = np.asarray(ink_mask)[y0:y1, x0:x1]
+        if sub.shape == region.shape[:2]:
+            keep = sub == 0
+            if int(np.count_nonzero(keep)) >= 30:
+                bg = region[keep]
+    if bg.shape[0] < 30:
+        return False
+    return float(np.max(np.std(bg, axis=0))) <= float(rcfg.get("residual_glyph_flat_std", 14.0))
+
+
 def _flatten_photo_scene(candidates: list, cfg: dict) -> tuple[list, int]:
     """Select independent foreground owners while retaining only scene fragments in the plate.
 
@@ -3648,6 +3702,33 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         candidate_mask = masks.get(c.get("id"))
         mask_fraction = (float(np.count_nonzero(candidate_mask)) / max(1, w * h)
                          if candidate_mask is not None else 0.0)
+        # Residual-CC display glyphs (088 "SALE"/"21%") that OCR could not read ship as
+        # pixel-exact baked raster slices.  Front-to-back ownership then hands each slice
+        # only PART of its own ink (a boxy sub-region), so removing the full glyph ink from
+        # the plate and re-pasting the fragmented slices leaves grey plate showing THROUGH
+        # the letterforms — a broken "S" missing its top, an "E" cut by a seam.  The slice
+        # pixels ARE the original pixels at the original position, so on a flat plate keeping
+        # the ink is lossless where a slice covers and fills the ownership gap where it does
+        # not.  Withhold removal for these; the plate keeps the exact glyphs and the slices
+        # still ship on top for editability.  Scoped to flat plates + under-covered ownership
+        # so photographic cutouts (which must vacate the plate to swap cleanly) are untouched.
+        _frag_role = str((c.get("meta") or {}).get("role") or "").lower()
+        if (c.get("target") == "image"
+                and candidate_mask is not None
+                and _frag_role in {"", "shape", "icon"}
+                and _residual_baked_raster(c.get("meta"))
+                and bool(rcfg.get("keep_flat_residual_glyphs", True))):
+            _cid = c.get("id")
+            _owned_here = int(np.count_nonzero(
+                (ownership == owner_number.get(_cid, 0)) & (candidate_mask > 0)))
+            _mask_here = int(np.count_nonzero(candidate_mask))
+            _frac = _owned_here / max(1, _mask_here)
+            if (_frac < float(rcfg.get("residual_glyph_ownership_full", 0.995))
+                    and _plate_ring_is_flat(rgb, box, candidate_mask, rcfg)):
+                c["meta"]["removal_skipped"] = "flat-residual-glyph-kept-in-plate"
+                c["meta"]["overlay_without_removal"] = True
+                c["meta"]["residual_glyph_ownership_fraction"] = round(_frac, 4)
+                continue
         if c.get("target") == "text":
             ownership_decision = (c.get("meta") or {}).get("ownership_decision")
             text_meta = c.get("meta") or {}
