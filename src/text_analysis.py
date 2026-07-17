@@ -128,6 +128,66 @@ def _horizontal_overlap(a: dict, b: dict) -> float:
     return overlap / denom
 
 
+def _clip_mask_to_quad(mask, quad: Any, x0: int, y0: int, pad_ratio: float = 0.05):
+    """Restrict a line's ink mask to the line's OWN quad.
+
+    ``_painted_geometry`` samples an AXIS-ALIGNED bbox. For a ROTATED line that bbox
+    reaches well past the glyphs, and on a tight rotated lockup it swallows the
+    NEIGHBOURING line's ink: on 013's badge 28.7% of the '+ FREE GIFTS' mask was
+    actually '61% OFF' cream, and 15.3% of '61% OFF' was the yellow below it. Every
+    downstream consumer then measures two lines at once -- ``_dominant_axis_gradient``
+    reads cream at the top and yellow at the bottom and invents a linear gradient,
+    ``_stroke_from_mask`` reads the two-colour split as an outline, and the ink
+    density / render weight match is computed over a foreign glyph set.
+
+    Only ROTATED lines are clipped. It is tempting to treat this as a no-op for upright
+    text ("the quad is the bbox") but that is false: OCR quads are routinely TIGHTER
+    than the line box, hugging the cap/x-height, so 067's word 'Day' has a 39.6px quad
+    inside a 59.3px box and its 'y' descender lives in the gap. Clipping upright text to
+    such a quad amputates descenders (25-45% of the ink on 213 measured lines) to fix a
+    contamination that upright text does not have -- an axis-aligned box already sits
+    tight to its own line band. Only a tilted box reaches diagonally into a neighbour.
+
+    The quad is padded outward first: OCR quads sit tight to the glyph core while
+    overshoot, accents and anti-aliasing live just outside it. A pad of 5% of the text
+    height drops all of the foreign ink on 013 while keeping the AA skirt; at 12%+ the
+    neighbour starts coming back. If the clip would take most of the ink the quad is
+    not trustworthy (bad winding, degenerate box) -- abstain and keep the raw mask
+    rather than hand the caller an empty line.
+    """
+    try:
+        import numpy as np
+        import cv2
+
+        if abs(_quad_rotation(quad)) < 2.0:
+            return mask
+        points = [(float(p[0]) - x0, float(p[1]) - y0) for p in list(quad)[:4]]
+        if len(points) != 4:
+            return mask
+        m = np.asarray(mask).astype(bool)
+        if not m.any():
+            return mask
+        poly = np.round(np.array(points, dtype=np.float32)).astype(np.int32)
+        filled = np.zeros(m.shape, np.uint8)
+        cv2.fillPoly(filled, [poly], 1)
+        if not filled.any():
+            return mask
+        # Text height is the SHORT side of the quad; providers disagree on winding, so
+        # take the shorter of the two opposite-edge pairs rather than assuming an order.
+        edges = [math.hypot(points[i][0] - points[(i + 1) % 4][0],
+                            points[i][1] - points[(i + 1) % 4][1]) for i in range(4)]
+        quad_h = min(edges[0] + edges[2], edges[1] + edges[3]) / 2.0
+        pad = max(2, int(round(pad_ratio * quad_h)))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pad + 1, 2 * pad + 1))
+        filled = cv2.dilate(filled, kernel)
+        clipped = m & filled.astype(bool)
+        if clipped.sum() < 0.35 * m.sum():
+            return mask
+        return clipped
+    except Exception:
+        return mask
+
+
 def _quad_rotation(quad: Any) -> float:
     """Return the text baseline angle from an OCR quadrilateral.
 
@@ -1136,6 +1196,12 @@ def _painted_geometry(image, line: dict, snap_deg: float = 0.0) -> tuple[dict, d
         paint = {"fill": dict(_FLAT_FILL_BLACK), "stroke": None}
         return painted, baseline, "#000000", fallback_conf, None, paint
 
+    # A rotated line's axis-aligned crop reaches past its own glyphs and into its
+    # neighbours'. Drop the foreign ink BEFORE anything measures this mask -- colour,
+    # gradient, stroke, painted bounds, baseline and the weight match all read it.
+    if line.get("quad"):
+        mask = _clip_mask_to_quad(mask, line.get("quad"), x0, y0)
+
     # Strip a foreign-hue strike/underline rule (091's red scribbles) BEFORE any
     # geometry, colour, or density sampling so the struck word keeps its true black
     # fill and regular weight, and record it so the decoration is re-emitted. OCR may
@@ -1445,11 +1511,58 @@ def _native_colored_price_rules(image, line: dict) -> list[dict]:
 # Typography estimates and optional font matching
 
 
-def _estimate_weight(mask, painted_box: dict) -> int:
+def _upright_ink_density(mask, rotation: float) -> Optional[float]:
+    """Ink density measured on the line's OWN upright bbox.
+
+    ``mask`` is tight to an AXIS-ALIGNED ink bbox. For a ROTATED line that bbox is
+    inflated by four empty corner triangles, so ink/area is diluted purely by the
+    angle: 013's '61% OFF' (-7.8 deg) measured 0.338 against the 0.516 of the upright
+    headline beside it at the same authored weight, and got bucketed 300 points
+    lighter. De-rotating first removes the angle from the measurement, so a rotated
+    line is compared on the same footing as the upright text these buckets were
+    calibrated on.
+
+    Below ~2 deg the rotation cannot dilute meaningfully and resampling would only add
+    interpolation noise, so upright text abstains here and keeps the caller's plain
+    ``mask.mean()`` BIT-FOR-BIT. Re-tightening it instead would silently change upright
+    text too: ``_pre_font_signals`` may hand over a font_mask whose decoration rows have
+    been zeroed, which is no longer tight to its ink, so re-deriving the bbox moves the
+    denominator. That cost 088's upright 'Black Friday' (rot 0.3 deg) a font flip to
+    Playfair Display and -0.078 ssim in-region -- a defect invented by the measurement,
+    not found by it.
+    """
+    try:
+        import numpy as np
+        import cv2
+
+        if abs(float(rotation)) < 2.0:
+            return None
+        m = np.asarray(mask).astype(np.uint8)
+        if not m.any():
+            return None
+        h, w = m.shape
+        diag = int(math.hypot(h, w)) + 4
+        padded = np.zeros((diag, diag), np.uint8)
+        oy, ox = (diag - h) // 2, (diag - w) // 2
+        padded[oy:oy + h, ox:ox + w] = m
+        matrix = cv2.getRotationMatrix2D((diag / 2.0, diag / 2.0), float(rotation), 1.0)
+        m = cv2.warpAffine(padded, matrix, (diag, diag), flags=cv2.INTER_NEAREST)
+        if not m.any():
+            return None
+        ys, xs = np.nonzero(m)
+        tight = m[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        return float(tight.mean())
+    except Exception:
+        return None
+
+
+def _estimate_weight(mask, painted_box: dict, rotation: float = 0.0) -> int:
     if mask is None:
         return 400
     try:
-        density = float(mask.mean())
+        density = _upright_ink_density(mask, rotation)
+        if density is None:
+            density = float(mask.mean())
     except Exception:
         return 400
     # Density alone is intentionally conservative; exact weight is resolved by
@@ -2761,7 +2874,10 @@ def _pre_font_signals(line: dict, painted: dict, mask, config: dict) -> dict:
         if mask is not None and getattr(mask, "any", bool)() else cap_ratio
     )
     font_size = max(1.0, min(512.0, painted["h"] / ink_ratio if painted["h"] else line["box"]["h"] * 0.9))
-    weight = _estimate_weight(mask, painted)
+    # Weight is bucketed from ink density, which the line's own rotation dilutes; hand
+    # the angle over so a tilted line is not read as lighter than the upright text it
+    # was authored to match.
+    weight = _estimate_weight(mask, painted, rotation=_quad_rotation(line.get("quad")))
     shear_angle = _measure_shear_angle(mask)
     return {"font_size": font_size, "weight": weight, "shear_angle": shear_angle}
 
