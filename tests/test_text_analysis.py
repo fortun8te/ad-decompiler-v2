@@ -1222,6 +1222,77 @@ def test_025_genuine_emphasis_words_are_not_function_words():
         assert not text_analysis._short_function_word(token), token
 
 
+def _icon_row(head_px=55.0, line_colour="#c42724", stroke=True, gradient=True,
+              word_colour="#020000"):
+    """066's checklist row: the OCR box starts `head_px` left of the first glyph, over a
+    red ✗, so the line's paint is measured across icon+text."""
+    style = {"fontFamily": "Poppins", "fontSize": 30, "fontWeight": 400,
+             "fontStyle": "Regular", "color": line_colour,
+             "fill": {"kind": "linear" if gradient else "flat", "color": line_colour},
+             "stroke": ({"kind": "flat", "color": "#040200", "width": 3.0,
+                         "align": "OUTSIDE"} if stroke else None)}
+    words = []
+    for i, text in enumerate(("Smudges", "on", "upper", "lid")):
+        words.append({
+            "text": text, "box": {"x": 880.0 + 60 * i, "y": 1003.0, "w": 54.0, "h": 30.0},
+            "style": {**style, "color": word_colour, "stroke": None,
+                      "fill": {"kind": "flat", "color": word_colour}},
+            "style_evidence": {"source": "word-pixels", "confidence": 1.0,
+                               "changed": ["color"]},
+        })
+    return {"text": "Smudges on upper lid", "style": style, "words": words,
+            "box": {"x": 880.0 - head_px, "y": 1003.0, "w": 450.0, "h": 44.0}}
+
+
+def test_066_icon_inside_the_line_box_never_paints_a_stroke_around_the_glyphs():
+    """066: 'Smudges on upper lid' / 'Up to 3 shades' rendered as a smeared ghost double.
+
+    Their OCR boxes start ~55px left of the first glyph, over the red ✗, so the line's
+    paint came back as the ICON's red with a red->black gradient and a 3px OUTSIDE black
+    stroke — which render_preview hands to PIL's draw.text, outlining every glyph. The
+    words, measured on their own boxes, are unanimous that the text is flat black.
+    """
+    line = _icon_row()
+    repair = text_analysis._repair_non_glyph_line_paint(line)
+    assert repair, "an icon inside the line box must not survive as text paint"
+    assert line["style"]["stroke"] is None, "the ghost-double stroke must go"
+    assert line["style"]["fill"]["kind"] == "flat", "the icon->text gradient must go"
+    assert repair["glyph_color"] == "#020000"
+    assert repair["non_glyph_head_px"] == 55.0
+    # The glyphs still paint their own colour, via the per-word runs.
+    assert all(w["style"]["color"] == "#020000" for w in line["words"])
+
+
+def test_066_icon_repair_touches_only_the_decoration_it_invented():
+    """Scope guard. The base colour and the box are icon-poisoned too, but BOTH feed
+    grouping, and 'correcting' them costs more than it fixes while the emitted node box
+    is still expanded to the icon's x downstream: recolouring the base drops _can_join's
+    colour veto so the rows join their neighbours, the merged block's left edges go ragged
+    (825 against 880), _infer_alignment reads CENTER and every row slides left under its
+    own icon (066 text recall 0.95 -> 0.85; trimming the box instead gave 0.80). Only the
+    stroke and the gradient actually draw the ghost double, and neither feeds grouping.
+    """
+    line = _icon_row()
+    before_x, before_colour = line["box"]["x"], line["style"]["color"]
+    text_analysis._repair_non_glyph_line_paint(line)
+    assert line["style"]["color"] == before_colour, "base colour feeds _can_join; leave it"
+    assert line["box"]["x"] == before_x, "box geometry is the node-box owner's to fix"
+
+
+def test_135_unanimously_wrong_words_never_repaint_a_clean_line():
+    """The other half: words share a failure mode and can be unanimously WRONG.
+
+    135's 'vezels suikers' reads #1f1f1f flat with no stroke (correct — the label copy is
+    dark), while both tight word boxes flip polarity and read #dedede. Its box has no
+    word-free head, so the repair must stay out; trusting the words would paint light
+    grey text onto a light label.
+    """
+    line = _icon_row(head_px=1.0, line_colour="#1f1f1f", stroke=False, gradient=False,
+                     word_colour="#dedede")
+    assert text_analysis._repair_non_glyph_line_paint(line) is None
+    assert line["style"]["color"] == "#1f1f1f", "a clean line keeps its own paint"
+
+
 def test_066_glyph_composition_alone_never_bolds_a_word(monkeypatch):
     """066: 'Easy to remove' rendered 'remove' Bold against a Regular line.
 

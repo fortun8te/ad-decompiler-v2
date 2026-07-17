@@ -3964,6 +3964,94 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
         }
 
 
+# How much of a line box may sit ahead of its first glyph before the box is judged to
+# have swallowed a neighbouring object. Measured on the bench: rows with an icon inside
+# the box run 0.104-0.183, every clean row 0.000-0.010.
+_NON_GLYPH_HEAD_FRACTION = 0.06
+
+
+def _repair_non_glyph_line_paint(line: dict) -> Optional[dict]:
+    """Drop a line's paint when the line's OWN GLYPHS unanimously contradict it.
+
+    An OCR line box can swallow an adjacent ICON. 066's checklist rows are the case: the
+    box for 'Smudges on upper lid' starts at x=825 while its first glyph starts at x=880,
+    so 55px of red ✗ sit inside the box (OCR even reads the mark as a letter: 'X Up to 3
+    shades'). _painted_geometry then measures the line's paint across icon+text and
+    returns the ICON's red as the colour, a red->black LINEAR gradient as the fill, and a
+    3px black OUTSIDE STROKE. render_preview hands that stroke to PIL's draw.text, which
+    outlines every glyph with it — and a black outline around red text is exactly the
+    "ghost double"/smeared bold seen on those two rows. Their clean neighbours ('Not
+    disclosed', 'Tubing technology') have no icon inside the box and emit flat black with
+    no stroke.
+
+    The trigger is the FOREIGN REGION itself, not the disagreement: unanimous words are
+    not enough on their own, because words share a failure mode and can be unanimously
+    WRONG. 135's 'vezels suikers' is the counter-example — its line reads #1f1f1f flat
+    with no stroke (correct, the label copy is dark) while both of its tight word boxes
+    flip polarity and read #dedede, so trusting the words there would paint light grey
+    text onto a light label. Requiring a word-free strip at the head of the box separates
+    them by 10x: contaminated 0.104-0.183 (066's two rows, 067's bottle line) vs clean
+    0.000-0.010 (066's own unaffected rows, 088, and 135).
+    """
+    style = line.get("style")
+    words = [w for w in (line.get("words") or [])
+             if isinstance(w, dict) and len(str(w.get("text") or "").strip()) >= 2
+             and any(ch.isalnum() for ch in str(w.get("text") or ""))]
+    if not style or len(words) < 2:
+        return None
+    box = _clean_box(line.get("box"))
+    boxes = [_clean_box(w.get("box")) for w in words]
+    if not box.get("w") or not all(b.get("w") for b in boxes):
+        return None
+    head = (min(b["x"] for b in boxes) - box["x"]) / max(1.0, box["w"])
+    if head < _NON_GLYPH_HEAD_FRACTION:
+        return None
+    recoloured = [w for w in words
+                  if "color" in ((w.get("style_evidence") or {}).get("changed") or [])]
+    # Unanimity is the corroborating signal: one recoloured word is authored emphasis
+    # ('ONLY $19'); every word disagreeing means the line's base is the thing that is off.
+    if len(recoloured) != len(words):
+        return None
+    colours = [str((w.get("style") or {}).get("color") or "") for w in recoloured]
+    if not all(colours):
+        return None
+    if any(_colour_distance(colours[0], c) > 40.0 for c in colours[1:]):
+        return None  # the words do not agree either; no consensus to adopt
+    consensus = colours[0]
+    had_stroke = bool(style.get("stroke"))
+    had_gradient = str((style.get("fill") or {}).get("kind") or "flat") != "flat"
+    if not (had_stroke or had_gradient):
+        return None
+    # Drop ONLY the decoration the icon invented. The base COLOUR is deliberately left
+    # alone even though the glyphs disagree with it: every word already carries its own
+    # colour run, so the text still paints black, and the base is what keeps _can_join's
+    # colour veto separating these icon-bearing rows from their neighbours. Recolouring
+    # the base lets them join, and their boxes are still icon-inflated (825 against 880),
+    # so the merged block's left edges go ragged, _infer_alignment reads CENTER, and every
+    # row slides left under its own icon — 066's text recall fell 0.95 -> 0.85. The stroke
+    # and the red->black gradient are what actually draw the ghost double, and neither
+    # feeds grouping, so removing just those fixes the render and changes nothing else.
+    style["fill"] = {"kind": "flat", "color": str(style.get("color") or consensus)}
+    style["stroke"] = None
+    # NOTE: the BOX is inflated by the icon too (825 against a first glyph at 880), and
+    # trimming it here is NOT safe today. Measured on 066: the text stage's own blocks are
+    # already correct either way (B7 = x872 w309 LEFT), but build_design_json emits that
+    # block as a node at x=824 w=369.9 — expanded to the icon's own x once the restored
+    # ✗/✓ icons exist. Against that polluted node box a ragged-left block infers CENTER,
+    # which happens to pull the glyphs back to x=871 (near the true 881); trimming makes
+    # the block infer LEFT, which honours the polluted box and renders at x=858, straight
+    # under the icon (ssim 0.780 -> 0.731, recall 0.85 -> 0.80). The node-box expansion is
+    # the real defect and it is downstream of this file; until it is fixed, leaving the box
+    # alone is strictly better. See work/probe_066_doubles.py.
+    # The per-word colour runs STAY: they are what paints the glyphs their real colour
+    # over a base the icon poisoned.
+    repair = {"text": line.get("text"), "glyph_color": consensus,
+              "dropped_stroke": had_stroke, "dropped_gradient": had_gradient,
+              "non_glyph_head_px": round(min(b["x"] for b in boxes) - box["x"], 1)}
+    line.setdefault("meta", {})["non_glyph_paint_repaired"] = repair
+    return repair
+
+
 # ---------------------------------------------------------------------------
 # Roles, paragraph grouping, alignment, hierarchy and repeated styles
 
@@ -4603,6 +4691,7 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
             line.setdefault("meta", {})["font_match"] = copy.deepcopy(match_evidence)
         item["line_fit"] = _apply_line_render_fit(line, item["font_mask"], item["painted"], render_fit_options)
         _enrich_word_styles(image, line, config)
+        _repair_non_glyph_line_paint(line)
         enriched.append(line)
 
     # Pass 3.5: document-level font consensus. Ads use one or two families, but
