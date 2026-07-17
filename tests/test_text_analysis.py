@@ -1989,24 +1989,58 @@ def test_mapping_targets_are_all_license_clean_google_families():
     assert text_analysis._figma_google_family("Calibri")[0] == "Carlito"
 
 
-def test_relabel_preserves_all_styling_only_swaps_family():
+def test_relabel_swaps_family_and_repaths_the_file_to_that_family():
+    """The relabel must not leave the label and the FILE naming different fonts.
+
+    Renaming Calibri -> Carlito (Figma-loadable) while KEEPING calibri.ttf is what made
+    design.json declare Carlito while the preview drew Calibri: Figma resolves the NAME,
+    the preview resolves the FILE, and every preview-derived pixel metric on that node
+    then measured a face the deliverable never ships.
+    """
     original = {
         "family": "Calibri", "style": "Bold", "weight": 700,
         "score": 0.61, "source": "local-render", "path": "/fonts/calibri.ttf",
         "fit": {"fontSize": 41.0, "letterSpacing": 0.3, "score": 0.55, "rejected": False},
     }
     (relabelled,) = text_analysis._relabel_google_families([dict(original)])
-    # Only the family name changed; it now names a Figma-loadable Google font.
+    # The family name is now a Figma-loadable Google font.
     assert relabelled["family"] == "Carlito"
-    assert relabelled["local_family"] == "Calibri"
     assert relabelled["figma_loadable"] is True
     assert relabelled["figma_font_source"] == "mapped-local"
-    # Path (used to render/fit), weight, style, score and fit are all untouched.
-    assert relabelled["path"] == original["path"]
+    # Styling evidence that does not depend on the file is untouched either way.
     assert relabelled["weight"] == 700
     assert relabelled["style"] == "Bold"
-    assert relabelled["score"] == 0.61
-    assert relabelled["fit"] == original["fit"]
+    if relabelled.get("family_resolved"):
+        # Carlito IS installed: the file follows the label, so preview == deliverable.
+        assert "carlito" in str(relabelled["path"]).lower()
+        assert "calibri" not in str(relabelled["path"]).lower()
+        # The path IS the family now — there is no local face being remapped.
+        assert "local_family" not in relabelled
+        # The outvoted face's fit is not this face's; it is dropped for the caller to
+        # re-measure (match_fonts -> _refit_relabelled), never published as-is.
+        assert "fit" not in relabelled
+    else:
+        # Carlito is not installed here: keep the real local file and record the remap
+        # rather than lying about which file we drew.
+        assert relabelled["path"] == original["path"]
+        assert relabelled["local_family"] == "Calibri"
+        assert relabelled["score"] == 0.61
+        assert relabelled["fit"] == original["fit"]
+
+
+def test_relabel_respects_a_pinned_font_files_universe():
+    """A caller that pinned font_files chose those exact files: do not reach past them
+    into the ambient OFL corpus. Such callers keep the documented relabel."""
+    original = {
+        "family": "Calibri", "style": "Bold", "weight": 700,
+        "score": 0.61, "source": "local-render", "path": "/fonts/calibri.ttf",
+    }
+    (relabelled,) = text_analysis._relabel_google_families(
+        [dict(original)], {"font_files": ["/fonts/calibri.ttf"]})
+    assert relabelled["family"] == "Carlito"
+    assert relabelled["path"] == original["path"]
+    assert relabelled["local_family"] == "Calibri"
+    assert not relabelled.get("family_resolved")
 
 
 def test_google_native_match_preferred_over_equal_score_local_only(tmp_path):

@@ -16,6 +16,7 @@ from src import build_design_json, render_preview, schema
 from src.build_design_json import (
     _generous_text_box, _split_weight_run_siblings, _strip_edge_emoji,
     _solid_plate_bands, _promote_weight_candidate, _normalize_text_stroke,
+    _norm_family,
 )
 from src.ocr import _restore_interpuncts
 from src.text_analysis import fit_text_box
@@ -152,10 +153,19 @@ def test_weight_run_split_produces_siblings():
     weights = [p["style"].get("fontWeight") for p in pieces]
     assert weights == [300, 700, 300]
     bold = pieces[1]["style"]
-    # Bold sibling must not keep the Light file as candidates[0].path
+    # Bold sibling must not keep the Light file as candidates[0].path. Dropping the path
+    # outright is NOT the contract and was actively harmful: `render_preview._text_font`
+    # draws a pathless node with its hardcoded Arial branch, so the node declared Inter
+    # and the preview drew Arial Bold. What it may carry is a freshly RESOLVED file for
+    # the DECLARED family at the declared weight (a variable face dials its wght axis).
+    # Either is honest; keeping the Light face — or pointing at a foreign family — is not.
     assert bold["fontWeight"] == 700
-    assert bold["fontCandidates"][0]["weight"] == 700
-    assert "path" not in bold["fontCandidates"][0] or not bold["fontCandidates"][0].get("path")
+    top = bold["fontCandidates"][0]
+    assert top["weight"] == 700
+    assert "inter-light" not in str(top.get("path") or "").lower()
+    if top.get("path"):
+        assert _norm_family(top.get("family")) == _norm_family("Inter")
+        assert top.get("family_resolved") is True
     xs = [p["box"]["x"] for p in pieces]
     assert xs == sorted(xs)
     assert all(not p.get("text_runs") for p in pieces)
@@ -171,8 +181,17 @@ def test_promote_weight_candidate_rewrites_mismatched_regular_file():
     }
     _promote_weight_candidate(style)
     assert style["fontWeight"] == 700
-    assert style["fontCandidates"][0]["weight"] == 700
-    assert "path" not in style["fontCandidates"][0]
+    top = style["fontCandidates"][0]
+    assert top["weight"] == 700
+    # The stale REGULAR file must never survive on a Bold node. Dropping the path was
+    # the old way to guarantee that, but a pathless candidate is drawn by
+    # `render_preview._text_font`'s hardcoded Arial branch — so the node declared Inter
+    # and the preview drew Arial Bold. Rewriting it to a real Inter at this weight (a
+    # variable face dials its wght axis) satisfies the same contract honestly.
+    assert "inter-regular" not in str(top.get("path") or "").lower()
+    if top.get("path"):
+        assert _norm_family(top.get("family")) == _norm_family("Inter")
+        assert top.get("family_resolved") is True
 
 
 def test_promote_weight_candidate_keeps_platform_family_over_weight_drift():

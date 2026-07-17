@@ -1702,6 +1702,18 @@ def _fallback_font_candidates(weight: int, options: dict, top_k: int, italic: bo
         }
         if gfam != str(family):
             entry["local_family"] = str(family)
+        # A pathless fallback is drawn by _text_font's hardcoded Arial branch — so a
+        # line that matched nothing and fell back to "Inter" ships design.json saying
+        # Inter while the preview draws Arial (bench-11: every Inter line on 094/104/135
+        # that had no matched cluster). Resolve the fallback family to its real on-disk
+        # file so the preview draws what Figma will, and drive its variable axis (picked
+        # BY NAME for the declared weight). Not installed -> leave pathless (the honest
+        # Arial fallback) rather than inventing a file.
+        resolved = _resolve_family_path(gfam, int(weight), italic)
+        if resolved:
+            entry["path"] = resolved
+            entry.pop("local_family", None)
+            entry["family_resolved"] = True
         out.append(entry)
         if len(out) >= top_k:
             break
@@ -1925,14 +1937,41 @@ def _figma_google_family(family: Any, path: Optional[str] = None,
     return _CLASS_DEFAULT_GOOGLE.get(cls or "sans", "Inter"), "mapped-class"
 
 
-def _relabel_google_families(candidates: list) -> list:
+def _relabel_google_families(candidates: list, options: Optional[dict] = None) -> list:
     """Relabel each candidate's reported ``family`` to a Figma-loadable Google
-    family (same class), preserving the local ``path`` and every other field so
-    styling and fit evidence are untouched. Records ``local_family`` when the
-    name changed and ``figma_font_source`` (the mapping kind); marks
-    ``figma_loadable``. Order and count are preserved (no dedup) so callers that
-    inspect the candidate chain — and its per-source diversity — see it intact.
+    family (same class), then make the local ``path`` render THAT family so the
+    preview draws exactly what Figma will ship.
+
+    The relabel used to keep the outvoted local face's path: it renamed the
+    fit-winning lookalike (Candara / Bahnschrift / Calibri) to its Google
+    equivalent (Open Sans / Barlow Condensed / Carlito) but left ``path`` on the
+    lookalike. Figma resolves the NAME and ships Open Sans; the preview resolved
+    the FILE and drew Candara — a silent third face. Every preview-derived pixel
+    metric on those nodes was then measuring a font the deliverable never uses,
+    and the substituted advance widths made glyph positions drift along a run
+    (the ``local-ssim-worst-region`` failures). Measured at bench-11: 32 of 33
+    family-substituted nodes DECLARE a family that is installed locally (only
+    Tinos was genuinely absent), so the honest fix is decision (a): if the
+    declared family is available, the preview MUST draw it.
+
+    So when the reported family is a real on-disk family we resolve it to its own
+    file (weight/slant-aware) and swap the path, marking ``family_resolved`` so
+    the downstream per-line render-fit re-measures ``fontSize`` against the face
+    Figma ships — closing the advance-width drift rather than hiding it. Two guards
+    keep this from perturbing correct nodes: we only re-resolve when the current
+    path does NOT already render the reported family (a rename fired, or the path
+    is missing — e.g. a pathless fallback candidate that would otherwise fall to
+    Arial), and if the family is not installed (Tinos) we keep the old path and
+    the ``local_family`` record rather than lying about the file. Order and count
+    are preserved (no dedup) so callers that inspect the candidate chain — and its
+    per-source diversity — see it intact.
+
+    A caller that pinned an explicit ``font_files`` universe chose those exact files
+    deliberately, and resolving would reach past them into the ambient OFL corpus (the
+    same rule ``_google_fonts_cache_dirs`` already follows). Such callers keep the
+    documented relabel: family renamed, path and ``local_family`` preserved.
     """
+    pinned = bool((options or {}).get("font_files"))
     out = []
     for cand in candidates or []:
         if not isinstance(cand, dict):
@@ -1943,14 +1982,89 @@ def _relabel_google_families(candidates: list) -> list:
         kind = item.pop("_google_kind", None)
         if gfam is None:
             gfam, kind = _figma_google_family(item.get("family"), item.get("path"), item.get("source"))
-        if gfam and str(item.get("family")) != gfam:
+        renamed = bool(gfam) and str(item.get("family")) != gfam
+        if renamed:
             item["local_family"] = item.get("family")
             item["family"] = gfam
         if kind:
             item["figma_font_source"] = kind
         item["figma_loadable"] = True
+
+        # Make the drawn FILE agree with the reported (deliverable) family. Only when
+        # the current path can't already be that family: a rename just swapped the
+        # label off the local face's own file, or there is no usable path at all
+        # (a name-only fallback that would otherwise render as the Arial fallback).
+        family = item.get("family")
+        path = item.get("path")
+        path_ok = bool(path) and os.path.exists(str(path))
+        if family and not pinned and (renamed or not path_ok):
+            weight = int(round(_num(item.get("weight"), 400)))
+            italic = "italic" in str(item.get("style") or "").lower()
+            resolved = _resolve_family_path(family, weight, italic)
+            if resolved and os.path.normcase(str(resolved)) != os.path.normcase(str(path or "")):
+                item["path"] = resolved
+                item.pop("local_family", None)   # path now IS this family; no remap
+                # The old face's fit is NOT this face's, but it must not simply be
+                # dropped: `fit` is the evidence the fidelity gate reads to decide that
+                # EVERY candidate fits badly and the line must fall back to pixels.
+                # Dropping it silences that gate (a wrong-class face then ships as text).
+                # Flag for re-fit against the face we now draw; the caller re-measures.
+                item.pop("fit", None)
+                item["_refit_path"] = True
+                # Picked BY NAME for a declared weight, so a variable face must be
+                # dialled to it (mirrors _apply_platform_ui_font_prior / _promote).
+                item["family_resolved"] = True
         out.append(item)
     return out
+
+
+def _refit_relabelled(candidates: list, text: str, source_mask, estimated_size: float,
+                      fit_opts: dict) -> list:
+    """Re-measure the fit of every candidate whose FILE was swapped by the relabel.
+
+    The relabel resolves the reported family to its own file so the preview draws what
+    Figma ships; that invalidates the fit recorded for the outvoted face. Re-fitting in
+    place (order preserved — the relabel is deliberately post-ranking) keeps the fit
+    honest AND keeps the fidelity gate fed: a declared face that genuinely fits the ink
+    badly is still rejected and the line still falls back to pixels, which dropping the
+    fit outright would have silently prevented.
+    """
+    if not fit_opts.get("enabled", True) or source_mask is None:
+        for item in candidates or []:
+            if isinstance(item, dict):
+                item.pop("_refit_path", None)
+        return candidates
+    try:
+        from src import font_fit
+    except Exception:
+        for item in candidates or []:
+            if isinstance(item, dict):
+                item.pop("_refit_path", None)
+        return candidates
+    min_score = _num(fit_opts.get("min_score"), font_fit.DEFAULT_MIN_FIT_SCORE)
+    for item in candidates or []:
+        if not isinstance(item, dict) or not item.pop("_refit_path", False):
+            continue
+        path = item.get("path")
+        if not path:
+            continue
+        try:
+            fit = font_fit.fit_line(
+                text, str(path), source_mask, estimated_size, fit_opts,
+                weight=_num(item.get("weight"), 400.0),
+            )
+        except Exception:
+            fit = None
+        if fit is not None:
+            # Same contract refine_candidates publishes: a fit below min_score is
+            # evidence AGAINST this face, and the fidelity gate reads `rejected`.
+            fit["rejected"] = fit["score"] < min_score
+            item["fit"] = fit
+            # Deliberately NOT rewriting `score`: the relabel runs AFTER ranking, and
+            # `score` is what that ranking (and `_apply_platform_ui_font_prior`'s
+            # strong-keep) was decided on. Re-fitting must correct the fit EVIDENCE for
+            # the face we now draw, not retroactively re-open the font SELECTION.
+    return candidates
 
 
 def _google_fonts_cache_dirs(options: dict) -> list[str]:
@@ -2023,8 +2137,20 @@ def _resolve_family_path(family: Any, weight: int, italic: bool,
         return _FAMILY_PATH_CACHE[key]
     opts = dict(options or {})
     # The declared family is a NAME, not a member of any caller-pinned universe:
-    # resolve it against the ambient corpus (curated OFL + installed system faces).
+    # resolve it against the ambient corpus (OFL + installed system faces).
     opts.pop("font_files", None)
+    # Curation and the scan cap both bound the MATCH set — they keep the matcher from
+    # ranking the whole OFL tree. Neither has any business here: we are not choosing a
+    # family, we are fetching the file for one already declared. Both made INSTALLED
+    # families read as "not installed" — curation for being off the curated list, and
+    # `scan_limit` (3000) because `_discover_fonts` walks the corpus alphabetically and
+    # this one is 3879 files, so everything late in the alphabet was never seen. That is
+    # why 135 declared Tinos and Source Code Pro — both sitting in
+    # ~/.cache/google-fonts/ofl — while drawing Times New Roman and Consolas. Widen the
+    # scan for NAME lookups only; the matcher's own cap is untouched, and _discover_fonts
+    # caches per (dirs, scan_limit) so the wider walk happens once.
+    opts["google_fonts_curated"] = False
+    opts["scan_limit"] = max(int(_num(opts.get("scan_limit"), 3000)), 20000)
     fonts = list(_discover_google_fonts(opts))
     try:
         fonts.extend(_discover_fonts({"font_dirs": _platform_font_dirs()}))
@@ -2532,10 +2658,14 @@ def _resolve_font_candidates(text: str, source_mask, geo: dict, options: dict,
     if corpus_primary and len(merged) > top_k:
         merged = merged[:top_k]
 
-    # Relabel the reported family to a Figma-loadable Google equivalent AFTER
-    # ranking (local path kept for rendering, so styling/fit are untouched). Every
-    # emitted fontFamily is now one Figma can natively load.
-    merged = _relabel_google_families(merged)
+    # Relabel the reported family to a Figma-loadable Google equivalent AFTER ranking,
+    # resolving each reported family to its OWN file so the preview draws exactly what
+    # Figma will load. Every emitted fontFamily is one Figma can natively load, and the
+    # file under it now agrees. Re-fit whatever the relabel re-pathed, so the published
+    # fit measures the face we actually draw (and the fidelity gate still sees a real
+    # score for it) rather than the outvoted local face's.
+    merged = _relabel_google_families(merged, options)
+    merged = _refit_relabelled(merged, text, source_mask, estimated_size, fit_opts)
     return merged, evidence
 
 
