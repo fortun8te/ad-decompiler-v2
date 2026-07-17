@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Optional
 
 DEFAULTS = {
@@ -82,6 +83,29 @@ DEFAULTS = {
     # reconciliation
     "match_iou": 0.20,
     "absorb_group_pad": 3,
+    # row-icon / text-box overlap clip signal (066 L10/L15: OCR swallowed the leading
+    # ✗ glyph into the text line box, so the box starts ON the icon column). We do not
+    # own the text node; we publish the x the text should start at (meta.row.text_clip_x)
+    # so build_design_json / merge_layers can clip the box's LEFT edge off the icon.
+    "clip_overlap_tol": 2.0,
+    # brand-lockup (wordmark) proposal — a small, isolated, TWO-TONE text stack (101
+    # 'craFT'/'cadence': teal small-caps over black) is custom brand artwork, not two
+    # editable font lines. Proposed here as a raster 'logo' element; downstream suppresses
+    # the covered OCR lines and emits the pixel-exact chip (badge agent).
+    "lockup_enabled": True,          # run detection + write evidence to icon_detect.json
+    # Emitting the logo ELEMENT changes the render, and the badge agent must land the
+    # OCR-line suppression + raster-chip emission in the SAME change or 101 ships a
+    # duplicate (raster wordmark under editable text). Default-off until that lands
+    # (mirrors peel's default-off wiring); flip with the badge diff.
+    "lockup_emit": False,
+    "lockup_sat_min": 25.0,          # min ink chroma (max-min RGB) to read as a brand hue
+    "lockup_two_tone_dist": 60.0,    # min ink colour distance between two stack lines
+    "lockup_stack_gap": 1.5,         # vertical gap between stacked lines, in line heights
+    "lockup_align_tol": 0.35,        # left/center edge agreement, in line heights
+    "lockup_iso_gap": 1.4,           # a foreign line this close (in heights) breaks isolation
+    "lockup_max_area_frac": 0.035,   # union bbox vs canvas
+    "lockup_max_chars": 16,
+    "lockup_cover_frac": 0.70,       # skip if this deep inside an existing logo/badge/burst
 }
 
 _GLYPH_ROLE = {"check": "verified", "cross": "cross", "question": "question-mark"}
@@ -708,6 +732,230 @@ def detect_chart_region(rgb, lines: list[dict], canvas: dict, opts: dict) -> Opt
     return {"box": box, "gridlines": len(group), "spacing": round(sp, 1)}
 
 
+# ── 3b. row-icon ↔ text-box overlap (066 L10/L15) ────────────────────────────────────
+
+def _annotate_text_clip(dets: list[dict], opts: dict) -> None:
+    """Flag row/inline glyphs whose linked OCR line box starts at/left of the icon's
+    right edge and record where the text should begin.
+
+    066's ``Smudges on upper lid`` / ``X Up to 3 shades`` rows have OCR boxes that start
+    ON the red ✗ column (x≈824) instead of after it (x≈872) — OCR read the mark as a
+    leading letter and swallowed it, so the text NODE inherits an icon-inflated left edge
+    and the ✗ ink lands inside the text box (renders "Xmudges…"). We own the icon box, so
+    we publish ``text_clip_x`` = icon-right + the list's own clean gap; build_design_json /
+    merge_layers clip the text box's LEFT edge to it so icon ink never sits in a text node.
+    Purely additive: clean rows (text starts after the icon) get nothing.
+    """
+    rows = [d for d in dets if d.get("row_box") and d.get("box")]
+    tol = float(opts.get("clip_overlap_tol", 2.0))
+    col_tol_factor = float(opts.get("column_x_tol_factor", 0.9))
+    for d in rows:
+        ib, tb = d["box"], d["row_box"]
+        icon_right = ib["x"] + ib["w"]
+        if tb["x"] >= icon_right - tol:
+            continue  # text already starts after the icon — nothing to clip
+        cx = ib["x"] + ib["w"] / 2.0
+        col_tol = col_tol_factor * max(8.0, float(ib["h"]))
+        clean_gaps = []
+        for o in rows:
+            ob, otb = o["box"], o["row_box"]
+            if abs((ob["x"] + ob["w"] / 2.0) - cx) > col_tol:
+                continue
+            gap = otb["x"] - (ob["x"] + ob["w"])
+            if gap >= tol:
+                clean_gaps.append(gap)
+        if clean_gaps:
+            clean_gaps.sort()
+            gap = clean_gaps[len(clean_gaps) // 2]
+        else:
+            gap = 0.5 * float(ib["h"])
+        d["overlaps_text"] = True
+        d["text_clip_x"] = int(round(icon_right + gap))
+
+
+# ── 3c. brand-lockup (wordmark) proposal (101 'craft cadence') ────────────────────────
+
+_LOCKUP_STOPCHARS = re.compile(r"[\d.!?,:;/@%$€£+*=]")
+_LOCKUP_UI = re.compile(
+    r"^(?:the|and|for|new|buy|get|off|free|sale|save|shop|now|our|your|with|vs\.?)$",
+    re.I,
+)
+
+
+def _line_ink(rgb, box: dict):
+    """Mean colour of the darkest ~30% (ink) pixels of an OCR line box, or None."""
+    np = _np()
+    x0, y0 = max(0, int(box["x"])), max(0, int(box["y"]))
+    x1 = min(rgb.shape[1], int(round(box["x"] + box["w"])))
+    y1 = min(rgb.shape[0], int(round(box["y"] + box["h"])))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    crop = rgb[y0:y1, x0:x1].reshape(-1, 3).astype(np.float64)
+    if crop.shape[0] < 4:
+        return None
+    lum = crop @ np.array([0.299, 0.587, 0.114])
+    thr = float(np.percentile(lum, 30))
+    ink = crop[lum <= thr]
+    if ink.size == 0:
+        ink = crop
+    return ink.mean(axis=0)
+
+
+def _brand_hue(mean_rgb, sat_min: float) -> bool:
+    if mean_rgb is None:
+        return False
+    m = mean_rgb
+    return (float(m.max() - m.min()) >= sat_min
+            and 14.0 < float(m.mean()) < 232.0)
+
+
+def _colour_dist(a, b) -> float:
+    np = _np()
+    if a is None or b is None:
+        return 0.0
+    return float(np.sqrt(((a - b) ** 2).sum()))
+
+
+def _lockup_word_ok(text: str, max_chars: int) -> bool:
+    t = str(text or "").strip()
+    if not t or len(t) > max_chars:
+        return False
+    if _LOCKUP_STOPCHARS.search(t) or _LOCKUP_UI.match(t):
+        return False
+    words = t.split()
+    if len(words) > 2:
+        return False
+    return sum(ch.isalpha() for ch in t) >= 3
+
+
+def _union_box(boxes: list[dict]) -> dict:
+    x0 = min(b["x"] for b in boxes)
+    y0 = min(b["y"] for b in boxes)
+    x1 = max(b["x"] + b["w"] for b in boxes)
+    y1 = max(b["y"] + b["h"] for b in boxes)
+    return {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+
+
+def _x_overlap_frac(a: dict, b: dict) -> float:
+    ix = max(0.0, min(a["x"] + a["w"], b["x"] + b["w"]) - max(a["x"], b["x"]))
+    return ix / max(1.0, min(a["w"], b["w"]))
+
+
+def detect_brand_lockups(rgb, lines: list[dict], canvas: dict, fused: list[dict],
+                         opts: dict) -> list[dict]:
+    """Propose small isolated TWO-TONE text stacks as raster 'logo' elements.
+
+    A custom wordmark that font-matching cannot reproduce (101's teal 'craFT' small-caps
+    over black 'cadence') ships today as two mismatched text lines because it sits
+    mid-canvas beside the product — outside ``wordmark.is_wordmark_candidate``'s
+    header/footer slot, and SAM's 'logo' prompt only caught the round BOGO badge. The
+    decisive, low-false-positive signal is TWO-TONE INK in a tight, isolated, short-word
+    stack: body columns and offer bursts are single-hue, and a genuine multi-colour
+    lettermark is almost never ordinary copy. Emits a logo element carrying the covered
+    OCR line ids; the badge agent suppresses those lines and rasterizes the chip.
+    """
+    if not opts.get("lockup_enabled", True) or not lines:
+        return []
+    np = _np()
+    H, W = rgb.shape[:2]
+    sat_min = float(opts.get("lockup_sat_min", 25.0))
+    max_chars = int(opts.get("lockup_max_chars", 16))
+    stack_gap = float(opts.get("lockup_stack_gap", 1.5))
+    align_tol = float(opts.get("lockup_align_tol", 0.35))
+    iso_gap = float(opts.get("lockup_iso_gap", 1.4))
+    two_tone = float(opts.get("lockup_two_tone_dist", 60.0))
+
+    feats = []
+    for ln in lines:
+        b = ln.get("box") or {}
+        if float(b.get("w", 0)) < 3 or float(b.get("h", 0)) < 3:
+            continue
+        ok = _lockup_word_ok(ln.get("text"), max_chars)
+        ink = _line_ink(rgb, b) if ok else None
+        feats.append({"ln": ln, "box": {k: float(b[k]) for k in ("x", "y", "w", "h")},
+                      "ok": ok, "ink": ink,
+                      "hue": _brand_hue(ink, sat_min) if ok else False})
+    candidates = [f for f in feats if f["ok"]]
+
+    # existing elements that would make a coloured stack NOT a fresh wordmark: an offer
+    # burst / badge / logo already owns the region (101's BOGO), or it is deep inside one.
+    cover_frac = float(opts.get("lockup_cover_frac", 0.70))
+    cover_roles = {"logo", "badge", "sale_burst", "price_burst", "starburst",
+                   "sticker", "button", "seal", "verified"}
+    covers = [el for el in (fused or [])
+              if str(el.get("role") or "").lower() in cover_roles and el.get("box")]
+
+    used: list[int] = []
+    out = []
+    for i, seed in enumerate(candidates):
+        if i in used or not seed["hue"]:
+            continue
+        cluster = [seed]
+        cidx = [i]
+        sb, sh = seed["box"], seed["box"]["h"]
+        scx = sb["x"] + sb["w"] / 2.0
+        for j, other in enumerate(candidates):
+            if j == i or j in used:
+                continue
+            ob = other["box"]
+            cb = _union_box([c["box"] for c in cluster])
+            vgap = max(0.0, max(ob["y"] - (cb["y"] + cb["h"]),
+                                cb["y"] - (ob["y"] + ob["h"])))
+            if vgap > stack_gap * max(sh, ob["h"]):
+                continue
+            if _x_overlap_frac(cb, ob) < 0.25:
+                continue
+            ocx = ob["x"] + ob["w"] / 2.0
+            aligned = (abs(ob["x"] - cb["x"]) <= align_tol * sh
+                       or abs(ocx - scx) <= align_tol * sh)
+            if not aligned:
+                continue
+            if abs(ob["h"] - sh) > 0.8 * sh:
+                continue
+            cluster.append(other)
+            cidx.append(j)
+        if len(cluster) < 2:
+            continue
+        # TWO-TONE gate: at least two members whose ink colours are decisively apart.
+        inks = [c["ink"] for c in cluster if c["ink"] is not None]
+        if len(inks) < 2 or max(_colour_dist(a, b)
+                                for a in inks for b in inks) < two_tone:
+            continue
+        box = _union_box([c["box"] for c in cluster])
+        if box["w"] * box["h"] > float(opts.get("lockup_max_area_frac", 0.035)) * W * H:
+            continue
+        # ISOLATION: no FOREIGN OCR line is stacked right against the block.
+        member_ids = {id(c["ln"]) for c in cluster}
+        foreign = False
+        for ln in lines:
+            if id(ln) in member_ids:
+                continue
+            b = ln.get("box") or {}
+            if float(b.get("w", 0)) < 3 or float(b.get("h", 0)) < 3:
+                continue
+            fb = {k: float(b[k]) for k in ("x", "y", "w", "h")}
+            vgap = max(0.0, max(fb["y"] - (box["y"] + box["h"]),
+                                box["y"] - (fb["y"] + fb["h"])))
+            if vgap <= iso_gap * box["h"] and _x_overlap_frac(box, fb) >= 0.30:
+                foreign = True
+                break
+        if foreign:
+            continue
+        # not already owned by a burst/badge/logo (BOGO), and not the product's own label.
+        if any(_overlap_frac(box, c["box"]) >= cover_frac for c in covers):
+            continue
+        used.extend(cidx)
+        cluster.sort(key=lambda c: c["box"]["y"])
+        out.append({
+            "box": {"x": int(round(box["x"])), "y": int(round(box["y"])),
+                    "w": int(round(box["w"])), "h": int(round(box["h"]))},
+            "text_ids": [c["ln"].get("id") for c in cluster],
+            "text": " ".join(str(c["ln"].get("text") or "").strip() for c in cluster),
+            "inks": [[int(v) for v in c["ink"]] for c in cluster if c["ink"] is not None],
+        })
+    return out
+
+
 # ── 4. reconciliation with the fused element list ────────────────────────────────────
 
 def _write_mask(mask, box: dict, path: str) -> None:
@@ -737,7 +985,7 @@ def _glyph_meta(det: dict) -> dict:
                     **{k: v for k, v in (det.get("info") or {}).items()}},
     }
     if det.get("row_text_id") is not None:
-        meta["row"] = {
+        row = {
             "text_id": det["row_text_id"],
             "line_box": det.get("row_box"),
             "align": "left-of-text",
@@ -745,6 +993,12 @@ def _glyph_meta(det: dict) -> dict:
                                - (det["row_box"]["y"] + det["row_box"]["h"] / 2.0), 1)
             if det.get("row_box") else None,
         }
+        # OCR swallowed the leading glyph into the text box: publish where the text
+        # should start so the box's LEFT edge can be clipped off the icon (066 L10/L15).
+        if det.get("overlaps_text"):
+            row["overlaps_text"] = True
+            row["text_clip_x"] = det.get("text_clip_x")
+        meta["row"] = row
     template = _VECTOR_TEMPLATES.get(det["glyph"]) or {}
     if template.get("paths"):
         meta["vector_template"] = dict(template)
@@ -788,6 +1042,7 @@ def refine(fused: list[dict], canvas: dict, cfg: Optional[dict] = None,
         dets += detect_standalone_glyphs(rgb, lines, canvas, opts, dets)
     if opts.get("inline_enabled", True):
         dets += detect_inline_glyphs(rgb, lines, canvas, opts, dets)
+    _annotate_text_clip(dets, opts)
 
     dropped_ids: set[str] = set()
     small_limit = 0.02 * canvas["w"] * canvas["h"]
@@ -813,6 +1068,9 @@ def refine(fused: list[dict], canvas: dict, cfg: Optional[dict] = None,
         entry = {"glyph": det["glyph"], "score": det["score"], "box": det["box"],
                  "row_text_id": det.get("row_text_id"), "anchor": det["anchor"],
                  "column_size": det.get("column_size")}
+        if det.get("overlaps_text"):
+            entry["overlaps_text"] = True
+            entry["text_clip_x"] = det.get("text_clip_x")
         report["detections"].append(entry)
         meta_patch = _glyph_meta(det)
         if group:
@@ -892,6 +1150,42 @@ def refine(fused: list[dict], canvas: dict, cfg: Optional[dict] = None,
                                             "containment": 1.0, "area_ratio": round(
                         el["box"]["w"] * el["box"]["h"] /
                         max(1.0, host["box"]["w"] * host["box"]["h"]), 4)})
+
+    # brand lockups: small isolated two-tone text stacks → raster 'logo' proposals.
+    # Detection always records evidence; element emission is gated (see lockup_emit).
+    if opts.get("lockup_enabled", True):
+        report["lockups"] = []
+        emit = bool(opts.get("lockup_emit", False))
+        for lk in detect_brand_lockups(rgb, lines, canvas, fused, opts):
+            if not emit:
+                report["lockups"].append({"id": None, "emitted": False, **lk})
+                continue
+            box = lk["box"]
+            cid = f"E{_next_id(fused):03d}"
+            rel = os.path.join("fused_elements", f"{cid}.png")
+            full = np.zeros((canvas["h"], canvas["w"]), bool)
+            full[box["y"]:box["y"] + box["h"], box["x"]:box["x"] + box["w"]] = True
+            path = os.path.join(run_dir, rel)
+            _write_mask(full, box, path)
+            area = float(box["w"] * box["h"])
+            fused.append({
+                "id": cid,
+                "meta": {"wordmark": True, "brand_lockup": True,
+                         "lockup_text_ids": lk["text_ids"], "lockup_text": lk["text"],
+                         "lockup_inks": lk["inks"], "raster_first": True,
+                         "source": "icon-cv"},
+                "box": dict(box), "kind": "icon", "role": "logo", "score": 0.62,
+                "area": area, "coverage": round(area / (canvas["w"] * canvas["h"]), 6),
+                "source": "icon-cv",
+                "mask": {"kind": "alpha", "src": rel}, "mask_src": rel,
+                "mask_path": os.path.abspath(path),
+                "asset_src": None, "asset_candidates": [],
+                "parent_id": None, "relationships": [],
+                "provenance": {"sources": ["icon-cv"], "observations": [],
+                               "nms": {"observation_count": 1, "merged_count": 0,
+                                       "merges": []}},
+            })
+            report["lockups"].append({"id": cid, **lk})
 
     if opts.get("chart_enabled", True):
         chart = detect_chart_region(rgb, lines, canvas, opts)

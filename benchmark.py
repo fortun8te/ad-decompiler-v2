@@ -168,10 +168,20 @@ def contract_verdict(row: dict) -> dict:
     it. native_text_ratio >= 0.90, zero glyph residue, placement within tolerance.
     """
     ntr = row.get("native_text_ratio")
-    native_ok = ntr is not None and float(ntr) >= CONTRACT_NATIVE_TEXT_MIN
     residue_clean = row.get("glyph_residue_clean")
     placement_ok = row.get("placement_ok")
     reasons = []
+    # N/A verdict (021 class): native_text_ratio is None because 100% of the copy is baked
+    # by design into a genuine photographic scene (nothing_to_decompile) — there was no text
+    # to make native. That is neither a contract PASS ("we produced native text everywhere":
+    # false, there was none) nor a contract FAIL ("we rasterized editable copy": also false,
+    # the bake is correct). Report it distinctly and exclude it from the pass/fail tally, so a
+    # photocopy can never be laundered into a pass and a correct bake is never scored a miss.
+    if ntr is None and row.get("nothing_to_decompile"):
+        return {"id": row.get("id"), "pass": None, "native_text_ratio": None,
+                "glyph_residue_clean": residue_clean, "placement_ok": placement_ok,
+                "reasons": ["nothing to decompile (all copy baked in-scene by design)"]}
+    native_ok = ntr is not None and float(ntr) >= CONTRACT_NATIVE_TEXT_MIN
     if ntr is None:
         reasons.append("native_text_ratio unknown")
     elif not native_ok:
@@ -483,6 +493,13 @@ def _entry(run_dir: Path, result: dict) -> dict:
         # editable_text_recall is the honest share of ALL source text that ended up correct
         # AND editable.
         "true_text_coverage": qa.get("true_text_coverage", structure.get("true_text_coverage")),
+        # Coverage of ALL source text that ships editable (kept_in_photo in the denominator):
+        # the user's "how much of this ad can I edit?" number. 0.0 on a fully-baked photo.
+        "editable_text_fraction": qa.get("editable_text_fraction", structure.get("editable_text_fraction")),
+        # "Nothing to decompile" (all copy baked in-scene by design) vs a real decompile.
+        # Drives the N/A contract verdict so 021 is neither a false pass nor a false fail.
+        "nothing_to_decompile": qa.get("nothing_to_decompile", structure.get("nothing_to_decompile")),
+        "all_source_text_baked": qa.get("all_source_text_baked", structure.get("all_source_text_baked")),
         # F4: detected text lines shipped as raster (slice / wordmark / foreground_raster)
         # instead of editable TEXT. Surfaced so slices are visible, not hidden inside a 1.0.
         "rasterized_text_count": qa.get("rasterized_text_count",
@@ -894,13 +911,18 @@ def main():
     # the raw summary. Always emit the one-line roll-up; --contract adds the per-image detail.
     verdicts = [contract_verdict(row) for row in runs]
     passing = sum(1 for v in verdicts if v["pass"])
-    print(f"\nCONTRACT: {passing}/{len(runs)} pass "
+    # N/A verdicts (pass is None: nothing to decompile) are neither pass nor fail; scoring
+    # them against the run count would understate a batch of legitimately photographic ads.
+    scored = sum(1 for v in verdicts if v["pass"] is not None)
+    na = len(verdicts) - scored
+    na_note = f", {na} n/a (nothing to decompile)" if na else ""
+    print(f"\nCONTRACT: {passing}/{scored} pass{na_note} "
           f"(native text >= {CONTRACT_NATIVE_TEXT_MIN:.0%}, zero glyph residue, placement in tolerance)")
     if args.contract:
         for verdict in verdicts:
             ntr = verdict["native_text_ratio"]
             ntr_str = "—" if ntr is None else f"{float(ntr):.0%}"
-            status = "PASS" if verdict["pass"] else "fail"
+            status = "n/a " if verdict["pass"] is None else ("PASS" if verdict["pass"] else "fail")
             why = "" if verdict["pass"] else "  <- " + "; ".join(verdict["reasons"])
             print(f"  [{status}] {verdict['id']}  native_text={ntr_str}{why}")
     print(json.dumps(report["summary"], indent=2))

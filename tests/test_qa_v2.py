@@ -392,6 +392,86 @@ def test_scene_baked_exemption_still_applies_to_a_genuine_photo(tmp_path):
     assert "low-editable-ratio" not in _rules(result)
 
 
+# ── F-vacuous: 0 editable text must never read as a perfect editability score (021) ─────
+
+
+def test_all_source_text_baked_reads_undefined_not_a_vacuous_perfect_score(tmp_path):
+    """021's mechanism: every readable source line is kept_in_photo, so the editable-text
+    denominator is 0. The old convention returned 1.0 (a 0/0 pass) — "we baked the whole ad"
+    scored identically to "we perfectly decompiled everything". The honest value is undefined:
+    editable_text_recall / native_text_ratio / true_text_coverage are None, never 1.0."""
+    result = _write_scene_baked_run(
+        tmp_path, "caption_over_photo",
+        layers=[{"id": "bg", "type": "image", "meta": {"role": "background"}},
+                {"id": "photo", "type": "image", "meta": {"role": "photo"}}])
+    assert result["editable_text_recall"] is None
+    assert result["native_text_ratio"] is None
+    assert result["true_text_coverage"] is None
+    # ...and the distinct, machine-readable "nothing to decompile" status is set, so a reader
+    # can tell it apart from an actual perfect decompile.
+    assert result["nothing_to_decompile"] is True
+    assert result["all_source_text_baked"] is True
+    # A genuine photographic scene bake is correct-by-design: it must NOT hard-fail.
+    assert "no-editable-content" not in _rules(result)
+    assert "missing-editable-text" not in _rules(result)
+
+
+def test_all_baked_without_a_scene_verdict_hard_fails_no_editable_content(tmp_path):
+    """The other side of the vacuous fix: when the denominator empties out but the bake is
+    NOT a legitimate photographic scene (junk wrapper groups, denied exemption), the run
+    rasterized every line of copy and delivered zero editable text. Because recall is now
+    undefined (not a false 1.0), the recall/coverage gates skip it — so an explicit
+    no-editable-content hard-fail must catch it instead. A photocopy is never CLEAN."""
+    result = _write_scene_baked_run(
+        tmp_path, "caption_over_photo",
+        layers=[{"id": "bg", "type": "image", "meta": {"role": "background"}},
+                {"id": "g0", "type": "group", "children": []},
+                {"id": "g1", "type": "group", "children": []}])
+    assert result["editable_text_recall"] is None
+    assert result["nothing_to_decompile"] is False
+    assert "no-editable-content" in _rules(result)
+
+
+def test_editable_text_fraction_is_ink_weighted_not_line_counted(tmp_path):
+    """editable_text_fraction answers "how much of THIS ad can I edit?" over ALL source text
+    (kept_in_photo INCLUDED in the denominator), weighted by measured text ink. One big
+    editable headline plus many tiny baked package lines is highly batch-editable even though
+    only a fraction of the *lines* are editable — so the ink-dominant editable line must lift
+    the fraction well above its 1-of-N line share (013: 0.20 by count, 0.63 by ink)."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    image = Image.new("RGB", (200, 200), "white")
+    draw = ImageDraw.Draw(image)
+    # Ink is a MINORITY of each box (dark strokes on a light plate), exactly like real text:
+    # the box's local median is the background, and the dark stroke pixels are the ink weight.
+    # One ink-heavy editable headline (a wide, tall stroke band)...
+    draw.rectangle((10, 25, 190, 45), fill=(10, 10, 10))
+    # ...and four tiny baked package lines (a few stroke pixels each).
+    for i in range(4):
+        draw.rectangle((12, 102 + i * 12, 27, 105 + i * 12), fill=(10, 10, 10))
+    image.save(source)
+    image.save(render)
+    source_ocr = {"lines": [
+        {"id": "H", "text": "HUGE HEADLINE", "conf": 0.99, "box": {"x": 10, "y": 10, "w": 180, "h": 60}},
+        {"id": "P0", "text": "tiny package one", "conf": 0.99, "box": {"x": 10, "y": 100, "w": 60, "h": 8}},
+        {"id": "P1", "text": "tiny package two", "conf": 0.99, "box": {"x": 10, "y": 112, "w": 60, "h": 8}},
+        {"id": "P2", "text": "tiny package three", "conf": 0.99, "box": {"x": 10, "y": 124, "w": 60, "h": 8}},
+        {"id": "P3", "text": "tiny package four", "conf": 0.99, "box": {"x": 10, "y": 136, "w": 60, "h": 8}},
+    ]}
+    design = {
+        "layers": [{"id": "h", "type": "text", "text": "HUGE HEADLINE",
+                    "style": {"fontFamily": "Inter"}, "meta": {}}],
+        "kept_in_photo": ["tiny package one", "tiny package two",
+                          "tiny package three", "tiny package four"],
+        "meta": {"editable_ratio": 1.0},
+    }
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path),
+                                source_ocr=source_ocr, design=design)
+    frac = result["editable_text_fraction"]
+    # 1 of 5 lines is editable (line-count would be 0.20); the headline's ink dominates.
+    assert frac is not None and frac > 0.5, f"expected ink-weighted >0.5, got {frac}"
+
+
 def test_single_background_without_removal_work_can_legitimately_match_source(tmp_path):
     source = tmp_path / "source.png"
     render = tmp_path / "render.png"

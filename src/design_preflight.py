@@ -270,18 +270,30 @@ def run(run_dir, cfg=None):
 
     # 4) Editable-text recall — QA's gate is render-free, so preflight can run it as-is.
     text_editability = pixel_diff._text_editability(
-        source_ocr, design, pixel_diff._flatten_layers(design.get("layers") or []))
+        source_ocr, design, pixel_diff._flatten_layers(design.get("layers") or []),
+        source_gray=source_gray)
     exempt = _scene_baked_exemption(run_dir, design, source_lines)
     checks["scene_baked_exemption"] = bool(exempt)
     if text_editability is not None:
-        checks["editable_text_recall"] = text_editability["editable_text_recall"]
+        etr = text_editability["editable_text_recall"]
+        checks["editable_text_recall"] = etr
+        checks["editable_text_fraction"] = text_editability.get("editable_text_fraction")
+        checks["all_source_text_baked"] = text_editability.get("all_source_text_baked")
         floor = thresholds.get("editable_text_recall_min")
-        if (floor is not None and not exempt
-                and text_editability["editable_text_recall"] < float(floor)):
+        # etr is None when editable recall is undefined (every line baked-by-design, denom==0).
+        # That is the no-editable-content case, not a low-recall miss; predict it only when the
+        # bake is NOT an allowed photographic scene, mirroring the QA gate in pixel_diff.
+        if etr is None:
+            if text_editability.get("all_source_text_baked") and not exempt:
+                predicted.append({
+                    "rule": "no-editable-content",
+                    "detail": "every readable source line was baked into a photo layer "
+                              "(0 editable text nodes) with no photographic-scene verdict",
+                })
+        elif floor is not None and not exempt and etr < float(floor):
             predicted.append({
                 "rule": "missing-editable-text",
-                "detail": f"editable text recall "
-                          f"{text_editability['editable_text_recall']:.2f} < {float(floor):.2f}",
+                "detail": f"editable text recall {etr:.2f} < {float(floor):.2f}",
             })
 
     # 5) Render text-recall upper bound: unowned lines cannot appear in any render.

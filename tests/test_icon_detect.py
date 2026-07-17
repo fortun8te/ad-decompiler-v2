@@ -169,6 +169,69 @@ def test_refine_absorbs_stacked_duplicates(tmp_path):
     assert icons[0]["meta"].get("absorbed_ids")
 
 
+def test_text_clip_signal_for_swallowed_glyph():
+    """066 L10/L15: OCR box starts ON the icon column → publish text_clip_x after it."""
+    dets = [
+        # overlap row: text box starts at 820, icon spans 824..857
+        {"box": {"x": 824, "y": 1291, "w": 33, "h": 33},
+         "row_box": {"x": 820, "y": 1286, "w": 318, "h": 45}, "row_text_id": "L15"},
+        # clean sibling rows in the same column: text starts well after the icon
+        {"box": {"x": 824, "y": 950, "w": 33, "h": 33},
+         "row_box": {"x": 873, "y": 943, "w": 403, "h": 53}, "row_text_id": "L9"},
+        {"box": {"x": 824, "y": 1120, "w": 33, "h": 33},
+         "row_box": {"x": 872, "y": 1111, "w": 309, "h": 60}, "row_text_id": "L12"},
+    ]
+    ic._annotate_text_clip(dets, ic.DEFAULTS)
+    over = dets[0]
+    assert over["overlaps_text"] is True
+    # clip x is past the icon's right edge (857) and lands in the clean column (872-880)
+    assert 857 < over["text_clip_x"] <= 885
+    # clean rows are never annotated
+    assert not dets[1].get("overlaps_text")
+    assert not dets[2].get("overlaps_text")
+
+
+def _lockup_lines_and_img(two_tone=True):
+    img = _canvas(w=1000, h=1000)
+    # line 1 "craft" teal, line 2 "cadence" black (or teal when single-tone), isolated
+    c1 = (90, 190, 195)
+    c2 = (30, 30, 30) if two_tone else (90, 190, 195)
+    img[374:395, 104:210] = 255
+    img[374:395, 104:180] = c1
+    img[406:424, 72:238] = 255
+    img[406:424, 72:200] = c2
+    lines = [
+        {"id": "L2", "text": "craft", "box": {"x": 104, "y": 374, "w": 106, "h": 21}},
+        {"id": "L3", "text": "cadence", "box": {"x": 72, "y": 406, "w": 166, "h": 18}},
+        # far-away body copy so the block stays isolated
+        {"id": "L9", "text": "typical tube", "box": {"x": 628, "y": 647, "w": 240, "h": 17}},
+    ]
+    return img, lines
+
+
+def test_brand_lockup_two_tone_detected():
+    img, lines = _lockup_lines_and_img(two_tone=True)
+    out = ic.detect_brand_lockups(img, lines, {"w": 1000, "h": 1000}, [], ic.DEFAULTS)
+    assert len(out) == 1
+    lk = out[0]
+    assert set(lk["text_ids"]) == {"L2", "L3"}
+    assert lk["box"]["x"] <= 80 and lk["box"]["w"] >= 150
+
+
+def test_brand_lockup_single_tone_rejected():
+    img, lines = _lockup_lines_and_img(two_tone=False)
+    out = ic.detect_brand_lockups(img, lines, {"w": 1000, "h": 1000}, [], ic.DEFAULTS)
+    assert out == []
+
+
+def test_brand_lockup_skips_when_owned_by_burst():
+    img, lines = _lockup_lines_and_img(two_tone=True)
+    covering = [{"id": "S0", "role": "sale_burst",
+                 "box": {"x": 60, "y": 360, "w": 200, "h": 80}}]
+    out = ic.detect_brand_lockups(img, lines, {"w": 1000, "h": 1000}, covering, ic.DEFAULTS)
+    assert out == []
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

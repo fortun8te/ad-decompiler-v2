@@ -1757,7 +1757,7 @@ def _font_consistency_audit(design):
     }
 
 
-def _text_editability(source_ocr, design, layers):
+def _text_editability(source_ocr, design, layers, source_gray=None):
     """Honest text-editability accounting (F4).
 
     ``editable_text_recall`` = detected source text lines that ship as a CORRECT editable
@@ -1769,9 +1769,19 @@ def _text_editability(source_ocr, design, layers):
     denominator. The only text excluded from the denominator is ``kept_in_photo`` scene text
     (legitimately not-editable-by-design), which is tracked separately.
 
+    ``editable_text_fraction`` is the user-facing COVERAGE number — "how much of THIS ad can
+    I actually edit?" — over ALL readable source text (kept_in_photo INCLUDED in the
+    denominator). When ``source_gray`` is supplied it is weighted by measured text INK per
+    line, not by line count, because a giant editable headline plus a dozen tiny baked
+    package lines is highly batch-editable even though only a fraction of the *lines* are
+    editable (013: 3/15 lines = 0.20 by count, but 0.63 by ink — the headline dominates).
+    Ink weighting matches the user's own framing ("editable text ink / total source text
+    ink") and the batch use case ("we can simply modify the text"). Falls back to line-count
+    weighting when the source image is unavailable.
+
     Returns a dict of counts/ratios (or ``None`` when there is nothing to score):
-      editable_text_recall, text_lines_total, kept_in_photo_lines,
-      rasterized_text_count, rasterized_text_ratio, editable_text_correct.
+      editable_text_recall, editable_text_fraction, all_source_text_baked, text_lines_total,
+      kept_in_photo_lines, rasterized_text_count, rasterized_text_ratio, editable_text_correct.
     """
     if not source_ocr or not design:
         return None
@@ -1819,7 +1829,35 @@ def _text_editability(source_ocr, design, layers):
     raster_blob = " ".join(raster_texts)
     kept_blob = " ".join(_norm(text) for text in (design.get("kept_in_photo") or []))
 
+    # Ink weight per line for editable_text_fraction. Measured text-stroke pixels (robust to
+    # fg/bg polarity via distance from the box's local median) when the source image is
+    # available; a value of 1.0 per line (line-count) otherwise. This is prominence, not
+    # a count, so an editable headline outweighs a dozen tiny baked package lines.
+    def _line_ink(line):
+        if source_gray is None:
+            return 1.0
+        box = line.get("box") or {}
+        try:
+            x, y = int(box.get("x", 0)), int(box.get("y", 0))
+            w, h = int(box.get("w", 0)), int(box.get("h", 0))
+        except (TypeError, ValueError):
+            return 1.0
+        H, W = source_gray.shape[:2]
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(W, x + w), min(H, y + h)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        patch = source_gray[y0:y1, x0:x1]
+        if patch.size == 0:
+            return 0.0
+        import numpy as _np
+        med = float(_np.median(patch))
+        # Text ink = pixels well away from the local plate colour; area floor of 1px so a
+        # detected-but-faint line never contributes literally zero weight to the denominator.
+        return float(max(1.0, _np.count_nonzero(_np.abs(patch - med) > 40)))
+
     total = kept = correct = rasterized = 0
+    total_ink = correct_ink = 0.0
     for line in source_ocr.get("lines", []):
         if line.get("conf", 1) < 0.5:
             continue
@@ -1828,29 +1866,57 @@ def _text_editability(source_ocr, design, layers):
             continue
         line_id = str(line.get("id") or "")
         total += 1
+        ink = _line_ink(line)
+        total_ink += ink
         # By-design baked scene text is not something the pipeline promises to make editable.
         if kept_blob and norm and norm in kept_blob:
             kept += 1
             continue
         if norm and norm in editable_blob:
             correct += 1
+            correct_ink += ink
         elif line_id in raster_line_ids or (raster_blob and norm and norm in raster_blob):
             rasterized += 1
         # else: the line is simply missing — not editable and not even rasterized. It counts
         # against recall (stays in the denominator, never in the numerator).
     denom = total - kept
-    recall = 1.0 if denom <= 0 else correct / denom
+    # F-vacuous (021): when EVERY readable source line is by-design baked scene text
+    # (denom == 0), there is nothing the pipeline was SUPPOSED to make editable. The old
+    # convention returned 1.0 here — a 0/0 pass — so "we baked the whole ad into one photo"
+    # scored identically to "we perfectly decompiled everything". 021 (a UGC photo of a
+    # laptop with physical BUY-TWO / FOR-FREE sticky notes) read editable_text_recall /
+    # native_text_ratio 1.0 / CLEAN while delivering ZERO editable text nodes. The honest
+    # value is *undefined*: recall is None (not applicable), reported distinctly and gated
+    # separately (no-editable-content in the structural audit), never a success score. The
+    # precedent for closing a vacuous 0/0 pass is benchmark.py:contract_verdict (it vetoed
+    # the same vacuous native_text_ratio on bake hard-fails); this closes it at the source.
+    all_source_text_baked = denom <= 0
+    recall = None if all_source_text_baked else correct / denom
     rasterized_ratio = (rasterized / denom) if denom > 0 else 0.0
+    # editable_text_fraction answers the user's real question — "how much of THIS ad can I
+    # actually edit?" — over ALL readable source text, kept_in_photo INCLUDED in the
+    # denominator (unlike recall, which excludes by-design-baked lines). Weighted by measured
+    # text ink (see _line_ink) so an editable headline outweighs many tiny baked package
+    # lines: a fully-baked photo (021) reads 0.0 even though recall is undefined; a real
+    # decompile whose dominant copy is editable (013) reads ~0.63. It can never go vacuous:
+    # when there is genuinely no source text at all (total == 0) it is None, not a false 1.0.
+    editable_fraction = None if total_ink <= 0 else correct_ink / total_ink
+    recall_rounded = None if recall is None else round(recall, 4)
     return {
-        "editable_text_recall": round(recall, 4),
+        "editable_text_recall": recall_rounded,
         # native_text_ratio (Codia contract, docs/CODIA-PARITY-SPEC.md §2): native editable
         # TEXT lines / all readable OCR lines that are NOT by-design baked scene text. Slices,
         # wordmark/lockup rasters, foreground_raster bakes, AND simply-missing lines all count
         # against it (they stay in the denominator, never in the numerator). This is the QA
         # objective — "every string is native TEXT" — surfaced under its contract name. It is
-        # numerically the same fraction as editable_text_recall; the alias makes the contract
-        # dimension nameable by codia_parity/qa_reward/benchmark without re-deriving it.
-        "native_text_ratio": round(recall, 4),
+        # numerically the same fraction as editable_text_recall (None when 0/0-vacuous); the
+        # alias makes the contract dimension nameable by codia_parity/qa_reward/benchmark.
+        "native_text_ratio": recall_rounded,
+        # Coverage of ALL source text (kept included in denominator). See note above.
+        "editable_text_fraction": None if editable_fraction is None else round(editable_fraction, 4),
+        # True iff every readable source line was baked-by-design (denom == 0): the signal
+        # that separates "nothing to decompile" from "decompiled perfectly".
+        "all_source_text_baked": bool(all_source_text_baked and total > 0),
         "text_lines_total": total,
         "kept_in_photo_lines": kept,
         "rasterized_text_count": rasterized,
@@ -2294,9 +2360,23 @@ def _structural_audit(
         editable = sum(1 for layer in layers if layer.get("type") in ("text", "shape", "group"))
         editable_ratio = editable / len(layers)
     editable_ratio = None if editable_ratio is None else float(editable_ratio)
-    text_editability = _text_editability(source_ocr, design, layers)
+    # Source grayscale (luma) drives the ink-weighted editable_text_fraction. Derived from the
+    # RGB source the audit already holds; None-safe so a caller without an image still scores.
+    _src_gray = None
+    if source_rgb is not None:
+        try:
+            _arr = source_rgb.astype("float32") if hasattr(source_rgb, "astype") else None
+            if _arr is not None and _arr.ndim == 3:
+                _src_gray = _arr[..., 0] * 0.299 + _arr[..., 1] * 0.587 + _arr[..., 2] * 0.114
+            elif _arr is not None:
+                _src_gray = _arr
+        except Exception:
+            _src_gray = None
+    text_editability = _text_editability(source_ocr, design, layers, source_gray=_src_gray)
     editable_text_recall = None if text_editability is None else text_editability["editable_text_recall"]
     native_text_ratio_metric = None if text_editability is None else text_editability["native_text_ratio"]
+    editable_text_fraction = None if text_editability is None else text_editability.get("editable_text_fraction")
+    all_source_text_baked = bool(text_editability and text_editability.get("all_source_text_baked"))
     rasterized_text_count = None if text_editability is None else text_editability["rasterized_text_count"]
     rasterized_text_ratio = None if text_editability is None else text_editability["rasterized_text_ratio"]
     # F-honesty: editable_text_recall's own denominator is "detected source text lines"
@@ -2490,6 +2570,24 @@ def _structural_audit(
                 "— OCR missed most of the source text)"
             )
         _add_fail(fails, "missing-editable-text", "; ".join(details))
+    # F-vacuous gate (021 class): every readable source line was baked-by-design, so
+    # editable_text_recall is undefined (denom == 0). editable_text_recall / true_text_coverage
+    # can no longer read a false 1.0, so the two gates above skip this run entirely — but a run
+    # that rasterized EVERY line of copy must never come back CLEAN. If merge's evidence says
+    # this is a genuine photographic scene (021: printed sticky-note copy IN the photo), it is
+    # exempt and reported distinctly as "nothing to decompile"; if it is NOT scene-baked, it is
+    # a photocopy that silently delivered zero editable text and hard-fails. This is the
+    # explicit gate the None value is paired with — it strengthens QA, it does not relax it.
+    if all_source_text_baked and source_lines:
+        if scene_baked_all_text:
+            supplied.setdefault("scene_baked_photo", True)
+            supplied.setdefault("nothing_to_decompile", True)
+        else:
+            _add_fail(
+                fails, "no-editable-content",
+                "every readable source line was baked into a photo layer (0 editable text "
+                "nodes) with no photographic-scene verdict — the ad's copy is not editable",
+            )
     if duplicate_ownership:
         _add_fail(fails, "duplicate-ownership",
                   f"{len(duplicate_ownership)} observation ownership conflict(s): " + duplicate_ownership[0])
@@ -2614,7 +2712,17 @@ def _structural_audit(
         "leaf_accounting": leaf_accounting,
         "editable_text_recall": None if editable_text_recall is None else round(editable_text_recall, 4),
         # native_text_ratio (Codia contract): native editable TEXT / all readable lines.
+        # None (not 1.0) when every line was baked-by-design — see _text_editability F-vacuous.
         "native_text_ratio": None if native_text_ratio_metric is None else round(native_text_ratio_metric, 4),
+        # Coverage of ALL source text that is editable (kept_in_photo in the denominator).
+        # Reads ~0.0 for a fully-baked photo (021), high for a real decompile (013).
+        "editable_text_fraction": None if editable_text_fraction is None else round(editable_text_fraction, 4),
+        # True iff editable recall is undefined because 100% of the copy is baked-by-design.
+        # Paired with the scene_baked_photo / nothing_to_decompile flags below so a reader can
+        # tell "nothing to decompile" (021) apart from "decompiled perfectly".
+        "all_source_text_baked": all_source_text_baked,
+        "scene_baked_photo": bool(supplied.get("scene_baked_photo")),
+        "nothing_to_decompile": bool(supplied.get("nothing_to_decompile")),
         "true_text_coverage": true_text_coverage,
         "rasterized_text_count": rasterized_text_count,
         "rasterized_text_ratio": rasterized_text_ratio,
@@ -3067,6 +3175,16 @@ def compare(
         # pixel number in this file — see _font_consistency_audit.
         "deliverable_font_consistency": font_consistency,
         "editable_text_recall": structure["editable_text_recall"],
+        # Coverage of ALL source text that ships editable (kept_in_photo in the denominator).
+        # Top-level mirror so a bare ``jq .editable_text_fraction qa.json`` — the user's real
+        # "how much of this ad can I edit?" question — reads 0.0 on a fully-baked photo (021)
+        # instead of the vacuous 1.0 editable_text_recall used to show.
+        "editable_text_fraction": structure.get("editable_text_fraction"),
+        # "Nothing to decompile" (021) vs "decompiled perfectly": both used to read as CLEAN
+        # with recall 1.0; these flags make the distinction first-class and machine-readable.
+        "all_source_text_baked": structure.get("all_source_text_baked"),
+        "nothing_to_decompile": structure.get("nothing_to_decompile"),
+        "scene_baked_photo": structure.get("scene_baked_photo"),
         # ── Codia construction contract (the QA objective — see _contract_summary) ────
         # contract_score is the composite of record (native text first, then construction
         # quality, then a small SSIM floor term). contract.pass is the per-run verdict.
