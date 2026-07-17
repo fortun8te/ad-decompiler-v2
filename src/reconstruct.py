@@ -857,6 +857,105 @@ def _ensure_text_removal_coverage(candidate, mask, rgb, cfg):
                 "px": cov_dilate, "display": bool(display), "edge": bool(touches_edge),
             }
             merged = dilated
+    merged = _claim_clipped_glyph_edges(candidate, merged, rgb, cfg)
+    return merged
+
+
+def _claim_clipped_glyph_edges(candidate, mask, rgb, cfg):
+    """Claim glyph ink that CONTINUES just outside the OCR box.
+
+    ``inpaint.text_ink_mask`` constrains ink to the authored OCR box, and OCR boxes
+    routinely clip a glyph's last few pixels: 107's '58%' box ends at x=737 while the '%'
+    bowl runs to x=751, and 'Of Athletes Are Chronically' ends at x=939 with the 'y' tail
+    at x=943.  Those slivers are never claimed, so they stay baked in the plate and render
+    as stray dots beside the re-rendered native text.  The defect reads as a speck; the
+    cause is a mask that stops at an arbitrary rectangle instead of at the end of the glyph.
+
+    Grow into source ink that is 8-CONNECTED to already-claimed ink and lies within
+    ``pad`` px of the box.  Connectivity is the safety property: a neighbouring icon or
+    word that merely sits near the box is untouched unless its pixels physically continue
+    the glyph already being removed.  A bounded extra-area guard fails closed if the local
+    contrast estimate ever selects a plate region rather than a glyph edge.  Config:
+    ``reconstruct.text_clipped_edge_pad`` (0 disables).
+    """
+    cv2, np, _ = _deps()
+    rcfg = (cfg or {}).get("reconstruct") or {}
+    base_pad = int(rcfg.get("text_clipped_edge_pad", 10))
+    base = np.asarray(mask, dtype=np.uint8)
+    if base_pad <= 0 or not base.any():
+        return mask
+    box = candidate.get("visible_box") or candidate.get("ink_box") or candidate.get("box", {})
+    height, width = rgb.shape[:2]
+    bx = float(box.get("x", 0) or 0)
+    by = float(box.get("y", 0) or 0)
+    bw = float(box.get("w", 0) or 0)
+    bh = float(box.get("h", 0) or 0)
+    if bw <= 0 or bh <= 0:
+        return mask
+    # How far OCR clips a glyph scales with the glyph: 107's 139px-tall '58%' loses 14px
+    # of the '%' bowl, which a fixed small pad cannot reach. Keep the pad proportional so
+    # display copy is covered without over-reaching around body copy.
+    pad = max(base_pad, min(int(rcfg.get("text_clipped_edge_max_pad", 24)),
+                            int(round(float(rcfg.get("text_clipped_edge_h_frac", 0.12)) * bh))))
+    x0 = max(0, int(round(bx)) - pad)
+    y0 = max(0, int(round(by)) - pad)
+    x1 = min(width, int(round(bx + bw)) + pad)
+    y1 = min(height, int(round(by + bh)) + pad)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return mask
+    try:
+        ink = np.asarray(inpaint.text_ink_mask(
+            rgb, {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0},
+            allow_box_fallback=False,
+        ), dtype=np.uint8)
+    except Exception:
+        return mask
+    if not ink.any():
+        return mask
+    seed = base > 0
+    # Connectivity alone is NOT enough: a strike-through scribble physically touches the
+    # glyphs it crosses (091), and swallowing it into this text's removal would erase a
+    # decoration that is its own element. A clipped edge is literally the same glyph, so
+    # also require the SAME ink colour — that keeps the '%' bowl and rejects the red swipe.
+    claimed_ink = seed & (ink > 0)
+    if int(np.count_nonzero(claimed_ink)) < 8:
+        return mask
+    # Prefer the node's DECLARED colour. Sampling the mask is unreliable exactly where it
+    # matters: a strike crossing the glyphs contaminates the in-box sample with its own
+    # colour, and a median over that mix would then admit the scribble it must reject.
+    style_color = ((candidate.get("style") or {}).get("color"))
+    if style_color:
+        ink_color = np.asarray(_hex_to_rgb(style_color), dtype=np.float32)
+    else:
+        ink_color = np.median(rgb[claimed_ink].astype(np.float32), axis=0)
+    colour_tol = float(rcfg.get("text_clipped_edge_colour_tol", 40.0))
+    colour_ok = np.abs(rgb.astype(np.float32) - ink_color).mean(axis=2) <= colour_tol
+    combined = (((ink > 0) & colour_ok) | seed).astype(np.uint8)
+    count, labels = cv2.connectedComponents(combined, connectivity=8)
+    if count <= 1:
+        return mask
+    keep = np.unique(labels[seed])
+    keep = keep[keep > 0]
+    if keep.size == 0:
+        return mask
+    grown = np.isin(labels, keep) & (ink > 0) & colour_ok & (~seed)
+    extra = int(np.count_nonzero(grown))
+    if extra <= 0:
+        return mask
+    # Fail closed on a runaway claim: a real clipped edge is a sliver, not a region.
+    max_extra = max(96, int(float(rcfg.get("text_clipped_edge_max_frac", 0.35))
+                            * int(np.count_nonzero(seed))))
+    if extra > max_extra:
+        return mask
+    # The Otsu ink estimate stops at the glyph core; its antialias fringe is what would
+    # still read as a grey speck. Grow the claimed sliver (only) by a hair to take it.
+    fringe = int(rcfg.get("text_clipped_edge_fringe", 2))
+    claimed = (grown * 255).astype(np.uint8)
+    if fringe > 0:
+        claimed = cv2.dilate(claimed, np.ones((2 * fringe + 1, 2 * fringe + 1), np.uint8))
+    merged = np.maximum(base, claimed)
+    meta = candidate.setdefault("meta", {})
+    meta["removal_clipped_edges_claimed"] = {"px": extra, "pad": pad}
     return merged
 
 
@@ -942,6 +1041,17 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
     # Foreign decoration ink (strike scribble) is a strong mark against the plate colour.
     deco_mark_tol = float(audit_cfg.get("decoration_mark_tolerance", 48.0))
     deco_min_px = int(audit_cfg.get("decoration_min_px", 32))
+    # Third ghost class: a *partial* inpaint smear (see _smear_residue).
+    smear_enabled = bool(audit_cfg.get("smear_enabled", True))
+    smear_max_plate_hf = float(audit_cfg.get("smear_max_plate_hf", 3.0))
+    smear_min_contrast = float(audit_cfg.get("smear_min_contrast", 25.0))
+    smear_retain_frac = float(audit_cfg.get("smear_retain_frac", 0.30))
+    smear_min_ratio = float(audit_cfg.get("smear_min_ratio", 0.18))
+    smear_ring = max(3, int(audit_cfg.get("smear_ring", 13)) | 1)
+    smear_window = max(5, int(audit_cfg.get("smear_window", 21)) | 1)
+    smear_gradient_fill = bool(audit_cfg.get("smear_gradient_fill", True))
+    smear_fill_window = max(5, int(audit_cfg.get("smear_fill_window", 41)) | 1)
+    smear_fill_min_samples = float(audit_cfg.get("smear_fill_min_samples", 8))
 
     def _residue(plate_arr, ink, ink_color):
         nonlocal plate_f32
@@ -953,6 +1063,81 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
             d_ink = np.abs(plate_f32 - ink_color).mean(axis=2)
             res = res | (ink & (d_ink <= ink_tolerance))
         return res
+
+    def _luma(arr):
+        a = np.asarray(arr, dtype=np.float32)
+        return a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+
+    def _smear_residue(plate_arr, ink):
+        """Detect a *partial* inpaint smear: the ghost class (a)/(b) structurally cannot see.
+
+        (a) and (b) are ABSOLUTE colour tests — "plate still equals source" and "plate
+        still equals saturated ink".  A generative fill over a translucent/glass card
+        leaves a blurred, dimmed glyph that matches NEITHER yet is plainly readable to
+        the user (025 'Cuts you off' measured |plate-source| ~93 and |plate-ink| ~111
+        against bars of 12 / 40, so it scored 0.09 residue and shipped doubled under the
+        native TEXT node).  Detect it structurally instead: how much of each glyph
+        pixel's ORIGINAL local contrast still survives on the plate.
+
+        The local background is estimated from NON-ink pixels only, so a backdrop shared
+        by source and plate cancels and only glyph-shaped energy is measured.  Gated on
+        the plate around the glyphs being locally smooth: on fine texture (025's hair
+        headline, whose plate is genuinely clean) the local-background estimate is noise
+        and the solid-fill remedy would be wrong anyway, so a photographic backdrop is
+        left to the absolute tests.  Returns ``(mask, ratio)`` or ``(None, 0.0)``.
+        """
+        ring_k = np.ones((smear_ring, smear_ring), np.uint8)
+        ring = (cv2.dilate(ink.astype(np.uint8), ring_k) > 0) & (~ink)
+        if int(np.count_nonzero(ring)) < 20:
+            return None, 0.0
+        plate_l = _luma(plate_arr)
+        hf = np.abs(plate_l - cv2.GaussianBlur(plate_l, (5, 5), 0))
+        if float(np.median(hf[ring])) > smear_max_plate_hf:
+            return None, 0.0  # photographic backdrop, not a smooth plate
+        keep = (~ink).astype(np.float32)
+        win = (smear_window, smear_window)
+        den = cv2.boxFilter(keep, -1, win, normalize=False)
+        safe_den = np.maximum(den, 1e-6)
+
+        def _bg(channel):
+            return cv2.boxFilter(channel * keep, -1, win, normalize=False) / safe_den
+
+        src_l = _luma(source)
+        c_src = src_l - _bg(src_l)
+        c_plate = plate_l - _bg(plate_l)
+        strong = ink & (den > 4) & (np.abs(c_src) > smear_min_contrast)
+        strong_px = int(np.count_nonzero(strong))
+        if strong_px < max(8, min_px):
+            return None, 0.0
+        retained = np.zeros_like(c_src)
+        np.divide(c_plate, c_src, out=retained, where=np.abs(c_src) > 1e-6)
+        hit = strong & (retained > smear_retain_frac)
+        return hit, int(np.count_nonzero(hit)) / max(1, strong_px)
+
+    def _gradient_plate_fill(plate_u8_arr, fill_area):
+        """Per-pixel plate estimate for a smear fill, sampled from OUTSIDE the fill.
+
+        The scalar ring median is right for flat UI chrome, but 025's cards are a soft
+        gradient behind a vignette: one median colour over a whole row paints a visible
+        tinted patch (it reads as a highlighter bar behind the copy). Estimate the plate
+        per pixel from surrounding non-fill pixels so the fill follows the gradient.
+
+        This is only offered to the smear class, whose detector already REQUIRES a locally
+        smooth plate — the precondition that makes the detection valid is exactly the one
+        that makes this interpolation valid. Returns None when the neighbourhood is too
+        crowded to sample honestly, so the caller falls back to the scalar median.
+        """
+        keep = (~fill_area).astype(np.float32)
+        win = (smear_fill_window, smear_fill_window)
+        den = cv2.boxFilter(keep, -1, win, normalize=False)
+        if float(np.mean(den[fill_area] > smear_fill_min_samples)) < 0.98:
+            return None  # not enough clean plate around the glyphs to interpolate
+        safe = np.maximum(den, 1e-6)
+        out = np.empty(plate_u8_arr.shape, dtype=np.float32)
+        src = plate_u8_arr.astype(np.float32)
+        for ch in range(3):
+            out[..., ch] = cv2.boxFilter(src[..., ch] * keep, -1, win, normalize=False) / safe
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     def _ink_safe_exterior(samples, ink_color):
         """Keep ring samples that are clearly plate-coloured, not leftover glyph ink."""
@@ -1044,11 +1229,26 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
                     continue
             # Trial paint + residue check before committing union/ledger.
             before = plate_u8[fill_area].copy()
-            plate_u8[fill_area] = fill
+            gradient = (_gradient_plate_fill(plate_u8, fill_area)
+                        if (smear_gradient_fill and t.get("kind") == "smear") else None)
+            if gradient is not None:
+                plate_u8[fill_area] = gradient[fill_area]
+                used_gradient = True
+            else:
+                plate_u8[fill_area] = fill
+                used_gradient = False
             plate_f32 = None  # trial pixels must be scored, not a stale cache
-            remaining = int(_residue(plate_u8.astype(np.int16), ink, ink_color).sum())
+            trial = plate_u8.astype(np.int16)
+            remaining = int(_residue(trial, ink, ink_color).sum())
             rem_ratio = remaining / max(1, t["total"])
-            if remaining >= resolved_abs_px and rem_ratio >= resolved_ratio:
+            reverted = remaining >= resolved_abs_px and rem_ratio >= resolved_ratio
+            if not reverted and t.get("kind") == "smear":
+                # A smear was never visible to the absolute tests, so their "resolved"
+                # verdict cannot clear it either — re-run the detector that flagged it.
+                _smear_after, smear_after_ratio = _smear_residue(trial, ink)
+                reverted = (_smear_after is not None
+                            and smear_after_ratio >= smear_min_ratio)
+            if reverted:
                 plate_u8[fill_area] = before
                 plate_f32 = None
                 skipped_ids.append(str(t["item"].get("id")))
@@ -1061,7 +1261,8 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
             np.maximum(expand_total, fill_u8, out=expand_total)
             t["resolved"] = True
             t["flag"]["resolved"] = True
-            t["flag"]["resolved_by"] = "solid-plate-fill"
+            t["flag"]["resolved_by"] = ("gradient-plate-fill" if used_gradient
+                                        else "solid-plate-fill")
             t["flag"]["hard_fail"] = False
             t["flag"]["residual_px_after"] = remaining
             filled_ids.append(str(t["item"].get("id")))
@@ -1118,16 +1319,33 @@ def _post_inpaint_text_residual(rgb, background_path, records, ink_masks, union,
         residue = residue & source_inkish
         count = int(residue.sum())
         ratio = count / total
-        if count < min_px or ratio < min_ratio:
+        kind = None
+        smear_ratio = None
+        if count >= min_px and ratio >= min_ratio:
+            kind = "ink-match"
+        elif smear_enabled:
+            # The absolute tests cleared it; a partial smear still reads as doubled copy.
+            smear, s_ratio = _smear_residue(plate, ink)
+            if (smear is not None and s_ratio >= smear_min_ratio
+                    and int(smear.sum()) >= min_px):
+                residue = residue | smear
+                count = int(residue.sum())
+                ratio = count / total
+                kind = "smear"
+                smear_ratio = round(float(s_ratio), 4)
+        if kind is None:
             continue
+        flag = {
+            "id": item.get("id"), "box": item.get("box"),
+            "residual_px": count, "residual_ratio": round(ratio, 4),
+            "kind": kind, "resolved": False,
+        }
+        if smear_ratio is not None:
+            flag["smear_ratio"] = smear_ratio
         tracked.append({
             "item": item, "ink": ink, "ink_color": ink_color, "total": total,
-            "residue": residue,
-            "flag": {
-                "id": item.get("id"), "box": item.get("box"),
-                "residual_px": count, "residual_ratio": round(ratio, 4),
-                "resolved": False,
-            },
+            "residue": residue, "kind": kind,
+            "flag": flag,
             "resolved": False,
         })
 
@@ -3713,12 +3931,68 @@ def _collect_live_overlays(nodes, exclude_ids, offset=(0.0, 0.0), out=None):
     return out
 
 
-def _safe_hoist_z(node, abs_box, overlays, default=60.0):
+def _root_ancestor_z(root_nodes, layer_id):
+    """z of the TOP-LEVEL node whose subtree holds ``layer_id``.
+
+    ``None`` when the layer already sits at root (its z is root-scoped already) or when
+    no ancestor carries a usable z — both mean "nothing to clear".
+    """
+
+    def _holds(nodes):
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            if str(node.get("id")) == str(layer_id):
+                return True
+            if _holds(node.get("children") or []):
+                return True
+        return False
+
+    for node in root_nodes or []:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("id")) == str(layer_id):
+            return None
+        if _holds(node.get("children") or []):
+            z_raw = node.get("z_index")
+            if z_raw is None:
+                z_raw = node.get("z")
+            try:
+                return float(z_raw) if z_raw is not None else None
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _hoist_floor(targets, layer_id):
+    """Highest root z the slice must clear across every tree it is hoisted in.
+
+    One ``hoist_z`` is written to layout.json AND design.json, so it has to clear the
+    layer's group in whichever tree nests it deepest; a layer already at root in every
+    tree yields ``None`` (nothing to clear, historical behaviour preserved).
+    """
+    floors = [
+        z for z in (_root_ancestor_z(root, layer_id) for _target, root in targets or [])
+        if z is not None
+    ]
+    return max(floors) if floors else None
+
+
+def _safe_hoist_z(node, abs_box, overlays, default=60.0, floor=None):
     """Root z for a hoisted slice that never rises above an intersecting live overlay.
 
     Preserves a legitimately lower original z; otherwise sits just under the lowest
     live overlay the slice intersects. Falls back to ``default`` foreground z only when
-    nothing live overlaps (the historical behaviour, safe when there is nothing to bury)."""
+    nothing live overlaps (the historical behaviour, safe when there is nothing to bury).
+
+    ``floor`` is the root z of the group the slice is being hoisted OUT of.  z ranks a
+    node against its SIBLINGS, so a child's z is only meaningful inside its own group:
+    the hoist keeps the number but changes the scope.  101's TPU tube sat at in-group
+    z 2 inside the white panel (root z 50) and rendered fine; hoisted to root it kept
+    z 2, the panel's own #ffffff fill painted over it, and the entire product plus its
+    'BUY 3, GET 1 FREE' badge vanished into a white void.  Re-basing above ``floor``
+    keeps the hoist rendering what it rendered before it moved.
+    """
     z_raw = node.get("z_index")
     if z_raw is None:
         z_raw = node.get("z")
@@ -3726,6 +4000,8 @@ def _safe_hoist_z(node, abs_box, overlays, default=60.0):
         base = float(z_raw) if z_raw not in (None, "", "0", "0.0") else 0.0
     except (TypeError, ValueError):
         base = 0.0
+    if floor is not None:
+        base = max(base, float(floor) + 1.0)
     ceil = None
     for obox, oz, _oid in overlays:
         if _boxes_intersect(obox, abs_box):
@@ -3733,7 +4009,12 @@ def _safe_hoist_z(node, abs_box, overlays, default=60.0):
     if ceil is not None:
         if base and base < ceil:
             return base
-        return ceil - 1.0
+        # Ducking under the overlay must never sink the slice back beneath the group
+        # fill we just cleared: invisible beats mildly mis-ordered.
+        lowered = ceil - 1.0
+        if floor is None or lowered > float(floor):
+            return lowered
+        return base
     return base if base > 0 else default
 
 
@@ -3973,7 +4254,8 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
                     src_rel = _write_asset(
                         Image.fromarray(tile), assets_dir, f"{rid}_boxslice")
                     box_slice = {"x": bx0, "y": by0, "w": bx1 - bx0, "h": by1 - by0}
-                    hoist_z = _safe_hoist_z(targets[0][0][2], box_slice, live_overlays)
+                    hoist_z = _safe_hoist_z(targets[0][0][2], box_slice, live_overlays,
+                                            floor=_hoist_floor(targets, rid))
                     for (container, index, node, _offset), root in targets:
                         _apply_slice_mutation(node, box_slice, src_rel, scores, reasons)
                         node["meta"]["fallback_slice_kind"] = "box-no-ledger-alpha"
@@ -4045,7 +4327,9 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
         # every parent-relative child (013: c_E007__hostbg_P12 rendered as a displaced
         # plain-green square over the bag's printed bear logo). Hoist each slice to its
         # tree ROOT with its absolute box: root placement cannot drift.
-        hoist_z = _safe_hoist_z(targets[0][0][2], abs_box, live_overlays) if targets else 60.0
+        hoist_z = (_safe_hoist_z(targets[0][0][2], abs_box, live_overlays,
+                                 floor=_hoist_floor(targets, rid))
+                   if targets else 60.0)
         for (container, index, node, _offset), root in targets:
             _apply_slice_mutation(node, abs_box, src_rel, scores, reasons)
             if root is not None and container is not root:
