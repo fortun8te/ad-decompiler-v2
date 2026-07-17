@@ -3070,6 +3070,100 @@ def _write_asset(image, assets_dir, candidate_id):
     return f"assets/{name}"
 
 
+def _badge_chip_clean(rgb, candidates: list, cfg: dict):
+    """Rebuild every promoted offer badge's chrome with its OWN ink lifted off, chip-locally.
+
+    Returns ``(chip_plate, chip_mask, plate_chip_regions, records)``: a canvas-sized copy of
+    the source whose badge chips are clean, the mask of exactly the pixels rebuilt, the
+    footprints of cleaned PLATE-HOSTED chips only (the caller withholds those from the
+    generative union; an element-hosted chip's plate hole is legitimate and must inpaint),
+    and a per-chip ledger.
+
+    THE ARCHITECTURE THIS FIXES (both halves measured on 013, not assumed):
+
+    1. FUSION. The canvas removal union merges every hole before a backend is chosen, so the
+       61%-OFF disc's ink and the pouch cutout -- which touch at x=348-385 -- become ONE
+       component, box=(0,676,1080,769), area=684,685px, spanning the full canvas width.
+       ``_flat_hole_fill`` measures THAT component's ring, finds it 18% uniform against the
+       85% it needs, correctly refuses, and Flux smears a slab across the disc.
+    2. ANTI-ALIASING. Cropping to the chip is necessary but NOT sufficient. Even unfused and
+       chip-local, ``text_ink_mask`` is glyph-tight, so 2-3px of cream-into-green halo sits
+       just OUTSIDE the hole and poisons the ring the fill measures: 0/15 glyph components
+       route flat at zero dilation, 5/15 at the pipeline's default 2px. The rim has to be
+       swallowed into the hole (``inpaint.chip_local_ink_removal``) before any of this works.
+
+    With both: 4 of 6 components route to a flat #057C3E fill and the rest to chip-local
+    Big-LaMa -- a solid disc instead of a slab, and never a generative pass over a canvas band.
+
+    The result feeds BOTH consumers, which is the point of doing it here, once, on the source:
+      * ELEMENT-HOSTED chips (101/131) -- ``_source_rgba`` slices cutouts straight from these
+        pixels, so a badge cutout drawn over the plate carries clean chrome. Slicing the raw
+        original instead is what put the ink back on top of its own removal (double render).
+      * PLATE-HOSTED chips (013) -- SAM never emitted an element for the disc, so the disc IS
+        the plate; the caller hands these pixels to the inpaint as its source and holds the
+        rebuilt mask out of the generative union.
+    """
+    _, np, _ = _deps()
+    chips: dict = {}
+    for c in candidates:
+        meta = c.get("meta") or {}
+        chip_id = meta.get("offer_badge_id")
+        if not (chip_id and meta.get("badge_offer_lockup") and meta.get("badge_chip_box")):
+            continue
+        entry = chips.setdefault(chip_id, {
+            "chip_box": meta.get("badge_chip_box"),
+            "host_id": meta.get("badge_chip_host"),
+            "ids": [], "boxes": [],
+        })
+        entry["ids"].append(c.get("id"))
+        entry["boxes"].append(c.get("box") or {})
+
+    plate = np.asarray(rgb, dtype=np.uint8).copy()
+    chip_mask = np.zeros(plate.shape[:2], dtype=np.uint8)
+    chip_regions = np.zeros(plate.shape[:2], dtype=np.uint8)
+    records: list = []
+    for chip_id, entry in chips.items():
+        ink = np.zeros(plate.shape[:2], dtype=np.uint8)
+        for box in entry["boxes"]:
+            ink = np.maximum(ink, np.asarray(
+                inpaint.text_ink_mask(rgb, box, allow_box_fallback=False), dtype=np.uint8))
+        cleaned, filled, info = inpaint.chip_local_ink_removal(
+            rgb, entry["chip_box"], ink, cfg,
+        )
+        record = {"chip_id": chip_id, "ids": list(entry["ids"]),
+                  "host_id": entry.get("host_id"), **{
+                      k: v for k, v in (info or {}).items() if k != "chip_backend_route"}}
+        if cleaned is None:
+            # Honest fallback: the caller leaves this chip's text baked and says why.
+            record["cleaned"] = False
+            records.append(record)
+            continue
+        cx, cy, cw, ch = info["chip_box"]
+        plate[cy:cy + ch, cx:cx + cw] = cleaned
+        chip_mask[cy:cy + ch, cx:cx + cw] = np.maximum(
+            chip_mask[cy:cy + ch, cx:cx + cw], (filled > 0).astype(np.uint8) * 255)
+        if not entry.get("host_id"):
+            chip_regions[cy:cy + ch, cx:cx + cw] = 255
+        record["cleaned"] = True
+        # Publish the proof: this line's ink is gone from every surface downstream reads, so
+        # the single-ownership audit must not "clean" it a second time. That audit erases
+        # anything inside the text's BOX that differs from the box's ring median, which is
+        # only safe when the box holds nothing but plate and the text's own ink. 013's
+        # '+ FREE GIFTS' box runs to x=385 and the pouch starts at x=348, so with the ink
+        # already gone the only thing left for it to find IS the pouch — which it painted
+        # over with disc green, a hard rectangle across the bag (badge ssim stuck at 0.55).
+        _members = set(entry["ids"])
+        for c in candidates:
+            if c.get("id") in _members:
+                c.setdefault("meta", {})["badge_chip_cleaned"] = True
+            elif entry.get("host_id") and c.get("id") == entry["host_id"]:
+                # The chrome host now carries NO ink, so its raster may own its whole matte
+                # again (see the ownership rescue in reconstruct()).
+                c.setdefault("meta", {})["badge_chip_host_cleaned"] = True
+        records.append(record)
+    return plate, chip_mask, chip_regions, records
+
+
 def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                 cfg: Optional[dict] = None) -> dict:
     cv2, np, Image = _deps()
@@ -3109,6 +3203,15 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                 # pixels stay in the plate produces double text in the render.
                 mask = _ensure_text_removal_coverage(candidate, mask, rgb, cfg)
             masks[candidate.get("id")] = mask
+
+    # Chip-local badge ink removal, BEFORE anything reads source pixels. ``chip_rgb`` is the
+    # source with every promoted badge's chrome rebuilt clean; it is what the raster cutouts
+    # and the plate are both built from. ``rgb`` stays the pristine original and remains the
+    # reference for the plate-integrity gate, so the two never get confused.
+    chip_rgb, chip_clean_mask, chip_regions, chip_records = _badge_chip_clean(rgb, canonical, cfg)
+    if chip_records:
+        print(f"[chip] badge chips: {len(chip_records)} "
+              f"({sum(1 for r in chip_records if r.get('cleaned'))} cleaned)")
 
     # Front-to-back ownership is diagnostic and makes overlapping raster assets exclusive.
     # Text/icons are frontmost; smaller nested layers win over broad photo regions.
@@ -3361,6 +3464,22 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             c["meta"]["ownership_rescued"] = "cv-list-glyph"
             c["meta"]["ownership_fraction_before_rescue"] = round(ownership_fraction, 4)
             c["meta"]["ownership_cutout"] = True
+        # Same rescue, for a badge chip whose ink was lifted chip-locally. Its editable text
+        # sits ON this chrome and is frontmost, so ownership hands the text the glyph pixels
+        # and the chrome keeps a matte full of holes — 101's 87x87 teal disc came out of the
+        # ownership pass with 33 opaque pixels of 7569, blank enough that materialization
+        # swapped it for a slice of the plate, which by then had the disc punched out of it.
+        # A white hole with the offer missing.
+        #
+        # The premise of that punch — "these pixels are the text, and the text re-renders
+        # natively, so the raster must not also carry them" — is FALSE here, and provably so:
+        # _badge_chip_clean already removed this chip's ink and stamps the host only when it
+        # succeeded. What sits under the glyphs now is the disc's own chrome. Handing it back
+        # adds no ink and duplicates nothing; it just stops the chrome being deleted.
+        elif not is_text_fallback and c["meta"].get("badge_chip_host_cleaned"):
+            owned = (mask > 0).astype(np.uint8) * 255
+            c["meta"]["ownership_rescued"] = "chip-cleaned-badge-chrome"
+            c["meta"]["ownership_fraction_before_rescue"] = round(ownership_fraction, 4)
         # Do retain broad photo frames for the layout regression contract, but
         # never export an empty semantic cutout (product/person/icon) merely
         # because a frontmost owner already claims all of its pixels.
@@ -3370,7 +3489,13 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
             c["meta"]["suppression_reason"] = "fully-contained-in-foreground-owner"
             updated.append(c)
             continue
-        image = _source_rgba(c, rgb, mask, run_dir)
+        # Cutouts are sliced from the CHIP-CLEANED source, not the raw original. This is the
+        # whole fix for element-hosted badges (101's c_E005, 131's c_E003): _source_rgba
+        # slices a badge cutout straight out of the source and draws it OVER the plate, so
+        # slicing the original hands back the very ink the plate just removed -- the double
+        # render. Outside badge chips chip_rgb is byte-identical to rgb, and a neighbour that
+        # merely overlaps a chip (013's pouch) only ever takes pixels its own matte covers.
+        image = _source_rgba(c, chip_rgb, mask, run_dir)
         image = _apply_owned_alpha(image, owned, c.get("box", {}))
         # Text-bearing badge/button shells: ownership punches glyph holes into the
         # chrome matte. Fill those enclosed holes with the shell's plate colour so
@@ -3677,9 +3802,65 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
     large_removal = [item for item in removal if not _is_text_removal(item)]
     background_path = os.path.join(run_dir, "background_clean.png")
     regional_enabled = bool(((cfg.get("inpaint") or {}).get("regional") or {}).get("enabled", False))
+
+    # A badge chip's chrome has already been rebuilt from its own surface, so the plate is
+    # inpainted FROM those pixels and the rebuilt mask is withheld from the generative union.
+    # Both halves are load-bearing:
+    #   * source  — the chip pixels the backend never touches must already be clean, since
+    #     for a plate-hosted badge (013) the plate IS the disc.
+    #   * mask    — leaving the badge ink in the union is what fuses it to the pouch cutout
+    #     into one canvas-wide component and re-summons the slab. Withheld, the pouch's hole
+    #     is judged alone, on its own merits.
+    # ``union`` itself is deliberately NOT narrowed: it stays the honest public ledger of
+    # every pixel this run removed (removal_mask.png, ownership, the plate-integrity gate).
+    # The gate asks that the plate differ from source only INSIDE union, and the chip's
+    # rebuilt pixels are a subset of the ink it replaced, so it holds.
+    plate_source_path = image_path
+    gen_union = union
+    chip_withheld = np.zeros((h, w), dtype=np.uint8)
+    if np.any(chip_regions):
+        # Withhold the badge lines' OWN removal, across the whole chip -- not merely the
+        # pixels the fill rewrote. The removal hole for a badge line is its OCR QUAD, not its
+        # glyphs (measured on 013: 35,888 quad px inside the chip vs 24,247 of dilated ink),
+        # so withholding only the ink would leave the quad's chrome-coloured remainder in the
+        # union for Flux to smear -- the slab again, just thinner. Inside a chip we take the
+        # whole quad: its ink is rebuilt and its untouched remainder IS the disc's own chrome,
+        # already correct in chip_rgb and needing no backend at all.
+        #
+        # Scoped by per-pixel OWNERSHIP and by the chip footprint, so this can only ever
+        # withhold the badge's own hole. 013's pouch cutout overlaps the disc and keeps its
+        # removal in full -- the point is to stop the two FUSING, not to skip the pouch.
+        # removal_owner_index maps NUMBER -> id (and its keys are strings), so it has to be
+        # inverted to look a candidate up. Reading it the intuitive way round silently
+        # yields no matches, the quad remainder stays in the union, and the backend repaints
+        # a rim around every glyph — a ghost outline of the text it was asked to remove.
+        _number_by_id = {v: int(k) for k, v in (removal_owner_index or {}).items()}
+        # ONLY plate-hosted chips (host_id None). For those the disc IS the plate — 013's
+        # seal was never an element — so the plate must carry the cleaned chrome. An
+        # ELEMENT-hosted chip is the opposite: its disc ships as its own raster and its
+        # footprint is removed from the plate on purpose, the raster covering the hole.
+        # Withholding there strands an island of un-inpainted chip pixels in the middle of
+        # that hole (101: a teal rounded-square marooned in the white gap where the disc was).
+        chip_ids = {
+            i for r in chip_records
+            if r.get("cleaned") and not r.get("host_id") for i in (r.get("ids") or [])
+        }
+        chip_numbers = [n for n in (_number_by_id.get(i) for i in chip_ids) if n]
+        if chip_numbers:
+            chip_withheld = (
+                np.isin(removal_ownership, chip_numbers) & (chip_regions > 0)
+            ).astype(np.uint8) * 255
+        chip_withheld = np.maximum(
+            chip_withheld, cv2.bitwise_and(chip_clean_mask, chip_regions))
+        plate_source_path = os.path.join(run_dir, "chip_source.png")
+        Image.fromarray(chip_rgb).save(plate_source_path)
+        gen_union = cv2.bitwise_and(union, cv2.bitwise_not(chip_withheld))
+        print(f"[chip] withheld {int((chip_withheld>0).sum())}px from the generative union "
+              f"({int((union>0).sum())} -> {int((gen_union>0).sum())})")
+
     if regional_enabled:
         inpaint_result = inpaint.inpaint_regional(
-            image_path, removal, union, background_path, cfg, run_dir,
+            plate_source_path, removal, gen_union, background_path, cfg, run_dir,
         )
     else:
         text_union = inpaint.build_union_mask(
@@ -3690,12 +3871,19 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
         )
         if np.any(text_union) and np.any(large_union):
             large_union = cv2.bitwise_and(large_union, cv2.bitwise_not(text_union))
+        if np.any(chip_withheld):
+            keep = cv2.bitwise_not(chip_withheld)
+            text_union = cv2.bitwise_and(text_union, keep)
+            large_union = cv2.bitwise_and(large_union, keep)
         if text_removal and large_removal:
             inpaint_result = inpaint.inpaint_role_aware(
-                image_path, {"text": text_union, "large": large_union}, background_path, cfg,
+                plate_source_path, {"text": text_union, "large": large_union}, background_path, cfg,
             )
         else:
-            inpaint_result = inpaint.inpaint_once(image_path, union, background_path, cfg)
+            inpaint_result = inpaint.inpaint_once(
+                plate_source_path, gen_union, background_path, cfg)
+    if np.any(chip_clean_mask):
+        inpaint_result = dict(inpaint_result or {}, chip_local_badges=chip_records)
 
     # Post-inpaint ghost-text audit: residue under removed text expands the masks
     # in-place (union + ledger) and triggers one targeted text-backend repair pass,
@@ -4192,6 +4380,25 @@ def apply_raster_slice_fallback(run_dir: str, source_path: str, cfg: Optional[di
             report["skipped"].append({
                 "id": rid,
                 "reason": "codia-never-slice-readable-text",
+                "failing_reasons": list(reasons),
+            })
+            continue
+        if (node.get("meta") or {}).get("badge_chip_host_cleaned"):
+            # A badge chip whose offer is now NATIVE TEXT scores low on region SSIM by
+            # construction — the region deliberately no longer matches the source, because
+            # the baked offer was replaced by a re-rendered one (101: region_ssim 0.470
+            # against a 0.58 floor). That is the feature, not a defect, and the same logic
+            # the text exemption above already applies.
+            #
+            # Slicing it is strictly destructive here. The slice's alpha is only the pixels
+            # the ledger inpainted FOR THIS LAYER, which excludes the quad its own text
+            # owns, so it re-pastes the chrome ring and leaves a transparent rectangle where
+            # the offer used to be — 101 shipped a teal disc with a white hole punched in
+            # it, 2230 alpha px of 5980. And with the text quad included it would simply
+            # paste the original ink back under the native copy: the double render.
+            report["skipped"].append({
+                "id": rid,
+                "reason": "chip-cleaned-badge-chrome-native-offer",
                 "failing_reasons": list(reasons),
             })
             continue

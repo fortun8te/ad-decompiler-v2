@@ -1037,7 +1037,22 @@ def _promote_weight_candidate(style: dict) -> None:
     if abs(_cand_weight(top) - weight) > _WEIGHT_CANDIDATE_MATCH_TOL:
         top["weight"] = weight
         top["style"] = style_label
-        top.pop("path", None)
+        # Dropping the path here leaves a PATHLESS candidate, and `_text_font` draws a
+        # pathless node with its hardcoded Arial branch — so the node declares Inter and
+        # the preview draws Arial Bold (135's `c_B3__w1`: declared Inter/700, drew
+        # arialbd.ttf). Dropping was only ever right because the candidate's FILE is the
+        # wrong weight; the declared FAMILY is still what Figma ships, and it usually
+        # has a real file at this weight (a variable face dials straight to it). Resolve
+        # it and drive the axis; only when the family is not installed do we fall back to
+        # dropping the path rather than lying about the file.
+        resolved = _resolve_family_path(preferred_family or top.get("family"), weight, italic)
+        if resolved:
+            top["path"] = resolved
+            top.pop("local_family", None)
+            top.pop("fit", None)        # the outvoted weight's fit is not this face's
+            top["family_resolved"] = True   # picked by name: drive its variable axis
+        else:
+            top.pop("path", None)
     else:
         top["weight"] = _cand_weight(top)
         top_style = str(top.get("style") or "")
@@ -2244,6 +2259,15 @@ def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings, plate_rg
         role = str((layer.meta or {}).get("role") or "").lower()
         if role in {"text-stack", "text-row", "copy-stack", "stat-stack", "stat-column"}:
             return
+        if (layer.meta or {}).get("offer_badge_group"):
+            # An offer badge already HAS a surface, and it is never a rectangle. Its chrome
+            # is either the root plate (013's disc was never an element — SAM left it in the
+            # plate, chip-cleaned) or the badge's own raster cutout (101/131). A manufactured
+            # slice is redundant against both, and actively wrong: cut at the group's BOX, it
+            # paints a hard-edged green rectangle over whatever shares those bounds — on 013
+            # it covered the pouch from x=348-385 with disc chrome, because the pouch's matte
+            # legitimately does not claim every pixel of its own bounding box.
+            return
         if any(str(child.id or "").endswith(("__hostbg", "__groupbg"))
                for child in layer.children):
             return  # already self-contained (host raster / earlier pass)
@@ -2428,6 +2452,13 @@ def _audit_single_ownership(layers, run_dir, canvas, warnings, cfg):
             continue
         meta = layer.meta or {}
         if fallback_kind(meta):  # raster slice / masked-pixel fallback: not native ink
+            continue
+        if meta.get("badge_chip_cleaned"):
+            # Reconstruct already lifted this line's ink off its badge chip and verified it
+            # (reconstruct._badge_chip_clean stamps this only on a chip it actually cleaned),
+            # so there is no baked duplicate left to collapse. Erasing again cannot help and
+            # can only hurt: this pass fills EVERYTHING inside the text box that is unlike
+            # the box's ring, and a badge's box routinely overlaps its neighbours.
             continue
         box = layer.box or {}
         ink = meta.get("prefit_ink_box") or box
@@ -3326,6 +3357,232 @@ def _infer_sizing(layer) -> None:
         _infer_sizing(child)
 
 
+def _regroup_offer_badges(candidates: list) -> list:
+    """Gather an offer badge's editable lines into their own 'Badge / …' group.
+
+    Merge tags a rotated offer lockup's lines with ``meta.badge_offer_lockup`` (chrome kept
+    as raster on the clean plate; text editable — "for batch jobs we can simply modify the
+    text"). layout.py's generic text-stacking, run earlier, cannot know they belong to a
+    badge and will pull one of them into an unrelated headline's Text Stack, shifting BOTH.
+    Here — after layout, before compile, in the one file that owns the design tree — we:
+
+      1. collect every ``badge_offer_lockup`` text node with its ABSOLUTE box (accumulating
+         ancestor group origins, since child boxes are parent-relative);
+      2. remove them from wherever layout parked them;
+      3. dissolve any generic text-stack/row left with < 2 real children (a 1-child auto-
+         layout frame repositions its child — that was the headline regression);
+      4. emit one 'Badge / <first line>' group per ``offer_badge_id`` at canvas-absolute
+         geometry, children relative to the group origin, z above the plate.
+
+    The chrome stays baked-clean in the background plate (013's disc is not a separate
+    element), so the group is text-only; a designer still selects it and retypes the offer
+    as one object. Non-badge groups are never touched.
+    """
+    STACK_ROLES = {"text-stack", "text-row", "caption-stack"}
+
+    def _is_dissolvable_stack(node) -> bool:
+        if node.get("target") != "group":
+            return False
+        role = str((node.get("meta") or {}).get("role") or "").lower()
+        return role in STACK_ROLES
+
+    def _abs_of(node) -> dict:
+        """The node's LOGICAL absolute box. layout._relativize stamps meta.absolute_box
+        before making box parent-relative, so it — not box — is the reliable anchor."""
+        meta = node.get("meta") or {}
+        ab = meta.get("absolute_box")
+        if isinstance(ab, dict) and ab.get("w"):
+            return dict(ab)
+        return dict(node.get("box") or {})
+
+    def _lift_out(node, parent_abs) -> None:
+        """Restore a node parked inside a group to canvas-absolute — each field in ITS basis.
+
+        Do NOT do this by snapping ``box`` to the absolute and translating the rest along
+        with it. ``layout._relativize`` is not a uniform translation: it stamps
+        ``meta.absolute_box`` from the LOGICAL box but rewrites ``box`` from the PAINTED
+        origin (layout.py:1479-1494). So inside a group ``box`` and ``visible_box`` share the
+        painted basis while ``absolute_box`` is in the logical one, and for a headline with
+        leading above its caps those bases differ — 013's 'We NEVER do this!' has box.y=279
+        against visible_box.y=294. Snapping box to 279 and dragging visible_box by the same
+        delta lands visible_box on 279 too, and since _compile fits a text node from
+        ``visible_box`` the headline drew 15px high: y 236.3 -> 221.3, and ssim 0.916 -> 0.626
+        on a fixture whose badge was otherwise correct.
+
+        Inverting each field in its own basis instead: ``box`` comes back from the logical
+        absolute_box, and ``visible_box`` — the only other field _relativize touched — is
+        un-relativized by adding the parent origin back. ink_box and prefit_ink_box were
+        never relativized, so they are already absolute and must not move.
+        """
+        ab = _abs_of(node)
+        node["box"] = {**(node.get("box") or {}),
+                       "x": float(ab.get("x", 0) or 0), "y": float(ab.get("y", 0) or 0)}
+        if parent_abs:
+            px = float((parent_abs or {}).get("x", 0) or 0)
+            py = float((parent_abs or {}).get("y", 0) or 0)
+            visible = node.get("visible_box")
+            if isinstance(visible, dict) and visible:
+                node["visible_box"] = {**visible,
+                                       "x": float(visible.get("x", 0) or 0) + px,
+                                       "y": float(visible.get("y", 0) or 0) + py}
+
+    def _move_to(node, nx, ny) -> None:
+        """Place node so its box origin is (nx, ny), carrying EVERY box-like field with it.
+
+        _compile fits a text node from ``visible_box`` (falling back to ink_box, then box),
+        so moving box alone silently leaves the node fitted at its old address — that is
+        exactly how the lifted headline landed at (-29, 0). Translate them together.
+        """
+        b = node.get("box") or {}
+        dx = float(nx) - float(b.get("x", 0) or 0)
+        dy = float(ny) - float(b.get("y", 0) or 0)
+        if not dx and not dy:
+            return
+        node["box"] = {**b, "x": float(b.get("x", 0) or 0) + dx,
+                       "y": float(b.get("y", 0) or 0) + dy}
+        for key in ("visible_box", "ink_box"):
+            v = node.get(key)
+            if isinstance(v, dict) and v:
+                node[key] = {**v, "x": float(v.get("x", 0) or 0) + dx,
+                             "y": float(v.get("y", 0) or 0) + dy}
+        meta = node.get("meta")
+        if isinstance(meta, dict):
+            for key in ("prefit_ink_box",):
+                v = meta.get(key)
+                if isinstance(v, dict) and v:
+                    meta[key] = {**v, "x": float(v.get("x", 0) or 0) + dx,
+                                 "y": float(v.get("y", 0) or 0) + dy}
+
+    collected: dict = {}  # offer_badge_id -> list of nodes (absolute geometry restored)
+
+    def _strip(nodes, parent_abs=None):
+        out = []
+        for n in nodes:
+            meta = n.get("meta") or {}
+            if n.get("target") == "text" and meta.get("badge_offer_lockup"):
+                _lift_out(n, parent_abs)  # back to canvas-absolute
+                collected.setdefault(str(meta.get("offer_badge_id") or "badge"), []).append(n)
+                continue
+            kids = n.get("children")
+            if kids:
+                # _relativize made these children relative to THIS node's logical box, so
+                # that — not the accumulated painted origin — is their parent basis.
+                new_kids = _strip(kids, _abs_of(n))
+                if _is_dissolvable_stack(n) and len(new_kids) < 2:
+                    # A 1-child auto-layout frame repositions its child; restore each
+                    # survivor to its own absolute box and lift it out of the frame.
+                    for k in new_kids:
+                        _lift_out(k, _abs_of(n))
+                        out.append(k)
+                    continue
+                n["children"] = new_kids
+            out.append(n)
+        return out
+
+    stripped = _strip(candidates)
+    if not collected:
+        return candidates
+
+    def _find_host(nodes, host_id, parent_abs=None):
+        """(container_list, index, node, parent_abs) for ``host_id`` anywhere in the tree."""
+        for i, n in enumerate(nodes):
+            if str(n.get("id")) == str(host_id):
+                return nodes, i, n, parent_abs
+            kids = n.get("children")
+            if kids:
+                hit = _find_host(kids, host_id, _abs_of(n))
+                if hit:
+                    return hit
+        return None
+
+    for bid, members in collected.items():
+        if not members:
+            continue
+        ordered = sorted(members, key=lambda n: (float((n.get("box") or {}).get("y", 0)),
+                                                 float((n.get("box") or {}).get("x", 0))))
+        first_text = str(ordered[0].get("text") or "").strip()
+        z_vals = [float((n.get("meta") or {}).get("z") or n.get("z") or n.get("z_index") or 40.0)
+                  for n in members]
+        z = max(z_vals) if z_vals else 40.0
+
+        # An ELEMENT-hosted chip is grouped WITH ITS CHROME, in the chrome's own place in the
+        # tree. Both halves matter:
+        #   * "layerise properly" — selecting `Badge / BUY 3, GET 1 FREE!` should hand a
+        #     designer the disc AND its offer as one object, which is what the badge IS.
+        #   * paint order is HIERARCHICAL: render_preview paints a subtree as a UNIT at the z
+        #     of its TOP-LEVEL ancestor. 101's disc lives inside a Card at z=50, so a badge
+        #     group hoisted to top level at the text's own z=12 painted BEFORE that Card and
+        #     the disc landed on top of the offer — a perfectly clean chip with no text on it.
+        #     Grouping in place keeps the chip exactly where it always painted, and the text
+        #     is simply the last child of its own chrome.
+        # 013 keeps the top-level form: its disc is in the PLATE, so there is no host to
+        # anchor to and nothing that can paint over the text.
+        host_id = (ordered[0].get("meta") or {}).get("badge_chip_host")
+        found = _find_host(stripped, host_id) if host_id else None
+        if found:
+            container, index, host, host_parent_abs = found
+            hb = host.get("box") or {}
+            member_boxes = [m.get("box") or {} for m in ordered]
+            # The host's box is in ITS parent's basis; the members are canvas-absolute after
+            # _lift_out. Put the members into the host's basis before unioning.
+            pax = float((host_parent_abs or {}).get("x", 0) or 0)
+            pay = float((host_parent_abs or {}).get("y", 0) or 0)
+            for m in ordered:
+                b = m.get("box") or {}
+                _move_to(m, float(b.get("x", 0)) - pax, float(b.get("y", 0)) - pay)
+            member_boxes = [m.get("box") or {} for m in ordered]
+            xs0 = min([float(hb.get("x", 0))] + [float(b.get("x", 0)) for b in member_boxes])
+            ys0 = min([float(hb.get("y", 0))] + [float(b.get("y", 0)) for b in member_boxes])
+            xs1 = max([float(hb.get("x", 0)) + float(hb.get("w", 0))]
+                      + [float(b.get("x", 0)) + float(b.get("w", 0)) for b in member_boxes])
+            ys1 = max([float(hb.get("y", 0)) + float(hb.get("h", 0))]
+                      + [float(b.get("y", 0)) + float(b.get("h", 0)) for b in member_boxes])
+            group_box = {"x": xs0, "y": ys0, "w": xs1 - xs0, "h": ys1 - ys0}
+            host_z = float((host.get("meta") or {}).get("z") or host.get("z")
+                           or host.get("z_index") or 0.0)
+            for n in [host] + ordered:  # children RELATIVE to the group origin
+                b = n.get("box") or {}
+                _move_to(n, float(b.get("x", 0)) - xs0, float(b.get("y", 0)) - ys0)
+            # Chrome first, offer last: inside the group the text must paint over its chip.
+            host["z"] = host_z
+            for n in ordered:
+                n["z"] = max(z, host_z + 1.0)
+            group_abs = {"x": xs0 + pax, "y": ys0 + pay, "w": group_box["w"], "h": group_box["h"]}
+            container[index] = {
+                "id": bid,
+                "target": "group",
+                "box": group_box,
+                "z": host_z,  # exactly where the chrome always painted
+                "children": [host] + ordered,
+                "meta": {"role": "badge", "offer_badge_group": True, "z": host_z,
+                         "absolute_box": group_abs, "badge_offer_text": first_text,
+                         "badge_chip_host": host_id},
+                "name": _with_snippet("Badge", first_text),
+            }
+            continue
+
+        boxes = [m.get("box") or {} for m in ordered]
+        xs0 = min(float(b.get("x", 0)) for b in boxes)
+        ys0 = min(float(b.get("y", 0)) for b in boxes)
+        xs1 = max(float(b.get("x", 0)) + float(b.get("w", 0)) for b in boxes)
+        ys1 = max(float(b.get("y", 0)) + float(b.get("h", 0)) for b in boxes)
+        group_box = {"x": xs0, "y": ys0, "w": xs1 - xs0, "h": ys1 - ys0}
+        for n in ordered:  # children are stored RELATIVE to the group origin
+            b = n.get("box") or {}
+            _move_to(n, float(b.get("x", 0)) - xs0, float(b.get("y", 0)) - ys0)
+        stripped.append({
+            "id": bid,
+            "target": "group",
+            "box": group_box,
+            "z": z,
+            "children": ordered,
+            "meta": {"role": "badge", "offer_badge_group": True, "z": z,
+                     "absolute_box": dict(group_box), "badge_offer_text": first_text},
+            "name": _with_snippet("Badge", first_text),
+        })
+    return stripped
+
+
 def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = None,
           doc_id: str = "doc", name: str = "design", kept_in_photo: Optional[list] = None,
           cfg: Optional[dict] = None) -> DesignDoc:
@@ -3418,6 +3675,14 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
                 ))
 
     kept = list(kept_in_photo or [])
+    # Offer badges: their editable text (merge tags meta.badge_offer_lockup) must ship as
+    # its OWN 'Badge / …' group, not swept into an unrelated headline's Text Stack. Do this
+    # BEFORE compile so the group is a plain candidate like any other. See _regroup_offer_badges.
+    try:
+        candidates = _regroup_offer_badges(candidates)
+    except Exception as exc:  # regrouping must never break the compile
+        warnings.append({"code": "offer-badge-regroup-error", "detail": str(exc)})
+
     for candidate in candidates:
         if candidate.get("target") == "drop":
             if candidate.get("text"):

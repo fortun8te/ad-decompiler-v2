@@ -1003,6 +1003,122 @@ def _flat_hole_fill(rgb, mask, cfg: Optional[dict] = None):
     return working, (remaining * 255).astype(np.uint8), info
 
 
+def chip_local_ink_removal(rgb, chip_box: dict, ink_mask, cfg: Optional[dict] = None):
+    """Lift text ink off a badge chip using the chip's OWN chrome as the fill source.
+
+    Returns ``(cleaned_chip_rgb, filled_mask, info)`` for the crop described by ``chip_box``
+    -- ``filled_mask`` is the chip-local mask this call actually reconstructed, so the caller
+    can reconcile the canvas removal union against exactly the pixels that were rebuilt.
+    Returns ``(None, None, info)`` when the ink cannot be removed within the chip (bake).
+
+    WHY THIS EXISTS -- measured on 013. The canvas removal pass unions every hole on the
+    plate into one mask before choosing a backend, so a badge's glyph holes fuse with any
+    cutout they happen to touch. 013's 61%-OFF disc ink meets the pouch cutout at
+    x=348-385; the two become a single component box=(0,676,1080,769) area=684,685px.
+    ``_flat_hole_fill`` then measures the ring of THAT component -- a canvas-wide band
+    whose surround is 18% uniform against the 85% required -- correctly refuses, and the
+    generative backend smears a slab across the disc (badge ssim 0.9842 -> 0.6758).
+
+    Nothing about the disc changed; only the COMPANY its mask kept did. Cropping to the
+    chip first makes the ring what it physically is: the disc's own solid chrome. Each
+    glyph becomes its own component ringed by #057C3E, flat-fill routes, and the disc
+    reconstructs exactly under the ink.
+
+    Flat-fill is force-enabled for the chip regardless of the canvas archetype: a designed
+    badge IS a flat plate even when the ad around it is photographic, and the caller has
+    already MEASURED this chip's flatness (``merge_layers._chrome_ink_removable``) before
+    asking. Per-component uniformity still decides each hole, so a graded/glossy chip's
+    holes fall through to the fallback below and, failing that, to an honest bake.
+
+    The generative fallback is confined to the chip crop and Flux is explicitly disabled:
+    a whole-canvas band is exactly the failure this function exists to prevent.
+    """
+    cv2, np, _ = _deps()
+    source = np.asarray(rgb, dtype=np.uint8)
+    height, width = source.shape[:2]
+    x0 = max(0, int(round(float(chip_box.get("x", 0) or 0))))
+    y0 = max(0, int(round(float(chip_box.get("y", 0) or 0))))
+    x1 = min(width, int(round(float(chip_box.get("x", 0) or 0) + float(chip_box.get("w", 0) or 0))))
+    y1 = min(height, int(round(float(chip_box.get("y", 0) or 0) + float(chip_box.get("h", 0) or 0))))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None, None, {"reason": "chip-too-small", "chip_box": [x0, y0, x1 - x0, y1 - y0]}
+    chip = source[y0:y1, x0:x1].copy()
+    chip_ink = (np.asarray(ink_mask)[y0:y1, x0:x1] > 0).astype(np.uint8) * 255
+    if not np.any(chip_ink):
+        return None, None, {"chip_box": [x0, y0, x1 - x0, y1 - y0], "reason": "no-ink-in-chip"}
+
+    # Swallow the glyph's own ANTI-ALIASED RIM before anything measures the surround.
+    # ``text_ink_mask`` is deliberately glyph-tight, so 2-3px of cream-into-green halo sits
+    # OUTSIDE the hole. That rim is the dominant reason flat-fill refuses a badge: measured
+    # on 013's disc, the ring band 1-2px off the glyphs is 31% uniform and the band 5-6px
+    # out is 90% -- the contamination is the glyph, not the chrome (ring |dev| p95=195, i.e.
+    # cream vs the disc's #057C3E). At the pipeline's default 2px dilation only 5/15 glyph
+    # components route flat; at 3px, 11/15; at 4px, 12/15. The rim is also ink in its own
+    # right -- filling only the tight core would leave a ghost outline of every glyph.
+    dilate_px = int(((cfg or {}).get("inpaint") or {}).get("chip_ink_dilate", 4))
+    if dilate_px > 0:
+        chip_ink = cv2.dilate(chip_ink, np.ones((2 * dilate_px + 1,) * 2, np.uint8))
+    ink_px = int(np.count_nonzero(chip_ink))
+    info: dict = {"chip_box": [x0, y0, x1 - x0, y1 - y0], "ink_px": ink_px,
+                  "ink_dilate": dilate_px}
+    # Ink covering most of the chip leaves no chrome to reconstruct FROM -- that is a
+    # wordmark/logotype, not text on a badge. Bake it rather than invent a surface.
+    ink_fraction = ink_px / float(max(1, chip_ink.size))
+    info["ink_fraction"] = round(ink_fraction, 4)
+    max_fraction = float(((cfg or {}).get("inpaint") or {}).get("chip_max_ink_fraction", 0.60))
+    if ink_fraction > max_fraction:
+        return None, None, dict(info, reason="chip-mostly-ink")
+
+    chip_cfg = dict(cfg or {})
+    chip_icfg = dict((cfg or {}).get("inpaint") or {})
+    # The chip is a flat plate by construction and by prior measurement (see docstring).
+    chip_icfg["solid_flat_regions"] = True
+    chip_cfg["inpaint"] = chip_icfg
+
+    flat = _flat_hole_fill(chip, chip_ink, chip_cfg)
+    if flat is None:
+        return None, None, dict(info, reason="flat-fill-unavailable")
+    working, remaining, flat_info = flat
+    info["solid_flat"] = flat_info
+    if not np.any(remaining):
+        info["backend"] = "chip-flat"
+        return working.astype(np.uint8), chip_ink, info
+
+    # NOT a gradient tier here, deliberately. The canvas ladder is flat -> gradient ->
+    # generative, and a shaded disc makes the middle rung look obvious. Measured on 013 it
+    # is worse than skipping it: the per-component linear plane VALIDATES on the
+    # '+ FREE GIFTS' hole (filled_fraction 0.96) and paints a visibly rectangular block of
+    # slightly-wrong green across the disc, where chip-local Big-LaMa leaves only a faint
+    # smudge. A plane fitted on a ring that straddles the disc edge and the pouch behind it
+    # is fitting two surfaces at once. Left out until a fixture actually wants it.
+    #
+    # Textured remainder inside the chip: keep it chip-local. Big-LaMa when it is
+    # installed, OpenCV otherwise -- and never Flux (see docstring).
+    gen_cfg = dict(chip_cfg)
+    gen_icfg = dict(chip_icfg)
+    gen_icfg["mode"] = "auto"
+    gen_icfg["comfy"] = dict(gen_icfg.get("comfy") or {}, enabled=False, required=False)
+    gen_icfg["strict_acceptance"] = False
+    gen_icfg["allow_fallback"] = True
+    gen_cfg["inpaint"] = gen_icfg
+    gen_cfg["runtime"] = dict(gen_cfg.get("runtime") or {}, require_active_models=False)
+    try:
+        generated, used, gen_diag = _inpaint_single_pass(working, remaining, gen_cfg)
+    except Exception as exc:  # a chip must never crash the run; bake instead
+        return None, None, dict(info, reason="chip-inpaint-failed", error=str(exc))
+    generated = np.asarray(generated, dtype=np.uint8)
+    if generated.shape[:2] != working.shape[:2]:
+        generated = cv2.resize(
+            generated, (working.shape[1], working.shape[0]), interpolation=cv2.INTER_LINEAR,
+        )
+    out = working.copy()
+    sel = remaining > 0
+    out[sel] = generated[sel]
+    info["backend"] = f"chip-{used}"
+    info["chip_backend_route"] = (gen_diag or {}).get("backend_route")
+    return out.astype(np.uint8), chip_ink, info
+
+
 def _inpaint_single_pass(rgb, mask, cfg: Optional[dict] = None):
     """Run one inpaint backend selection without multi-pass orchestration."""
     _, np, _ = _deps()

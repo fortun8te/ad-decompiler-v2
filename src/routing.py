@@ -298,6 +298,28 @@ def _text_fidelity_fallback(c: dict, meta: dict, cfg: dict | None) -> dict | Non
     low_conf = bool(meta.get("low_fidelity")) or (fidelity_conf is not None and fidelity_conf < threshold)
     if not low_conf:
         return None
+    if meta.get("badge_offer_lockup"):
+        # A PROVEN offer badge's copy stays TEXT even on a weak font match. This gate's own
+        # premise — "keep text editable in a plausible same-class font rather than slice it
+        # to pixels" — applies with more force here than anywhere else: the offer is the one
+        # string a variant swap rewrites ("for batch jobs we can simply modify the text"),
+        # and it is why the chip was cleaned in the first place.
+        #
+        # Slicing it back is self-defeating rather than merely cautious. 131's
+        # 'BUY 2 GET1 FREE' measured ink_confidence 0.25 against a 0.30 bar and demoted to a
+        # masked-pixel raster, which the slice fallback then replaced with source pixels —
+        # so the run lifted the ink off the disc and pasted the very same ink back on top as
+        # an image. Chrome perfectly cleaned, offer not editable, nothing gained.
+        #
+        # Narrow by construction: merge only sets badge_offer_lockup on a carrier that reads
+        # unanimously as the offer AND whose ink it has proven removable, so this cannot
+        # reach body copy, a photographic ribbon (088), or a brand mark.
+        meta["badge_fidelity_override"] = {
+            "confidence": fidelity_conf,
+            "reason": meta.get("fidelity_reason") or "low-confidence font/effect match",
+            "kept": "text",
+        }
+        return None
     c["target"] = "image"
     fallback_src = meta.get("fallback_src")
     if fallback_src:

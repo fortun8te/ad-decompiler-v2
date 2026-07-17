@@ -195,6 +195,48 @@ def _rotated_box_overlap_frac(a: dict, b: dict) -> float:
     return (iw * ih) / smaller
 
 
+def _rotated_carrier_clusters(text_cands: list, min_deg: float,
+                              agree_deg: float = 5.0,
+                              overlap_frac: float = 0.25) -> list[list[str]]:
+    """Group rotated OCR lines into the CARRIERS they are printed on.
+
+    Single-linkage over lines that both OVERLAP and AGREE on an angle: a seal's two
+    lines share the disc they sit on, so they land in one group. Sole members are
+    returned too (a one-line carrier is still a carrier); callers decide what a
+    group of one means.
+    """
+    floor = max(0.0, float(min_deg) - float(agree_deg))
+    members = []
+    for c in text_cands:
+        rot = abs(float(c.get("rotation") or (c.get("meta") or {}).get("rotation") or 0.0))
+        if rot >= floor and c.get("id"):
+            members.append((c.get("id"), rot, c.get("box") or {}))
+    if len(members) < 2:
+        return [[m[0]] for m in members]
+    parent = {mid: mid for mid, _, _ in members}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(members)):
+        for j in range(i + 1, len(members)):
+            (id_a, rot_a, box_a), (id_b, rot_b, box_b) = members[i], members[j]
+            if abs(rot_a - rot_b) > agree_deg:
+                continue
+            if _rotated_box_overlap_frac(box_a, box_b) < overlap_frac:
+                continue
+            ra, rb = find(id_a), find(id_b)
+            if ra != rb:
+                parent[ra] = rb
+    groups: dict = {}
+    for mid, _, _ in members:
+        groups.setdefault(find(mid), []).append(mid)
+    return list(groups.values())
+
+
 def _rotated_carrier_consensus(text_cands: list, min_deg: float,
                                agree_deg: float = 5.0,
                                overlap_frac: float = 0.25) -> dict:
@@ -216,45 +258,277 @@ def _rotated_carrier_consensus(text_cands: list, min_deg: float,
     Axis-aligned overlay copy never joins a rotated cluster (``agree_deg``, plus the
     floor below), so genuine native headlines/CTAs are untouched.
     """
-    floor = max(0.0, float(min_deg) - float(agree_deg))
-    members = []
+    rot_by_id = {}
     for c in text_cands:
-        rot = abs(float(c.get("rotation") or (c.get("meta") or {}).get("rotation") or 0.0))
-        if rot >= floor and c.get("id"):
-            members.append((c.get("id"), rot, c.get("box") or {}))
-    if len(members) < 2:
-        return {}
-    # Single-linkage: same carrier == touching boxes whose angles agree.
-    parent = {mid: mid for mid, _, _ in members}
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for i in range(len(members)):
-        for j in range(i + 1, len(members)):
-            (id_a, rot_a, box_a), (id_b, rot_b, box_b) = members[i], members[j]
-            if abs(rot_a - rot_b) > agree_deg:
-                continue
-            if _rotated_box_overlap_frac(box_a, box_b) < overlap_frac:
-                continue
-            ra, rb = find(id_a), find(id_b)
-            if ra != rb:
-                parent[ra] = rb
-    clusters: dict = {}
-    for mid, rot, _ in members:
-        clusters.setdefault(find(mid), []).append(rot)
+        if c.get("id"):
+            rot_by_id[c["id"]] = abs(float(
+                c.get("rotation") or (c.get("meta") or {}).get("rotation") or 0.0))
     out = {}
-    for mid, _, _ in members:
-        rots = sorted(clusters[find(mid)])
-        if len(rots) < 2:
+    for group in _rotated_carrier_clusters(text_cands, min_deg, agree_deg, overlap_frac):
+        if len(group) < 2:
             continue
+        rots = sorted(rot_by_id.get(mid, 0.0) for mid in group)
         mid_i = len(rots) // 2
         median = rots[mid_i] if len(rots) % 2 else (rots[mid_i - 1] + rots[mid_i]) / 2.0
-        out[mid] = median
+        for mid in group:
+            out[mid] = median
     return out
+
+
+# An offer badge's lines read as the offer itself ('61% OFF', '+ FREE GIFTS'). This set is
+# deliberately NARROW: headline/subheadline are excluded because that is exactly what a
+# fragmented photographic ribbon's OCR reads as (088's can prints 'BLACK F'/'BLACK' at
+# -29/-31 deg, both subheadline), and promoting those re-creates the mangled ribbon.
+_OFFER_LOCKUP_ROLES = frozenset({"offer", "price"})
+
+# Chrome that is a discrete BADGE CHIP: a small, bounded, designed carrier whose whole job
+# is to hold an offer. Narrower than _TEXT_BEARING_SHELL_ROLES on purpose — buttons/CTAs
+# already extract as text+plate, and logo/wordmark/brand marks bake as artwork (their
+# "text" IS the mark). Also narrower than CHROME_AS_RASTER_ROLES, which sweeps in icons and
+# story chrome that never host an offer lockup.
+_BADGE_CHIP_ROLES = frozenset({
+    "badge", "seal", "chip", "pill", "sticker",
+    "price_burst", "sale_burst", "starburst", "burst", "splat", "sticker_burst",
+})
+
+# ...plus the roles the bake site ALREADY treats as a badge the moment they host text
+# (`bake_host_role = "badge" if owner_role in {...logo...}`, and it rewrites meta.role to
+# match). SAM/Qwen routinely label a small circular offer sticker a 'logo' — 101's c_E005,
+# an 87x87 'BUY 3, GET 1 FREE' disc, arrives here roled 'logo', and the whole ad contains no
+# element roled 'badge' at all until that bake site renames it. Reading only 'badge' meant
+# the gate could never see the very chips it exists to promote. This does NOT put brand
+# marks at risk: the caller still requires the carrier's copy to read unanimously as the
+# OFFER, and a logotype's own text reads brand/headline/body, never 'offer'/'price'.
+_BADGE_CHIP_HOST_ROLES = _BADGE_CHIP_ROLES | frozenset({
+    "logo", "wordmark", "brand", "logotype",
+})
+
+
+def _load_run_rgb(run_dir):
+    """Source pixels for the run, or None when unavailable (callers must degrade to bake)."""
+    if not run_dir:
+        return None
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return None
+    for name in ("normalized.png", "original.png"):
+        path = os.path.join(str(run_dir), name)
+        if os.path.exists(path):
+            try:
+                return np.asarray(Image.open(path).convert("RGB"))
+            except (OSError, ValueError):
+                return None
+    return None
+
+
+def _chrome_ink_removable(rgb, box: dict, max_spread: float = 12.0) -> tuple[bool, dict]:
+    """Can this line's ink be lifted off its carrier and the surface reconstructed?
+
+    The user's policy allows baking ONLY as an honest fallback for chrome whose ink cannot
+    be cleanly removed (glossy sphere, gradient, texture) — so that has to be measured, not
+    assumed. The probe asks the question removal actually faces: take the very glyph mask
+    the removal ledger would cut (``inpaint.text_ink_mask``) and look at the chrome ringing
+    it. A flat carrier (013's solid #057C3E disc, spread ~4.7) reconstructs exactly under
+    the glyphs from its own surround; a textured/graded one does not, and bakes with the
+    reason recorded.
+    """
+    stats: dict = {}
+    if rgb is None:
+        return False, {"reason": "no-source-pixels"}
+    try:
+        import numpy as np
+        import cv2
+        from . import inpaint as _inpaint
+    except ImportError:
+        return False, {"reason": "no-imaging-deps"}
+    try:
+        ink = _inpaint.text_ink_mask(rgb, box or {}, None, allow_box_fallback=False)
+    except Exception:
+        return False, {"reason": "ink-mask-failed"}
+    if ink is None or not np.any(ink):
+        return False, {"reason": "no-ink-mask"}
+    near = cv2.dilate(ink, np.ones((9, 9), np.uint8), iterations=3)
+    chrome = (near > 0) & (ink == 0)
+    n = int(np.count_nonzero(chrome))
+    if n < 200:
+        return False, {"reason": "chrome-sample-too-small", "chrome_px": n}
+    px = rgb[chrome].astype(np.float32)
+    median = np.median(px, axis=0)
+    spread = float(np.median(np.abs(px - median).mean(axis=1)))
+    stats = {"chrome_px": n, "spread": round(spread, 2),
+             "chrome_rgb": [int(v) for v in median.round()]}
+    if spread > max_spread:
+        stats["reason"] = "chrome-not-flat"
+        return False, stats
+    return True, stats
+
+
+def _badge_carriers(text_cands: list, elem_cands: list, min_deg: float, cfg: dict,
+                    product_regions: list, scene_text_inside: float) -> list:
+    """Every BADGE CARRIER in the ad, with its member lines and its CHROME BOUNDS.
+
+    A carrier is one physical surface that ink is printed on. Two kinds of evidence prove
+    one exists, and the badge work needs both — the rotation requirement the first version
+    of this gate carried was incidental to 013, not principled:
+
+    * ELEMENT — a chrome-as-raster badge/seal/sticker/burst cutout that geometrically owns
+      the lines. The element IS the carrier and its box IS the chrome bounds. 101's c_E005
+      (87x87 at 288,408) and 131's c_E003 (285x286 at 251,825) are these, and both are
+      axis-aligned, which is exactly why the rotated-only gate never saw them.
+    * ROTATION — no chrome element survived fusion, but lines that OVERLAP and AGREE on an
+      off-axis angle can only be printed on one surface. 013's disc is this case: SAM never
+      emitted an element for it, so the disc lives in the plate and the cluster is all the
+      evidence there is. A lone rotated line is not a lockup (no corroboration), but a lone
+      line on an ELEMENT is — the element already corroborates it.
+
+    Returns a list of ``{"key", "member_ids", "host_id", "chrome_box", "kind"}``.
+    """
+    by_id = {c["id"]: c for c in text_cands if c.get("id")}
+    carriers: list = []
+    claimed: set = set()
+
+    # ── element-hosted carriers ───────────────────────────────────────────────────────
+    for elem in elem_cands:
+        role = str((elem.get("meta") or {}).get("role") or elem.get("role") or "").lower()
+        if role not in _BADGE_CHIP_HOST_ROLES or not is_chrome_as_raster_role(role):
+            continue
+        ebox = elem.get("box") or {}
+        if not (float(ebox.get("w", 0) or 0) > 0 and float(ebox.get("h", 0) or 0) > 0):
+            continue
+        members = [
+            c["id"] for c in text_cands
+            if c.get("id") and _inside_frac(c.get("box") or {}, ebox) >= scene_text_inside
+        ]
+        if not members:
+            continue
+        carriers.append({
+            "key": f"elem:{elem.get('id')}",
+            "member_ids": members,
+            "host_id": elem.get("id"),
+            "chrome_box": dict(ebox),
+            "kind": "element",
+        })
+        claimed.update(members)
+
+    # ── rotated-cluster carriers (no chrome element to host them) ─────────────────────
+    pad = float((cfg.get("merge") or {}).get("badge_chip_pad", 14))
+    for group in _rotated_carrier_clusters(text_cands, min_deg):
+        group = [m for m in group if m not in claimed]
+        if len(group) < 2:
+            continue
+        boxes = [by_id[m].get("box") or {} for m in group if m in by_id]
+        if not boxes:
+            continue
+        x0 = min(float(b.get("x", 0) or 0) for b in boxes) - pad
+        y0 = min(float(b.get("y", 0) or 0) for b in boxes) - pad
+        x1 = max(float(b.get("x", 0) or 0) + float(b.get("w", 0) or 0) for b in boxes) + pad
+        y1 = max(float(b.get("y", 0) or 0) + float(b.get("h", 0) or 0) for b in boxes) + pad
+        carriers.append({
+            "key": f"rot:{sorted(group)[0]}",
+            "member_ids": list(group),
+            "host_id": None,
+            "chrome_box": {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0},
+            "kind": "rotated",
+        })
+    return carriers
+
+
+def _offer_lockup_ids(text_cands: list, rgb, min_deg: float, cfg: dict,
+                      diagnostics: dict, elem_cands: list | None = None,
+                      product_regions: list | None = None,
+                      scene_text_inside: float = 0.7) -> dict:
+    """Carriers that are OFFER BADGES: raster chrome, but editable offer text.
+
+    Policy (verbatim, twice): a badge/seal ships as a pixel-exact RASTER and we recreate
+    its TEXT — "for batch jobs we can simply modify the text". '61% OFF' is precisely the
+    string a variant swap rewrites, so it must be a native TEXT node, not baked pixels.
+
+    The rotated-scene-ink gate below cannot tell 013's designed 8-deg disc from 088's
+    ribbons wrapping a photographed can, and bakes both. Measurement says the usual
+    discriminators do NOT separate them: 088's flat white ribbon is FLATTER than 013's
+    disc (4.7 vs 2.7 spread), and OCR is confident on its garbage ('CK' scores 0.89) —
+    so neither flatness nor confidence alone can decide. What does separate them is the
+    CARRIER read as a whole: 013's disc is a cluster whose every line reads 'offer'
+    ('61% OFF' + '+ FREE GIFTS'), while 088's ribbon fragments scatter across
+    subheadline/body/caption and 013's pouch label reads headline/body. One carrier, one
+    verdict — the mechanism is unchanged; only the verdict flips, to "both native".
+
+    Requires BOTH: the carrier is unanimously offer copy, AND its ink is provably
+    removable. Anything unproven bakes, with the reason recorded.
+
+    Returns ``{text_id: {"chip_id", "chip_box", "host_id"}}`` — the chip descriptor travels
+    with the line so reconstruct can remove that line's ink INSIDE its own chip rather than
+    on the canvas plate, where it can never route flat (see inpaint.chip_local_ink_removal).
+    """
+    if not bool((cfg.get("merge") or {}).get("editable_offer_badges", True)):
+        return {}
+    by_id = {c["id"]: c for c in text_cands if c.get("id")}
+    promoted: dict = {}
+    carriers = _badge_carriers(
+        text_cands, elem_cands or [], min_deg, cfg,
+        product_regions or [], scene_text_inside,
+    )
+    if os.environ.get("CHIP_DEBUG"):
+        # A carrier that is never even BUILT leaves no trace in the contract below (there is
+        # nothing to reject), which is exactly how 101's chip hid: every badge in the ad was
+        # roled 'logo' at this point and the gate silently saw zero carriers. CHIP_DEBUG=1
+        # prints the roles this gate actually sees, which is the only way to tell "rejected"
+        # from "never considered".
+        print("[chipdbg] elem roles:", sorted({
+            str((e.get("meta") or {}).get("role") or "").lower() for e in (elem_cands or [])}))
+        print("[chipdbg] text roles:", [
+            (c.get("id"), str((c.get("meta") or {}).get("role") or c.get("role") or "").lower())
+            for c in text_cands])
+        print("[chipdbg] carriers:", [
+            {k: c[k] for k in ("key", "kind", "host_id", "member_ids")} for c in carriers])
+    for carrier in carriers:
+        group = [m for m in carrier["member_ids"] if m in by_id]
+        if not group:
+            continue
+        members = [by_id[m] for m in group]
+        roles = [str((by_id[m].get("meta") or {}).get("role")
+                     or by_id[m].get("role") or "").lower() for m in group]
+        if not roles or not all(r in _OFFER_LOCKUP_ROLES for r in roles):
+            # Recorded, not silent: "this carrier is a badge but its copy does not read as
+            # the offer" is the single most common reason a badge stays baked, and it is the
+            # exact judgement 088 depends on. It must be visible in the report.
+            diagnostics["scene_text_contract"].append({
+                "ids": list(group), "action": "offer-badge-bake-role-mismatch",
+                "carrier": carrier["kind"], "host": carrier.get("host_id"),
+                "roles": roles,
+            })
+            continue
+        removable, stats = True, []
+        for c in members:
+            ok, st = _chrome_ink_removable(rgb, c.get("box") or {})
+            st = dict(st, id=c.get("id"))
+            stats.append(st)
+            if not ok:
+                removable = False
+        if not removable:
+            # Honest fallback: chrome the ink cannot be lifted off stays baked, and says why.
+            diagnostics["scene_text_contract"].append({
+                "ids": list(group), "action": "offer-badge-bake-unremovable",
+                "carrier": carrier["kind"], "host": carrier.get("host_id"),
+                "probe": stats,
+            })
+            continue
+        chip_id = "badge-" + str(carrier["key"])
+        for m in group:
+            promoted[m] = {
+                "chip_id": chip_id,
+                "chip_box": dict(carrier["chrome_box"]),
+                "host_id": carrier.get("host_id"),
+            }
+        diagnostics["scene_text_contract"].append({
+            "ids": list(group), "action": "offer-badge-editable",
+            "carrier": carrier["kind"], "host": carrier.get("host_id"),
+            "chip_id": chip_id, "chip_box": carrier["chrome_box"],
+            "roles": roles, "probe": stats,
+        })
+    return promoted
 
 
 def _bake_text_into_chrome_host(text: dict, host: dict, diagnostics: dict, *, action: str) -> None:
@@ -3192,6 +3466,18 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
     _rotated_carrier_rot = _rotated_carrier_consensus(
         text_cands, float((cfg.get("merge") or {}).get("rotated_scene_ink_deg", 8.0))
     )
+    # ...and the same carrier read decides WHICH verdict the seal shares: an offer badge
+    # keeps its chrome as raster but hands its text back as editable TEXT (see
+    # _offer_lockup_ids). Everything unproven still bakes. Element-hosted badges are read
+    # here too, so an axis-aligned 101/131 chip is judged by the same evidence as 013's
+    # rotated disc — the rotation was never the point, the carrier is.
+    _offer_lockup = _offer_lockup_ids(
+        text_cands, _load_run_rgb(run_dir),
+        float((cfg.get("merge") or {}).get("rotated_scene_ink_deg", 8.0)),
+        cfg, diagnostics,
+        elem_cands=elem_cands, product_regions=product_regions,
+        scene_text_inside=scene_text_inside,
+    )
 
     # scene text: OCR line inside a photo region -> keep baked in the base.
     # VLM scene_text_role overrides geometry when confident; geometry remains fallback.
@@ -3464,6 +3750,13 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                     _body_copy = str((c.get("meta") or {}).get("role") or c.get("role") or "").lower() in {
                         "body", "heading", "title", "subtitle", "headline",
                     }
+                    # A PROVEN offer badge is the one thing this branch must not bake: its
+                    # carrier reads unanimously as the offer and its ink is measurably
+                    # liftable, so '61% OFF' / 'BUY 2, GET 1 FREE' ships as native TEXT over
+                    # raster chrome. This is 101's and 131's real blocker — both are
+                    # element-hosted chips that reach exactly here (bake-chrome-text) and
+                    # never had a rotation to qualify them under the old gate.
+                    _chip = _offer_lockup.get(c.get("id"))
                     if (
                         _bake_chrome_text_enabled(cfg)
                         and is_chrome_as_raster_role(bake_host_role)
@@ -3471,6 +3764,7 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                         and not _is_vs_chip_text(c)
                         and not _body_copy
                         and not _wide_plate
+                        and not _chip
                     ):
                         om = owner_elem.setdefault("meta", {})
                         if owner_role in {"logo", "wordmark", "brand", "logotype"}:
@@ -3486,6 +3780,15 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
                     c["meta"]["parent_id"] = cutout_owner["id"]
                     c["meta"]["shell_text_host"] = cutout_owner["id"]
                     c["meta"]["ownership_enforced"] = True
+                    if _chip:
+                        # This branch `continue`s before the overlay-role tagging below, so
+                        # the badge tags have to be applied here too or an element-hosted
+                        # chip would ship editable but ungrouped and un-cleaned.
+                        c["meta"]["badge_offer_lockup"] = True
+                        c["meta"]["offer_badge_id"] = _chip["chip_id"]
+                        c["meta"]["badge_chip_box"] = _chip["chip_box"]
+                        if _chip.get("host_id"):
+                            c["meta"]["badge_chip_host"] = _chip["host_id"]
                     if owner_elem is not None:
                         om = owner_elem.setdefault("meta", {})
                         om["text_bearing_shell"] = True
@@ -3577,7 +3880,10 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
         _carrier_rot = _rotated_carrier_rot.get(c.get("id"))
         if _carrier_rot is not None:
             _rot = max(_rot, float(_carrier_rot))
-        if _rot >= _rot_scene_min:
+        # An offer badge is chrome-as-raster too — but its OFFER is the batch-swap string,
+        # so it falls through to the overlay-role branch below (native TEXT + ink removed
+        # from the plate) instead of baking. Proven per carrier, never assumed.
+        if _rot >= _rot_scene_min and c.get("id") not in _offer_lockup:
             meta = c["meta"]
             positive_overlay = bool(
                 ownership_action == "recreate"
@@ -3607,6 +3913,23 @@ def merge(ocr, elements, qwen, canvas, cfg: Optional[dict] = None, run_dir=None)
             # explicit because a downstream router may conservatively return drop.
             c["meta"]["overlay_text"] = True
             c["meta"]["removal_required"] = True
+            _chip = _offer_lockup.get(c.get("id"))
+            if _chip:
+                # This line is one of an OFFER BADGE's lines (chrome kept as raster, text
+                # editable). Tag it so build_design_json can gather the lockup into its own
+                # named 'Badge / …' group instead of letting layout.py's generic text-stack
+                # sweep it in with an unrelated headline (which shifts both). The tag also
+                # holds it out of that flow — a rotated badge line is not headline copy.
+                c["meta"]["badge_offer_lockup"] = True
+                # Per-CARRIER id, not one id for the whole ad: 131 carries a badge chip AND
+                # separate offer copy, and collapsing them into one group would drag
+                # unrelated lines under one 'Badge / …' node.
+                c["meta"]["offer_badge_id"] = _chip["chip_id"]
+                # The chip descriptor travels with the line: reconstruct removes this ink
+                # INSIDE these bounds (chip-local), never on the canvas plate.
+                c["meta"]["badge_chip_box"] = _chip["chip_box"]
+                if _chip.get("host_id"):
+                    c["meta"]["badge_chip_host"] = _chip["host_id"]
             continue
         for pr in scene_regions:
             if _inside_frac(c["box"], pr) >= photo_inside:
