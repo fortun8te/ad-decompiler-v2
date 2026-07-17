@@ -253,6 +253,14 @@ def run_one(input_path, run_dir, cfg, start_from="normalize"):
             if ocr_judge.get("enabled"):
                 vram.stage_boundary("ocr", "vlm-ocr-judge", cfg, run_dir,
                                     log_fn=lambda msg: _log(run_dir, msg))
+                # LM Studio evicts the VLM whenever the OCR CUDA engines go resident, so
+                # the judge can reach a dead server and silently lose its ENTIRE pass:
+                # benchmark-7's 131 logged lines_checked=11 corrected=0 errored=11 in one
+                # second (two errors opened the circuit breaker, the rest short-circuited)
+                # and `lms load` only ran two minutes later, after inpaint. restore_vlm is
+                # idempotent and a no-op when already loaded, so ensuring it here costs
+                # nothing and stops the judge from being skipped by eviction.
+                vram.restore_vlm(cfg, run_dir, log_fn=lambda msg: _log(run_dir, msg))
                 raw_ocr = vlm_ocr_judge.judge_ocr_lines(norm_path, raw_ocr, cfg)
             if (cfg.get("vlm") or {}).get("enabled"):
                 vram.stage_boundary("ocr", "vlm-proofread", cfg, run_dir,
