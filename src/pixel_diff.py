@@ -48,6 +48,13 @@ DEFAULT_THRESHOLDS = {
     "local_ssim_min": DEFAULT_VISUAL_PASS_SSIM,
     "edge_f1_min": 0.68,
     "color_similarity_min": 0.82,
+    # F-colour-honesty: corroboration floor for a color-fidelity HARD fail. Scored on
+    # `local_similarity` (colour measured where colour is comparable), NOT on the whole-image
+    # number above — the two are different scales on purpose and 0.98 is calibrated from
+    # measured data, not carried over. See the `_color_metrics` docstring for the full table:
+    # every real bench-10 render lands at 0.989-1.000 while injected colour defects land at
+    # 0.970 and below, so 1.0 dE sits in the empty gap between them.
+    "color_local_similarity_min": 0.98,
     "editable_ratio_min": 0.15,
     # native_leaf_ratio is native_leaf_count / foreground_leaf_count (text/shape leaves only,
     # background excluded). 0.30 is conservative on purpose: it only needs to catch the
@@ -96,6 +103,39 @@ DEFAULT_THRESHOLDS = {
     # independent gate on the single worst window regardless of the aggregate score.
     # Configurable — callers/archetypes may raise or lower it.
     "local_ssim_worst_window_min": 0.10,
+    # F-worst-region-honesty: the floor above fired on 13 of 16 bench-10 fixtures, which made
+    # it useless as a signal — it no longer discriminated good from bad. Montaging every
+    # bench-9 worst window (work/worst_windows.png) showed EVERY one lands on a text glyph,
+    # and most are the same benign phenomenon: we substitute fonts (a font agent measured 41
+    # of 99 delivered text nodes drawing a different face in preview), so glyph advance
+    # widths differ slightly and positions DRIFT along a text run — 0px at the run's anchor,
+    # 20-30px by its far end. A 64px window sitting at the END of a run then compares "tail
+    # of a glyph" against "blank" and collapses to ~0.02 SSIM for text a designer cannot tell
+    # apart (measured: 009 "We zien je", 104 "ration", 101 "ARE BU", 107 "EEK 4").
+    #
+    # The fix is NOT a looser floor (that would trade one lie for another) — it is asking
+    # whether a pure TRANSLATION explains the window. The test is deliberately SYMMETRIC:
+    #   forward  = source window vs the render searched over +/-radius   (catches deletions)
+    #   backward = render window vs the source searched over +/-radius   (catches ghosts)
+    # and a window is only excused when min(forward, backward) clears the bar. One-sided
+    # search would excuse an ADDED ghost double (source blank -> some nearby render patch is
+    # also blank -> "explained"); requiring the reverse match too closes that hole, because a
+    # fabricated ghost has no counterpart anywhere in the source. Measured on the real
+    # artifacts (see the table in the F-worst-region-honesty notes on _translation_explains).
+    #
+    # Radius is HALF a window and no more. Beyond that the search stops measuring
+    # displacement and starts finding coincidental look-alikes: 025's genuinely missing emoji
+    # (bench-9, x=64 y=896) stays at 0.096 out to radius 32 but spuriously matches a
+    # look-alike wood-grain patch at 0.639 once radius reaches 48. Half a window is also the
+    # honest semantic boundary — content displaced by more than half a window is misplaced,
+    # not drifted.
+    "local_ssim_shift_radius_ratio": 0.5,
+    # The bar for "a translation EXPLAINS this window" is deliberately much higher than the
+    # 0.10 fail floor: being merely no-longer-failing after shifting is not an explanation. A
+    # real drift snaps to a GOOD match (measured 0.59-0.98); genuine damage does not come
+    # close (025 missing emoji 0.096, 016 60px-misplaced headline 0.012, 067 0.155, 135
+    # wrong-weight glyphs 0.422). 0.50 sits in the empty gap between those two populations.
+    "local_ssim_shift_explained_min": 0.50,
     # ── CODIA CONSTRUCTION CONTRACT (docs/CODIA-PARITY-SPEC.md) ───────────────────────
     # The QA objective is Codia's construction, not screenshot SSIM: every string is native
     # editable TEXT, everything hard is an image cutout, flat chrome is a solid plate,
@@ -246,6 +286,133 @@ def _local_ssim_worst_window(a, b, preserve_mask=None, target_windows=10):
     return {"ssim": round(float(_ssim(worst_pa, worst_pb)), 5), "bbox": worst_bbox}
 
 
+def _window_grid(a, preserve_mask=None, target_windows=10):
+    """The exact non-overlapping window grid `_local_ssim_values` scores, as bboxes.
+
+    Single source of truth for "which windows are scored", so the worst-window gate and the
+    aggregate can never drift apart on geometry.
+    """
+    h, w = a.shape
+    window = max(8, min(64, int(round(min(h, w) / max(1, target_windows)))))
+    out = []
+    for y in range(0, h, window):
+        for x in range(0, w, window):
+            hh = min(h, y + window) - y
+            ww = min(w, x + window) - x
+            if hh <= 0 or ww <= 0:
+                continue
+            if preserve_mask is not None:
+                km = preserve_mask[y : y + hh, x : x + ww]
+                if km.size == 0 or float(km.mean()) < 0.70:
+                    continue
+            out.append({"x": int(x), "y": int(y), "w": int(ww), "h": int(hh)})
+    return out, window
+
+
+def _window_at(image, x, y, w, h):
+    if x < 0 or y < 0 or y + h > image.shape[0] or x + w > image.shape[1]:
+        return None
+    return image[y : y + h, x : x + w]
+
+
+def _translation_explains(source_gray, render_gray, box, radius, bar):
+    """Is this window's low SSIM explained by a pure local translation of intact content?
+
+    Symmetric on purpose — see the ``local_ssim_shift_radius_ratio`` threshold notes.
+    ``forward`` alone would excuse a fabricated ghost; ``backward`` alone would excuse a
+    deletion. Only content that is present on BOTH sides, merely displaced, clears both.
+
+    Measured on the real bench-9/bench-10 artifacts (radius 32, bar 0.50):
+
+        fixture  raw     fwd    bwd    min     verdict   what it actually is
+        009      0.011   0.982  1.000  0.982   drift     "We zien je" tail, identical face
+        131     -0.091   0.985  0.934  0.934   drift
+        091      0.046   0.902  0.918  0.902   drift
+        066      0.024   0.959  1.000  0.959   drift
+        101      0.016   0.964  1.000  0.964   drift     window blank in both to the eye
+        104      0.018   0.867  1.000  0.867   drift     "ration", tail clips the corner
+        094     -0.031   0.975  0.841  0.841   drift
+        002     -0.099   0.829  0.841  0.829   drift
+        013      0.070   0.853  0.977  0.853   drift*    *italic-vs-upright; see below
+        107      0.024   0.593  0.679  0.593   drift     "EEK 4", visually identical
+        135     -0.023   0.422  0.947  0.422   DAMAGE    renders "OP" bold, source is light
+        067      0.001   0.155  0.864  0.155   DAMAGE
+        025 b9   0.074   0.096  0.982  0.096   DAMAGE    emoji missing entirely
+        016     -0.017   0.012  0.982  0.012   DAMAGE    headline misplaced by 60px
+
+    The two populations do not overlap: worst drift 0.593, best damage 0.422.
+
+    *013 is the one deliberate soft edge. Its window catches our render drawing ITALIC where
+    the source is upright (the declared-Bold/italic-file bug), and translation "explains" it
+    at 0.853 because the same glyph exists a few px away. It is not lost: the
+    deliverable-consistency check (`_font_consistency_audit`) names it exactly — "declares
+    Bold, preview drew Italic" — which is a far better report than an anonymous 0.07 window.
+
+    Both directions are scored at ONE SHARED displacement (forward at ``+shift``, backward at
+    ``-shift``) rather than each picking its own best. A real translation is a single vector:
+    if the content moved by (dx,dy) then source@(x,y) matches render@(x+dx,y+dy) AND
+    render@(x,y) matches source@(x-dx,y-dy). Letting the two directions choose independent
+    shifts would let a window be "explained" by two unrelated coincidental look-alikes.
+    """
+    x, y, bw, bh = box["x"], box["y"], box["w"], box["h"]
+    src_win = source_gray[y : y + bh, x : x + bw]
+    ren_win = render_gray[y : y + bh, x : x + bw]
+    best, best_shift, best_pair = -2.0, (0, 0), (0.0, 0.0)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            ahead = _window_at(render_gray, x + dx, y + dy, bw, bh)
+            behind = _window_at(source_gray, x - dx, y - dy, bw, bh)
+            if ahead is None or behind is None:
+                continue
+            forward = float(_ssim(src_win, ahead))
+            if forward <= best:
+                continue  # min(forward, backward) cannot beat `best` — skip the 2nd SSIM
+            backward = float(_ssim(ren_win, behind))
+            agreed = min(forward, backward)
+            if agreed > best:
+                best, best_shift, best_pair = agreed, (int(dx), int(dy)), (forward, backward)
+    if best < -1.0:  # degenerate: every shift left the image
+        value = float(_ssim(src_win, ren_win))
+        best, best_pair = value, (value, value)
+    return {
+        "forward": round(float(best_pair[0]), 5),
+        "backward": round(float(best_pair[1]), 5),
+        "shift_tolerant_ssim": round(float(best), 5),
+        "shift": {"dx": best_shift[0], "dy": best_shift[1]},
+        "explained": bool(best >= float(bar)),
+    }
+
+
+def _classify_subfloor_windows(source_gray, render_gray, preserve_mask, floor, radius_ratio,
+                               bar, max_windows=48):
+    """Split every below-floor window into genuine DAMAGE vs benign translation DRIFT.
+
+    Checking every sub-floor window (not just the single worst) matters: otherwise a drift
+    artifact that happens to score worst would mask a real defect sitting one window over.
+    Cheap in practice — measured 0-26 sub-floor windows per bench-10 fixture (median 2).
+    """
+    boxes, window = _window_grid(source_gray, preserve_mask)
+    radius = max(1, int(round(window * float(radius_ratio))))
+    scored = []
+    for box in boxes:
+        pa = source_gray[box["y"] : box["y"] + box["h"], box["x"] : box["x"] + box["w"]]
+        pb = render_gray[box["y"] : box["y"] + box["h"], box["x"] : box["x"] + box["w"]]
+        value = float(_ssim(pa, pb))
+        if value < float(floor):
+            scored.append((value, box))
+    scored.sort(key=lambda item: item[0])
+    damage, drift = [], []
+    # Bound the work on pathological runs (067: 26 sub-floor windows). The cap is far above
+    # the observed maximum and windows are examined worst-first, so a real defect cannot be
+    # cropped out by it in practice.
+    for value, box in scored[:max_windows]:
+        verdict = _translation_explains(source_gray, render_gray, box, radius, bar)
+        entry = {"ssim": round(value, 5), "bbox": box, **verdict}
+        (drift if verdict["explained"] else damage).append(entry)
+    return {"damage": damage, "drift": drift, "radius": radius,
+            "subfloor_total": len(scored), "examined": len(scored[:max_windows])}
+
+
 def _multiscale_ssim(a, b, preserve_mask=None):
     import numpy as np
 
@@ -390,17 +557,102 @@ def _rgb_to_lab(rgb):
                      200 * (f[..., 1] - f[..., 2])), axis=-1)
 
 
+def _local_color_error(source_lab, render_lab, radius=16, step=2):
+    """Per-pixel: how far is the colour we PAINTED from the nearest colour the source has
+    within +/-radius px of that spot.
+
+    Colour fidelity, isolated from coverage. It answers "is every colour we emit a colour
+    that belongs there", which is what `color-fidelity` claims to measure, and it is blind
+    by construction to WHERE a faithful colour landed:
+      * a glyph rendered 3px over paints black onto a pixel whose source neighbourhood
+        contains that same black -> ~0 error (correct: placement is not colour);
+      * a red headline painted blue paints a colour the source has nowhere nearby -> large;
+      * any tint shifts every painted colour off its local source palette -> large;
+      * MISSING content paints the background colour, which IS in the source neighbourhood
+        -> ~0 (correct: absence is a coverage defect, and other gates own it).
+    Deliberately one-directional (painted -> source). The reverse (source colours absent from
+    our render) is exactly the coverage question this metric must NOT answer.
+    """
+    import numpy as np
+
+    best = None
+    for dy in range(-radius, radius + 1, step):
+        for dx in range(-radius, radius + 1, step):
+            shifted = np.roll(np.roll(source_lab, dy, axis=0), dx, axis=1)
+            distance = np.linalg.norm(render_lab - shifted, axis=2)
+            best = distance if best is None else np.minimum(best, distance)
+    return best
+
+
 def _color_metrics(source_rgb, render_rgb):
+    """Colour fidelity — reported two ways, because the classic one is not about colour.
+
+    F-colour-honesty. `similarity` is ``1 - mean(deltaE)/50`` over EVERY pixel. On text-heavy
+    art that is not a colour metric at all: it degenerates into a GLYPH-COVERAGE proxy,
+    because "black glyph here / white paper there" is the maximally opposite colour pair and
+    swamps the mean. Measured on 067 (the only fixture that carries this fail): every hue the
+    pipeline emits is essentially exact — red headline source (252,2,2) vs render (252,1,0);
+    black body (0,0,0) vs (0,0,0); background (246,246,246) vs (246,246,246); jars dE 0.59;
+    signature dE 1.15; median text-region dE 1.04; ZERO tint anywhere. Yet mean dE was 11.84
+    (similarity 0.763 < the 0.820 gate) because the dE distribution is bimodal: 55% of text
+    pixels at dE<2 but 20.2% at dE>50. By contribution 99% of the "colour" error was text
+    placement (headline 21.5%, para 1 47.8%, para 2 26.1%, jars 0.6%) — a font-substitution
+    artefact ALREADY counted by ssim/worst-region, re-reported under a colour name. No colour
+    fix could ever clear it: fixing 067's paragraph break moved it 0.739 -> 0.763.
+
+    `similarity` keeps its exact old definition and scale — harness_critic, repair and the
+    archetype `color_similarity_min` presets are all calibrated to it, and silently rescaling
+    a number they threshold would disable their gates without saying so. What changes is that
+    it may no longer HARD-fail on its own: a `color-fidelity` hard fail must now be
+    corroborated by `local_similarity`, which measures colour where colour is comparable (see
+    `_local_color_error`). Uncorroborated = the coverage artefact 067 proves exists, and it
+    is reported as a warning instead.
+
+    Calibration of `local_similarity` is measured, not guessed — mean local dE at radius 16
+    over real ad renders vs injected colour defects:
+        all 16 bench-10 real renders   0.00 - 0.39   (-> local_similarity 0.992 - 1.000)
+        region erased to background    0.14          coverage defect, correctly NOT colour
+        067 HEAD (colour proven exact) 0.16
+        20px pure translation, sparse  0.00          drift is not colour
+        red headline -> pink           ~0.5          MISSED (see limitation below)
+        top band red +90               1.24          fires
+        red headline -> blue           2.55          fires
+        blue tint +25 / +60            4.72 / 7.66   fires
+        magenta block over a region    6.80          fires
+    A floor of 1.0 dE (local_similarity 0.98) sits in the gap between the worst real render
+    (0.39) and the weakest defect it catches (1.24).
+
+    The radius is 16, also measured rather than assumed. It must exceed the glyph drift a
+    substituted font produces (20-32px measured on the worst-window study) or a pure
+    TRANSLATION starts reading as a colour error when content is sparse enough that a
+    displaced glyph finds no same-coloured neighbour: on an adversarial isolated-glyph page a
+    20px translation scores 1.83 at radius 8 (false fire) but 0.00 at radius 16. Real ad text
+    is dense enough that radius 8 also passed all 16 fixtures; 16 is simply the setting with
+    margin on both sides. Larger is not free — at radius 24 the weakest real defect drops to
+    1.14 and starts crowding the floor.
+
+    Known limitation, stated rather than hidden: this is a MEAN, so a subtle hue shift over a
+    small area (the pink-headline injection: ~1% of canvas, dE ~20 locally) dilutes below the
+    floor and is missed. A large or strongly off-palette colour error is caught; a small
+    tasteful one is not. Catching that needs per-element colour comparison against
+    design.json fills, which is a bigger build than this pass.
+    """
     import numpy as np
 
     src, ren = _metric_rgb(source_rgb), _metric_rgb(render_rgb)
-    delta = np.linalg.norm(_rgb_to_lab(src) - _rgb_to_lab(ren), axis=2)
+    src_lab, ren_lab = _rgb_to_lab(src), _rgb_to_lab(ren)
+    delta = np.linalg.norm(src_lab - ren_lab, axis=2)
     mean = float(delta.mean())
     p95 = float(np.percentile(delta, 95))
     mae = float(np.abs(src - ren).mean())
+    local_mean = float(_local_color_error(src_lab, ren_lab).mean())
     return {
+        # Unchanged definition/scale — every existing consumer and threshold keeps working.
         "similarity": max(0.0, 1.0 - mean / 50.0),
         "delta_e_mean": mean,
+        # Coverage-blind colour signal; the corroboration a color-fidelity HARD fail needs.
+        "local_similarity": max(0.0, 1.0 - local_mean / 50.0),
+        "delta_e_local_mean": local_mean,
         "delta_e_p95": p95,
         "rgb_mae": mae,
     }
@@ -505,8 +757,58 @@ def _scene_baked_exemption_block_reason(run_dir, design) -> str:
 
 def _text_recall(source_ocr, render_ocr, source_gray=None, render_gray=None,
                  design=None, run_dir=None):
-    return _text_recall_detail(source_ocr, render_ocr, source_gray, render_gray,
-                               design=design, run_dir=run_dir)["recall"]
+    """Share of source lines an OCR of the RENDERED IMAGE reads back. Kept deliberately.
+
+    This is the render-OCR round-trip, and it stays exactly as it was because it has one
+    legitimate caller: `figma_verify`, which OCRs the REAL FIGMA EXPORT. There, re-reading
+    the rendered pixels is the whole point — the export IS the deliverable, so text that
+    cannot be read back really did go missing in Figma.
+
+    `compare()` no longer uses it. Against our own PREVIEW the same round-trip is a
+    consistency metric, not a correctness one, and it punished correct work (131) — see
+    `_text_recall_detail`, which is what compare() scores instead. Same question, two
+    different right answers, depending on whether you are looking at the real export or at
+    our own proxy of it.
+    """
+    kept = [l for l in source_ocr.get("lines", []) if l.get("conf", 1) >= 0.5
+            and len(_norm(l.get("text", ""))) >= 3]
+    if not kept:
+        return 1.0
+    ren_blob = " ".join(_norm(l["text"]) for l in (render_ocr or {}).get("lines", []))
+    kept_blob = " ".join(_norm(t) for t in ((design or {}).get("kept_in_photo") or []))
+    baked_leaves = _baked_line_leaves(design, source_gray) if kept_blob else []
+    asset_cache = {}
+    found = 0
+    excluded = 0
+    for line in kept:
+        norm = _norm(line["text"])
+        if norm in ren_blob:
+            found += 1
+            continue
+        # Same pixel-verbatim fallback as before: OCR is not deterministic even on IDENTICAL
+        # pixels (021 measured recall 0.6 on a render with ssim 1.0 vs source).
+        if source_gray is not None and render_gray is not None:
+            clipped = _clip_box(line.get("box") or {}, *source_gray.shape[1::-1])
+            if clipped is not None:
+                try:
+                    import numpy as _np
+                    x0, y0, x1, y1 = clipped
+                    delta = _np.abs(source_gray[y0:y1, x0:x1].astype(_np.float32)
+                                    - render_gray[y0:y1, x0:x1].astype(_np.float32))
+                    if float(delta.mean()) <= 2.0:
+                        found += 1
+                        continue
+                except Exception:
+                    pass
+        if kept_blob and norm and norm in kept_blob:
+            try:
+                if _line_baked_in_asset(line.get("box") or {}, source_gray,
+                                        baked_leaves, run_dir, asset_cache):
+                    excluded += 1
+            except Exception:
+                pass
+    denominator = len(kept) - excluded
+    return 1.0 if denominator <= 0 else found / denominator
 
 
 def _clip_box(box, width, height):
@@ -614,29 +916,143 @@ def _line_baked_in_asset(line_box, source_gray, leaves, run_dir, asset_cache):
     return False
 
 
+def _confusable_fold(text):
+    """`_confusable_key` from src.ocr — canonical form under known OCR glyph confusion.
+
+    Imported lazily (and reused, never re-implemented) so the SAME folding the OCR
+    arbitration uses also governs how QA compares strings. Falls back to plain `_norm` if
+    src.ocr cannot be imported, which only makes the comparison stricter, never looser.
+    """
+    global _CONFUSABLE_FOLD_FN
+    if _CONFUSABLE_FOLD_FN is None:
+        fn = None
+        for module in ("src.ocr", "ocr"):
+            try:
+                fn = getattr(__import__(module, fromlist=["_confusable_key"]),
+                             "_confusable_key")
+                break
+            except Exception:
+                continue
+        _CONFUSABLE_FOLD_FN = fn or (lambda value: _norm(value))
+    return _CONFUSABLE_FOLD_FN(text)
+
+
+_CONFUSABLE_FOLD_FN = None
+
+
+def _delivered_text_blob(design, fold=True):
+    """The copy we actually DELIVER, in any form, block-joined.
+
+    Counts TEXT nodes AND text carried by raster layers (fallback slices, wordmark/lockup
+    art, foreground_raster bakes — the same layers `_text_editability` accounts for). A
+    rasterized line IS delivered: the copy is present in the output, just not editably.
+    Keeping it here is what keeps `text_recall` (is the copy present at all) a different
+    question from `editable_text_recall` (is it editable) — and therefore what keeps their
+    product, `true_text_coverage`, meaningful rather than a squared restatement of one
+    number. Rasterizing text still costs the run: it lowers editable_text_recall /
+    native_text_ratio, which is where that loss belongs.
+
+    Same block-regrouping as `_text_editability` (one source line is often emitted as
+    several sibling word nodes): fragments of one block concatenate, separate blocks stay
+    space-separated so unrelated nodes can never fuse into a phantom match.
+    """
+    key = _confusable_fold if fold else _norm
+    blocks = {}
+    raster = []
+    for layer in _flatten_layers((design or {}).get("layers") or []):
+        if layer.get("type") == "text":
+            value = key(layer.get("text"))
+            if value:
+                blocks.setdefault(_text_block_key(layer), []).append(value)
+            continue
+        meta = layer.get("meta") or {}
+        is_raster_text = layer.get("type") == "image" and (
+            _fallback_kind(meta) is not None
+            or meta.get("wordmark") or meta.get("platform_lockup")
+            or meta.get("layer_disposition") == "foreground_raster"
+        )
+        if not is_raster_text:
+            continue
+        value = key(layer.get("text") or meta.get("source_text"))
+        if value:
+            raster.append(value)
+    return " ".join(["".join(parts) for parts in blocks.values()] + raster)
+
+
 def _text_recall_detail(source_ocr, render_ocr, source_gray=None, render_gray=None,
                         design=None, run_dir=None):
+    """Share of source text lines we actually DELIVER, scored against source truth.
+
+    F-recall-honesty. This metric used to re-OCR our own render and compare that reading to
+    the source's reading, which made it a CONSISTENCY metric wearing a correctness metric's
+    name: it rewarded being wrong the same way twice and PUNISHED being right. Measured on
+    ad 131 at bench-10 — the deliverable is character-perfect:
+
+        source truth (ocr.json)   'BUY 2, GET 1 FREE + FREE SHIPPING $100+'
+        delivered  (design.json)  'BUY 2, GET 1 FREE + FREE SHIPPING $100+'   <- correct
+        render re-OCR             'BUY2. GETIFRE: + FREE SHPPINC $100+'       <- engine junk
+        source truth              'BLACK FRIDAY SALE'
+        delivered                 'BLACK FRIDAY SALE'                         <- correct
+        render re-OCR             'BLACKERIDAYSALE'
+
+    ...and the old metric scored that 0.556, the WORST in the run, purely because doctr
+    re-reads our own correct glyphs as 'SHPPINC'/'TODAV'. Every text fix the pipeline landed
+    (the deterministic OCR fix here, the VLM's TODAV->TODAY earlier) showed up as a
+    regression. A metric that moves DOWN when the work gets RIGHT is worse than no metric.
+
+    So recall now asks the only question that matters for a deliverable: **is each source
+    line present in what we ship?** A line counts as delivered when either
+
+      1. its text is in `design.json`'s TEXT nodes — the thing we actually hand to Figma,
+         compared under `_confusable_key` folding so a G/C engine quirk in the SOURCE
+         reading (131's raw 'SHIPPINC') cancels against our corrected string instead of
+         scoring as a miss; or
+      2. its pixels survive verbatim in the render — text legitimately baked into a kept
+         photo IS present, and pixel identity cannot be faked by a wrong reconstruction.
+
+    Render-OCR is NOT part of this number any more. It moved to `render_text_legibility`
+    (see `_render_text_legibility`), which is where a "does the preview draw it legibly"
+    question belongs — reported, never a hard gate, because the preview is our own proxy and
+    Figma, not the preview, draws the shipped file.
+    """
     kept = [l for l in source_ocr.get("lines", []) if l.get("conf", 1) >= 0.5
             and len(_norm(l.get("text", ""))) >= 3]
     if not kept:
         return {"recall": 1.0, "found": 0, "lines_total": 0,
-                "baked_excluded": 0, "baked_excluded_lines": []}
-    ren_blob = " ".join(_norm(l["text"]) for l in render_ocr.get("lines", []))
+                "baked_excluded": 0, "baked_excluded_lines": [],
+                "delivered": 0, "baked_verbatim": 0, "missing_lines": [],
+                "basis": "no-source-text"}
+    # No design means no deliverable to read, so "did we deliver it" is unanswerable and
+    # must not be answered with a confident 0.0. figma_verify is exactly this caller: it
+    # compares a REAL FIGMA EXPORT with no design.json in hand, and there the rendered
+    # pixels genuinely ARE the deliverable, so OCRing them is the right measure. Score what
+    # we were actually given, and record which question got answered.
+    if design is None:
+        return {"recall": _text_recall(source_ocr, render_ocr, source_gray, render_gray,
+                                       design=design, run_dir=run_dir),
+                "found": None, "lines_total": len(kept), "baked_excluded": 0,
+                "baked_excluded_lines": [], "delivered": None, "baked_verbatim": None,
+                "missing_lines": [], "basis": "render-ocr (no design supplied)"}
+    delivered_blob = _delivered_text_blob(design)
     kept_blob = " ".join(_norm(t) for t in ((design or {}).get("kept_in_photo") or []))
     baked_leaves = _baked_line_leaves(design, source_gray) if kept_blob else []
     asset_cache = {}
-    found = 0
+    found = delivered = baked_verbatim = 0
     baked_excluded = []
+    missing = []
     for line in kept:
         norm = _norm(line["text"])
-        if norm in ren_blob:
+        # 1. Present in the DELIVERABLE (design.json text nodes), confusable-folded.
+        folded = _confusable_fold(line["text"])
+        if folded and delivered_blob and folded in delivered_blob:
             found += 1
+            delivered += 1
             continue
-        # Baked-verbatim fallback: OCR is not deterministic even on IDENTICAL pixels
-        # (021 measured recall 0.6 on a render with ssim 1.0 vs source). If the pixel
-        # region under this line's box survives essentially unchanged in the render,
-        # the text is literally present — count it, no re-OCR roulette. Un-gameable:
-        # pixel identity cannot be faked by a wrong reconstruction.
+        # 2. Baked-verbatim fallback: the pixel region under this line's box survives
+        # essentially unchanged in the render, so the text is literally present. (Also the
+        # old guard against OCR non-determinism on IDENTICAL pixels — 021 measured recall
+        # 0.6 on a render with ssim 1.0 vs source.) Un-gameable: pixel identity cannot be
+        # faked by a wrong reconstruction.
         if source_gray is not None and render_gray is not None:
             clipped = _clip_box(line.get("box") or {}, *source_gray.shape[1::-1])
             if clipped is not None:
@@ -647,15 +1063,16 @@ def _text_recall_detail(source_ocr, render_ocr, source_gray=None, render_gray=No
                                     - render_gray[y0:y1, x0:x1].astype(_np.float32))
                     if float(delta.mean()) <= 2.0:
                         found += 1
+                        baked_verbatim += 1
                         continue
                 except Exception:
                     pass
         # Product-printed-text fairness (135): a line that merge deliberately kept in the
         # photo (design.kept_in_photo) AND whose pixels are verbatim present in the owning
-        # product/photo ASSET is correctly baked-by-design — the render pipeline never
-        # promised to re-OCR it. Exclude it from the recall DENOMINATOR so the metric
-        # reflects editable-ad text only. Both conditions are evidence-based: the merge
-        # verdict comes from the source image, and the pixels are read from the real asset.
+        # product/photo ASSET is correctly baked-by-design — the pipeline never promised to
+        # make it editable. Exclude it from the recall DENOMINATOR so the metric reflects
+        # editable-ad text only. Both conditions are evidence-based: the merge verdict comes
+        # from the source image, and the pixels are read from the real asset.
         if kept_blob and norm and norm in kept_blob:
             try:
                 if _line_baked_in_asset(line.get("box") or {}, source_gray,
@@ -664,11 +1081,61 @@ def _text_recall_detail(source_ocr, render_ocr, source_gray=None, render_gray=No
                     continue
             except Exception:
                 pass
+        missing.append(str(line.get("text"))[:60])
     denominator = len(kept) - len(baked_excluded)
     recall = 1.0 if denominator <= 0 else found / denominator
     return {"recall": recall, "found": found, "lines_total": len(kept),
             "baked_excluded": len(baked_excluded),
-            "baked_excluded_lines": baked_excluded}
+            "baked_excluded_lines": baked_excluded,
+            # Auditable split of the numerator: how many lines we ship as real text vs how
+            # many are only "present" as preserved pixels. A run whose recall leans on
+            # baked_verbatim is NOT delivering editable text, and native_text_ratio /
+            # editable_text_recall are the metrics that say so.
+            "delivered": delivered, "baked_verbatim": baked_verbatim,
+            # Never silent about what we dropped.
+            "missing_lines": missing,
+            # Which question this number answers — never leave that to inference.
+            "basis": "delivered-vs-source-truth"}
+
+
+def _render_text_legibility(render_ocr, design):
+    """Does our PREVIEW visibly draw the text we delivered? Reported, never a hard gate.
+
+    This is what the old `text_recall` was actually measuring, restored to an honest scope
+    and an honest name. It compares render-OCR against the DELIVERED strings (not against
+    source truth) under `_confusable_key` folding, so the engine's own glyph confusions
+    (131: doctr reads our correct 'FREE SHIPPING' as 'FREE SHPPINC') cancel on both sides
+    instead of manufacturing a phantom regression.
+
+    It is deliberately NOT gated:
+      * the preview is OUR proxy renderer, not the deliverable — Figma draws the shipped
+        file, and a font agent measured 41 of 99 delivered text nodes drawing a DIFFERENT
+        face in preview than Figma will resolve;
+      * OCR on stylised display type is noisy enough that a low score is a hint to look,
+        not evidence of a defect.
+    A low value with `text_recall` at 1.0 means "we shipped the right strings; the preview
+    may be drawing them unreadably" — worth a look, not a rejection.
+    """
+    if not render_ocr or not design:
+        return None
+    delivered_lines = [layer.get("text") for layer in
+                       _flatten_layers((design or {}).get("layers") or [])
+                       if layer.get("type") == "text" and _norm(layer.get("text"))]
+    if not delivered_lines:
+        return None
+    render_blob = " ".join(_confusable_fold(l.get("text"))
+                           for l in render_ocr.get("lines", []) if l.get("conf", 1) >= 0.5)
+    legible = 0
+    illegible = []
+    for text in delivered_lines:
+        folded = _confusable_fold(text)
+        if folded and render_blob and folded in render_blob:
+            legible += 1
+        else:
+            illegible.append(str(text)[:60])
+    return {"legible": legible, "delivered_lines": len(delivered_lines),
+            "ratio": round(legible / len(delivered_lines), 4),
+            "not_read_back": illegible}
 
 
 def _load_design(design, run_dir):
@@ -1153,6 +1620,141 @@ def _duplicate_ownership(layers):
             else:
                 owners[key] = lid
     return sorted(set(duplicates))
+
+
+_FONT_WEIGHT_WORDS = (
+    ("thin", 100), ("extralight", 200), ("ultralight", 200), ("demilight", 350),
+    ("semilight", 350), ("light", 300), ("semibold", 600), ("demibold", 600),
+    ("extrabold", 800), ("ultrabold", 800), ("black", 900), ("heavy", 900),
+    ("medium", 500), ("bold", 700), ("regular", 400), ("normal", 400), ("book", 400),
+)
+
+
+def _subfamily_weight(subfamily):
+    """Weight class a font FILE advertises in its own subfamily name."""
+    name = str(subfamily or "").casefold().replace(" ", "").replace("-", "")
+    for word, value in _FONT_WEIGHT_WORDS:
+        if word in name:
+            return value
+    return 400
+
+
+def _is_italic_name(name):
+    lowered = str(name or "").casefold()
+    return "italic" in lowered or "oblique" in lowered
+
+
+def _font_consistency_audit(design):
+    """Does each text node's DECLARED font match the file the preview actually drew?
+
+    F-deliverable-consistency. Two different things resolve a font, and QA never compared
+    them:
+      * FIGMA (our deliverable) resolves the declared ``fontFamily`` + ``fontStyle`` NAME;
+      * our preview resolves a FILE from ``fontCandidates`` and draws that.
+    When they disagree, the preview's pixels stop being evidence about the deliverable — and
+    a whole defect class becomes invisible to SSIM BY CONSTRUCTION, because SSIM only ever
+    sees the preview. Ad 013 is the proof: it declared ``fontStyle`` Bold while carrying an
+    ITALIC file, so the preview resolved the FILE and drew italic (matching the source, SSIM
+    happy) while Figma resolves the STYLE NAME and would ship it UPRIGHT. No pixel metric
+    could ever have caught that. This check is cheap, needs no render, and reads both sides.
+
+    Measured at bench-10 (103 text nodes): 33 draw a different FAMILY than declared —
+    `_relabel_google_families` rewrites a matched local face to a Figma-loadable Google name
+    (declared "Open Sans" -> draws Candara on 088/101/107; declared "Barlow Condensed" ->
+    draws Bahnschrift on 091; declared "Inter" -> draws Arial on 094). Those nodes' preview
+    pixels are NOT what Figma will draw, which is exactly why preview SSIM overstates
+    deliverable fidelity.
+
+    Severity is evidence-led, not uniform:
+      * family substitution -> WARNING. It is endemic (33/103) and deliberate; hard-failing
+        it would fire on 10 of 16 fixtures and be exactly the useless always-on gate this
+        pass exists to remove. It is reported per node so it can never be silent again.
+      * drawn-italic-while-declared-upright -> HARD. This is 013's class and it ships wrong.
+        A missing font can never CAUSE it (every fallback face is upright), so it cannot be
+        an environment artefact, and it fires 0/103 at bench-10 — a gate that is silent today
+        and speaks only when the defect returns.
+      * declared-italic-but-drawn-upright -> WARNING, not hard: that IS what a missing italic
+        file on this machine looks like, and Figma would still ship italic correctly.
+      * weight -> WARNING, and only when the axis was NOT driven. A variable face
+        (``Inter[opsz,wght].ttf``) advertises subfamily "Regular" while `_text_font` dials
+        its wght axis to the declared weight, so reading the file's name alone reports a
+        phantom mismatch (measured: it falsely flagged 009 w700 and 013 w800). Mirrors
+        `_text_font`'s own ``family_resolved`` rule. What survives is real: 135's
+        ``c_B1__w1`` declares Poppins/Regular/w400 but its Regular candidate has no file, so
+        the preview draws Poppins **ExtraBold** — independently corroborated by 135's worst
+        window, where the render draws "OP" bold over a light source.
+    """
+    try:
+        from src import render_preview
+    except Exception:
+        try:
+            import render_preview  # type: ignore
+        except Exception:
+            return None
+    nodes = []
+    for layer in _flatten_layers((design or {}).get("layers") or []):
+        if layer.get("type") != "text":
+            continue
+        style = layer.get("style") or {}
+        try:
+            font = render_preview._text_font(style, style.get("fontSize") or 12)
+            path = getattr(font, "path", None)
+            file_family, file_style = font.font.family, font.font.style
+        except Exception:
+            continue
+        if not file_family:
+            continue
+        declared_family = str(style.get("fontFamily") or "")
+        declared_style = str(style.get("fontStyle") or "")
+        try:
+            declared_weight = float(style.get("fontWeight") or 400)
+        except (TypeError, ValueError):
+            declared_weight = 400.0
+        # Was the wght axis driven for this node? Same rule _text_font itself uses.
+        axis_driven = False
+        for candidate in (style.get("fontCandidates") or []):
+            if (isinstance(candidate, dict) and candidate.get("path") and path
+                    and os.path.normcase(str(candidate["path"])) == os.path.normcase(str(path))):
+                axis_driven = bool(candidate.get("family_resolved"))
+                break
+        issues = []
+        if declared_family.strip().casefold() != str(file_family).strip().casefold():
+            issues.append("family")
+        declared_italic, file_italic = _is_italic_name(declared_style), _is_italic_name(file_style)
+        if file_italic and not declared_italic:
+            issues.append("italic-drawn-not-declared")   # 013's class — hard
+        elif declared_italic and not file_italic:
+            issues.append("italic-declared-not-drawn")
+        if not axis_driven and abs(_subfamily_weight(file_style) - declared_weight) >= 200:
+            issues.append("weight")
+        if issues:
+            nodes.append({
+                "id": layer.get("id"), "issues": issues,
+                "declared": {"family": declared_family, "style": declared_style,
+                             "weight": declared_weight},
+                "drawn": {"family": str(file_family), "style": str(file_style),
+                          "file": os.path.basename(str(path or "")),
+                          "weight_axis_driven": axis_driven},
+            })
+    total = sum(1 for layer in _flatten_layers((design or {}).get("layers") or [])
+                if layer.get("type") == "text")
+    if not total:
+        return None
+    consistent = total - len(nodes)
+    return {
+        "text_nodes": total,
+        "consistent_nodes": consistent,
+        # How much of the preview is actually evidence about the deliverable. Read this
+        # BEFORE trusting any preview-derived pixel number.
+        "preview_matches_declaration_ratio": round(consistent / total, 4),
+        "mismatched_nodes": nodes,
+        "family_substituted": sum(1 for n in nodes if "family" in n["issues"]),
+        "italic_drawn_not_declared": sum(
+            1 for n in nodes if "italic-drawn-not-declared" in n["issues"]),
+        "italic_declared_not_drawn": sum(
+            1 for n in nodes if "italic-declared-not-drawn" in n["issues"]),
+        "weight_mismatched": sum(1 for n in nodes if "weight" in n["issues"]),
+    }
 
 
 def _text_editability(source_ocr, design, layers):
@@ -2250,11 +2852,15 @@ def compare(
     design_data = _load_design(design, run_dir)
     text_recall = None
     text_recall_detail = None
-    if source_ocr and render_ocr:
+    # F-recall-honesty: recall is now delivered-vs-source-truth and no longer needs
+    # render_ocr, so it is computed whenever source text exists. Previously a run with no
+    # render-OCR silently reported text_recall=None (no gate at all).
+    if source_ocr:
         text_recall_detail = _text_recall_detail(
-            source_ocr, render_ocr, source_gray, render_gray,
+            source_ocr, render_ocr or {}, source_gray, render_gray,
             design=design_data, run_dir=run_dir)
         text_recall = text_recall_detail["recall"]
+    render_legibility = _render_text_legibility(render_ocr, design_data)
 
     opts = dict(DEFAULT_THRESHOLDS)
     # F-per-archetype-floor: apply the archetype preset's own edge/color floors (if any)
@@ -2273,12 +2879,37 @@ def compare(
         text_recall=text_recall,
     )
     quality_flags = []
+    # quality_warnings are REPORTED but never merged into hard_fails: they are the channel
+    # for "we measured something real, and it is not a defect a human would see". Keeping
+    # them out of quality_flags is deliberate — harness.py/_blocker_names treats every
+    # quality_flag as an acceptance blocker.
+    quality_warnings = []
     if multiscale < opts["local_ssim_min"]:
         quality_flags.append({"rule": "local-ssim", "detail": f"{multiscale:.3f} < {opts['local_ssim_min']:.3f}"})
     if edge["f1"] < opts["edge_f1_min"]:
         quality_flags.append({"rule": "edge-fidelity", "detail": f"{edge['f1']:.3f} < {opts['edge_f1_min']:.3f}"})
+    # F-colour-honesty: a whole-image colour miss only HARD-fails when a measure that can
+    # actually see colour agrees. Uncorroborated means the dE is glyph coverage wearing a
+    # colour name (067: every emitted hue exact, 99% of the "colour" error is text
+    # placement) — reported, not blocking. See _color_metrics.
     if color["similarity"] < opts["color_similarity_min"]:
-        quality_flags.append({"rule": "color-fidelity", "detail": f"{color['similarity']:.3f} < {opts['color_similarity_min']:.3f}"})
+        local_min = opts.get("color_local_similarity_min", 0.98)
+        if color["local_similarity"] < float(local_min):
+            quality_flags.append({
+                "rule": "color-fidelity",
+                "detail": (f"{color['similarity']:.3f} < {opts['color_similarity_min']:.3f} "
+                           f"and colour-comparable local similarity "
+                           f"{color['local_similarity']:.3f} < {float(local_min):.3f} "
+                           f"(mean local dE {color['delta_e_local_mean']:.2f}) — real colour error")})
+        else:
+            quality_warnings.append({
+                "rule": "color-fidelity-coverage-artifact",
+                "detail": (f"whole-image color_similarity {color['similarity']:.3f} < "
+                           f"{opts['color_similarity_min']:.3f}, but every colour we paint is "
+                           f"within mean dE {color['delta_e_local_mean']:.2f} of the source's "
+                           f"own local colours (local similarity {color['local_similarity']:.3f}) "
+                           f"— the dE is glyph COVERAGE, not colour; see local-ssim-worst-region "
+                           f"and the font checks for the placement/face defects that cause it")})
     # F8: per-archetype text strictness. The archetype preset's text_recall_min (0.90 for
     # social) is threaded into thresholds by the caller; enforce it here so the strict text
     # bar the preset promises actually gates instead of being wired nowhere. Only fires when
@@ -2287,6 +2918,29 @@ def compare(
     if text_recall is not None and text_recall_min is not None and text_recall < float(text_recall_min):
         quality_flags.append({"rule": "low-text-recall",
                               "detail": f"text recall {text_recall:.3f} < {float(text_recall_min):.3f}"})
+
+    # F-deliverable-consistency: compare the DECLARED font against the file the preview drew.
+    # Catches the SSIM-invisible class (013: declared Bold, italic file, preview drew italic,
+    # Figma ships upright) and quantifies how much of the preview is evidence about the
+    # deliverable at all. See _font_consistency_audit.
+    font_consistency = _font_consistency_audit(design_data)
+    if font_consistency:
+        for node in font_consistency["mismatched_nodes"]:
+            declared, drawn = node["declared"], node["drawn"]
+            where = (f"node {node['id']} declares {declared['family']!r}/{declared['style']!r}"
+                     f"/w{declared['weight']:.0f} but the preview drew "
+                     f"{drawn['family']!r}/{drawn['style']!r} ({drawn['file']})")
+            if "italic-drawn-not-declared" in node["issues"]:
+                # Ships wrong: Figma resolves the STYLE NAME (upright), the preview resolved
+                # the FILE (italic). No fallback face is italic, so this cannot be a missing
+                # font on this machine — it is a real declaration/file disagreement.
+                quality_flags.append({"rule": "font-style-mismatch", "detail":
+                    where + " — Figma resolves the declared style NAME and would ship this "
+                            "UPRIGHT while the preview shows italic; pixel metrics cannot "
+                            "see this"})
+            else:
+                quality_warnings.append({"rule": "font-declaration-mismatch",
+                                         "detail": where + f" [{', '.join(node['issues'])}]"})
 
     # F-worst-region: gate the single worst local SSIM window independently of the
     # mean-dominated aggregate, so a catastrophic region (009/016: worst window ~0.03-0.04)
@@ -2303,17 +2957,51 @@ def compare(
         except Exception:
             worst_window_png = None
     worst_window_min = opts.get("local_ssim_worst_window_min")
-    if (worst_window is not None and worst_window_min is not None
-            and worst_window["ssim"] < float(worst_window_min)):
-        bbox = worst_window["bbox"]
-        quality_flags.append({
-            "rule": "local-ssim-worst-region",
-            "detail": (
-                f"worst local window ssim {worst_window['ssim']:.3f} < {float(worst_window_min):.3f} "
-                f"at x={bbox['x']} y={bbox['y']} w={bbox['w']} h={bbox['h']}"
-            ),
-            "bbox": bbox,
-        })
+    # F-worst-region-honesty: a below-floor window only HARD-fails when no local translation
+    # explains it. Windows that are merely DRIFTED (our substituted font's advance widths
+    # walking the glyphs a few px along the run) are reported as a non-blocking warning with
+    # their measured shift, NOT as a hard fail — see `_translation_explains` for the
+    # per-fixture evidence and for why the test is symmetric.
+    window_report = None
+    if worst_window is not None and worst_window_min is not None:
+        window_report = _classify_subfloor_windows(
+            source_gray, render_gray, preserve_mask, worst_window_min,
+            opts.get("local_ssim_shift_radius_ratio", 0.5),
+            opts.get("local_ssim_shift_explained_min", 0.50))
+        if window_report["damage"]:
+            worst_damage = window_report["damage"][0]
+            bbox = worst_damage["bbox"]
+            quality_flags.append({
+                "rule": "local-ssim-worst-region",
+                "detail": (
+                    f"worst unexplained local window ssim {worst_damage['ssim']:.3f} < "
+                    f"{float(worst_window_min):.3f} at x={bbox['x']} y={bbox['y']} "
+                    f"w={bbox['w']} h={bbox['h']} — not explained by translation "
+                    f"(best match within +/-{window_report['radius']}px: "
+                    f"{worst_damage['shift_tolerant_ssim']:.3f})"
+                ),
+                "bbox": bbox,
+            })
+        if window_report["drift"]:
+            # One aggregated warning, not one per window: 067 has 20 drifted windows and a
+            # wall of near-identical entries is its own kind of noise. Every window is still
+            # listed in full under qa["local_ssim_window_report"]["drift"].
+            worst_drift = min(window_report["drift"], key=lambda item: item["ssim"])
+            bbox = worst_drift["bbox"]
+            quality_warnings.append({
+                "rule": "local-ssim-worst-region-shifted",
+                "detail": (
+                    f"{len(window_report['drift'])} local window(s) below "
+                    f"{float(worst_window_min):.3f} are explained by translation, not damage; "
+                    f"worst is ssim {worst_drift['ssim']:.3f} at x={bbox['x']} y={bbox['y']} "
+                    f"w={bbox['w']} h={bbox['h']}, which a dx={worst_drift['shift']['dx']} "
+                    f"dy={worst_drift['shift']['dy']} shift restores to "
+                    f"{worst_drift['shift_tolerant_ssim']:.3f} — glyph drift from font "
+                    f"substitution (see deliverable_font_consistency), not local damage"
+                ),
+                "bbox": bbox,
+                "count": len(window_report["drift"]),
+            })
 
     # quality_flags must actually gate acceptance — merge them into hard_fails rather than
     # leaving them as inert diagnostics that _structural_audit knows nothing about.
@@ -2354,16 +3042,30 @@ def compare(
         "edge_precision": round(edge["precision"], 4),
         "edge_recall": round(edge["recall"], 4),
         "color_similarity": round(color["similarity"], 4),
+        # F-colour-honesty: colour measured where colour is comparable. This is the reading
+        # that says whether the HUES are right; color_similarity above says whether the ink
+        # landed on the same pixels, which is a coverage question. See _color_metrics.
+        "color_local_similarity": round(color["local_similarity"], 4),
+        "delta_e_local_mean": round(color["delta_e_local_mean"], 4),
         "delta_e_mean": round(color["delta_e_mean"], 4),
         "delta_e_p95": round(color["delta_e_p95"], 4),
         "rgb_mae": round(color["rgb_mae"], 4),
         "visual_score": round(visual_score, 4),
         "quality_flags": quality_flags,
+        # Non-blocking, still reported: see the quality_warnings note above.
+        "quality_warnings": quality_warnings,
         "text_recall": None if text_recall is None else round(text_recall, 4),
         # Denominator honesty: how many source lines were excluded as correctly-baked
         # product text (kept_in_photo + pixels verbatim in the owning asset), with the
         # excluded line texts listed so the exclusion is auditable, never silent.
         "text_recall_detail": text_recall_detail,
+        # "Does our preview draw what we delivered" — the old render-OCR round-trip, kept as
+        # an honest, separately-named, NON-gating signal. See _render_text_legibility.
+        "render_text_legibility": render_legibility,
+        # F-deliverable-consistency: declared font vs the face the preview actually drew.
+        # `preview_matches_declaration_ratio` is the honest caveat on every preview-derived
+        # pixel number in this file — see _font_consistency_audit.
+        "deliverable_font_consistency": font_consistency,
         "editable_text_recall": structure["editable_text_recall"],
         # ── Codia construction contract (the QA objective — see _contract_summary) ────
         # contract_score is the composite of record (native text first, then construction
@@ -2386,7 +3088,12 @@ def compare(
         "true_text_coverage": structure.get("true_text_coverage"),
         "rasterized_text_count": structure.get("rasterized_text_count"),
         "rasterized_text_ratio": structure.get("rasterized_text_ratio"),
+        # Unchanged raw signal (compat: qa_reward/repair/harness read it): the single worst
+        # window's RAW SSIM, still honestly reported even when it is only glyph drift.
         "local_ssim_worst_window": worst_window,
+        # ...and the honest reading of the same grid: which below-floor windows are real
+        # damage vs translation drift, each with its measured shift and both-way match.
+        "local_ssim_window_report": window_report,
         "worst_window_png": worst_window_png,
         "per_layer": per_layer,
         "per_region_max_delta": float(cells.max()),

@@ -904,14 +904,26 @@ def test_element_recall_top_level_reflects_a_real_drop(tmp_path):
 
 
 def test_true_text_coverage_catches_the_editable_text_recall_denominator_lie(tmp_path):
-    """021-style case: the render's TEXT nodes carry every line's copy verbatim (so
-    editable_text_recall reads a perfect 1.0 -- every source line OCR saw became an
-    editable node), but only one of those six lines is actually verified present in the
-    rendered pixels (render OCR only recognizes "BUY NOW"). editable_text_recall alone
-    hides that 5/6 of the ad's text never actually shipped correctly; true_text_coverage
-    = text_recall * editable_text_recall must read low, and the missing-editable-text
-    hard fail must fire on that combined signal even though editable_text_recall alone
-    clears its own 0.80 bar.
+    """The denominator lie, expressed through the vector that can actually tell it.
+
+    editable_text_recall drops every ``kept_in_photo`` line from its DENOMINATOR (scene text
+    baked into a photo is legitimately not-editable-by-design). Claim every line as
+    kept_in_photo and the denominator empties out: recall reads a perfect 1.0 while only one
+    of six lines was actually delivered. true_text_coverage = text_recall *
+    editable_text_recall must not be fooled, and missing-editable-text must fire on the
+    combined signal.
+
+    text_recall is not fooled because its own exclusion is evidence-based, not declared: a
+    line only leaves its denominator when `_line_baked_in_asset` finds those pixels verbatim
+    in the owning photo asset. Here nothing is baked anywhere, so all six lines stay in the
+    denominator and the five we never delivered count against us.
+
+    (This test previously staged the same "1 of 6" numbers by having render-OCR read back
+    only one of six correctly-delivered lines. That premise was retired with the render-OCR
+    round-trip itself: ad 131 ships 'BLACK FRIDAY SALE' character-perfect and doctr reads it
+    back as 'BLACKERIDAYSALE', so "OCR could not re-read it" was never evidence that the text
+    did not ship. See _text_recall_detail. The lie this test names is real; only the vector
+    used to demonstrate it changed.)
     """
     source = tmp_path / "source.png"
     render = tmp_path / "render.png"
@@ -924,14 +936,15 @@ def test_true_text_coverage_catches_the_editable_text_recall_denominator_lie(tmp
     source_ocr = {"lines": [
         {"id": f"L{i}", "text": text, "conf": 0.99} for i, text in enumerate(lines)
     ]}
-    # Only the last line is actually legible in the rendered output.
     render_ocr = {"lines": [{"id": "R0", "text": "BUY NOW", "conf": 0.99}]}
+    # Only "BUY NOW" is actually delivered; the other five are merely CLAIMED as baked
+    # scene text, with no asset anywhere carrying their pixels.
     design = {
         "layers": [
-            {"id": f"line{i}", "type": "text", "text": text,
-             "style": {"fontFamily": "Inter"}, "meta": {}}
-            for i, text in enumerate(lines)
+            {"id": "cta", "type": "text", "text": "BUY NOW",
+             "style": {"fontFamily": "Inter"}, "meta": {}},
         ],
+        "kept_in_photo": lines[:5],
         "meta": {"editable_ratio": 1.0},
     }
 
@@ -1122,3 +1135,217 @@ def test_editable_recall_does_not_fuse_unrelated_blocks_into_phantom_matches():
 
     assert result["editable_text_correct"] == 0
     assert result["editable_text_recall"] == 0.0
+
+
+# ── F-honesty: the four metrics that used to mislead in both directions ──────────────
+#
+# Each test below locks in the property that made a metric honest: the gate stays SILENT on
+# the benign phenomenon it used to punish, and still FIRES on the real defect it must never
+# miss. See the docstrings in pixel_diff for the measured per-fixture evidence.
+
+
+def _text_page(size=(640, 640), shift=0, bg="white"):
+    """Text-like glyph runs whose TAILS land near a window boundary — the exact geometry of
+    every real worst window (009/104/107): a drift walks the tail out of the window, leaving
+    it blank in the render and glyph-edged in the source, which is what collapses a 64px
+    window's SSIM to ~0.02 on text a designer cannot tell apart."""
+    img = Image.new("RGB", size, bg)
+    draw = ImageDraw.Draw(img)
+    for row in range(4):
+        y = 100 + row * 120
+        for col in range(6):
+            x = 64 + col * 60 + shift
+            draw.rectangle([x, y, x + 44, y + 56], fill="black")
+    return img
+
+
+def test_worst_region_does_not_hard_fail_a_faithful_render_that_only_drifted(tmp_path):
+    """The bench-10 lie: 13 of 16 fixtures hard-failed local-ssim-worst-region, and every
+    window was glyphs drifted by font substitution (009 "We zien je", 104 "ration", 107
+    "EEK 4" — all visually identical). A pure translation is not damage."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    _text_page().save(source)
+    _text_page(shift=20).save(render)
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    # The window really does score below the floor — this is the artifact, not a soft case.
+    assert result["local_ssim_worst_window"]["ssim"] < 0.10
+    assert "local-ssim-worst-region" not in _rules(result)
+    # ...and it is REPORTED, never silently dropped.
+    assert any(w["rule"] == "local-ssim-worst-region-shifted"
+               for w in result["quality_warnings"])
+
+
+def test_worst_region_still_hard_fails_content_that_vanished(tmp_path):
+    """025's missing emoji: content in the source and NOWHERE in the render. No translation
+    can explain it, so it must stay a hard fail."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    _text_page().save(source)
+    erased = _text_page()
+    ImageDraw.Draw(erased).rectangle([20, 20, 180, 180], fill="white")
+    erased.save(render)
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    assert "local-ssim-worst-region" in _rules(result)
+
+
+def test_worst_region_still_hard_fails_a_fabricated_ghost(tmp_path):
+    """The reverse of a deletion, and the reason the translation test is symmetric: a
+    one-directional search would excuse an ADDED ghost (some nearby render patch is also
+    blank). A fabricated double has no counterpart in the source and must stay hard."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    clean = _text_page()
+    clean.save(source)
+    ghosted = _text_page()
+    ghosted.paste(clean.crop((20, 30, 180, 60)), (20, 250))
+    ghosted.save(render)
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    assert "local-ssim-worst-region" in _rules(result)
+
+
+def test_text_recall_scores_the_deliverable_not_an_ocr_of_our_own_render(tmp_path):
+    """131: we ship 'BLACK FRIDAY SALE' character-perfect, doctr reads our own correct render
+    back as 'BLACKERIDAYSALE', and recall scored 0.556 — worst in the run. Every text fix
+    looked like a regression. Recall must score what we DELIVER."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (60, 40), "white").save(source)
+    Image.new("RGB", (60, 40), "white").save(render)
+    source_ocr = {"lines": [
+        {"id": "L0", "text": "BLACK FRIDAY SALE", "conf": 0.99},
+        {"id": "L1", "text": "BUY 2, GET 1 FREE + FREE SHIPPING $100+", "conf": 0.99},
+    ]}
+    # What the engine actually reads back off our own correct glyphs.
+    render_ocr = {"lines": [
+        {"id": "R0", "text": "BLACKERIDAYSALE", "conf": 0.9},
+        {"id": "R1", "text": "BUY2. GETIFRE: + FREE SHPPINC $100+", "conf": 0.9},
+    ]}
+    design = {"layers": [
+        {"id": "a", "type": "text", "text": "BLACK FRIDAY SALE",
+         "style": {"fontFamily": "Inter"}, "meta": {}},
+        {"id": "b", "type": "text", "text": "BUY 2, GET 1 FREE + FREE SHIPPING $100+",
+         "style": {"fontFamily": "Inter"}, "meta": {}},
+    ], "meta": {"editable_ratio": 1.0}}
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path),
+                                source_ocr=source_ocr, render_ocr=render_ocr, design=design)
+
+    assert result["text_recall"] == 1.0
+    assert result["text_recall_detail"]["basis"] == "delivered-vs-source-truth"
+    assert "low-text-recall" not in _rules(result)
+    # The round-trip is not discarded — it is reported under a name that means what it says.
+    assert result["render_text_legibility"]["ratio"] < 1.0
+
+
+def test_text_recall_still_falls_when_copy_is_not_delivered(tmp_path):
+    """The metric must still discriminate, or a 1.0 means nothing."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (60, 40), "white").save(source)
+    Image.new("RGB", (60, 40), "white").save(render)
+    source_ocr = {"lines": [
+        {"id": "L0", "text": "HEADLINE COPY", "conf": 0.99},
+        {"id": "L1", "text": "DROPPED ENTIRELY", "conf": 0.99},
+    ]}
+    design = {"layers": [
+        {"id": "a", "type": "text", "text": "HEADLINE COPY",
+         "style": {"fontFamily": "Inter"}, "meta": {}},
+    ], "meta": {"editable_ratio": 1.0}}
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path),
+                                source_ocr=source_ocr, render_ocr={"lines": []}, design=design)
+
+    assert result["text_recall"] == 0.5
+    assert "DROPPED ENTIRELY" in result["text_recall_detail"]["missing_lines"]
+
+
+def test_text_recall_without_a_design_scores_the_render_and_says_so(tmp_path):
+    """figma_verify compares a REAL Figma export with no design.json in hand. There the
+    rendered pixels ARE the deliverable, so OCRing them is right — but the report must say
+    which question it answered rather than passing off one for the other."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (60, 40), "white").save(source)
+    Image.new("RGB", (60, 40), "white").save(render)
+    source_ocr = {"lines": [{"id": "L0", "text": "Hello World", "conf": 0.9},
+                            {"id": "L1", "text": "Buy Now", "conf": 0.9}]}
+    render_ocr = {"lines": [{"id": "R0", "text": "Hello World", "conf": 0.9}]}
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path),
+                                source_ocr=source_ocr, render_ocr=render_ocr)
+
+    assert result["text_recall"] == 0.5
+    assert result["text_recall_detail"]["basis"] == "render-ocr (no design supplied)"
+
+
+def test_color_fidelity_does_not_hard_fail_when_only_glyph_coverage_differs(tmp_path):
+    """067: every hue exact, yet color-fidelity failed because 20% of text pixels sat at
+    dE>50 (black vs white) purely from font substitution. A colour gate must not fire when
+    no colour is wrong."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    _text_page().save(source)
+    _text_page(shift=20).save(render)   # same ink, same hues, different coverage
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    assert result["color_similarity"] < 0.82        # the whole-image number still dips...
+    assert "color-fidelity" not in _rules(result)   # ...but nothing is the wrong colour
+    assert any(w["rule"] == "color-fidelity-coverage-artifact"
+               for w in result["quality_warnings"])
+
+
+def test_color_fidelity_still_hard_fails_a_real_hue_error(tmp_path):
+    """A tint is a real colour defect and must still be caught."""
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    _text_page().save(source)
+    tinted = np.asarray(_text_page()).copy()
+    tinted[..., 2] = np.clip(tinted[..., 2].astype(int) + 90, 0, 255)
+    Image.fromarray(tinted).save(render)
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path))
+
+    assert "color-fidelity" in _rules(result)
+
+
+def test_declared_font_style_disagreeing_with_the_drawn_file_is_a_hard_fail(tmp_path):
+    """013: declared fontStyle Bold while carrying an ITALIC file. The preview resolved the
+    FILE and drew italic (SSIM happy); Figma resolves the STYLE NAME and ships it UPRIGHT.
+    Invisible to every pixel metric by construction."""
+    import glob as _glob
+
+    import pytest
+
+    italic = _glob.glob(os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                                     "Fonts", "ariali.ttf"))
+    if not italic:
+        pytest.skip("no italic system font available to stage the mismatch")
+    source = tmp_path / "source.png"
+    render = tmp_path / "render.png"
+    Image.new("RGB", (60, 40), "white").save(source)
+    Image.new("RGB", (60, 40), "white").save(render)
+    # NB: the declared family must not be "Arial" — _text_font special-cases that name and
+    # resolves Windows' canonical arialbd.ttf directly, which would never reach the candidate.
+    design = {"layers": [
+        {"id": "c_B0", "type": "text", "text": "We NEVER do this",
+         "style": {"fontFamily": "Inter", "fontStyle": "Bold", "fontWeight": 700,
+                   "fontSize": 32,
+                   "fontCandidates": [{"family": "Inter", "style": "Bold", "weight": 700,
+                                       "path": italic[0], "family_resolved": True}]},
+         "meta": {}},
+    ], "meta": {"editable_ratio": 1.0}}
+
+    result = pixel_diff.compare(str(source), str(render), str(tmp_path), design=design)
+
+    assert "font-style-mismatch" in _rules(result)
+    audit = result["deliverable_font_consistency"]
+    assert audit["italic_drawn_not_declared"] == 1
+    assert audit["preview_matches_declaration_ratio"] < 1.0
