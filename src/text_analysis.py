@@ -222,6 +222,16 @@ def _quad_rotation(quad: Any) -> float:
 
 _DEFAULT_ROTATION_SNAP_DEG = 2.5
 
+# A single line's angle below this size is only believable with a second signal
+# (block-mates, an agreeing neighbour, or a rotated carrier). Past it the angle is
+# corroborated by its own magnitude — 013's tilted badge reads 8+ deg per line.
+_DEFAULT_ROTATION_CORROBORATE_DEG = 6.0
+
+# Two independent lines "agree" on a rotation when their angles are this close —
+# the same tolerance merge_layers._rotated_carrier_consensus-style clusters use to
+# read one physical carrier's spread (013's seal lines sat 1.16 deg apart).
+_ROTATION_CORROBORATE_AGREE_DEG = 1.5
+
 
 def _snap_rotation(angle: float, snap_deg: float) -> float:
     """Snap a near-zero baseline angle to exactly horizontal.
@@ -4614,7 +4624,44 @@ def _pitch_break(group: list[dict], current: dict, config: dict) -> bool:
     return step > established * _num(config.get("paragraph_pitch_break_factor"), 1.35)
 
 
-def _can_join(previous: dict, current: dict, config: dict) -> bool:
+def _is_emoji_char(ch: str) -> bool:
+    """One pictograph codepoint, tested with the SAME ranges as
+    ``build_design_json._strip_edge_emoji`` (variation selectors/ZWJ, the >= U+1F000
+    planes, and Unicode's So category) so a line the compiler would render with an
+    emoji chip is a line the grouper also treats as emoji-led. There is no shared
+    helper to import — ``_strip_edge_emoji`` keeps its test as a local closure — so
+    this mirrors it rather than drifting to a second, narrower definition."""
+    import unicodedata
+
+    code = ord(ch)
+    if code in (0x200D, 0xFE0E, 0xFE0F, 0x20E3):
+        return True
+    if code >= 0x1F000:
+        return True
+    return unicodedata.category(ch) == "So"
+
+
+def _leads_with_emoji(line: dict) -> bool:
+    """True when the line's first visible glyph is an emoji/pictograph token."""
+    text = str(line.get("text") or "").lstrip()
+    return bool(text) and _is_emoji_char(text[0])
+
+
+def _starts_new_visual_row(previous: dict, current: dict) -> bool:
+    """True when ``current`` RESETS to the row's left edge rather than continuing a flow.
+
+    The emoji veto below must never shred a genuine wrapped paragraph that happens to
+    reopen with a pictograph mid-sentence; the visible fact that separates 025's
+    comparison rows from a wrap is that each emoji row restarts at the SAME left edge
+    as the row above it (a new row), instead of carrying on from where the previous
+    line ended. Tolerance follows _can_join's own alignment slack (~one line height).
+    """
+    a, b = previous["box"], current["box"]
+    return abs(a["x"] - b["x"]) <= max(a["h"], b["h"]) * 1.15
+
+
+def _can_join(previous: dict, current: dict, config: dict,
+              group: Optional[list[dict]] = None) -> bool:
     a, b = previous["box"], current["box"]
     acy, bcy = _box_center(a)[1], _box_center(b)[1]
     if abs(acy - bcy) < min(a["h"], b["h"]) * 0.55:
@@ -4630,6 +4677,22 @@ def _can_join(previous: dict, current: dict, config: dict) -> bool:
         return False
     if _colour_distance(previous["style"]["color"], current["style"]["color"]) > _num(
             config.get("paragraph_color_distance"), 90.0):
+        return False
+    # 025: three emoji-led comparison rows ("😍 Blocks everything" / "😐 Blocks some" /
+    # "😢 Blocks nothing") share one face and one colour, so every band above passes
+    # and the _same_typography role-escape below then glues all three into ONE block —
+    # the emoji chips misalign and the whole card stacks wrong. A row that LEADS with
+    # an emoji token is its own visual row, never the continuation of the line above
+    # it. The veto is gated on a genuine row restart (left edge reset) so a wrapped
+    # paragraph whose next line happens to open with a pictograph still joins.
+    if (_leads_with_emoji(previous) or _leads_with_emoji(current)) and \
+            _starts_new_visual_row(previous, current):
+        return False
+    # The block's own baseline rhythm vetoes BEFORE the role-escape below can wave the
+    # join through: _same_typography may only forgive a ROLE label, never a step that
+    # breaks the pitch this block has already established. ``group`` is optional so
+    # pairwise callers keep working; _make_blocks always passes it.
+    if group and _pitch_break(group, current, config):
         return False
     if not _compatible_roles(previous["role"], current["role"]):
         # ...unless the two lines are typographically INDISTINGUISHABLE. Roles are
@@ -4758,7 +4821,7 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
         candidates = []
         for index, group in enumerate(groups):
             previous = group[-1]
-            if not _can_join(previous, line, config):
+            if not _can_join(previous, line, config, group=group):
                 continue
             if _interleaved(previous, line, ordered):
                 continue
@@ -4865,6 +4928,116 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
             "meta": block_meta,
         })
     return blocks
+
+
+def _boxes_rotation_adjacent(a: dict, b: dict) -> bool:
+    """True when two line boxes sit close enough to share one printed carrier.
+
+    Stacked neighbours (overlapping x-intervals, vertical gap within one line
+    height) or side-by-side neighbours (overlapping y-intervals, small horizontal
+    gap) are the only geometry that lets one line's angle corroborate another's —
+    two distant lines tilting alike is coincidence, not evidence.
+    """
+    ax0, ax1 = _num(a.get("x")), _num(a.get("x")) + _num(a.get("w"))
+    bx0, bx1 = _num(b.get("x")), _num(b.get("x")) + _num(b.get("w"))
+    ay0, ay1 = _num(a.get("y")), _num(a.get("y")) + _num(a.get("h"))
+    by0, by1 = _num(b.get("y")), _num(b.get("y")) + _num(b.get("h"))
+    scale = max(1.0, ay1 - ay0, by1 - by0)
+    x_overlap = min(ax1, bx1) - max(ax0, bx0)
+    y_overlap = min(ay1, by1) - max(ay0, by0)
+    v_gap = max(0.0, max(ay0, by0) - min(ay1, by1))
+    h_gap = max(0.0, max(ax0, bx0) - min(ax1, bx1))
+    return (x_overlap > 0 and v_gap <= scale) or (y_overlap > 0 and h_gap <= scale)
+
+
+def _apply_rotation_corroboration(lines: list[dict], blocks: list[dict], config: dict) -> None:
+    """Pin every line to its block's corroborated rotation; gate lone wobble to 0.
+
+    OCR quads on perfectly horizontal ad copy wobble past the snap threshold by a
+    few degrees (088's "OFF" measured 4.42 deg), while a genuinely tilted carrier
+    tilts ALL of its lines together.  So a SMALL angle (< ``rotation_corroborate_deg``,
+    default 6.0) is only kept with a second signal:
+
+      (i)   block-mate agreement — _make_blocks already requires EVERY member line
+            at >= snap with a spread <= 3 deg, else the block consensus is exactly 0;
+      (ii)  an overlapping/adjacent line from another block whose RAW angle agrees
+            within ``_ROTATION_CORROBORATE_AGREE_DEG`` (1.5 deg);
+      (iii) an injected carrier median (``meta["carrier_rotation_deg"]``, e.g. a
+            rotated badge/seal cluster read) agreeing within 3 deg.
+
+    A lone small angle with none of those signals snaps to 0.  Angles at or above
+    the threshold need no corroboration (013's badge lines read 8+ deg).  The raw
+    quad angle is always preserved in ``meta["rotation_raw_deg"]`` for audit.
+
+    Multi-line blocks are RIGID: every member line takes the block consensus
+    exactly, so one line can never render at its own private angle inside a
+    rotated paragraph (and a mixed [0, 4.7] pair emits 0, never a mean like 2.35).
+    """
+    snap_deg = _num(config.get("rotation_snap_deg"), _DEFAULT_ROTATION_SNAP_DEG)
+    corroborate_deg = _num(config.get("rotation_corroborate_deg"), _DEFAULT_ROTATION_CORROBORATE_DEG)
+    by_id = {line.get("id"): line for line in lines}
+    member_of = {}
+    for block in blocks:
+        for line_id in block.get("line_ids") or []:
+            member_of[line_id] = block
+    # Snapshot every line's PRE-GATE angle: adjacency corroboration must read the
+    # same evidence regardless of which block is processed first.
+    raw_angle = {line.get("id"): float(line.get("rotation_deg", 0.0) or 0.0) for line in lines}
+
+    def _set(line: dict, angle: float) -> None:
+        angle = round(float(angle), 3)
+        line["rotation"] = angle
+        line["rotation_deg"] = angle
+
+    def _adjacent_agrees(line: dict, angle: float) -> bool:
+        own_block = member_of.get(line.get("id"))
+        for other in lines:
+            if other is line or member_of.get(other.get("id")) is own_block:
+                continue
+            other_angle = raw_angle.get(other.get("id"), 0.0)
+            if abs(other_angle) < max(0.01, snap_deg):
+                continue
+            if abs(other_angle - angle) > _ROTATION_CORROBORATE_AGREE_DEG:
+                continue
+            if _boxes_rotation_adjacent(line.get("box") or {}, other.get("box") or {}):
+                return True
+        return False
+
+    def _carrier_agrees(line: dict, angle: float) -> bool:
+        carrier = (line.get("meta") or {}).get("carrier_rotation_deg")
+        if carrier is None:
+            return False
+        carrier = _num(carrier)
+        return abs(carrier) >= max(0.01, snap_deg) and abs(carrier - angle) <= 3.0
+
+    def _gate_single(line: dict) -> float:
+        angle = float(line.get("rotation_deg", 0.0) or 0.0)
+        if angle == 0.0 or abs(angle) >= corroborate_deg:
+            return angle
+        if _carrier_agrees(line, angle) or _adjacent_agrees(line, angle):
+            return angle
+        return 0.0
+
+    for block in blocks:
+        members = [by_id[line_id] for line_id in (block.get("line_ids") or []) if line_id in by_id]
+        if not members:
+            continue
+        consensus = float(block.get("rotation_deg", block.get("rotation", 0.0)) or 0.0)
+        # A multi-line block's consensus IS its corroboration (signal i); a lone
+        # line must prove its small angle through signals (ii)/(iii).
+        final = consensus if len(members) > 1 else _gate_single(members[0])
+        for line in members:
+            _set(line, final)
+        block["rotation"] = round(final, 3)
+        block["rotation_deg"] = round(final, 3)
+        member_ids = {line.get("id") for line in members}
+        for geometry in block.get("line_geometry") or []:
+            if geometry.get("id") in member_ids:
+                geometry["rotation_deg"] = round(final, 3)
+    # Orphan lines (no owning block) get the same single-line gate.
+    for line in lines:
+        if line.get("id") not in member_of:
+            _set(line, _gate_single(line))
 
 
 def _make_sections(blocks: list[dict], canvas: dict) -> list[dict]:
@@ -5054,8 +5227,10 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
         raw_rotation = _quad_rotation(line.get("quad"))
         line["rotation"] = _snap_rotation(raw_rotation, snap_deg)
         line["rotation_deg"] = line["rotation"]
-        if line["rotation"] != raw_rotation:
-            line.setdefault("meta", {})["rotation_raw_deg"] = raw_rotation
+        # Always keep the raw OCR angle for audit: the corroboration gate below may
+        # hold a small uncorroborated angle at 0, and the raw quad read is the only
+        # evidence trail explaining why the emitted line is horizontal.
+        line.setdefault("meta", {})["rotation_raw_deg"] = raw_rotation
         line["ink_confidence"] = ink_confidence
         masks[line["id"]] = mask
         decoration, decoration_evidence = _native_text_decoration(mask, line.get("text", ""))
@@ -5320,6 +5495,9 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
     _assign_roles(enriched, canvas)
     _prefer_plain_editable_text(enriched)
     blocks = _make_blocks(enriched, canvas, config)
+    # Rotation is settled here, once, before anything downstream reads it: rigid
+    # block consensus for paragraphs, the corroboration gate for lone small angles.
+    _apply_rotation_corroboration(enriched, blocks, config)
     block_unify = _unify_block_families(enriched, prepared, render_fit_options, font_options)
     if block_unify:
         result["block_font_unification"] = block_unify

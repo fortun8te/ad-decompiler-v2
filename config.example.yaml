@@ -357,6 +357,16 @@ reconstruct:
   allow_text_box_fallback: false
   allow_opaque_text_region_fallback: true
   text_box_promote_max_fraction: 0.0
+  # Display-glyph seam guard (088 "SALE"/"21%"). Display faces defeat OCR, so those
+  # glyphs survive as residual-CC observations and ship as pixel-exact baked raster
+  # slices. Front-to-back ownership hands each slice only PART of its ink, so removing
+  # the full glyph and re-pasting the fragments shows plate THROUGH the letterforms. On
+  # a flat plate the slice pixels ARE the original pixels at the original position, so
+  # removal is withheld instead: the plate keeps the ink and the slices ship on top.
+  keep_flat_residual_glyphs: true
+  residual_glyph_ownership_full: 0.995  # skip removal only below this ownership coverage
+  residual_glyph_ring_pad: 8            # px ring around the fragment sampled for flatness
+  residual_glyph_flat_std: 14.0         # max per-channel ring std that still counts as flat
   # Conservative primitive paint extraction for semantic shapes only.  It preserves
   # source-provided paint facts and falls back to a plain fill for uncertain masks.
   style_extraction:

@@ -2132,8 +2132,17 @@ def _text_sources(ocr, diagnostics=None):
         block["ink_box"] = block.get("painted_box") or block.get("box")
         block["conf"] = (sum(float(line.get("conf", 1)) for line in members) / len(members)
                          if members else float(block.get("conf", 1)))
-        block["rotation"] = (sum(float(line.get("rotation", 0)) for line in members) / len(members)
-                             if members else float(block.get("rotation", 0)))
+        # text_analysis already settled this block's rotation: _make_blocks requires
+        # EVERY member line to agree on a substantial angle (else exactly 0) and the
+        # corroboration gate pinned each member to that consensus. Re-averaging member
+        # angles here undoes both — a mixed [0, 4.7] pair emitted at a spurious 2.35
+        # (025's c_B7). Trust the block's corroborated rotation_deg; the per-line mean
+        # survives only as the fallback for legacy blocks that predate the field.
+        if block.get("rotation_deg") is not None:
+            block["rotation"] = float(block.get("rotation_deg") or 0.0)
+        else:
+            block["rotation"] = (sum(float(line.get("rotation", 0)) for line in members) / len(members)
+                                 if members else float(block.get("rotation", 0)))
         block["repeated_style_id"] = style_id
         out.append(block)
     # A partial/malformed block list must never delete otherwise valid OCR observations.

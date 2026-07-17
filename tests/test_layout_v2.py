@@ -320,7 +320,7 @@ def test_semantic_z_band_orders_placeholder_layers_before_geometry_fallbacks():
 def test_paragraph_lines_with_shared_block_id_form_one_editable_group():
     tree = layout.infer([
         {"id": "line1", "target": "text", "box": {"x": 20, "y": 20, "w": 100, "h": 12}, "text": "First", "meta": {"role": "body", "block_id": "p1"}},
-        {"id": "line2", "target": "text", "box": {"x": 20, "y": 80, "w": 90, "h": 12}, "text": "Second", "meta": {"role": "body", "block_id": "p1"}},
+        {"id": "line2", "target": "text", "box": {"x": 20, "y": 36, "w": 90, "h": 12}, "text": "Second", "meta": {"role": "body", "block_id": "p1"}},
     ], {"w": 200, "h": 150})
     assert len(tree) == 1
     assert tree[0]["target"] == "group"

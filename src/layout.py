@@ -1574,8 +1574,13 @@ def _semantic_text_stacks(roots):
         nmeta = node.get("meta") or {}
         same_paragraph = any(pmeta.get(key) is not None and pmeta.get(key) == nmeta.get(key)
                              for key in ("paragraph_id", "block_id", "text_block_id"))
-        if (same_paragraph or (0 <= gap <= max(14.0, median_h * 1.75)
-                               and _text_alignment(prior_box, box))):
+        # 025: a shared block_id used to BYPASS the gap test entirely, so when the
+        # upstream grouper glued three emoji-led comparison rows into one block the
+        # stack pass re-glued them here no matter how large the row spacing was. The
+        # gap band now gates EVERY join; block_id only relaxes the alignment demand
+        # for genuine same-paragraph wraps (whose gaps are small by definition).
+        if (0 <= gap <= max(14.0, median_h * 1.75)
+                and (same_paragraph or _text_alignment(prior_box, box))):
             current.append(node)
         else:
             if len(current) >= 2:

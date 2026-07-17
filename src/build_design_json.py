@@ -1296,6 +1296,11 @@ def _split_weight_run_siblings_unsafe(candidate: dict) -> list[dict]:
             frac_w = _line_advance(font, text[start:end].strip(), 0.0) / total_adv
         piece = dict(candidate)
         piece.pop("text_runs", None)
+        # Rotation is a LINE-level fact — the whole line's final, post-corroboration
+        # angle. A word quad wobbles independently of its line, so a split sibling
+        # must never pick up its own word angle: every piece of one line rotates
+        # identically, as one rigid line.
+        piece["rotation"] = float(candidate.get("rotation", 0) or 0)
         piece["id"] = f"{candidate.get('id') or 'text'}__w{index}"
         piece["text"] = segment_text
         style = dict(base_style)
@@ -1992,6 +1997,15 @@ def _compile(candidate: dict, run_dir: str, warnings: list) -> Layer:
         common["box"] = generous
         common["visible_box"] = dict(generous)
         common["meta"]["prefit_ink_box"] = dict(fitted_box)
+        # ad 066 list-row bullets: OCR swallowed the row's ✗/✓ as a leading letter, so
+        # the fitted box still starts ON the icon. build() resolved icon_detect's
+        # row.text_clip_x onto this candidate (meta.text_clip_x); shift the FINAL box's
+        # left edge onto it so icon ink never sits inside the text node. x/w only —
+        # y/h stay put for the leadingTrim=CAP_HEIGHT invariant.
+        applied_clip = _apply_text_clip(generous, fitted_box, candidate, style, meta)
+        if applied_clip is not None:
+            common["visible_box"] = dict(generous)
+            common["meta"]["text_clip_applied"] = applied_clip
         style.setdefault("verticalAlign", "CENTER")
         style.setdefault("autoResize", auto_resize)
         style["preFitted"] = True
@@ -3591,6 +3605,167 @@ def _regroup_offer_badges(candidates: list) -> list:
     return stripped
 
 
+def _iter_candidates(candidates):
+    """Yield every candidate dict in the tree, descending into group children."""
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        yield candidate
+        yield from _iter_candidates(candidate.get("children") or [])
+
+
+def _text_clip_map(candidates: list) -> dict:
+    """Resolve icon_detect's ``meta.row.text_clip_x`` onto TEXT candidate ids.
+
+    ad 066: OCR read the red ✗/✓ list bullets as a leading letter and swallowed them
+    into the line box, so the row's text starts ON the icon and the icon ink lands
+    inside the emitted text node ("Xmudges…"). icon_detect measures the list's own
+    clean gap and publishes ``row.text_clip_x`` = icon-right + gap on the ICON
+    candidate, keyed by ``row.text_id`` = the swallowed OCR LINE id
+    (icon_detect.py:773, surfaced at :1000). merge's block assembly
+    (merge_layers._text_sources) fans lines out into paragraph BLOCK candidates whose
+    ``meta.line_ids`` carry the member line ids (orphan lines keep ``meta.ocr_id``),
+    so the line→block map below is a straight inversion of that. A block covering
+    several clipped rows takes the MAX clip x — the furthest-right icon owns the
+    shared left edge.
+
+    Two signals feed the same map:
+      * icon candidates carrying ``meta.row.text_clip_x`` + ``overlaps_text`` (primary);
+      * text candidates merge already clipped (``meta.row_bullet_clipped.to_x``) —
+        layout may absorb the icon into a baked checklist shell
+        (merge_layers._absorb_list_icons_into_baked_shells, 066) and drop it from the
+        tree, in which case only merge's resolved target x still reaches build().
+
+    Values are CANVAS-absolute x; the caller re-bases them into a nested child's
+    local frame (layout._relativize stores group children parent-relative).
+    """
+    line_owner = {}
+    for cand in _iter_candidates(candidates):
+        meta = cand.get("meta") or {}
+        line_ids = meta.get("line_ids") or []
+        if not line_ids and meta.get("ocr_id") is not None:
+            line_ids = [meta.get("ocr_id")]
+        for line_id in line_ids:
+            if line_id not in (None, ""):
+                line_owner[str(line_id)] = str(cand.get("id") or "")
+    clip_map = {}
+
+    def _take(owner_id, clip_x):
+        try:
+            clip_x = float(clip_x)
+        except (TypeError, ValueError):
+            return
+        if clip_x > clip_map.get(owner_id, float("-inf")):
+            clip_map[owner_id] = clip_x
+
+    for cand in _iter_candidates(candidates):
+        meta = cand.get("meta") or {}
+        row = meta.get("row") or {}
+        if row.get("text_clip_x") is not None and row.get("overlaps_text"):
+            owner = line_owner.get(str(row.get("text_id") or ""))
+            if owner:
+                _take(owner, row.get("text_clip_x"))
+        clipped = meta.get("row_bullet_clipped") or {}
+        if clipped.get("to_x") is not None:
+            _take(str(cand.get("id") or ""), clipped.get("to_x"))
+    return clip_map
+
+
+def _attach_text_clips(candidates: list, clip_map: dict, offset_x: float = 0.0,
+                       in_button_shell: bool = False) -> int:
+    """Write each resolved clip onto its owning text candidate's ``meta.text_clip_x``.
+
+    The compile loop only sees the candidate in front of it, so the map is folded
+    into meta ahead of time; weight-split siblings copy candidate meta and inherit
+    the clip (only the piece whose box still starts left of clip_x is shifted).
+    Group children are parent-relative (layout._relativize): re-base the
+    canvas-absolute clip into the child's local frame via ``meta.absolute_box``
+    (stashed by layout/_regroup_offer_badges) when present, else via accumulated
+    ancestor offsets. ``in_button_shell`` tracks button-shell ancestry so the text
+    branch can refuse to re-centre a genuinely shell-centred CENTER label.
+    """
+    attached = 0
+    for node in candidates or []:
+        if not isinstance(node, dict):
+            continue
+        meta = node.setdefault("meta", {})
+        role = str(meta.get("role") or "").lower().replace("-", "_")
+        node_in_button = (in_button_shell or bool(meta.get("button_shell"))
+                          or role == "button")
+        box = node.get("box") or {}
+        try:
+            local_x = float(box.get("x", 0) or 0)
+        except (TypeError, ValueError):
+            local_x = 0.0
+        abs_box = meta.get("absolute_box") or {}
+        try:
+            node_offset = (float(abs_box["x"]) - local_x
+                           if abs_box.get("x") is not None else offset_x)
+        except (TypeError, ValueError):
+            node_offset = offset_x
+        clip_x = clip_map.get(str(node.get("id") or ""))
+        if clip_x is not None:
+            meta["text_clip_x"] = round(clip_x - node_offset, 2)
+            if node_in_button:
+                meta["button_shell_host"] = True
+            attached += 1
+        attached += _attach_text_clips(node.get("children") or [], clip_map,
+                                       node_offset + local_x, node_in_button)
+    return attached
+
+
+def _apply_text_clip(generous: dict, fitted_box: dict, candidate: dict,
+                     style: dict, meta: dict):
+    """Shift a FINAL text box's left edge onto icon_detect's row-bullet clip x.
+
+    Only x/w change — y/h are untouched, so the leadingTrim=CAP_HEIGHT contract
+    (first-line cap-top anchored at box.y) is preserved. Guards:
+      * no clip, or clip_x already left of the box start → no-op (clean rows);
+      * clip_x at/past the box right edge → no real overlap, never shred the box;
+      * RIGHT align keeps its right anchor — moving the left edge in would drag the
+        visible text right, so skip;
+      * CENTER on a button_shell host is genuinely centred on the shell — clipping
+        one side would re-centre the label off the shell midpoint, so skip;
+      * width never shrinks below the pre-fit ink width (meta.prefit_ink_box) so the
+        fitted lines cannot re-wrap; without ink evidence the floor is the visible
+        ink width + a small pad.
+
+    Returns the applied clip x, or None when the box was left alone.
+    """
+    clip_x = meta.get("text_clip_x")
+    if clip_x is None:
+        return None
+    try:
+        clip_x = float(clip_x)
+    except (TypeError, ValueError):
+        return None
+    align = str(style.get("align") or "LEFT").upper()
+    if align == "RIGHT":
+        return None
+    if align == "CENTER" and meta.get("button_shell_host"):
+        return None
+    try:
+        box_x = float(generous.get("x", 0) or 0)
+        box_w = float(generous.get("w", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (box_x < clip_x < box_x + box_w):
+        return None
+    try:
+        floor_w = float(fitted_box.get("w", 0) or 0)
+    except (TypeError, ValueError):
+        floor_w = 0.0
+    if floor_w <= 0:
+        ink = candidate.get("visible_box") or candidate.get("ink_box") or {}
+        try:
+            floor_w = float(ink.get("w", 0) or 0) + 2.0
+        except (TypeError, ValueError):
+            floor_w = 0.0
+    generous["x"] = round(clip_x, 2)
+    generous["w"] = round(max(box_w - (clip_x - box_x), floor_w), 2)
+    return clip_x
+
+
 def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = None,
           doc_id: str = "doc", name: str = "design", kept_in_photo: Optional[list] = None,
           cfg: Optional[dict] = None) -> DesignDoc:
@@ -3690,6 +3865,20 @@ def build(candidates: list, canvas: dict, run_dir: str, base_src: str | None = N
         candidates = _regroup_offer_badges(candidates)
     except Exception as exc:  # regrouping must never break the compile
         warnings.append({"code": "offer-badge-regroup-error", "detail": str(exc)})
+
+    # ad 066 row-bullet clip consumer: icon_detect's meta.row.text_clip_x has no other
+    # downstream reader, and merge's own box clip (merge_layers row_bullet_clipped) is
+    # lost here because the text branch re-fits against the UN-clipped ink/visible box —
+    # so the ✗/✓ ink landed inside the emitted text node. Resolve the clip onto the
+    # owning text candidates (line id -> block via meta.line_ids) and attach it to
+    # candidate meta so _compile's text branch can shift the FINAL box's left edge.
+    # Resolution must never break the compile: worst case the rows ship as before.
+    try:
+        clip_map = _text_clip_map(candidates)
+        if clip_map:
+            _attach_text_clips(candidates, clip_map)
+    except Exception as exc:
+        warnings.append({"code": "text-clip-map-error", "detail": str(exc)})
 
     for candidate in candidates:
         if candidate.get("target") == "drop":
