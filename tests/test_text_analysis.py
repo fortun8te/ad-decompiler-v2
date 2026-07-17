@@ -2281,3 +2281,102 @@ def test_plain_strike_without_foreign_ink_keeps_flat_text_decoration(tmp_path):
     assert line["meta"].get("strike_render") == "text-decoration"
     span = line["style"].get("decorationSpan")
     assert span is not None and span[0] == 0.0 and span[1] < 0.75
+
+
+def _italic_word_line(shear, base_style="Extra Bold Italic", weight=800):
+    """One-word line whose LINE is italic — the 013 'We NEVER' shape."""
+    base = {
+        "fontFamily": "Inter", "fontSize": 171.12, "fontWeight": weight,
+        "fontStyle": base_style, "color": "#111111", "italicShearDeg": -6.75,
+        "fontCandidates": [{
+            "family": "Inter", "style": base_style, "weight": weight,
+            "path": r"C:\fonts\Lato-ExtraBoldItalic.ttf",
+        }],
+    }
+    return {
+        "text": "We NEVER", "style": base,
+        "words": [{"text": "We NEVER", "box": {"x": 0, "y": 0, "w": 956, "h": 169}}],
+    }
+
+
+def _drive_word_shear(monkeypatch, shear):
+    monkeypatch.setattr(text_analysis, "_painted_geometry", lambda image, word: (
+        {"x": 0, "y": 0, "w": 953, "h": 181}, 150, "#111111", .95,
+        np.ones((181, 953), dtype=bool), {"fill": {"kind": "flat", "color": "#111111"}},
+    ))
+    monkeypatch.setattr(text_analysis, "_pre_font_signals", lambda *a, **k: {
+        "font_size": 171.12, "weight": 800, "shear_angle": shear,
+    })
+
+
+def test_word_under_assert_gate_does_not_flip_its_italic_line_upright(monkeypatch):
+    """013 'We NEVER': the SAME ink reads -6.75 as a line and -5.68 as a word.
+
+    Across the bench, line-vs-word shear on identical ink disagrees by a median of
+    1.58 deg and up to 3.50. A word landing just under the 6.0 assert gate is that
+    noise — not an upright run — so it must keep its line's italic instead of being
+    relabelled upright while still carrying the line's ITALIC font file.
+    """
+    line = _italic_word_line(-5.68)
+    _drive_word_shear(monkeypatch, -5.68)
+    text_analysis._enrich_word_styles(np.zeros((200, 1000, 3), dtype=np.uint8), line, {})
+    word = line["words"][0]
+    assert "italic" not in (word.get("style_evidence") or {}).get("changed", [])
+    if word.get("style"):
+        assert "italic" in word["style"]["fontStyle"].lower()
+
+
+def test_unmeasurable_word_shear_is_not_evidence_of_upright(monkeypatch):
+    """_measure_shear_angle returns None for thin masks AND for upright ink alike
+    (091 'MGNAT' line -6.34 -> word None). None must never release a line's italic."""
+    line = _italic_word_line(None)
+    _drive_word_shear(monkeypatch, None)
+    text_analysis._enrich_word_styles(np.zeros((200, 1000, 3), dtype=np.uint8), line, {})
+    word = line["words"][0]
+    assert "italic" not in (word.get("style_evidence") or {}).get("changed", [])
+
+
+def test_decisively_upright_word_still_releases_its_italic_line(monkeypatch):
+    """The capability is preserved: a word measuring ~0 inside an italic line flips
+    upright — and its candidate must not keep carrying the italic FILE."""
+    line = _italic_word_line(-0.4)
+    _drive_word_shear(monkeypatch, -0.4)
+    text_analysis._enrich_word_styles(np.zeros((200, 1000, 3), dtype=np.uint8), line, {})
+    word = line["words"][0]
+    assert "italic" in word["style_evidence"]["changed"]
+    assert "italic" not in word["style"]["fontStyle"].lower()
+    assert word["style"]["italicShearDeg"] is None
+    top = word["style"]["fontCandidates"][0]
+    # Either resolved to a real upright face, or the contradicting path was dropped.
+    assert not text_analysis.path_is_italic(top.get("path"))
+    assert "italic" not in str(top.get("style") or "").lower()
+
+
+def test_upright_line_still_asserts_italic_on_a_clearly_slanted_word(monkeypatch):
+    """025 'Hears': an italic word inside an upright line keeps working."""
+    line = _italic_word_line(-9.0, base_style="Regular", weight=400)
+    line["style"]["italicShearDeg"] = None
+    line["style"]["fontCandidates"] = [{
+        "family": "Inter", "style": "Regular", "weight": 400,
+        "path": r"C:\fonts\Lato-Regular.ttf",
+    }]
+    _drive_word_shear(monkeypatch, -9.0)
+    text_analysis._enrich_word_styles(np.zeros((200, 1000, 3), dtype=np.uint8), line, {})
+    word = line["words"][0]
+    assert "italic" in word["style_evidence"]["changed"]
+    assert "italic" in word["style"]["fontStyle"].lower()
+    assert word["style"]["italicShearDeg"] == -9.0
+
+
+def test_path_is_italic_asks_the_file_not_the_filename():
+    """`calibri.ttf`/`segoeui.ttf` END IN "i.ttf" without being italic; `Candarali.ttf`
+    IS italic without saying so. Filename rules get both backwards."""
+    for name in ("calibri.ttf", "segoeui.ttf", "candara.ttf", "georgia.ttf"):
+        path = os.path.join(r"C:\Windows\Fonts", name)
+        if os.path.exists(path):
+            assert text_analysis.path_is_italic(path) is False, name
+    for name in ("Candarali.ttf", "calibrii.ttf", "segoeuii.ttf"):
+        path = os.path.join(r"C:\Windows\Fonts", name)
+        if os.path.exists(path):
+            assert text_analysis.path_is_italic(path) is True, name
+    assert text_analysis.path_is_italic(None) is None

@@ -364,3 +364,26 @@ def test_decoration_reanchors_to_owner_across_group_and_translation():
     assert abs(line["y0"] - 335.0) <= 0.6 and abs(line["y1"] - 335.0) <= 0.6
     # The stale source line is preserved for provenance.
     assert deco.meta["source_line"]["x0"] == 999
+
+
+@pytest.mark.parametrize("stem", ["calibri", "segoeui"])
+def test_italic_variant_promotes_families_whose_name_ends_in_i(stem):
+    """`calibri.ttf`/`segoeui.ttf` end in "i.ttf" without being italic. The old
+    filename rule read them as ALREADY italic and returned None, so an italic run on
+    Calibri kept its UPRIGHT file while declaring italic — the preview drew upright
+    ink under a 'Regular Italic' label and Figma shipped italic (107's "don't")."""
+    import os
+    upright = os.path.join(r"C:\Windows\Fonts", stem + ".ttf")
+    italic = os.path.join(r"C:\Windows\Fonts", stem + "i.ttf")
+    if not (os.path.exists(upright) and os.path.exists(italic)):
+        pytest.skip("system font not installed")
+    assert build_design_json._italic_variant_path(upright, 400) == italic
+
+
+def test_italic_variant_leaves_an_already_italic_file_alone():
+    """`Candarali.ttf` IS italic without containing "italic" — ask the file."""
+    import os
+    path = os.path.join(r"C:\Windows\Fonts", "Candarali.ttf")
+    if not os.path.exists(path):
+        pytest.skip("system font not installed")
+    assert build_design_json._italic_variant_path(path, 400) is None

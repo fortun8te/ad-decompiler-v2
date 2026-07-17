@@ -11,7 +11,7 @@ from .schema import (
 )
 from .text_analysis import (
     fit_text_box, _fit_font, _line_advance, _norm_family, _resolve_family_path,
-    _style_name, _weight_candidates,
+    _style_name, _weight_candidates, path_is_italic,
 )
 from .raster_clusters import is_intentional_raster_cluster
 
@@ -955,8 +955,13 @@ def _italic_variant_path(path, weight: int):
     existing italic file path, or None to keep the original candidate."""
     if not path:
         return None
-    name = os.path.basename(str(path)).lower()
-    if "italic" in name or re.search(r"(?:i|z)\.(?:ttf|otf)$", name):
+    # Ask the FILE, not its name. The old test — "italic" in the name, or a name
+    # ending in i/z.ttf — read `calibri.ttf` and `segoeui.ttf` as ALREADY italic
+    # (both end in "i.ttf"), so an italic run on Calibri/Segoe UI silently kept its
+    # UPRIGHT file while declaring italic: 107's "don't" ships upright ink under a
+    # 'Regular Italic' label. It also missed genuinely italic files whose names never
+    # say so (`Candarali.ttf`).
+    if path_is_italic(path):
         return None
     base, ext = os.path.splitext(str(path))
     candidates = []
@@ -1044,6 +1049,21 @@ def _promote_weight_candidate(style: dict) -> None:
         italic_path = _italic_variant_path(top.get("path"), weight)
         if italic_path:
             top["path"] = italic_path
+    elif path_is_italic(top.get("path")):
+        # MIRROR of the branch above, which only ever repaired upright->italic. An
+        # UPRIGHT label carrying an ITALIC file is the same lie inverted, and it is
+        # invisible in the preview — which resolves the FILE and draws the right
+        # slant — while Figma resolves the STYLE NAME and ships upright. 013's
+        # headline node ('We NEVER' italic + 'do this!' upright) aggregates to Bold
+        # yet inherited Inter-Italic. Resolve the declared family upright, or drop the
+        # path rather than lie about it — as the weight-mismatch branch already does.
+        upright = _resolve_family_path(preferred_family or top.get("family"), weight, False)
+        if upright:
+            top["path"] = upright
+            top.pop("local_family", None)
+            top["family_resolved"] = True
+        else:
+            top.pop("path", None)
     if preferred_family and _norm_family(top.get("family")) != _norm_family(preferred_family):
         # Stamping the declared family onto a candidate while KEEPING its path makes
         # design.json and the preview name different fonts (009 read family "Inter"

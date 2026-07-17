@@ -3786,6 +3786,81 @@ def _short_function_word(text: str) -> bool:
     return len(token) <= 2 or token in _FUNCTION_WORDS
 
 
+# RELEASING a word from its line's italic needs far stronger evidence than asserting
+# italic on an upright line, because a word re-measures the SAME ink as its line with a
+# slightly different tight mask. Across the bench, single-token lines (word ink ==
+# line ink, so any delta is pure measurement noise) disagree by a median of 1.58° and
+# up to 3.50°: 013 'We NEVER' reads -6.75 as a line and -5.68 as a word, 107 'Orange'
+# -6.34 vs -4.76. With one symmetric 6.0° gate both words fall to the upright side of
+# their own italic line and get relabelled upright while still carrying the line's
+# ITALIC font file — the preview resolves the FILE and looks correct while Figma
+# resolves the STYLE NAME and ships the headline upright. Only a word measuring at most
+# this angle is decisively upright; unmeasurable (None) is NOT evidence of upright —
+# _measure_shear_angle returns None for thin/short masks AND for genuinely upright ink
+# alike (091 'MGNAT' line -6.34 → word None, 107 'DAILY HYDRATION' -8.43 → None).
+_ITALIC_RELEASE_DEG = 3.0
+
+
+def _word_italic_state(shear, base_italic: bool, config: dict) -> bool:
+    """Is this word italic? Hysteresis around its LINE's slant (see above)."""
+    assert_gate = _num(config.get("italic_shear_deg"), 6.0)
+    if shear is None:
+        return base_italic          # unmeasurable: keep the line's slant, don't invent one
+    magnitude = abs(shear)
+    if base_italic:
+        release = min(_ITALIC_RELEASE_DEG, assert_gate)
+        return magnitude > release
+    return magnitude >= assert_gate
+
+
+def path_is_italic(path) -> Optional[bool]:
+    """Does this FILE actually draw italic? Ask the font, not its filename.
+
+    ``_font_metadata`` reads the real name records (with a filename fallback), so
+    this is right where naming conventions lie: ``calibri.ttf`` and ``segoeui.ttf``
+    END IN "i.ttf" without being italic, while ``Candarali.ttf`` IS italic without
+    containing "italic". Returns None when there is no path to judge.
+    """
+    if not path:
+        return None
+    try:
+        return "italic" in str(_font_metadata(str(path)).get("style") or "").lower()
+    except Exception:
+        return None
+
+
+def _match_candidate_slant(style: dict, italic: bool, config: dict) -> None:
+    """Keep ``fontCandidates[0]`` on the slant the word now DECLARES.
+
+    Word overrides deliberately inherit the LINE's candidates (same face), so a word
+    that flips slant would otherwise declare one slant while carrying the other's
+    file. The mismatch is invisible in the preview — which resolves the FILE and
+    draws the right slant — but Figma resolves the STYLE NAME, so the DELIVERABLE
+    ships the wrong slant. Resolve the declared family at the new slant; if it is not
+    installed, drop a contradicting path rather than lie about it (the same fallback
+    ``build_design_json._promote_weight_candidate`` uses for weight mismatches).
+    """
+    cands = [dict(c) for c in (style.get("fontCandidates") or []) if isinstance(c, dict)]
+    if not cands:
+        return
+    top = cands[0]
+    weight = int(round(_num(style.get("fontWeight"), 400.0)))
+    resolved = _resolve_family_path(
+        style.get("fontFamily") or top.get("family"), weight, italic, _font_options(config))
+    if resolved:
+        top["path"] = resolved
+        top.pop("local_family", None)
+        top.pop("fit", None)        # the outvoted face's fit is not this face's
+        top["family_resolved"] = True
+    else:
+        path_italic = path_is_italic(top.get("path"))
+        if path_italic is not None and path_italic != italic:
+            top.pop("path", None)
+    top["style"] = _style_name(weight, italic=italic)
+    top["weight"] = weight
+    style["fontCandidates"] = [top] + cands[1:]
+
+
 def _enrich_word_styles(image, line: dict, config: dict) -> None:
     """Attach conservative, pixel-evidenced style overrides to OCR words.
 
@@ -4027,8 +4102,9 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
                 and colour_changed and weight_changed and valid_word_count <= 1
             )
         shear = geo.get("shear_angle")
-        italic_changed = bool(shear is not None and abs(shear) >= _num(config.get("italic_shear_deg"), 6.0)) \
-            != ("italic" in str(base.get("fontStyle") or "").lower())
+        base_italic = "italic" in str(base.get("fontStyle") or "").lower()
+        word_italic = _word_italic_state(shear, base_italic, config)
+        italic_changed = word_italic != base_italic
         if not any((colour_changed, size_changed, weight_changed, italic_changed)):
             continue
         style = copy.deepcopy(base)
@@ -4044,12 +4120,17 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
             style["lineHeight"] = round(max(measured_size * 1.15, painted["h"]), 2)
         if weight_changed:
             style["fontWeight"] = measured_weight
+        if weight_changed or italic_changed:
+            # One label for both signals: the slant is `word_italic` (== base_italic
+            # whenever italic_changed is False), so a weight-only override still
+            # reproduces the line's slant exactly as before.
             style["fontStyle"] = _style_name(
-                measured_weight, italic="italic" in str(style.get("fontStyle") or "").lower()
-            )
+                int(style.get("fontWeight", base_weight)), italic=word_italic)
         if italic_changed:
-            italic = bool(shear is not None and abs(shear) >= _num(config.get("italic_shear_deg"), 6.0))
-            style["fontStyle"] = _style_name(int(style.get("fontWeight", base_weight)), italic=italic)
+            # The style is a deepcopy of the LINE's, so a flipped word would otherwise
+            # keep the line's shear and contradict its own new label.
+            style["italicShearDeg"] = shear if word_italic else None
+            _match_candidate_slant(style, word_italic, config)
         word["style"] = style
         word["style_evidence"] = {
             "source": "word-pixels", "confidence": round(float(ink_conf), 4),
