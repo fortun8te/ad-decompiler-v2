@@ -1682,3 +1682,25 @@ def test_unresolved_strike_residue_is_surfaced_not_silently_shipped(tmp_path, mo
     assert any(i.endswith("__strike") for i in residual.get("hard_fail_ids") or [])
     strike = [f for f in residual["flagged"] if str(f["id"]).endswith("__strike")]
     assert strike and strike[0].get("hard_fail") is True and strike[0]["resolved"] is False
+
+
+def test_hoist_floor_ignores_a_non_painting_container():
+    """107 regression: re-basing above a bare container lifted an opaque slice over the
+    button group and pasted glyph tops across native text. Only a group that actually
+    PAINTS (fill, or a backdrop child) can bury a hoisted slice."""
+    from src import reconstruct as _r
+    painting = [{"id": "panel", "z_index": 50, "fill": "#ffffff",
+                 "children": [{"id": "tube", "z_index": 2}]}]
+    bare = [{"id": "root__band1", "z_index": 20, "fill": None,
+             "children": [{"id": "leader", "z_index": 5}]}]
+    assert _r._root_ancestor_z(painting, "tube") == 50.0   # 101: must clear the panel
+    assert _r._root_ancestor_z(bare, "leader") is None      # 107: nothing to clear
+
+
+def test_group_with_backdrop_child_still_counts_as_painting():
+    from src import reconstruct as _r
+    grp = [{"id": "band", "z_index": 30, "children": [
+        {"id": "band__groupbg", "src": "assets/x.png"},
+        {"id": "slice", "z_index": 3},
+    ]}]
+    assert _r._root_ancestor_z(grp, "slice") == 30.0

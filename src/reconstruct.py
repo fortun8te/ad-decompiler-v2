@@ -3931,11 +3931,41 @@ def _collect_live_overlays(nodes, exclude_ids, offset=(0.0, 0.0), out=None):
     return out
 
 
+def _group_paints(node):
+    """True when a group actually puts pixels down that could bury a hoisted slice.
+
+    A hoisted slice only needs to clear the group it left if that group PAINTS over it:
+    101's white panel carries a ``#ffffff`` fill and wiped the tube, but 107's
+    ``root__band1`` is a bare container (``fill=None``, no backdrop child), so re-basing
+    above it is unnecessary AND harmful — it lifted 107's opaque callout-leader slice
+    (z 5 -> 21) over the button group and pasted original glyph tops across the native
+    "DAILY HYDRATION" (1040px of damage; z=5 renders pixel-identical to the baseline).
+    """
+    if not isinstance(node, dict):
+        return False
+    if node.get("fill") or node.get("fills"):
+        return True
+    if node.get("src") or node.get("type") in ("image", "text", "shape"):
+        return True
+    # A backdrop/plate child paints on the group's behalf.
+    for child in node.get("children") or []:
+        if not isinstance(child, dict):
+            continue
+        cid = str(child.get("id") or "")
+        role = str((child.get("meta") or {}).get("role") or "")
+        if cid.endswith("__groupbg") or role in ("background", "backdrop", "plate"):
+            return True
+        if child.get("fill") or child.get("fills"):
+            return True
+    return False
+
+
 def _root_ancestor_z(root_nodes, layer_id):
     """z of the TOP-LEVEL node whose subtree holds ``layer_id``.
 
-    ``None`` when the layer already sits at root (its z is root-scoped already) or when
-    no ancestor carries a usable z — both mean "nothing to clear".
+    ``None`` when the layer already sits at root (its z is root-scoped already), when no
+    ancestor carries a usable z, or when the ancestor does not PAINT — all three mean
+    "nothing to clear".
     """
 
     def _holds(nodes):
@@ -3954,6 +3984,8 @@ def _root_ancestor_z(root_nodes, layer_id):
         if str(node.get("id")) == str(layer_id):
             return None
         if _holds(node.get("children") or []):
+            if not _group_paints(node):
+                return None
             z_raw = node.get("z_index")
             if z_raw is None:
                 z_raw = node.get("z")
