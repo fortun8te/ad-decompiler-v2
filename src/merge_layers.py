@@ -1401,6 +1401,17 @@ def _clip_text_boxes_off_row_bullets(candidates: list) -> int:
         text["box"] = tbox
         text.setdefault("meta", {})["row_bullet_clipped"] = {"from_x": tx, "to_x": clip_x}
         clipped += 1
+        # STRING-SIDE half of the same defect: OCR read the icon glyph as a leading
+        # letter ('X Up to 3 shades'). The icon owns that ink — icon_detect just told us
+        # so — therefore a leading X/x token on a clipped row is the swallowed glyph,
+        # not copy. Box clipping alone leaves the phantom letter in the deliverable.
+        raw = str(text.get("text") or "")
+        if raw[:1] in ("X", "x") and (len(raw) < 2 or not raw[1].isalnum()):
+            text["text"] = raw[1:].lstrip()
+            text["meta"]["row_bullet_glyph_stripped"] = raw[:1]
+        elif raw[:1] in ("X", "x") and raw[1:2].isupper():
+            text["text"] = raw[1:]
+            text["meta"]["row_bullet_glyph_stripped"] = raw[:1]
     return clipped
 
 
