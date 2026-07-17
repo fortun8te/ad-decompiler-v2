@@ -1371,7 +1371,7 @@ def _restore_dropped_punctuation(text: str, alternatives: Iterable[str]) -> str:
 # let a peer overwrite a correct brand token (067's ``PROYK``).
 _CONFUSABLE_CLASSES = (
     ("c", "g"),          # 131 SHIPPING->SHIPPINC, 067 SAYING->SAYINC / GOODBYE->COODBYE
-    ("0", "o", "d"),     # 131 $100+ -> $1OO+
+    ("0", "o"),          # 131 $100+ -> $1OO+
     ("1", "i", "l", "|", "ı"),   # 131 GET 1 FREE -> GETIFREE
     ("5", "s"),
     ("8", "b"),
@@ -1631,6 +1631,58 @@ def _fix_confusable_against_peers(winner_text: str, peer_texts: Iterable[str]) -
         if match is None or match.casefold() == core.casefold():
             continue
         out[index] = token.replace(core, _preserve_word_case(core, match), 1)
+        changed = True
+    return " ".join(out) if changed else None
+
+
+def _lexicon_by_confusable_key() -> dict:
+    """``{confusable_key: {words}}`` over the lexicon, built once."""
+    global _LEXICON_KEYS
+    if _LEXICON_KEYS is None:
+        index: dict = {}
+        for word in _LEXICON:
+            index.setdefault(_confusable_key(word), set()).add(word)
+        _LEXICON_KEYS = index
+    return _LEXICON_KEYS
+
+
+_LEXICON_KEYS: Optional[dict] = None
+
+
+def _fix_confusable_against_lexicon(text: str) -> Optional[str]:
+    """Repair display-caps glyph confusion with no peer reading to lean on.
+
+    ``_fix_confusable_against_peers`` needs another engine to have spelled the word;
+    when both engines agree on the misread — 131's bottom marquee reads ``SHIPPINC``
+    twice, 067 reads ``COODBYE`` — there is no peer, and the VLM judge is the only
+    thing standing between the ad and a corrupted headline. It errored on all 11 of
+    131's lines, so this closes the gap deterministically.
+
+    Fires only when an ALL-CAPS, purely alphabetic non-word maps to *exactly one*
+    lexicon word under ``_confusable_key``. Uppercase-only because that is where the
+    confusion is documented (display type has no x-height cues); purely alphabetic so
+    prices and contractions (``DON'T``, ``$100+``) can never be touched; unique-match
+    so an ambiguous skeleton is left for a human.
+    """
+    tokens = str(text or "").split()
+    if not tokens:
+        return None
+    index = _lexicon_by_confusable_key()
+    out = list(tokens)
+    changed = False
+    for position, token in enumerate(tokens):
+        core = _token_core(token)
+        if len(core) < 4 or not core.isalpha() or not core.isupper():
+            continue
+        if core.casefold() in _LEXICON:
+            continue
+        matches = index.get(_confusable_key(core)) or set()
+        if len(matches) != 1:
+            continue
+        match = next(iter(matches))
+        if match.casefold() == core.casefold():
+            continue
+        out[position] = token.replace(core, _preserve_word_case(core, match), 1)
         changed = True
     return " ".join(out) if changed else None
 
@@ -2429,7 +2481,11 @@ def _preserve_word_case(original: str, replacement: str) -> str:
     if original.islower():
         return replacement.lower()
     if original[:1].isupper() and original[1:].islower():
-        return replacement[:1].upper() + replacement[1:].lower()
+        # Title-case every word: a replacement may carry a space the misread token
+        # lost ("Blackfriday" -> "Black Friday", not "Black friday"). Single-word
+        # replacements are unaffected.
+        return " ".join(word[:1].upper() + word[1:].lower()
+                        for word in replacement.split())
     if original[:1].isupper():
         return replacement[:1].upper() + replacement[1:]
     return replacement
@@ -2530,6 +2586,7 @@ def cleanup_line_text(text: str) -> str:
     cleaned = _split_case_smash(str(text or ""))
     cleaned = _collapse_repeated_tokens(cleaned)
     cleaned = _apply_ocr_typos(cleaned)
+    cleaned = _fix_confusable_against_lexicon(cleaned) or cleaned
     cleaned = _fix_digit_run_letters(cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
     return cleaned
@@ -2578,6 +2635,22 @@ def _drop_glyphless_lines(lines: list[dict]) -> tuple[list[dict], list[str]]:
     return kept, dropped
 
 
+def cleanup_word_text(text: str) -> str:
+    """Character-level hygiene for a single word token (never changes token count).
+
+    Word tokens carry their own box, so only the fixes that rewrite glyphs *within* a
+    token may run here — the space-inserting ones (case-smash, glued phrases) would
+    put two words behind one box. Keeping this in step with the line matters: 131
+    shipped a line reading ``FREE SHIPPING`` whose word_geometry still said
+    ``SHIPPINC``, and build_design_json paints from word_geometry.
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return raw
+    cleaned = _fix_confusable_against_lexicon(raw) or raw
+    return _fix_digit_run_letters(cleaned)
+
+
 def _apply_line_text_cleanup(lines: list[dict]) -> list[dict]:
     output = []
     for line in lines:
@@ -2590,6 +2663,15 @@ def _apply_line_text_cleanup(lines: list[dict]) -> list[dict]:
             meta["ocr_text_cleanup"] = {"from": original, "to": cleaned}
             if item.get("ocr_text") is None:
                 item["ocr_text"] = original
+        # Keep word tokens in step with the line they belong to.
+        for word in item.get("words") or []:
+            word_original = str(word.get("text") or "")
+            word_cleaned = cleanup_word_text(word_original)
+            if word_cleaned != word_original:
+                word["text"] = word_cleaned
+                word.setdefault("meta", {})["ocr_text_cleanup"] = {
+                    "from": word_original, "to": word_cleaned,
+                }
         output.append(item)
     return output
 

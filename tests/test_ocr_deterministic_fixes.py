@@ -213,3 +213,237 @@ def test_fix_strikethrough_skips_undisputed_lines(tmp_path):
     assert calls == []
     assert out[0]["text"] == "Foggy and Steady"
     assert "strikethrough" not in out[0]["meta"]
+
+
+# ---------------------------------------------------------------------------
+# Ad 131 (postfix-benchmark-7, text_recall 0.636 — worst of the run).
+#
+# Every corruption below shipped from ONE cluster where both readings were present
+# and the wrong one won on calibrated confidence alone:
+#
+#   doctr   0.765  "BUY2. GETIFREE + FREE SHIPPINC +OOLS"    <- selected
+#   easyocr 0.519  "BUY 2, GET 1 FREE + FREE SHIPPING $1OO+"  <- correct, discarded
+#
+# meta.disagreement was set, so the VLM judge should have arbitrated — but all 11
+# judge calls errored that run (model evicted -> breaker opened), exactly as they
+# did for 013's "do1 this". These paths must hold with the VLM absent.
+
+_D131_DOCTR = "BUY2. GETIFREE + FREE SHIPPINC +OOLS"
+_D131_EASY = "BUY 2, GET 1 FREE + FREE SHIPPING $1OO+"
+_D131_TRUTH = "BUY 2, GET 1 FREE + FREE SHIPPING $100+"
+
+
+def test_confusable_key_normalizes_display_glyph_confusion():
+    # The two readings are the same ink: near-identical once G/C, 1/I and 0/O fold.
+    assert ocr._confusable_similarity(_D131_DOCTR, _D131_EASY) >= 0.9
+    # ...but very different as plain text, which is why plain similarity cannot gate.
+    assert ocr._text_similarity(_D131_DOCTR, _D131_EASY) < 0.9
+    assert ocr._confusable_key("SHIPPINC") == ocr._confusable_key("SHIPPING")
+    # Letters outside a confusable class never collapse — a peer must not overwrite
+    # a correct brand wordmark (067 'PROYK').
+    assert ocr._confusable_key("PROYK") != ocr._confusable_key("PROVE")
+
+
+def test_lexical_plausibility_separates_corrupt_from_clean_reading():
+    assert ocr._lexical_plausibility(_D131_DOCTR) < 0.3
+    assert ocr._lexical_plausibility(_D131_EASY) > 0.8
+
+
+def test_corruption_signals_identify_131_damage():
+    signals = ocr._corruption_signals(_D131_DOCTR, _D131_EASY)
+    assert any(s.startswith("mixed-alnum:BUY2.") for s in signals)
+    assert any(s.startswith("glued-run:GETIFREE") for s in signals)
+    assert any(s.startswith("confusable-of-word:SHIPPINC") for s in signals)
+    # A correct out-of-lexicon wordmark is 'unknown', never a corruption signal.
+    assert ocr._corruption_signals("PROYK", "PROVE") == []
+
+
+def test_reconcile_promotes_lexically_plausible_peer_over_confident_garbage():
+    """131 L0 end-to-end: real boxes and confidences from bench-7 ocr.json."""
+    primary = _line(_D131_DOCTR, 0.805, _box(122, 136.5, 1391.9, 67.4), "doctr")
+    challenger = _line(_D131_EASY, 0.59, _box(113, 126, 1414, 90), "easyocr")
+    fused = ocr._reconcile([primary], [[challenger]], cfg={"ocr": {}})
+    assert len(fused) == 1
+    assert fused[0]["text"] == _D131_EASY
+    arb = fused[0]["meta"]["lexical_arbitration"]
+    assert arb["from_engine"] == "doctr" and arb["to_engine"] == "easyocr"
+    # 'from' is the winner as it stood at arbitration — the token-level lexicon
+    # backstop has already repaired SHIPPINC by then; the glued/mixed damage that
+    # confidence alone could not see is what the promotion is deciding on.
+    assert "GETIFREE" in arb["from"] and "+OOLS" in arb["from"]
+    assert arb["from_plausibility"] < arb["to_plausibility"]
+    # Full stage output must equal the ad's actual copy, character for character.
+    assert ocr.cleanup_line_text(fused[0]["text"]) == _D131_TRUTH
+    # The raw engine readings stay on the record for the judge and for diagnostics.
+    assert _D131_DOCTR in fused[0]["meta"]["disagreement"]
+
+
+def test_lexical_arbitration_refuses_short_and_unrelated_readings():
+    # Different lines in one cluster: not arbitration's call, whatever they score.
+    members = [_line("SHOP THE SALE NOW", 0.9, _box(0, 0, 10, 10), "doctr"),
+               _line("Free returns within 30 days", 0.5, _box(0, 0, 10, 10), "easyocr")]
+    assert ocr._pick_lexical_peer(members, 0) is None
+    # Winner is an out-of-lexicon wordmark, peer is 'more lexical' but wrong: no
+    # corruption signal, so confidence keeps its win.
+    members = [_line("froya Arctic Skincare", 0.9, _box(0, 0, 10, 10), "doctr"),
+               _line("freya Arctic Skincare", 0.5, _box(0, 0, 10, 10), "easyocr")]
+    assert ocr._pick_lexical_peer(members, 0) is None
+    # Too short to gamble on.
+    members = [_line("GETI FREE", 0.9, _box(0, 0, 10, 10), "doctr"),
+               _line("GET 1 FREE", 0.5, _box(0, 0, 10, 10), "easyocr")]
+    assert ocr._pick_lexical_peer(members, 0) is None
+
+
+# ---------------------------------------------------------------------------
+# G->C on display caps: the benchmark's most-repeated misread.
+# 067 'SAYING'->'SAYINC' / 'GOODBYE'->'COODBYE', 131 'SHIPPING'->'SHIPPINC'.
+
+
+def test_confusable_against_peers_fixes_g_to_c_on_display_caps():
+    assert ocr._fix_confusable_against_peers(
+        "FREE SHIPPINC", ["FREE SHIPPING"]) == "FREE SHIPPING"
+    assert ocr._fix_confusable_against_peers(
+        "WE'RE SAYINC COODBYE", ["WE'RE SAYING GOODBYE"]) == "WE'RE SAYING GOODBYE"
+
+
+def test_confusable_against_peers_is_conservative():
+    # No peer evidence -> no fix (the peer supplies the glyph choice, not a guess).
+    assert ocr._fix_confusable_against_peers("FREE SHIPPINC", []) is None
+    # Peer is not a real word either -> nothing authoritative to adopt.
+    assert ocr._fix_confusable_against_peers("FREE SHIPPINC", ["FREE SHIPPINK"]) is None
+    # Correct text is left exactly alone.
+    assert ocr._fix_confusable_against_peers("FREE SHIPPING", ["FREE SHIPPING"]) is None
+    # Non-confusable letter differences are real differences: never adopt the peer.
+    assert ocr._fix_confusable_against_peers("PROYK", ["PROVE"]) is None
+
+
+def test_reconcile_applies_confusable_fix_without_whole_line_promotion():
+    """Token-local G->C rescue on a line the whole-reading promotion declines."""
+    primary = _line("WE'RE SAYINC COODBYE", 0.9, _box(0, 0, 900, 60), "doctr")
+    challenger = _line("WE'RE SAYING GOODBYE", 0.5, _box(0, 0, 900, 60), "easyocr")
+    fused = ocr._reconcile([primary], [[challenger]], cfg={"ocr": {}})
+    assert fused[0]["text"] == "WE'RE SAYING GOODBYE"
+
+
+# ---------------------------------------------------------------------------
+# G->C where BOTH engines agree on the misread, so there is no peer to learn from:
+# 067 'COODBYE', 131's bottom marquee reading 'SHIPPINC' twice. The VLM judge was
+# the only thing catching these, and on 131 it errored on all 11 lines.
+
+
+def test_confusable_against_lexicon_needs_no_peer():
+    assert ocr.cleanup_line_text("WERE SAYINC COODBYE") == "WERE SAYING GOODBYE"
+    # 131's marquee, verbatim from bench-7 ocr.json.
+    assert ocr.cleanup_line_text(
+        "SHIPPINC $100+ BUY 2 GET FREE · FREE SHIPPINC $100+"
+    ) == "SHIPPING $100+ BUY 2 GET FREE · FREE SHIPPING $100+"
+
+
+def test_lexicon_rescue_never_rewrites_wordmarks_or_punctuated_tokens():
+    # Brand wordmarks (067) have no lexicon skeleton and must survive untouched.
+    for text in ["PROYK", "FROYK", "AS", "III", "$100+", "B2B",
+                 "COMPREHENSIVE NUTRITION", "ONLINE EXCLUSIVE OFFER ENDING SOON"]:
+        assert ocr.cleanup_line_text(text) == text, text
+    # Purely-alphabetic gate: an apostrophe must never be dropped chasing a skeleton.
+    assert ocr._fix_confusable_against_lexicon("DON'T") is None
+    # Lowercase body copy is out of scope (the confusion is a display-caps artifact).
+    assert ocr._fix_confusable_against_lexicon("free shippinc") is None
+    # A real misread with no unique lexicon skeleton is left for a human.
+    assert ocr._fix_confusable_against_lexicon("ENDS TODAV") is None
+
+
+def test_word_tokens_are_cleaned_in_step_with_their_line():
+    """131 shipped a line reading 'FREE SHIPPING' whose word_geometry said 'SHIPPINC'.
+
+    build_design_json paints from word_geometry, so a stale token puts the misread
+    straight back into the Figma output the line text had just been cleared of.
+    """
+    line = {
+        "text": "SHIPPINC $1OO+",
+        "conf": 0.9,
+        "box": _box(0, 0, 400, 40),
+        "words": [
+            {"text": "SHIPPINC", "conf": 0.8, "box": _box(0, 0, 200, 40)},
+            {"text": "$1OO+", "conf": 0.8, "box": _box(200, 0, 200, 40)},
+        ],
+    }
+    out = ocr._apply_line_text_cleanup([line])[0]
+    assert out["text"] == "SHIPPING $100+"
+    assert [w["text"] for w in out["words"]] == ["SHIPPING", "$100+"]
+
+
+def test_cleanup_word_text_never_splits_a_token():
+    # A word token owns exactly one box, so a space-inserting fix must not run here
+    # even though the same string would gain a space as a line.
+    assert ocr.cleanup_line_text("BLACKFRIDAY") == "BLACK FRIDAY"
+    assert ocr.cleanup_word_text("BLACKFRIDAY") == "BLACKFRIDAY"
+    assert " " not in ocr.cleanup_word_text("WeNEVER")
+
+
+def test_lexicon_skeletons_are_unambiguous():
+    """Every lexicon word must own a unique confusable skeleton.
+
+    A collision would make the 'exactly one match' rule silently coin-flip between
+    two real words; assert the invariant instead of trusting it.
+    """
+    index = ocr._lexicon_by_confusable_key()
+    collisions = {k: sorted(v) for k, v in index.items() if len(v) > 1}
+    assert collisions == {}, collisions
+    assert len(index) == len(ocr._LEXICON)
+
+
+# ---------------------------------------------------------------------------
+# Ad 131: '$100+' read as '$1OO+' by BOTH engines — no peer to arbitrate against.
+
+
+def test_digit_run_letters_restore_price():
+    assert ocr.cleanup_line_text("FREE SHIPPING $1OO+") == "FREE SHIPPING $100+"
+    assert ocr.cleanup_line_text("Save $5O today") == "Save $50 today"
+    assert ocr._fix_digit_run_letters("1OO%") == "100%"
+
+
+def test_digit_run_letters_never_touch_real_alphanumerics():
+    # Every one of these must survive: the token must become ALL digits to convert.
+    for text in ["6g fiber", "5G ready", "B2B pricing", "3D render", "1080p video",
+                 "100ri0", "10ar/30", "SIZE10", "COVID19", "45%", "$100+"]:
+        assert ocr.cleanup_line_text(text) == text, text
+
+
+# ---------------------------------------------------------------------------
+# Ad 131: 'BLACK FRIDAY' glued by both engines (doctr 'BLACKFRIDAYSALE',
+# easyocr 'BLACKFRIDAY SALE') — no peer evidence, so a curated phrase map.
+
+
+def test_glued_display_phrase_regains_space():
+    assert ocr.cleanup_line_text("BLACKFRIDAY SALE") == "BLACK FRIDAY SALE"
+    assert ocr.cleanup_line_text("Blackfriday Sale") == "Black Friday Sale"
+    assert ocr.cleanup_line_text("BLACK FRIDAY SALE") == "BLACK FRIDAY SALE"
+
+
+def test_glued_phrase_map_does_not_split_authored_compounds():
+    # A generic 'split when both halves are words' rule would wreck these.
+    for text in ["Superfoods", "COMPREHENSIVE NUTRITION", "Greens"]:
+        assert ocr.cleanup_line_text(text) == text, text
+
+
+# ---------------------------------------------------------------------------
+# Ad 016: sub-glyph detector noise shipped as real text lines and polluted recall.
+
+
+def test_subglyph_noise_lines_are_suppressed():
+    for text in ["-", "- -", "- 6", ".", "  ", "|", "- - -"]:
+        assert ocr._is_glyphless_noise(text) is True, text
+
+
+def test_subglyph_suppression_keeps_real_short_lines():
+    # Real 016/131 lines that must survive: any letter, any multi-digit number, or
+    # a lone digit with no stray marks.
+    for text in ["Off", "45%", "8", "$100+", "III", "6g", "a", "50"]:
+        assert ocr._is_glyphless_noise(text) is False, text
+
+
+def test_drop_glyphless_lines_reports_what_it_removed():
+    lines = [{"text": "Get up to"}, {"text": "- -"}, {"text": "45%"}, {"text": "."}]
+    kept, dropped = ocr._drop_glyphless_lines(lines)
+    assert [line["text"] for line in kept] == ["Get up to", "45%"]
+    assert dropped == ["- -", "."]

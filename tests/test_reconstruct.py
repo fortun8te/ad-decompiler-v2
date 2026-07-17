@@ -1472,6 +1472,53 @@ def test_collect_live_overlays_and_safe_hoist_z_keep_slice_below_overlay():
                          overlays) == 60.0
 
 
+def test_safe_hoist_z_rebases_a_nested_slice_above_its_former_group_fill():
+    """A slice hoisted OUT of a filled panel must clear that panel's root z.
+
+    z ranks a node against its SIBLINGS, so a child's z only means something inside its
+    own group.  101's TPU tube sat at in-group z 2 inside the white panel (root z 50);
+    hoisted to root it kept z 2, the panel's #ffffff fill painted straight over it, and
+    the product plus its 'BUY 3, GET 1 FREE' badge rendered as an empty white void.
+    """
+    from src.reconstruct import (
+        _collect_live_overlays, _hoist_floor, _root_ancestor_z, _safe_hoist_z,
+    )
+
+    tree = [
+        {"id": "panel", "target": "group", "z_index": 50,
+         "fill": {"kind": "flat", "color": "#ffffff"},
+         "box": {"x": 0, "y": 0, "w": 499, "h": 1000}, "children": [
+            {"id": "tube", "target": "image", "z_index": 2,
+             "box": {"x": 174, "y": 213, "w": 165, "h": 406}},
+            {"id": "logo", "target": "text", "text": "craft", "z_index": 60,
+             "box": {"x": 102, "y": 371, "w": 108, "h": 31}},
+         ]},
+    ]
+    overlays = _collect_live_overlays(tree, {"tube"})
+    abs_box = {"x": 171, "y": 210, "w": 171, "h": 412}
+
+    floor = _root_ancestor_z(tree, "tube")
+    assert floor == 50.0                      # the panel it is being lifted out of …
+    assert _root_ancestor_z(tree, "panel") is None   # … a root node has nothing to clear.
+
+    # The bug: the in-group z survives the move to root and the fill erases the slice.
+    assert _safe_hoist_z({"z_index": 2}, abs_box, overlays) == 2.0
+    # The fix: re-based above the panel, still under the live overlay it intersects.
+    hoisted = _safe_hoist_z({"z_index": 2}, abs_box, overlays, floor=floor)
+    assert hoisted > 50.0 and hoisted < 60.0
+
+    # Ducking under an overlay must never sink the slice back under the group fill.
+    tight = [({"x": 171, "y": 210, "w": 171, "h": 412}, 12.0, "chip")]
+    assert _safe_hoist_z({"z_index": 2}, abs_box, tight, floor=50.0) > 50.0
+
+    # _hoist_floor clears the deepest nesting across every tree the slice is written to.
+    targets = [((None, 0, tree[0]["children"][0], (0.0, 0.0)), tree),
+               ((None, 0, {"id": "tube", "z_index": 2}, (0.0, 0.0)),
+                [{"id": "tube", "z_index": 2}])]
+    assert _hoist_floor(targets, "tube") == 50.0
+    assert _hoist_floor([], "tube") is None
+
+
 # ── Mandate 1: a failed chrome shell with no ledger alpha must box-slice, not ghost ──
 
 

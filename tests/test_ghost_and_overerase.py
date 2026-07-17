@@ -579,3 +579,152 @@ def test_sparse_ledger_alpha_never_replaces_an_existing_chip(tmp_path, monkeypat
                     if s.get("reason") == "slice-alpha-too-sparse"]
     assert sparse_skips, report.get("skipped")
     assert sparse_skips[0]["alpha_coverage"] < 0.02
+
+
+# ── partial-smear ghost: the class the ABSOLUTE colour tests structurally cannot see ──
+#
+# 025's checklist copy sits on translucent glass over a photo. Big-LaMa blurred the bright
+# glyphs instead of removing them, leaving a dimmed smear that matched NEITHER absolute
+# test — |plate-source| ~93 (bar: 12) and |plate-ink| ~111 (bar: 40) — so residue scored
+# 0.09, nothing was flagged, QA stayed green, and the plate shipped the baked ink UNDER
+# the native TEXT node: three rows rendered doubled ('Cuts you off', 'Reusable for years',
+# 'Award-winning design'). Detect it structurally: how much of each glyph pixel's ORIGINAL
+# local contrast still survives on the plate.
+
+
+def _smear_glyph_only(monkeypatch, smear, plate=PLATE):
+    """Model a real LaMa smear: the halo cleans, the glyph itself only DIMS.
+
+    Painting the whole mask one colour would be a different defect (a flat patch); the
+    ghost that ships doubled is glyph-shaped residue with a cleanly filled surround.
+    """
+    def fake_once(image_path, mask, output_path, cfg=None):
+        img = np.asarray(Image.open(image_path).convert("RGB")).copy()
+        m = np.asarray(reconstruct.inpaint.solidify_mask(mask)) > 0
+        ink = img.mean(axis=2) < 128
+        img[m & ~ink] = plate
+        img[m & ink] = smear
+        Image.fromarray(img).save(output_path)
+        return {"ok": True, "path": output_path, "backend": "fake-partial-smear",
+                "backend_class": "active"}
+
+    monkeypatch.setattr(reconstruct.inpaint, "inpaint_once", fake_once)
+
+
+def _run_residual(tmp_path, source, archetype="comparison_grid"):
+    return reconstruct.reconstruct(
+        str(source), {"lines": []}, [_text_candidate()], str(tmp_path),
+        {"inpaint": {"mode": "opencv"}, "scene": {"archetype": archetype}},
+    )["stats"]["text_residual"]
+
+
+def test_partial_smear_evading_both_absolute_tests_is_still_flagged(tmp_path, monkeypatch):
+    """A half-dimmed glyph matches neither 'still source' nor 'still ink' — yet it is read
+    by the user as doubled text, so it must be flagged and cleaned (025 c_B5/c_B7/c_B8)."""
+    source = tmp_path / "source.png"
+    _source(source)
+    # Mid-grey: 110 from the ink (bar 40) AND 110 from the source (bar 12) -> invisible to
+    # both absolute tests, but it retains ~50% of the glyph's local contrast.
+    _smear_glyph_only(monkeypatch, np.array([130, 127, 120], dtype=np.uint8))
+
+    residual = _run_residual(tmp_path, source)
+    assert residual["checked"] == 1
+    assert residual["flagged"], "a partial smear must not pass as clean"
+    flag = residual["flagged"][0]
+    assert flag["id"] == "c_B0"
+    assert flag["kind"] == "smear", "must be attributed to the smear detector"
+    assert flag["smear_ratio"] >= 0.18
+    assert flag["resolved"] is True
+    assert "c_B0" in (residual.get("solid_filled_ids") or [])
+
+
+def test_partial_smear_over_a_photographic_plate_is_left_alone(tmp_path, monkeypatch):
+    """The smear detector must stay off fine texture: 025's headline sits over hair, its
+    plate is genuinely CLEAN, and the local-background estimate there is just noise — a
+    plate-colour fill would paint a flat slab over the photo. Fail closed instead."""
+    source = tmp_path / "source.png"
+    image = Image.new("RGB", (200, 140), PLATE)
+    ImageDraw.Draw(image).rectangle((45, 48, 135, 65), fill=INK)
+    noisy = np.asarray(image).astype(np.int16)
+    rng = np.random.default_rng(7)
+    noisy += rng.integers(-42, 43, size=noisy.shape, dtype=np.int16)  # fine photo texture
+    Image.fromarray(np.clip(noisy, 0, 255).astype(np.uint8)).save(source)
+    _smear_glyph_only(monkeypatch, np.array([130, 127, 120], dtype=np.uint8))
+
+    residual = _run_residual(tmp_path, source)
+    assert residual["checked"] == 1
+    smears = [f for f in residual["flagged"] if f.get("kind") == "smear"]
+    assert smears == [], "a textured backdrop must not trip the smear detector"
+
+
+def test_smear_detector_can_be_disabled(tmp_path, monkeypatch):
+    """Config gate: reconstruct.text_residual.smear_enabled."""
+    source = tmp_path / "source.png"
+    _source(source)
+    _smear_glyph_only(monkeypatch, np.array([130, 127, 120], dtype=np.uint8))
+
+    residual = reconstruct.reconstruct(
+        str(source), {"lines": []}, [_text_candidate()], str(tmp_path),
+        {"inpaint": {"mode": "opencv"}, "scene": {"archetype": "comparison_grid"},
+         "reconstruct": {"text_residual": {"smear_enabled": False}}},
+    )["stats"]["text_residual"]
+    assert [f for f in residual["flagged"] if f.get("kind") == "smear"] == []
+
+
+# ── clipped glyph edges (107 stray dots) ─────────────────────────────────────────────
+#
+# text_ink_mask constrains ink to the authored OCR box. OCR boxes clip a glyph's last few
+# px — 107's '58%' box ends at x=737 while the '%' bowl runs to 751 — so the sliver is
+# never removed, stays baked in the plate, and renders as a stray dot beside the native
+# text. Claim source ink that is connected to claimed ink AND the same colour.
+
+
+def _clipped_source(path, tail_color=INK):
+    """A glyph bar whose real ink runs 14px PAST the OCR box the candidate declares."""
+    image = Image.new("RGB", (200, 140), PLATE)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((45, 48, 135, 65), fill=INK)        # ink inside the OCR box
+    draw.rectangle((136, 50, 150, 63), fill=tail_color)  # continues past box edge (136)
+    image.save(path)
+    return image
+
+
+def test_glyph_ink_continuing_past_the_ocr_box_is_claimed(tmp_path):
+    """The clipped sliver must join the removal mask, or it ships as a stray dot."""
+    source = tmp_path / "source.png"
+    _clipped_source(source)
+    rgb = np.asarray(Image.open(source).convert("RGB"), dtype=np.uint8)
+    candidate = _text_candidate()
+    base = reconstruct.inpaint.text_ink_mask(rgb, candidate["box"], allow_box_fallback=False)
+    assert int(np.count_nonzero(np.asarray(base)[50:64, 137:151])) == 0  # box clips it
+
+    grown = np.asarray(reconstruct._claim_clipped_glyph_edges(candidate, base, rgb, {}))
+    assert int(np.count_nonzero(grown[50:64, 137:151])) > 100, "sliver must be claimed"
+    assert candidate["meta"]["removal_clipped_edges_claimed"]["px"] > 0
+
+
+def test_touching_foreign_colour_decoration_is_not_swallowed(tmp_path):
+    """Connectivity alone is not enough: a strike-through physically touches the glyphs it
+    crosses (091). Claiming it would erase a decoration that is its own element, so the
+    claim is also gated on the node's DECLARED text colour."""
+    source = tmp_path / "source.png"
+    _clipped_source(source, tail_color=(205, 35, 35))  # red overhang, touching the bar
+    rgb = np.asarray(Image.open(source).convert("RGB"), dtype=np.uint8)
+    candidate = _text_candidate()  # style.color == #141414
+    base = reconstruct.inpaint.text_ink_mask(rgb, candidate["box"], allow_box_fallback=False)
+
+    grown = np.asarray(reconstruct._claim_clipped_glyph_edges(candidate, base, rgb, {}))
+    assert int(np.count_nonzero(grown[50:64, 137:151])) == 0, \
+        "a differently-coloured touching decoration must not be claimed"
+
+
+def test_clipped_edge_claim_can_be_disabled(tmp_path):
+    """Config gate: reconstruct.text_clipped_edge_pad = 0."""
+    source = tmp_path / "source.png"
+    _clipped_source(source)
+    rgb = np.asarray(Image.open(source).convert("RGB"), dtype=np.uint8)
+    candidate = _text_candidate()
+    base = reconstruct.inpaint.text_ink_mask(rgb, candidate["box"], allow_box_fallback=False)
+    grown = reconstruct._claim_clipped_glyph_edges(
+        candidate, base, rgb, {"reconstruct": {"text_clipped_edge_pad": 0}})
+    assert int(np.count_nonzero(np.asarray(grown)[50:64, 137:151])) == 0

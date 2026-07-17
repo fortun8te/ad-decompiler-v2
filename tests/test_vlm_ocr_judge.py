@@ -481,8 +481,12 @@ def test_forced_display_line_still_rejects_wholesale_rewrite(tmp_path, monkeypat
     line = _line("WERE SAYINC COODBYE", conf=0.94,
                  box={"x": 80, "y": 85, "w": 1400, "h": 76})
     out = vlm_ocr_judge.judge_ocr_lines(_image(tmp_path), {"lines": [line]}, _cfg())
-    assert out["lines"][0]["text"] == "WERE SAYINC COODBYE"
+    # The VLM's unrelated reading is refused, and the refusal stays on the record.
+    assert "SHOES" not in out["lines"][0]["text"]
     assert out["vlm_ocr_judge"]["notes"][0]["note"] == "vlm_novel_reading"
+    # Rejecting the VLM does not mean shipping the misread: the deterministic G->C
+    # backstop (ocr.cleanup_line_text) still repairs the line the judge would not.
+    assert out["lines"][0]["text"] == "WERE SAYING GOODBYE"
 
 
 def test_tallest_allcaps_headline_forced_beyond_top_two(tmp_path, monkeypatch):
