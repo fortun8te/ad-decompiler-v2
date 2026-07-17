@@ -1429,3 +1429,38 @@ def test_declared_font_style_disagreeing_with_the_drawn_file_is_a_hard_fail(tmp_
     audit = result["deliverable_font_consistency"]
     assert audit["italic_drawn_not_declared"] == 1
     assert audit["preview_matches_declaration_ratio"] < 1.0
+
+
+def test_ink_ownership_ledger_flags_verbatim_double_and_respects_geometry(tmp_path):
+    """The invariant tripwire: a native node OVER verbatim source ink in the plate is a
+    DOUBLE; the same text elsewhere (no box overlap) must NOT alias into one (088's
+    ribbon 'BLACK' vs the headline node was exactly that false positive)."""
+    import numpy as np
+    from PIL import Image
+    from src import pixel_diff as pd
+
+    src = np.full((200, 400), 255.0, dtype=np.float32)
+    src[20:60, 20:200] = 0.0          # ink for line A (stays in plate -> double)
+    src[120:150, 20:150] = 0.0        # ink for line B (cleaned from plate)
+    plate = src.copy()
+    plate[120:150, 20:150] = 255.0    # B cleaned; A untouched
+    Image.fromarray(plate.astype('uint8')).save(tmp_path / 'background_clean.png')
+
+    ocr = {"lines": [
+        {"text": "HELLO WORLD", "conf": 0.9, "box": {"x": 20, "y": 20, "w": 180, "h": 40}},
+        {"text": "GOODBYE", "conf": 0.9, "box": {"x": 20, "y": 120, "w": 130, "h": 30}},
+    ]}
+    design = {"layers": [
+        {"id": "t1", "type": "text", "text": "HELLO WORLD",
+         "box": {"x": 20, "y": 20, "w": 180, "h": 40}},
+        {"id": "t2", "type": "text", "text": "GOODBYE",
+         "box": {"x": 20, "y": 120, "w": 130, "h": 30}},
+        # Same text FAR AWAY: must not alias line A's ownership.
+        {"id": "t3", "type": "text", "text": "HELLO WORLD",
+         "box": {"x": 300, "y": 170, "w": 90, "h": 20}},
+    ]}
+    led = pd._ink_ownership_ledger(ocr, design, str(tmp_path), src)
+    states = {l["text"]: l["state"] for l in led["lines"]}
+    assert states["HELLO WORLD"] == "DOUBLE"      # node overlaps + plate holds ink
+    assert states["GOODBYE"] == "native-clean"    # node overlaps + plate cleaned
+    assert led["doubles"] == 1

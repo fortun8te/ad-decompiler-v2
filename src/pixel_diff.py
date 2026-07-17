@@ -979,6 +979,109 @@ def _delivered_text_blob(design, fold=True):
     return " ".join(["".join(parts) for parts in blocks.values()] + raster)
 
 
+def _ink_ownership_ledger(source_ocr, design, run_dir, source_gray):
+    """Per-line ink ownership: every source text line must end in EXACTLY ONE state.
+
+    The invariant behind our most persistent defect family (ghost doubles, baked strikes
+    under native text, dropped lines): a line's ink is owned by the plate OR a native
+    node — never both, never neither. We fixed 13+ INSTANCES of violations across
+    benches 5-13 (025 'Blocks everything' ghost, 002's baked euro-strike under native
+    text, 013's badge double, 066's outlined doubles...) without ever enforcing the
+    invariant, so each new code path could violate it again. This ledger enforces it.
+
+    States per line:
+      native-clean   node exists, plate under the box no longer holds the source ink  OK
+      baked          no node; plate (or an owning asset) still holds the ink          OK
+      DOUBLE         node exists AND the plate still holds the source ink verbatim    HARD
+      dropped        no node and no surface holds the ink                             report
+    The DOUBLE test is deliberately conservative: the plate crop must match the source
+    crop nearly verbatim (mean |diff| <= 4.0 over the box) — partially-cleaned smears are
+    reconstruct's residue detector's job, not this gate's, and a loose threshold here
+    would hard-fail every textured carrier.
+    """
+    import numpy as np
+    from PIL import Image
+
+    out = {"lines": [], "doubles": 0, "dropped": 0, "native_clean": 0, "baked": 0,
+           "basis": "plate-vs-source verbatim ink check"}
+    if design is None or source_gray is None or not run_dir:
+        out["basis"] = "unavailable (missing design/plate/source)"
+        return out
+    plate_path = os.path.join(run_dir, "background_clean.png")
+    if not os.path.isfile(plate_path):
+        out["basis"] = "unavailable (no background_clean.png)"
+        return out
+    try:
+        plate = np.asarray(Image.open(plate_path).convert("L"), dtype=np.float32)
+    except Exception:
+        out["basis"] = "unavailable (plate unreadable)"
+        return out
+    if plate.shape != source_gray.shape:
+        try:
+            plate = np.asarray(
+                Image.open(plate_path).convert("L").resize(source_gray.shape[1::-1]),
+                dtype=np.float32)
+        except Exception:
+            out["basis"] = "unavailable (plate size mismatch)"
+            return out
+
+    baked_leaves = _baked_line_leaves(design, source_gray)
+    asset_cache = {}
+    # Text-only matching aliases: a ribbon fragment reading 'BLACK' would match the
+    # HEADLINE node's 'Black Friday' and read as a double (measured on 088). A line is
+    # only "native" if a text node both CONTAINS its folded text and OVERLAPS its box.
+    text_nodes = []
+    for leaf, abs_box in _iter_leaf_layers_abs((design or {}).get("layers") or []):
+        if leaf.get("type") == "text" and (leaf.get("text") or "").strip():
+            text_nodes.append((_confusable_fold(leaf.get("text", "")), abs_box))
+
+    def _overlaps(a, b):
+        ax0, ay0 = float(a.get("x", 0)), float(a.get("y", 0))
+        ax1, ay1 = ax0 + float(a.get("w", 0)), ay0 + float(a.get("h", 0))
+        bx0, by0 = float(b.get("x", 0)), float(b.get("y", 0))
+        bx1, by1 = bx0 + float(b.get("w", 0)), by0 + float(b.get("h", 0))
+        return ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1
+
+    kept = [l for l in source_ocr.get("lines", []) if l.get("conf", 1) >= 0.5
+            and len(_norm(l.get("text", ""))) >= 3]
+    for line in kept:
+        folded = _confusable_fold(line.get("text", ""))
+        lbox = line.get("box") or {}
+        native = bool(folded) and any(
+            folded in node_text and _overlaps(lbox, node_box)
+            for node_text, node_box in text_nodes if node_text)
+        clipped = _clip_box(line.get("box") or {}, *source_gray.shape[1::-1])
+        plate_holds = None
+        if clipped is not None:
+            x0, y0, x1, y1 = clipped
+            if x1 > x0 and y1 > y0:
+                delta = float(np.abs(source_gray[y0:y1, x0:x1]
+                                     - plate[y0:y1, x0:x1]).mean())
+                plate_holds = delta <= 4.0
+        asset_holds = False
+        if not plate_holds:
+            try:
+                asset_holds = _line_baked_in_asset(line.get("box") or {}, source_gray,
+                                                   baked_leaves, run_dir, asset_cache)
+            except Exception:
+                asset_holds = False
+        if native and plate_holds:
+            state = "DOUBLE"
+            out["doubles"] += 1
+        elif native:
+            state = "native-clean"
+            out["native_clean"] += 1
+        elif plate_holds or asset_holds:
+            state = "baked"
+            out["baked"] += 1
+        else:
+            state = "dropped"
+            out["dropped"] += 1
+        out["lines"].append({"text": str(line.get("text"))[:48], "state": state,
+                             "plate_holds": plate_holds, "asset_holds": asset_holds})
+    return out
+
+
 def _text_recall_detail(source_ocr, render_ocr, source_gray=None, render_gray=None,
                         design=None, run_dir=None):
     """Share of source text lines we actually DELIVER, scored against source truth.
@@ -2969,6 +3072,8 @@ def compare(
             design=design_data, run_dir=run_dir)
         text_recall = text_recall_detail["recall"]
     render_legibility = _render_text_legibility(render_ocr, design_data)
+    ink_ownership = _ink_ownership_ledger(source_ocr or {}, design_data, run_dir,
+                                          source_gray) if source_ocr else None
 
     opts = dict(DEFAULT_THRESHOLDS)
     # F-per-archetype-floor: apply the archetype preset's own edge/color floors (if any)
@@ -2992,6 +3097,14 @@ def compare(
     # them out of quality_flags is deliberate — harness.py/_blocker_names treats every
     # quality_flag as an acceptance blocker.
     quality_warnings = []
+    if ink_ownership and ink_ownership.get("doubles"):
+        _doubled = [l["text"] for l in ink_ownership["lines"] if l["state"] == "DOUBLE"]
+        quality_flags.append({
+            "rule": "ink-double-render",
+            "detail": ("%d line(s) ship BOTH a native text node AND verbatim source ink "
+                       "still in the plate — a visible ghost double: %s"
+                       % (len(_doubled), ", ".join(repr(t) for t in _doubled[:4]))),
+        })
     if multiscale < opts["local_ssim_min"]:
         quality_flags.append({"rule": "local-ssim", "detail": f"{multiscale:.3f} < {opts['local_ssim_min']:.3f}"})
     if edge["f1"] < opts["edge_f1_min"]:
@@ -3167,6 +3280,7 @@ def compare(
         # product text (kept_in_photo + pixels verbatim in the owning asset), with the
         # excluded line texts listed so the exclusion is auditable, never silent.
         "text_recall_detail": text_recall_detail,
+        "ink_ownership": ink_ownership,
         # "Does our preview draw what we delivered" — the old render-OCR round-trip, kept as
         # an honest, separately-named, NON-gating signal. See _render_text_legibility.
         "render_text_legibility": render_legibility,
