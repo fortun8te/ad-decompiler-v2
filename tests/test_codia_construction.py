@@ -366,6 +366,72 @@ def test_group_on_distinct_plate_region_gets_background_child(tmp_path):
     assert abs(int(tile[90, 160, 2]) - 120) <= 2  # slice of the CLEAN plate
 
 
+def test_group_plate_is_skipped_when_it_would_occlude_an_earlier_top_level_layer(tmp_path):
+    """025: paint order is hierarchical, so a group lands at its TOP-LEVEL ancestor's z.
+
+    An emoji chip emitted at top-level z=5 paints BEFORE a card group at z=16, so the
+    card's opaque plate slice wipes it off the render. ``bg_z = min(child z) - 1`` is only
+    sibling-scoped and cannot rescue it. The plate must yield instead — losslessly, since
+    the slice comes from the clean plate the root background already paints."""
+    plate = np.full((400, 400, 3), 240, dtype=np.uint8)
+    plate[100:280, 40:360] = (30, 60, 120)  # distinct card region
+    plate_path = tmp_path / "background_clean.png"
+    Image.fromarray(plate).save(plate_path)
+    chip = {
+        "id": "emoji0", "target": "image", "src": "assets/emoji0.png",
+        "box": {"x": 60, "y": 120, "w": 32, "h": 32},
+        "meta": {"z": 5},
+    }
+    card = {
+        "id": "g0", "target": "group",
+        "box": {"x": 40, "y": 100, "w": 320, "h": 180},
+        "meta": {"role": "card", "z": 16},
+        "children": [{
+            "id": "t0", "target": "text", "text": "Review",
+            "box": {"x": 20, "y": 20, "w": 120, "h": 24},
+            "style": {"fontSize": 20.0, "color": "#ffffff"},
+            "meta": {},
+        }],
+    }
+    doc = build_design_json.build([chip, card], {"w": 400, "h": 400}, str(tmp_path),
+                                  base_src=str(plate_path))
+    group = next(l for l in doc.layers if l.type == "group")
+    assert not any(str(c.id).endswith("__groupbg") for c in group.children), (
+        "plate would paint over the earlier-painting emoji chip and erase it")
+    # The chip survives, and the group keeps its own content.
+    assert any(str(l.id) == "emoji0" for l in doc.layers)
+    assert any(str(c.id) == "t0" for c in group.children)
+
+
+def test_group_plate_kept_when_the_overlapping_layer_paints_later(tmp_path):
+    """The guard is scoped to OCCLUSION, not to overlap: a layer that paints AFTER the
+    group is drawn on top of the plate and is unharmed, so the plate must survive."""
+    plate = np.full((400, 400, 3), 240, dtype=np.uint8)
+    plate[100:280, 40:360] = (30, 60, 120)
+    plate_path = tmp_path / "background_clean.png"
+    Image.fromarray(plate).save(plate_path)
+    card = {
+        "id": "g0", "target": "group",
+        "box": {"x": 40, "y": 100, "w": 320, "h": 180},
+        "meta": {"role": "card", "z": 5},
+        "children": [{
+            "id": "t0", "target": "text", "text": "Review",
+            "box": {"x": 20, "y": 20, "w": 120, "h": 24},
+            "style": {"fontSize": 20.0, "color": "#ffffff"},
+            "meta": {},
+        }],
+    }
+    chip = {
+        "id": "emoji0", "target": "image", "src": "assets/emoji0.png",
+        "box": {"x": 60, "y": 120, "w": 32, "h": 32},
+        "meta": {"z": 16},
+    }
+    doc = build_design_json.build([card, chip], {"w": 400, "h": 400}, str(tmp_path),
+                                  base_src=str(plate_path))
+    group = next(l for l in doc.layers if l.type == "group")
+    assert any(str(c.id).endswith("__groupbg") for c in group.children)
+
+
 def test_group_on_shared_plate_gets_no_background_child(tmp_path):
     plate = np.zeros((400, 400, 3), dtype=np.uint8)  # uniform page plate
     plate_path = tmp_path / "background_clean.png"

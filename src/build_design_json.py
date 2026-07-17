@@ -2136,13 +2136,71 @@ def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings, plate_rg
     scale_y = ph / max(1.0, float(canvas.get("h", ph)))
     added = 0
 
-    def visit(layer, off_x: float, off_y: float):
+    # Paint order is HIERARCHICAL, not a flat z sort: render_preview walks top-level layers
+    # by z and then paints each subtree in place, so a group lands as a UNIT at the z of its
+    # TOP-LEVEL ancestor. A group plate's ``bg_z = min(child z) - 1`` is therefore only
+    # SIBLING-scoped — it orders the plate under its own siblings and can never order it
+    # under an EARLIER-painting top-level layer that happens to overlap the group's box.
+    # 025: ten emoji chips are emitted at top-level z=6..15; a card band at z=16 paints
+    # after all of them, so its opaque slice wiped eight of them off the render. Raising a
+    # chip's z cannot help (a child's z is scoped to its parent), so the plate itself must
+    # yield. Skipping it is lossless: the slice is cut from background_clean, which the root
+    # plate already paints — the band keeps its backdrop, just from the root plate instead
+    # of a duplicate chip parked on top of the emoji.
+    flat = []
+
+    def _flatten(items, off_x: float = 0.0, off_y: float = 0.0, root_z=None, ancestors=()):
+        for item in items:
+            ibox = item.box or {}
+            ax = off_x + float(ibox.get("x", 0) or 0)
+            ay = off_y + float(ibox.get("y", 0) or 0)
+            z = float(item.z_index or 0)
+            rz = z if root_z is None else root_z
+            iid = str(item.id or "")
+            flat.append({
+                "id": iid, "x": ax, "y": ay,
+                "w": float(ibox.get("w", 0) or 0), "h": float(ibox.get("h", 0) or 0),
+                "root_z": rz, "ancestors": ancestors,
+                "is_plate": iid.endswith(("__groupbg", "__hostbg")),
+                "role": str((item.meta or {}).get("role") or "").lower(),
+            })
+            _flatten(item.children or [], ax, ay, rz, ancestors + (iid,))
+
+    _flatten(layers)
+
+    def _occluded_victim(gid, gx, gy, gw, gh, group_root_z):
+        """Id of a layer this group's plate would wipe, or None.
+
+        A victim is any layer that (a) is NOT part of this group's subtree — the plate sits
+        under those by construction — (b) overlaps the group's box, and (c) whose top-level
+        ancestor paints EARLIER than this group's, so the plate lands on top of it. Backing
+        layers (the root plate, other manufactured plates) are never victims: they are meant
+        to sit behind."""
+        for entry in flat:
+            if entry["is_plate"] or entry["id"] == gid:
+                continue
+            if gid in entry["ancestors"]:
+                continue  # descendant of this group: the plate is under it
+            if entry["id"] == "background" or entry["role"] == "background":
+                continue
+            if not (entry["w"] and entry["h"]):
+                continue
+            if entry["root_z"] >= group_root_z:
+                continue  # paints after the plate: unharmed
+            if (gx + gw <= entry["x"] or entry["x"] + entry["w"] <= gx
+                    or gy + gh <= entry["y"] or entry["y"] + entry["h"] <= gy):
+                continue
+            return entry["id"]
+        return None
+
+    def visit(layer, off_x: float, off_y: float, root_z=None):
         nonlocal added
         box = layer.box or {}
         abs_x = off_x + float(box.get("x", 0) or 0)
         abs_y = off_y + float(box.get("y", 0) or 0)
+        rz = float(layer.z_index or 0) if root_z is None else root_z
         for child in layer.children or []:
-            visit(child, abs_x, abs_y)
+            visit(child, abs_x, abs_y, rz)
         if layer.type != "group" or not layer.children:
             return
         gid = str(layer.id or "group")
@@ -2157,6 +2215,11 @@ def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings, plate_rg
         w = float(box.get("w", 0) or 0)
         h = float(box.get("h", 0) or 0)
         if w * h < _GROUP_BG_MIN_AREA_PX or w * h > _GROUP_BG_MAX_CANVAS_FRAC * canvas_area:
+            return
+        victim = _occluded_victim(gid, abs_x, abs_y, w, h, rz)
+        if victim is not None:
+            warnings.append({"code": "group-background-skipped-occluding", "layer_id": gid,
+                             "detail": f"plate would occlude earlier-painting layer {victim}"})
             return
         x0 = int(round(abs_x * scale_x)); y0 = int(round(abs_y * scale_y))
         x1 = int(round((abs_x + w) * scale_x)); y1 = int(round((abs_y + h) * scale_y))
@@ -2220,7 +2283,7 @@ def _add_group_backgrounds(layers, canvas, run_dir, base_src, warnings, plate_rg
         added += 1
 
     for root in layers:
-        visit(root, 0.0, 0.0)
+        visit(root, 0.0, 0.0, None)
     return added
 
 
