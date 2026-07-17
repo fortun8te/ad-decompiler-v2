@@ -235,6 +235,24 @@ def _source_priority(candidate):
     return 0
 
 
+_LIST_GLYPH_ROLES = frozenset({
+    "verified", "checkmark", "check", "check-mark", "check_mark", "tick",
+    "cross", "question-mark", "question_mark",
+})
+
+
+def _is_cv_list_glyph(meta: dict) -> bool:
+    """A ✓/✗/? glyph located by src/icon_detect.py's template match.
+
+    The match itself is the independent evidence (and the chip box is the glyph's own
+    matte), so these do not need ``_verified_semantic_mask``: 101's four crosses carry
+    icon-cv provenance only, at scores .94-.95, with no SAM observation at all.
+    """
+    meta = meta or {}
+    role = str(meta.get("role") or "").lower().replace("_", "-")
+    return bool(meta.get("icon_cv")) or role in _LIST_GLYPH_ROLES
+
+
 def _verified_semantic_mask(meta: dict) -> bool:
     """Whether an alpha matte has independent high-confidence SAM evidence.
 
@@ -3326,6 +3344,21 @@ def reconstruct(image_path: str, ocr: dict, candidates: list, run_dir: str,
                 and ownership_fraction < .55):
             owned = (mask > 0).astype(np.uint8) * 255
             c["meta"]["ownership_rescued"] = "distinct-verified-cutout"
+            c["meta"]["ownership_fraction_before_rescue"] = round(ownership_fraction, 4)
+            c["meta"]["ownership_cutout"] = True
+        # Same rescue, for list-row ✓/✗/? glyphs. A checklist card carries z_band=chrome,
+        # so it out-ranks its own row glyphs in ownership and claims every glyph pixel;
+        # the glyph then drops as "fully-contained-in-foreground-owner" on the premise
+        # that the owner's raster still carries it. For these cards that premise is false
+        # — they ship as a flat fill / native `__shell`, or fold into the plate that the
+        # card paints over — so the drop deleted all nine of 101's marks and fifteen of
+        # 066's. Glyphs always ship as pixel-exact raster chips: re-claim the chip's own
+        # matte. Identical pixels at the same position, so this adds a layer, never a hole.
+        elif (not is_text_fallback
+                and _is_cv_list_glyph(c["meta"])
+                and ownership_fraction < .55):
+            owned = (mask > 0).astype(np.uint8) * 255
+            c["meta"]["ownership_rescued"] = "cv-list-glyph"
             c["meta"]["ownership_fraction_before_rescue"] = round(ownership_fraction, 4)
             c["meta"]["ownership_cutout"] = True
         # Do retain broad photo frames for the layout regression contract, but

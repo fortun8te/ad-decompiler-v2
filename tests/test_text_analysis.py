@@ -287,6 +287,103 @@ def test_peer_lines_of_one_block_unify_to_a_single_scale():
     assert len(sizes) == 1, f"callout peers must share one size, got {sizes}"
 
 
+def test_101_tittle_is_not_x_height_ink():
+    """101: 'mini pumps' fitted 30.25 in a column of 24.0 and was ejected from its peers.
+
+    It carries no b/d/f/h/k/l/t, so it was modelled as x-height-only ink — but the dot on
+    'i' clears x-height and lands at ~cap height, so the ink really spans tittle to
+    'p'-descender. Measured against 101 (ink_h 22, true size 24.0): x-height +26.1%,
+    ascender -4.3%, cap height -1.3%.
+    """
+    cap = 0.72
+    tittle = text_analysis._expected_ink_ratio("mini pumps", cap)
+    # Same glyph extremes as an explicit cap + descender line.
+    assert tittle == pytest.approx(text_analysis._expected_ink_ratio("Mp", cap))
+    assert 22.0 / tittle == pytest.approx(24.0, abs=0.5)
+    # A true ascender still out-tops a tittle, and x-height-only ink is unaffected.
+    assert text_analysis._expected_ink_ratio("mini bumps", cap) > tittle
+    assert text_analysis._expected_ink_ratio("names", cap) < tittle
+
+
+def test_101_column_peers_unify_across_role_shattered_blocks():
+    """101: a uniform checklist column whose rows the block grouper could not see.
+
+    '50% thicker for better' is labelled an *offer* (the offer regex fires on "50%") and
+    'repairs & sealant use' a *footer* (it sits low on the canvas), so _can_join's role
+    veto strands each in a singleton block that the block pass can never reach. They are
+    still one visual column and must share one scale.
+    """
+    def row(ident, text, y, size, weight, block):
+        return {"id": ident, "text": text, "block_id": block,
+                "box": {"x": 110.0, "y": y, "w": 260.0, "h": 25.0},
+                "style": {"fontFamily": "Poppins", "fontSize": size,
+                          "fontWeight": weight, "color": "#111111"}}
+
+    # Geometry and fitted styles as MEASURED off 101 (every row is one size in the source).
+    lines = [
+        row("L0", "50% thicker for better", 704.1, 24.04, 400, "B9"),
+        row("L1", "durability", 733.4, 20.89, 350, "B10"),
+        row("L2", "Aluminium valve built to last", 780.5, 24.04, 400, "B11"),
+        row("L3", "Compatible with electric", 825.2, 24.10, 400, "B11"),
+        row("L4", "mini pumps", 854.4, 23.69, 400, "B11"),
+        row("L5", "Removable valve core for", 905.3, 24.04, 400, "B11"),
+        row("L6", "repairs & sealant use", 930.7, 22.97, 350, "B13"),
+    ]
+    changes = text_analysis._unify_column_text_scale(lines)
+    assert changes
+    sizes = [ln["style"]["fontSize"] for ln in lines]
+    assert max(sizes) / min(sizes) <= 1.02, \
+        f"column rows must render as one size, got {sorted(set(sizes))}"
+    assert {ln["style"]["fontWeight"] for ln in lines} == {400}, "and one weight"
+
+
+def test_column_unification_never_flattens_a_real_size_step():
+    """091's authored 1.222 step sits in the same column and must survive it."""
+    def row(ident, text, y, size):
+        return {"id": ident, "text": text, "block_id": "B%s" % ident,
+                "box": {"x": 90.0, "y": y, "w": 300.0, "h": 26.0},
+                "style": {"fontFamily": "Inter", "fontSize": size,
+                          "fontWeight": 400, "color": "#111111"}}
+
+    lines = [row("L0", "ZERO SUGAR", 400.0, 24.0), row("L1", "SUPPLEMENT", 440.0, 24.0),
+             row("L2", "120MG NATURAL", 480.0, 29.33)]
+    text_analysis._unify_column_text_scale(lines)
+    assert lines[2]["style"]["fontSize"] == 29.33, "a 1.222 step is hierarchy, not drift"
+    assert lines[0]["style"]["fontSize"] == lines[1]["style"]["fontSize"] == 24.0
+
+
+def test_column_unification_does_not_reach_across_the_canvas():
+    """A column is a CONTIGUOUS stack: a distant logo sharing a left edge is not a peer."""
+    def row(ident, text, y, size):
+        return {"id": ident, "text": text, "block_id": "B%s" % ident,
+                "box": {"x": 105.0, "y": y, "w": 200.0, "h": 25.0},
+                "style": {"fontFamily": "Inter", "fontSize": size,
+                          "fontWeight": 400, "color": "#111111"}}
+
+    lines = [row("L0", "craft", 375.0, 25.37),      # logo, hundreds of px above
+             row("L1", "50% thicker for better", 704.0, 24.04),
+             row("L2", "durability", 733.0, 20.89)]
+    text_analysis._unify_column_text_scale(lines)
+    assert lines[0]["style"]["fontSize"] == 25.37, "the logo is not part of the checklist"
+    assert lines[1]["style"]["fontSize"] == lines[2]["style"]["fontSize"]
+
+
+def test_101_column_row_is_left_aligned_not_a_floating_callout():
+    """101's rows (x=110 of 1000) and 014's floater (x=120 of 1080) are the SAME box.
+
+    Only the rest of the canvas can tell them apart: a column row has lines flush to its
+    left edge, a floater does not. Without that, every singleton row was emitted RIGHT
+    and its left edge drifted with its own rendered width (the ragged indentation).
+    """
+    row = {"box": {"x": 110.0, "y": 704.0, "w": 262.0, "h": 25.0}}
+    column = [row,
+              {"box": {"x": 112.0, "y": 733.0, "w": 112.0, "h": 21.0}},
+              {"box": {"x": 110.0, "y": 780.0, "w": 349.0, "h": 25.0}}]
+    assert text_analysis._infer_alignment([row], 1000.0, siblings=column) == "LEFT"
+    # With no left-edge peers it is still a floating callout.
+    assert text_analysis._infer_alignment([row], 1000.0, siblings=[row]) == "RIGHT"
+
+
 def test_peer_unification_never_flattens_a_real_size_step():
     """The hard constraint: a headline beside its body copy must keep its contrast."""
     lines = [
@@ -1053,13 +1150,32 @@ def _jitter_line(words, base_weight=400):
     }
 
 
+# Ink density a word must carry for _estimate_weight to bucket it at each weight.
+_WEIGHT_DENSITY = {300: 0.10, 400: 0.25, 500: 0.30, 600: 0.40, 700: 0.50, 800: 0.60}
+
+
 def _patch_jitter(monkeypatch, weights, density=None, stroke=None):
-    """Drive _enrich_word_styles with per-word weight/density/stroke measurements."""
+    """Drive _enrich_word_styles with per-word weight/density measurements.
+
+    Ink density is what a weight estimate is MADE of (_estimate_weight buckets the mask
+    mean), so a fixture may not claim a per-word weight without giving that word the ink
+    to justify it — that ink is the evidence a mid-line weight change now requires. Pass
+    ``density`` to override the weight-implied ink per word, which is how a test models
+    "the absolute bucket flipped but the word's ink is no different from its line-mates".
+    """
+    def _mask_for(word):
+        value = (density or {}).get(word["text"])
+        if value is None:
+            value = _WEIGHT_DENSITY.get(weights[word["text"]], 0.25)
+        mask = np.zeros((30, 34), dtype=bool)
+        mask.reshape(-1)[: int(round(value * mask.size))] = True
+        return mask
+
     def fake_geo(image, word):
         return ({"x": word["box"]["x"], "y": word["box"]["y"],
                  "w": word["box"]["w"], "h": word["box"]["h"]},
                 None, "#111111", 1.0,
-                np.ones((30, 34), dtype=bool),
+                _mask_for(word),
                 {"fill": {"kind": "flat", "color": "#111111"}})
 
     def fake_signals(word, painted, mask, config):
@@ -1067,9 +1183,7 @@ def _patch_jitter(monkeypatch, weights, density=None, stroke=None):
 
     monkeypatch.setattr(text_analysis, "_painted_geometry", fake_geo)
     monkeypatch.setattr(text_analysis, "_pre_font_signals", fake_signals)
-    # Density comes off the mask mean; patch the mask-derived signals per word instead.
-    if density is not None:
-        monkeypatch.setattr(text_analysis, "_collar_box", lambda box, image=None: box)
+    monkeypatch.setattr(text_analysis, "_collar_box", lambda box, image=None: box)
 
 
 def test_009_short_function_word_bold_between_regular_neighbours_is_clamped(monkeypatch):
@@ -1079,12 +1193,15 @@ def test_009_short_function_word_bold_between_regular_neighbours_is_clamped(monk
     so the function word must be clamped back to the line's weight.
     """
     line = _jitter_line([("Schrijf", 400), ("we", 700), ("zien", 400)])
-    _patch_jitter(monkeypatch, {"Schrijf": 400, "we": 700, "zien": 400})
+    # The bucket says Bold, but the ink says otherwise: every word carries the SAME
+    # density, so there is nothing to corroborate the flip.
+    _patch_jitter(monkeypatch, {"Schrijf": 400, "we": 700, "zien": 400},
+                  density={"Schrijf": 0.25, "we": 0.25, "zien": 0.25})
     text_analysis._enrich_word_styles(np.zeros((40, 200, 3), dtype=np.uint8), line, {})
     we = line["words"][1]
     assert "weight" not in (we.get("style_evidence") or {}).get("changed", []), \
         "spurious mid-line bold on a function word must not survive"
-    assert (we.get("style_debug") or {}).get("weight_jitter_clamped")
+    assert (we.get("style_debug") or {}).get("weight_peer_clamped")
 
 
 def test_009_real_bold_121K_is_not_a_function_word_and_survives(monkeypatch):
@@ -1105,22 +1222,66 @@ def test_025_genuine_emphasis_words_are_not_function_words():
         assert not text_analysis._short_function_word(token), token
 
 
+def test_066_glyph_composition_alone_never_bolds_a_word(monkeypatch):
+    """066: 'Easy to remove' rendered 'remove' Bold against a Regular line.
+
+    Nothing about that line is bold. 'remove' is x-height-only ink, so its tight bbox is
+    SHORT and its raw density reads 0.564, while its line-mate 'Easy' (cap + descender,
+    a tall bbox) reads 0.332 at the SAME authored weight — a 1.70x split that lands them
+    in different absolute weight buckets. Composition, not emphasis: the line stays
+    uniform. This is the defect class that also produced 'Clump-free & buildable' and
+    'Spidery but long'.
+    """
+    line = _jitter_line([("Easy", 400), ("to", 400), ("remove", 700)])
+    # Raw densities as MEASURED off 066: identical authored weight, 1.70x apart.
+    _patch_jitter(monkeypatch, {"Easy": 400, "to": 400, "remove": 700},
+                  density={"Easy": 0.332, "to": 0.388, "remove": 0.564})
+    text_analysis._enrich_word_styles(np.zeros((40, 200, 3), dtype=np.uint8), line, {})
+    for word in line["words"]:
+        assert "weight" not in (word.get("style_evidence") or {}).get("changed", []), \
+            f"{word['text']}: glyph composition must not read as emphasis"
+
+
+def test_067_authored_emphasis_survives_the_composition_normalisation(monkeypatch):
+    """The other half of the contract: 067's '40% OFF' really is bold and must stay.
+
+    Measured off 067 — 'Sale'/'OFF' carry ~1.5x the normalised ink of their line-mates
+    while 'our' (which the absolute buckets also called Bold-700) carries exactly 1.0x
+    and is a false positive.
+    """
+    line = _jitter_line([("our", 700), ("Sale", 700), ("with", 400), ("OFF", 700),
+                         ("Experience", 400)])
+    _patch_jitter(monkeypatch,
+                  {"our": 700, "Sale": 700, "with": 400, "OFF": 700, "Experience": 400},
+                  density={"our": 0.509, "Sale": 0.550, "with": 0.350, "OFF": 0.551,
+                           "Experience": 0.276})
+    text_analysis._enrich_word_styles(np.zeros((40, 200, 3), dtype=np.uint8), line, {})
+    styles = {w["text"]: (w.get("style_evidence") or {}).get("changed", [])
+              for w in line["words"]}
+    assert "weight" in styles["Sale"], "authored emphasis must survive"
+    assert "weight" in styles["OFF"], "authored emphasis must survive"
+    assert "weight" not in styles["our"], \
+        "'our' is only Bold because a word's mask has no inter-word gaps; not emphasis"
+
+
 def test_function_word_bold_survives_when_it_is_not_sandwiched(monkeypatch):
     """A line-INITIAL function word has no left neighbour, so the clamp stays out.
 
-    067's 'our Sale with 40% OFF' opens on a genuinely bold 'our'; only a word wedged
-    between two agreeing neighbours is treated as jitter.
+    Only a word wedged between two AGREEING neighbours is treated as jitter, and a
+    function word that really does carry the ink still gets its bold.
     """
-    line = _jitter_line([("our", 700), ("Sale", 700), ("with", 400)])
-    _patch_jitter(monkeypatch, {"our": 700, "Sale": 700, "with": 400})
+    line = _jitter_line([("our", 700), ("Sale", 400), ("with", 400)])
+    _patch_jitter(monkeypatch, {"our": 700, "Sale": 400, "with": 400})
     text_analysis._enrich_word_styles(np.zeros((40, 200, 3), dtype=np.uint8), line, {})
     assert line["words"][0]["style"]["fontWeight"] == 700
 
 
 def test_function_word_bold_survives_when_neighbours_disagree(monkeypatch):
     """Neighbours that disagree on weight are not a uniform line; the clamp stays out."""
-    line = _jitter_line([("BUY", 700), ("to", 700), ("save", 400)])
-    _patch_jitter(monkeypatch, {"BUY": 700, "to": 700, "save": 400})
+    line = _jitter_line([("BUY", 700), ("to", 700), ("save", 400), ("now", 400),
+                         ("today", 400)])
+    _patch_jitter(monkeypatch, {"BUY": 700, "to": 700, "save": 400, "now": 400,
+                                "today": 400})
     text_analysis._enrich_word_styles(np.zeros((40, 200, 3), dtype=np.uint8), line, {})
     assert line["words"][1]["style"]["fontWeight"] == 700
 

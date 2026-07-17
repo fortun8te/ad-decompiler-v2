@@ -2514,6 +2514,13 @@ _XHEIGHT_OF_CAP = 0.72
 _DESCENDER_OF_CAP = 0.29
 _ASCENDER_CHARS = frozenset("bdfhklt")
 _DESCENDER_CHARS = frozenset("gjpqy")
+# 'i'/'j' carry a TITTLE (the dot), which clears x-height and lands at roughly cap
+# height — below the true ascender. Ignoring it models "mini pumps" (101) as
+# x-height-only ink when its ink really spans tittle→descender, inflating the fitted
+# size by 26% (30.25 against a column of 24.0) and ejecting the row from its peers.
+# Measured against 101's checklist column (ink_h 22 whose true size is 24.0): tittle
+# as x-height +26.1%, as ascender -4.3%, as CAP height -1.3%.
+_TITTLE_CHARS = frozenset("ij")
 
 
 def _expected_ink_ratio(text: str, cap_ratio: float) -> float:
@@ -2534,10 +2541,12 @@ def _expected_ink_ratio(text: str, cap_ratio: float) -> float:
         return cap_ratio
     has_ascender = any(ch in _ASCENDER_CHARS for ch in text if ch.islower())
     has_cap = any(ch.isupper() or ch.isdigit() for ch in text)
+    has_tittle = any(ch in _TITTLE_CHARS for ch in text if ch.islower())
     has_descender = any(ch in _DESCENDER_CHARS for ch in text if ch.islower())
     if has_ascender:
         top = cap_ratio * _ASCENDER_OF_CAP
-    elif has_cap:
+    elif has_cap or has_tittle:
+        # A tittle tops out at ~cap height: 'mini pumps' is NOT x-height-only ink.
         top = cap_ratio
     else:
         top = cap_ratio * _XHEIGHT_OF_CAP
@@ -3167,6 +3176,91 @@ def _unify_repeated_row_labels(enriched: list[dict]) -> list[dict]:
 # not a hierarchy. Kept tight: a real step (headline over body, 013's headline vs subhead)
 # is far larger than this, so it splits into its own cluster and survives untouched.
 _PEER_SIZE_TOLERANCE = 0.15
+# How far a peer's composition-normalised ink must stand out from its cluster before its
+# weight is treated as authored rather than mis-measured. Same threshold, same evidence
+# and same measured margin as the per-word gate in _enrich_word_styles.
+_PEER_WEIGHT_INK_RATIO = 1.30
+# A COLUMN is peers that the block grouper could not see (see _unify_column_text_scale).
+# Left edges must agree to within this fraction of the median line height, and the stack
+# must be vertically contiguous within this multiple of it — enough to bridge the row gaps
+# of a checklist (101: ~2x line height) without ever reaching an unrelated element.
+# All three gates are measured against the LOCAL pair of lines being joined, never a
+# document-wide median: on a poster the median line is a 74px display glyph, and
+# tolerances scaled from it (a 55px left slop, a 222px gap) chain unrelated headline
+# fragments into "columns" — 088 grouped 'BLACK' at y=812 with 'BLACK F' 327px below it.
+_COLUMN_LEFT_TOLERANCE = 0.35
+_COLUMN_GAP_FACTOR = 1.5
+# A column is a stack of same-size rows. Comparing the RAW OCR box heights (not the
+# fitted sizes the pass is about to rewrite) keeps a display fragment from joining body
+# copy it happens to sit above.
+_COLUMN_HEIGHT_RATIO = 1.35
+# Column peers get a looser size band than block peers because the ANALYTIC size model's
+# own residual is that big. Measured on 101's checklist (a column that is one size in the
+# source): the glyph model nails ascender-only rows to 0.2% but still under-reads
+# 'durability' by 13% (its 'y' descender is shallower than the 'p' the one-constant
+# descender model assumes), so two rows of identical authored size legitimately measure
+# 1.151 apart. 0.15 cannot see them as peers; 0.20 can.
+_COLUMN_SIZE_TOLERANCE = 0.20
+# ...and the hierarchy guard moves to the CLUSTER's total span, which is the stronger
+# statement: no unified column may span more than 20%, i.e. exactly the measurement noise
+# floor above. A real authored step (091's 1.222) exceeds it, so it can never be absorbed
+# no matter how its members chain.
+_COLUMN_SPREAD_CAP = 1.20
+
+
+def _snap_peer_cluster(cluster: list[dict], label: dict, changes: list[dict]) -> None:
+    """Snap one cluster of same-scale peers to a single size/family/weight.
+
+    Family and weight move only on a STRICT majority — never on a tie. A majority alone
+    is NOT enough to touch weight, though: a designer bolding one line of a three-line
+    stack is outvoted 2-1 by definition, which is how 135's headline lost its authored
+    Bold ('UPFRONT 3-WEEKSE' 400 / '50% KORTING OP' 800 / 'BIJNA' 400 -> all 400). So a
+    member also has to FAIL to stand out in the ink before its weight is overruled,
+    measured on composition-normalised density against its peers — the same evidence a
+    per-word weight change needs, for the same reason (a line's raw density moves with
+    its glyph mix: no-descender copy sits in a short, dense box and over-reads).
+    Measured, the two cases separate cleanly:
+        025's list rows   peerR 0.87 / 1.00 / 1.03  -> nothing stands out, unify to 400
+        135's headline    peerR 0.59 / 1.51 / 1.00  -> '50% KORTING OP' is really Bold
+    """
+    from collections import Counter
+
+    if len(cluster) < 2:
+        return
+    sizes = sorted(_num((m.get("style") or {}).get("fontSize"), 16.0) for m in cluster)
+    med_size = sizes[len(sizes) // 2]
+    fams = Counter(str((m.get("style") or {}).get("fontFamily")) for m in cluster)
+    weights = Counter(int(_num((m.get("style") or {}).get("fontWeight"), 400)) for m in cluster)
+    fam, fam_n = fams.most_common(1)[0]
+    weight, weight_n = weights.most_common(1)[0]
+    inks = sorted(d for d in (_num((m.get("meta") or {}).get("ink_density_norm"), 0.0)
+                              for m in cluster) if d > 0)
+    med_ink = inks[len(inks) // 2] if inks else None
+    for member in cluster:
+        style = member.get("style") or {}
+        changed = []
+        own_ink = _num((member.get("meta") or {}).get("ink_density_norm"), 0.0)
+        ink_ratio = (own_ink / med_ink) if (med_ink and own_ink > 0) else None
+        stands_out = ink_ratio is not None and (
+            ink_ratio >= _PEER_WEIGHT_INK_RATIO or ink_ratio <= 1.0 / _PEER_WEIGHT_INK_RATIO
+        )
+        if abs(_num(style.get("fontSize"), 16.0) - med_size) > 0.5:
+            style["fontSize"] = round(med_size, 2)
+            style["fontSizeCandidates"] = _size_candidates(med_size)
+            changed.append("size")
+        if fam_n * 2 > len(cluster) and str(style.get("fontFamily")) != fam:
+            style["fontFamily"] = fam
+            changed.append("family")
+        own_weight = int(_num(style.get("fontWeight"), 400))
+        if (weight_n * 2 > len(cluster) and own_weight != weight and not stands_out):
+            style["fontWeight"] = weight
+            style["fontWeightCandidates"] = _weight_candidates(weight)
+            changed.append("weight")
+        if changed:
+            member.setdefault("meta", {})["peer_scale_unified"] = {
+                **label, "size": round(med_size, 2), "changed": changed,
+            }
+            changes.append({"text": member.get("text"), "changed": changed, **label})
 
 
 def _unify_peer_text_scale(enriched: list[dict]) -> list[dict]:
@@ -3213,34 +3307,105 @@ def _unify_peer_text_scale(enriched: list[dict]) -> list[dict]:
                     continue
             clusters.append([member])
         for cluster in clusters:
-            if len(cluster) < 2:
+            _snap_peer_cluster(cluster, {"block": block_id}, changes)
+    return changes
+
+
+def _column_groups(usable: list[dict]) -> list[list[dict]]:
+    """Stack lines into left-aligned columns of same-size rows (see _unify_column_text_scale)."""
+    ordered = sorted(usable, key=lambda l: ((l.get("box") or {}).get("y", 0.0)))
+    columns: list[list[dict]] = []
+    for line in ordered:
+        box = line.get("box") or {}
+        colour = str((line.get("style") or {}).get("color") or "#000000")
+        placed = False
+        for column in columns:
+            last = column[-1]
+            lbox = last.get("box") or {}
+            tall = max(_num(lbox.get("h"), 16.0), _num(box.get("h"), 16.0))
+            short = max(1e-6, min(_num(lbox.get("h"), 16.0), _num(box.get("h"), 16.0)))
+            if tall / short > _COLUMN_HEIGHT_RATIO:
                 continue
-            sizes = sorted(_num((m.get("style") or {}).get("fontSize"), 16.0) for m in cluster)
-            med_size = sizes[len(sizes) // 2]
-            fams = Counter(str((m.get("style") or {}).get("fontFamily")) for m in cluster)
-            weights = Counter(int(_num((m.get("style") or {}).get("fontWeight"), 400)) for m in cluster)
-            fam, fam_n = fams.most_common(1)[0]
-            weight, weight_n = weights.most_common(1)[0]
-            for member in cluster:
-                style = member.get("style") or {}
-                changed = []
-                if abs(_num(style.get("fontSize"), 16.0) - med_size) > 0.5:
-                    style["fontSize"] = round(med_size, 2)
-                    style["fontSizeCandidates"] = _size_candidates(med_size)
-                    changed.append("size")
-                if fam_n * 2 > len(cluster) and str(style.get("fontFamily")) != fam:
-                    style["fontFamily"] = fam
-                    changed.append("family")
-                if weight_n * 2 > len(cluster) and int(_num(style.get("fontWeight"), 400)) != weight:
-                    style["fontWeight"] = weight
-                    style["fontWeightCandidates"] = _weight_candidates(weight)
-                    changed.append("weight")
-                if changed:
-                    member.setdefault("meta", {})["peer_scale_unified"] = {
-                        "block": block_id, "size": round(med_size, 2), "changed": changed,
-                    }
-                    changes.append({"text": member.get("text"), "block": block_id,
-                                    "changed": changed})
+            if abs(_num(lbox.get("x"), 0.0) - _num(box.get("x"), 0.0)) > max(
+                    2.0, tall * _COLUMN_LEFT_TOLERANCE):
+                continue
+            if _colour_distance(colour, str((last.get("style") or {}).get("color") or "#000000")) > 60.0:
+                continue
+            gap = _num(box.get("y"), 0.0) - (_num(lbox.get("y"), 0.0) + _num(lbox.get("h"), 0.0))
+            # An overlapping/same-row neighbour is a different element, not the next row.
+            if gap < -0.25 * short or gap > tall * _COLUMN_GAP_FACTOR:
+                continue
+            # A column never has ANOTHER line living between two of its rows — the same
+            # veto _make_blocks uses. Without it a chain hops over the row that really
+            # follows: 013's pouch label (whose OCR boxes are ~2x their glyphs and
+            # overlap each other) interleaved into 'COMPREHENSIVE NUTRITION'+'Greens'
+            # and 'Superfoods'+'Gummies', which then flattened a small letter-spaced
+            # eyebrow into the display text below it.
+            if _interleaved(last, line, ordered):
+                continue
+            column.append(line)
+            placed = True
+            break
+        if not placed:
+            columns.append([line])
+    return columns
+
+
+def _unify_column_text_scale(enriched: list[dict]) -> list[dict]:
+    """Snap lines that form one left-aligned COLUMN to a single scale.
+
+    _unify_peer_text_scale can only see peers that share a ``block_id``, and the block
+    grouper vetoes joins on ROLE (``_can_join`` -> ``_compatible_roles``). Roles are
+    semantic labels derived from regex/size/position, so a uniform column shatters on
+    contents alone: 101's checklist emits '50% thicker for better' as an *offer* (the
+    offer regex fires on "50%") and 'repairs & sealant use' as a *footer* (it sits below
+    y=0.86), stranding each in a singleton block that the block pass — which needs 2+
+    members — can never reach. The rows then render at 20.9/23.0/24.1 with weights
+    jittering 350/400, which is the visible "text scatter".
+
+    A column is a VISUAL fact, not a semantic one: lines sharing a left edge and a colour
+    in a contiguous vertical run are peers whatever role the labeller gave them. Grouping
+    on that recovers exactly the peers the role veto hid, and the size clustering is still
+    the hierarchy guard — a genuine step (091's 1.222) exceeds the band, lands in its own
+    cluster and is never merged with the copy beside it.
+    """
+    usable = []
+    for line in enriched:
+        style = line.get("style") or {}
+        text = str(line.get("text") or "").strip()
+        if not style.get("fontFamily") or len(text) < 2 or not any(c.isalnum() for c in text):
+            continue
+        box = line.get("box") or {}
+        if not box.get("h"):
+            continue
+        usable.append(line)
+    if len(usable) < 2:
+        return []
+
+    columns = _column_groups(usable)
+    changes: list[dict] = []
+    for column in columns:
+        if len(column) < 2:
+            continue
+        members = sorted(column, key=lambda m: _num((m.get("style") or {}).get("fontSize"), 16.0))
+        clusters: list[list[dict]] = []
+        for member in members:
+            size = _num((member.get("style") or {}).get("fontSize"), 16.0)
+            if clusters:
+                current = [_num((m.get("style") or {}).get("fontSize"), 16.0) for m in clusters[-1]]
+                # Chain against the cluster's running MEDIAN, not its smallest member: a
+                # min-anchored chain splits a uniform column on a hair (101 emitted 24.1
+                # against a 24.03 cutoff drawn from a 20.9 outlier). The spread cap keeps
+                # a median-anchored chain from walking a gradient into one bucket.
+                med = sorted(current)[len(current) // 2]
+                spread = max(current + [size]) / max(1e-6, min(current + [size]))
+                if size <= med * (1.0 + _COLUMN_SIZE_TOLERANCE) and spread <= _COLUMN_SPREAD_CAP:
+                    clusters[-1].append(member)
+                    continue
+            clusters.append([member])
+        for cluster in clusters:
+            _snap_peer_cluster(cluster, {"column": round(_num((cluster[0].get("box") or {}).get("x"), 0.0), 1)},
+                               changes)
     return changes
 
 
@@ -3561,6 +3726,26 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
     # a heavy-inked regular word can't fragment an otherwise-uniform line.
     weight_delta = int(_num(config.get("word_style_weight_delta"), 260))
     weight_min_conf = _num(config.get("word_style_weight_min_ink_confidence"), 0.60)
+    cap_ratio = max(0.45, min(0.90, _num(config.get("cap_height_ratio"), 0.72)))
+    # EVERY mid-line weight change must clear this ratio against the line's OWN words,
+    # measured on composition-normalised density (see below). The absolute weight bucket
+    # cannot carry a change by itself: a word's mask is gapless while its line's mask
+    # includes the inter-word spaces, so words systematically read denser than the line
+    # they sit in and the absolute buckets fire on that artefact alone (066's 'buildable'
+    # is bucketed Bold-700 against a Regular-400 line while being exactly as dense as its
+    # own line-mates).
+    #
+    # Swept over every bench fixture, the two populations are cleanly bimodal and NOTHING
+    # lands between them:
+    #     authored emphasis  >= 1.346  (104 '8K' 2.47, 009 'GC' 2.02 / '121K' 1.90,
+    #                                   091 '120MG' 1.73 / 'CRANGESUNRISE' 1.56,
+    #                                   067 'Sale' 1.56 / 'OFF' 1.50 / '40%' 1.346)
+    #     composition jitter <= 1.174  (002 'pouroon' 1.17, 066 'buildable' 1.16 /
+    #                                   'shades' 1.11, 091 'et' 1.10, 066 'on' 0.87)
+    # 1.30 sits inside that gap: 10.7% clear of the worst jitter, 3.5% under the weakest
+    # authored emphasis. Applied symmetrically (a genuinely LIGHTER word must be as far
+    # below its peers as a bolder one is above) so real light runs still survive.
+    relative_density_ratio = _num(config.get("word_style_relative_density_ratio"), 1.30)
     # A weight flip on a SHORT FUNCTION WORD wedged between two same-weight neighbours
     # is the residual jitter the gates above cannot see: 'we'/'to' carry so few glyphs
     # that their density is dominated by which letters they happen to contain, and a
@@ -3595,10 +3780,20 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
         painted, _baseline, colour, ink_conf, mask, paint = _painted_geometry(image, probe)
         if ink_conf < min_conf:
             continue
+        # COMPOSITION-NORMALISED density. Raw ink density is ink/(w*h) and the ink box's
+        # HEIGHT is set by the word's tallest and lowest glyphs — the very thing
+        # _expected_ink_ratio already models for size. So density is inflated by ~1/ratio:
+        # 066's 'remove' (x-height only, short box) measures 0.564 while its own line-mate
+        # 'Easy' (cap + descender, tall box) measures 0.332 at the SAME authored weight —
+        # a 1.70x split that lands them in different absolute weight buckets. Dividing the
+        # composition factor out makes words with different glyph mixes directly
+        # comparable: that same line collapses to a 1.06x spread, while authored emphasis
+        # survives untouched (009 '121K' 1.90x, 067 'Sale' 1.56x / 'OFF' 1.50x).
         density = None
         try:
             if mask is not None and mask.size:
-                density = float(mask.mean())
+                ratio = _expected_ink_ratio(word.get("text"), cap_ratio)
+                density = float(mask.mean()) * ratio / cap_ratio
         except Exception:
             density = None
         # Stroke width normalised by the word's own painted height: an ink signal that,
@@ -3639,18 +3834,44 @@ def _enrich_word_styles(image, line: dict, config: dict) -> None:
         measured_weight = measured["weight"]
         ratio = max(measured_size, base_size) / max(1.0, min(measured_size, base_size))
         colour_changed = _colour_distance(colour, base_colour) >= colour_delta
+        # A mid-line weight change needs the word to actually stand out from its OWN
+        # line-mates, not merely to land in a different absolute bucket than the line's
+        # (differently-supported) mask. A line with one styleable word has no peers to
+        # stand out from, so the absolute bucket is all there is and remains sufficient.
+        peer_density_ratio = (
+            measured["density"] / line_density
+            if line_density and measured["density"] else None
+        )
+        heavier = measured_weight > base_weight
+        stands_out = (
+            valid_word_count <= 1
+            or (peer_density_ratio is not None
+                and (peer_density_ratio >= relative_density_ratio if heavier
+                     else peer_density_ratio <= 1.0 / relative_density_ratio))
+        )
         weight_changed = (abs(measured_weight - base_weight) >= weight_delta
-                          and ink_conf >= weight_min_conf)
+                          and ink_conf >= weight_min_conf
+                          and stands_out)
+        if (not weight_changed and peer_density_ratio is not None
+                and abs(measured_weight - base_weight) >= weight_delta
+                and ink_conf >= weight_min_conf):
+            word.setdefault("style_debug", {})["weight_peer_clamped"] = {
+                "measured": measured_weight, "clamped_to": base_weight,
+                "peer_density_ratio": round(peer_density_ratio, 3),
+                "required": relative_density_ratio,
+            }
         # Relative-density bold: absolute density buckets cap thin display faces
         # well below Bold, so an authored bold word never clears the absolute
         # ±weight_delta gate (025: bold-italic "Hears" measured 600 vs base 400).
         # Ink density measured against the line's OWN words is face-independent —
         # a word ≥35% denser than its line's median word, whose absolute bucket
-        # already reads ≥200 heavier, is authored emphasis, not jitter.
-        if (not weight_changed and line_density and measured["density"]
+        # already reads ≥200 heavier, is authored emphasis, not jitter. This is the
+        # path that keeps 067's 'Sale'/'40% OFF' bold once the absolute buckets stop
+        # being trusted on their own.
+        if (not weight_changed and peer_density_ratio is not None
                 and len(densities) >= 3
                 and measured_weight - base_weight >= 200
-                and measured["density"] >= line_density * 1.35
+                and peer_density_ratio >= relative_density_ratio
                 and ink_conf >= weight_min_conf):
             measured_weight = max(measured_weight, base_weight + 300)
             weight_changed = True
@@ -3848,12 +4069,29 @@ def _can_join(previous: dict, current: dict, config: dict) -> bool:
     return aligned
 
 
-def _infer_alignment(lines: list[dict], canvas_w: float) -> str:
+def _infer_alignment(lines: list[dict], canvas_w: float,
+                     siblings: Optional[list[dict]] = None) -> str:
     if len(lines) == 1:
         box = lines[0]["box"]
         center = _box_center(box)[0]
         left = float(box.get("x", 0) or 0)
         right = left + float(box.get("w", 0) or 0)
+        # A lone line's own box cannot tell a floating callout from a row of a
+        # left-aligned column: 014's floater (x=120 of 1080) and 101's checklist rows
+        # (x=110 of 1000) are the SAME geometry. The distinguishing fact is elsewhere on
+        # the canvas — a column row has other lines flush to its left edge, a floater does
+        # not. Without this, 101's role-shattered singleton rows each fell into the
+        # "floater" branch below and were emitted RIGHT-aligned, so every row's left edge
+        # drifted with its own rendered width: the visible ragged indentation.
+        if siblings:
+            height = max(1.0, float(box.get("h", 0) or 0))
+            flush = sum(
+                1 for other in siblings
+                if other is not lines[0]
+                and abs(float((other.get("box") or {}).get("x", 0) or 0) - left) <= height * 0.75
+            )
+            if flush >= 2:
+                return "LEFT"
         # True centered labels have *symmetric* side margins. Wide left-anchored
         # body lines (009 "Daarbovenop…") also have a geometric center near mid
         # canvas — requiring margin symmetry avoids flipping them to CENTER.
@@ -3955,7 +4193,7 @@ def _make_blocks(lines: list[dict], canvas: dict, config: dict) -> list[dict]:
     groups.sort(key=lambda group: (group[0]["box"]["y"], group[0]["box"]["x"]))
     for index, group in enumerate(groups):
         block_id = f"B{index}"
-        alignment = _infer_alignment(group, canvas_w)
+        alignment = _infer_alignment(group, canvas_w, siblings=ordered)
         baselines = [line["baseline"]["y0"] for line in group]
         deltas = [baselines[i + 1] - baselines[i] for i in range(len(baselines) - 1)]
         median_size = _median((line["style"]["fontSize"] for line in group), 16.0)
@@ -4243,6 +4481,20 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
             except Exception:
                 font_mask = mask
         geo = _pre_font_signals(line, painted, font_mask, config)
+        # Stash the line's COMPOSITION-NORMALISED ink density (see _enrich_word_styles):
+        # the only weight signal that is comparable between two lines whose glyph mixes
+        # differ. Peer unification needs it to tell a mis-measured weight from an
+        # authored one — 025's 'Filters sound, not life' (no descender, so a short dense
+        # box) reads heavier than its own list-mates at the same authored weight, while
+        # 135's '50% KORTING OP' really is Bold among Regulars.
+        try:
+            if font_mask is not None and font_mask.size:
+                cap = max(0.45, min(0.90, _num(config.get("cap_height_ratio"), 0.72)))
+                line.setdefault("meta", {})["ink_density_norm"] = (
+                    float(font_mask.mean()) * _expected_ink_ratio(line.get("text"), cap) / cap
+                )
+        except Exception:
+            pass
         prepared.append({
             "line": line, "painted": painted, "colour": colour,
             "ink_confidence": ink_confidence, "mask": mask, "font_mask": font_mask,
@@ -4484,6 +4736,9 @@ def analyze_text(img_path: str, ocr_result: dict, cfg: Optional[dict] = None) ->
     if row_label_unify:
         result["row_label_unification"] = row_label_unify
     peer_scale_unify = _unify_peer_text_scale(enriched)
+    # Blocks first (tightest evidence), then columns — which recover the peers the block
+    # grouper's role veto stranded in singleton blocks (101's checklist).
+    peer_scale_unify = (peer_scale_unify or []) + _unify_column_text_scale(enriched)
     if peer_scale_unify:
         result["peer_scale_unification"] = peer_scale_unify
     sections = _make_sections(blocks, canvas)

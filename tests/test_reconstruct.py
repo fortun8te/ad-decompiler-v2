@@ -980,6 +980,24 @@ def test_list_provenance_is_not_treated_as_verified_sam_evidence():
     assert reconstruct._verified_semantic_mask({"provenance": []}) is False
 
 
+def test_cv_only_list_glyph_qualifies_for_the_ownership_rescue():
+    """101's four crosses carry icon-cv provenance only — no SAM observation at all.
+
+    A rescue gated on _verified_semantic_mask would save the checks (SAM-backed) and
+    still drop every cross, so the template match must count as evidence in its own
+    right. Non-glyph roles must not slip through this door.
+    """
+    cross = {"role": "cross", "icon_cv": {"score": 0.95, "anchor": "row"}}
+    assert reconstruct._verified_semantic_mask(cross) is False
+    assert reconstruct._is_cv_list_glyph(cross) is True
+    # Role alone is enough (underscore/hyphen spellings both normalize).
+    assert reconstruct._is_cv_list_glyph({"role": "question_mark"}) is True
+    assert reconstruct._is_cv_list_glyph({"role": "verified"}) is True
+    # ...and the door stays shut for everything else.
+    assert reconstruct._is_cv_list_glyph({"role": "product"}) is False
+    assert reconstruct._is_cv_list_glyph({}) is False
+
+
 def test_text_mask_stays_ink_shaped_by_default():
     image = np.full((200, 300, 3), 230, dtype=np.uint8)
     image[80:96, 120:125] = 20

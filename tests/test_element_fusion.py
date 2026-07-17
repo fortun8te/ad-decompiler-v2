@@ -735,6 +735,63 @@ def test_full_bleed_low_score_photo_band_is_suppressed(tmp_path):
     assert report["counts"]["suppressed_junk_bands"] == 1
 
 
+def _glyph(gid, x, y, role="verified", **meta):
+    return {"id": gid, "role": role, "kind": "icon", "box": _box(x, y, 3, 3),
+            "relationships": [], "meta": {"icon_cv": {"score": 0.9}, **meta}}
+
+
+def test_row_glyphs_survive_a_plate_sized_card_host():
+    """101: folding row glyphs into the host deleted all nine marks.
+
+    Fusion runs before the bake decision, so it cannot know the host carries the glyph
+    pixels — and here it does not: E000 is the full-canvas plate the opaque card groups
+    paint over. The chips must stay, and ship as raster chips.
+    """
+    plate = {"id": "E000", "role": "shape", "kind": "shape", "box": _box(0, 0, 100, 100)}
+    icons = [_glyph("E%03d" % i, 5, 10 + i * 10) for i in range(1, 5)]
+
+    results, marked = element_fusion._mark_list_icon_cards([plate] + icons, {})
+
+    assert [r["id"] for r in results] == ["E000", "E001", "E002", "E003", "E004"]
+    assert len(marked) == 4
+    # The load-bearing half of the old absorber: checklist copy stays editable TEXT.
+    assert plate["meta"]["checklist_editable"] is True
+    assert plate["meta"]["hosted_list_icons"] == ["E001", "E002", "E003", "E004"]
+
+
+def test_floating_glyph_is_not_absorbed_into_a_thin_products_bounding_box():
+    """101: the '?' hangs over the background beside a tube whose bbox merely contains it.
+
+    Box containment says nothing about whether a glyph sits on the product's ink.
+    """
+    tube = {"id": "E003", "role": "product", "kind": "photo-fragment",
+            "box": _box(60, 20, 20, 60), "relationships": []}
+    glyph = _glyph("E014", 64, 30, role="question-mark")
+
+    results, absorbed = element_fusion._absorb_product_decorations([tube, glyph], {})
+
+    assert [r["id"] for r in results] == ["E003", "E014"]
+    assert absorbed == []
+
+
+def test_printed_on_product_glyph_still_folds_through_its_product_link():
+    """135: a chip on the pack's own panel is label ink and must ride the cutout.
+
+    The guard above is narrow: it only withholds the BOX-only fallback, never the
+    mask-linked branch.
+    """
+    bar = {"id": "E000", "role": "product", "kind": "photo-fragment",
+           "box": _box(20, 20, 60, 60), "relationships": []}
+    chip = _glyph("E001", 30, 30, role="cross")
+    chip["parent_id"] = "E000"
+    chip["relationships"] = [{"type": "nested-in", "target": "E000", "containment": 0.99}]
+
+    results, absorbed = element_fusion._absorb_product_decorations([bar, chip], {})
+
+    assert [r["id"] for r in results] == ["E000"]
+    assert absorbed[0]["id"] == "E001"
+
+
 def test_high_score_full_bleed_photo_band_is_kept():
     """A real full-bleed photo (strong model score) keeps its element."""
     band = {

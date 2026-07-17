@@ -148,6 +148,19 @@ _LIST_ROW_ICON_ROLES = frozenset({
 _CHECKLIST_CARD_ROLES = frozenset({
     "card", "panel", "frame", "container", "plate", "shape", "badge", "",
 })
+
+
+def _is_cv_list_glyph(item: dict) -> bool:
+    """A ✓/✗/? glyph that src/icon_detect.py located by template match.
+
+    These always ship as pixel-exact raster chips cut from the original; absorbers
+    that reason from bounding boxes alone must not fold them into a host.
+    """
+    meta = item.get("meta") or {}
+    role = normalized_role(item.get("role") or meta.get("role"))
+    if role in _LIST_ROW_ICON_ROLES:
+        return True
+    return bool(meta.get("icon_cv")) and str(item.get("kind") or "").lower() == "icon"
 _RASTER_ROLES = {
     "photo",
     "product",
@@ -1154,12 +1167,24 @@ def _box_inside_frac(inner: dict, outer: dict) -> float:
     return (iw * ih) / area if area > 0 else 0.0
 
 
-def _absorb_list_icons_into_cards(results: list, opts: dict) -> tuple[list, list]:
-    """Fold checklist ✓/✗ chips into their hosting card before peel (066).
+def _mark_list_icon_cards(results: list, opts: dict) -> tuple[list, list]:
+    """Mark checklist cards that host ✓/✗ chips — never drop the chips (066/101).
 
-    icon_detect emits one chip per row. Peeling those chips out of a white card
-    destroys the card raster; merge/reconstruct cannot restore source ink once the
-    under-layer is hole-punched. Absorbing here keeps a single card element.
+    The chips themselves ALWAYS ship as pixel-exact raster chips cut from the
+    original.  Absorbing them into the host here deleted them outright: fusion runs
+    *before* the bake decision, so it cannot know whether a host will carry their
+    pixels — and in practice it does not.  101's host was the full-canvas plate
+    shape, which the opaque card groups then paint over; 066's cards render as a
+    vector ``__shell`` (flat fill, z=59) over their own groupbg raster.  Either way
+    the glyph pixels are covered, so the fold was a silent delete of all nine/fifteen
+    icons.  The one legitimate absorb — a host that genuinely bakes to an
+    original-pixel raster — is handled downstream by
+    ``merge_layers._absorb_list_icons_into_baked_shells``, which runs *after* the
+    bake decision and gates on ``baked_badge_text``/``shell_raster_chip``.
+
+    What survives here is the load-bearing half: flagging the host
+    ``checklist_editable`` so merge keeps the checklist copy as editable TEXT
+    instead of baking it into chrome (the body-copy bake guard).
     """
     if not results:
         return results, []
@@ -1184,8 +1209,8 @@ def _absorb_list_icons_into_cards(results: list, opts: dict) -> tuple[list, list
             cards.append(item)
     if not cards or not icons:
         return results, []
-    absorbed = []
-    gone = set()
+    marked = []
+    claimed = set()
     for card in cards:
         card_box = card.get("box") or {}
         card_area = float(card_box.get("w", 0) or 0) * float(card_box.get("h", 0) or 0)
@@ -1193,7 +1218,7 @@ def _absorb_list_icons_into_cards(results: list, opts: dict) -> tuple[list, list
             continue
         nested = []
         for icon in icons:
-            if icon.get("id") in gone:
+            if icon.get("id") in claimed:
                 continue
             ibox = icon.get("box") or {}
             iarea = float(ibox.get("w", 0) or 0) * float(ibox.get("h", 0) or 0)
@@ -1204,24 +1229,23 @@ def _absorb_list_icons_into_cards(results: list, opts: dict) -> tuple[list, list
         if len(nested) < min_icons:
             continue
         meta = card.setdefault("meta", {})
-        # Icons stay in the card raster (avoid hole-punch), but checklist *copy*
-        # must remain editable TEXT — never mark the card as a chrome text bake.
+        # Checklist *copy* must remain editable TEXT — never mark the card as a
+        # chrome text bake.  The chips stay as their own elements and ship as
+        # raster chips drawn over this card.
         meta["checklist_editable"] = True
         meta.pop("checklist_raster_chip", None)
-        meta.setdefault("absorbed_list_icons", [])
+        hosted = meta.setdefault("hosted_list_icons", [])
         for icon in nested:
-            gone.add(icon.get("id"))
-            meta["absorbed_list_icons"].append(icon.get("id"))
-            absorbed.append({
+            claimed.add(icon.get("id"))
+            hosted.append(icon.get("id"))
+            icon.setdefault("meta", {})["list_icon_host_id"] = card.get("id")
+            marked.append({
                 "id": icon.get("id"),
                 "host": card.get("id"),
-                "reason": "list-icon-absorbed-into-card",
+                "reason": "list-icon-hosted-by-card",
                 "role": icon.get("role"),
             })
-    if not gone:
-        return results, []
-    kept = [r for r in results if r.get("id") not in gone]
-    return kept, absorbed
+    return results, marked
 
 
 def _absorb_printed_artwork(results: list, opts: dict) -> tuple[list, list]:
@@ -1342,8 +1366,14 @@ def _absorb_product_decorations(results: list, opts: dict) -> tuple[list, list]:
                     target, containment = parent, cont
                     if rel and rel.get("area_ratio") is not None:
                         area_ratio = float(rel["area_ratio"])
-            if target is None:
+            if target is None and not _is_cv_list_glyph(r):
                 # Edge-straddling decoration with no product link: fold on box containment.
+                # NOT for cv-detected ✓/✗/? glyphs: a bounding box says nothing about
+                # whether a glyph sits on the product's *ink*. 101's floating '?' hangs
+                # over the background beside a thin tube whose bbox it happens to fall
+                # inside — box containment 1.0, mask overlap ~0. Printed-on-product
+                # glyphs (135's chips under the nutrition panel) reach this pass with a
+                # real product parent_id and fold via the mask-linked branch above.
                 best = None
                 for pid in product_ids:
                     frac = _box_inside_frac(r.get("box") or {}, by_id[pid].get("box") or {})
@@ -1801,11 +1831,13 @@ def fuse(
         except Exception:
             pass
 
-    # 066: checklist cards owning many ✓/✗ chips must keep those pixels. Emitting the
-    # chips as peelable siblings punches holes that later stages cannot heal.
-    absorbed_list_icons = []
-    if opts.get("absorb_list_icons_into_cards", True):
-        results, absorbed_list_icons = _absorb_list_icons_into_cards(results, opts)
+    # 066/101: checklist cards owning many ✓/✗ chips keep their copy editable, but the
+    # chips themselves always ship as raster chips — folding them into the host here
+    # deleted them, because fusion runs before the bake decision and these hosts render
+    # as vector shells / the plate. merge_layers absorbs only genuine baked rasters.
+    hosted_list_icons = []
+    if opts.get("mark_list_icon_cards", True):
+        results, hosted_list_icons = _mark_list_icon_cards(results, opts)
 
     # Generalized invariant (runs LAST, after icon_detect re-roles ✓/✗ glyphs and the
     # checklist-card absorber): every remaining non-product child that rides inside a
@@ -1825,14 +1857,14 @@ def fuse(
             "absorbed_printed_artwork": absorbed_artwork,
             "absorbed_packaging_shells": absorbed_shells,
             "absorbed_product_decorations": absorbed_decorations,
-            "absorbed_list_icons": absorbed_list_icons,
+            "hosted_list_icons": hosted_list_icons,
             "counts": {
                 "canonical": len(results),
                 "suppressed_junk_bands": len(suppressed_bands),
                 "absorbed_printed_artwork": len(absorbed_artwork),
                 "absorbed_packaging_shells": len(absorbed_shells),
                 "absorbed_product_decorations": len(absorbed_decorations),
-                "absorbed_list_icons": len(absorbed_list_icons),
+                "hosted_list_icons": len(hosted_list_icons),
             },
         }
         with open(os.path.join(run_dir, "fusion_report.json"), "w", encoding="utf-8") as fh:
